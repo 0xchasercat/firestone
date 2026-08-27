@@ -16,7 +16,7 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 | ID | Work | Branch | PR | Status | Depends on | Acceptance |
 |---|---|---|---|---|---|---|
 | M0-00 | Workspace, crate boundaries, typed errors, events, actions, dispatcher seam, CI | `agent/m0-foundation` | [#1](https://github.com/0xchasercat/firestone/pull/1) | complete | baseline | Workspace builds; architecture boundaries compile; CI runs the required gate |
-| M0-01 | Paths, spec and patch model, layering, validation, drift coverage | `agent/m0-spec` | pending | in progress | M0-00 | SPEC sections 5 through 7 unit coverage passes |
+| M0-01 | Paths, spec and patch model, layering, validation, drift coverage | `agent/m0-spec` | [#6](https://github.com/0xchasercat/firestone/pull/6) | ready for review | M0-00 | SPEC sections 5 through 7 unit coverage passes |
 | M0-02 | Atomic files, machine state, locking, liveness reconciliation | `agent/m0-state` | [#4](https://github.com/0xchasercat/firestone/pull/4) | complete | M0-00 | Reconcile matrix and lock contention tests pass |
 | M0-03a | Built-in catalog data and authoritative source validation | `agent/m0-catalog-data` | [#2](https://github.com/0xchasercat/firestone/pull/2) | complete | baseline | Initial entries have current per-architecture URLs and checksum sources; unbooted entries are marked as release gates |
 | M0-03b | Image reference parsing, catalog merge, architecture selection, resolution | `agent/m0-catalog` | [#5](https://github.com/0xchasercat/firestone/pull/5) | complete | M0-00, M0-03a | Catalog rules from sections 8.1 and 8.2 pass without network |

@@ -227,7 +227,16 @@ pub struct VmmSpec {
 }
 ```
 
-The CLI does not parse flags into `MachineSpec` directly. It parses into `MachineSpecPatch`, a mirror struct in which every leaf is `Option<T>` and vectors are append lists, derived with `clap::Args`. Effective spec = built‑in defaults ← global config `[defaults]` ← `firestone.toml` ← CLI patch. The same patch type is the body of REST `PATCH`.
+The CLI does not parse flags into `MachineSpec` directly. It parses into `MachineSpecPatch`, a mirror struct in which every settable leaf is `Option<T>`. The patch also has a typed `clear` list covering every optional leaf and append-vector leaf. Unknown clear paths and setting and clearing the same leaf in one layer are errors. `firestone-core` exposes clap-free field metadata and the CLI crate owns the `clap::Args` projection.
+
+Effective spec layering is deterministic:
+
+1. built-in defaults;
+2. global config `[defaults]` over the built-ins;
+3. `firestone.toml`, where a present vector replaces the lower-layer vector;
+4. the CLI or REST patch, where a present vector appends.
+
+Each layer applies its validated `clear` operations before its set operations. Clearing an optional leaf produces `None`; clearing a vector produces an empty vector. Machine persistence writes the effective spec as a machine-file layer, including clear entries for every effective optional `None`, so reloading it over unchanged global defaults is idempotent. The same `MachineSpecPatch` shape is the body of REST `PATCH`; `--clear FIELD` projects the typed clear list on the CLI.
 
 ### 5.2 `Action` — one enum, two transports
 
@@ -242,7 +251,7 @@ pub enum Action {
     Show { name: String },
     SetSpec { name: String, spec: MachineSpec },        // PUT
     PatchSpec { name: String, patch: MachineSpecPatch }, // PATCH
-    ImageList, ImagePull { r#ref: ImageRef }, ImageRemove { id: String }, ImagePrune,
+    ImageList, ImagePull { r#ref: ImageRef }, ImageRemove { id: String, force: bool }, ImagePrune,
     Doctor { fix: bool },
     Version,
 }
@@ -273,7 +282,7 @@ Every action emits `Result` exactly once on success, or returns an error (which 
 
 ### 5.4 The drift test (normative)
 
-A unit test serializes a fully populated `MachineSpec` and a fully populated `MachineSpecPatch` to JSON and asserts the recursive key sets are identical, and that every leaf key has a corresponding clap flag (introspected via `clap::Command::get_arguments()` on the patch struct, mapping `a.b.c` → `--a-b-c` with documented exceptions such as `mount` → `--mount host:guest[:ro]`). The surfaces cannot drift without this test failing.
+A core unit test derives recursive leaf paths from the serialized/schema shapes of a fully populated `MachineSpec` and `MachineSpecPatch`, excluding only patch control metadata and collapsing documented composite or opaque fields. It asserts spec/patch parity and derives expected field metadata from those paths. A CLI unit test asserts that every core field-metadata entry has a corresponding clap flag by introspecting `clap::Command::get_arguments()`, mapping `a.b.c` → `--a-b-c` with documented exceptions such as `mount` → `--mount host:guest[:ro]` and the typed clear list → repeatable `--clear FIELD`. The surfaces cannot drift without these tests failing.
 
 ---
 
@@ -285,10 +294,16 @@ Resolved once at startup into a `Paths` struct; no other code computes paths.
 
 | Purpose | Default | Override |
 |---|---|---|
-| config | `~/.config/firestone/` | `FIRESTONE_CONFIG_DIR` |
-| data | `~/.local/share/firestone/` | `FIRESTONE_DATA_DIR` |
+| config | absolute `$XDG_CONFIG_HOME/firestone/`, else `~/.config/firestone/` | `FIRESTONE_CONFIG_DIR` |
+| data | absolute `$XDG_DATA_HOME/firestone/`, else `~/.local/share/firestone/` | `FIRESTONE_DATA_DIR` |
 | runtime | `$XDG_RUNTIME_DIR/firestone/` (fallback `/tmp/firestone-<uid>/`, mode 0700) | `FIRESTONE_RUNTIME_DIR` |
 | all of the above | | `FIRESTONE_HOME=<dir>` sets `config=<dir>/config`, `data=<dir>/data`, `runtime=<dir>/run` (used by tests) |
+
+`FIRESTONE_HOME` has precedence over individual overrides; individual overrides have precedence over XDG and home defaults. Relative XDG values are invalid under the XDG base-directory specification and are treated as unset. An absolute `XDG_RUNTIME_DIR` must already be a real directory owned by the current uid with mode 0700; Firestone creates only its `firestone` child. When no valid absolute runtime value is set, the fallback is `/tmp/firestone-<uid>` with uid ownership and mode 0700.
+
+`Paths` captures one absolute startup HOME and uses it for every `~` expansion. Explicit runtime roots, including the `FIRESTONE_HOME` run directory, are accepted only when their existing ancestry cannot be renamed by another uid. Root-owned non-writable ancestors and root-owned sticky `/tmp` are safe; symlink ancestors and writable wrong-owner ancestors are errors. Firestone never recursively creates an untrusted runtime ancestry and then validates only the leaf.
+
+Relative user paths keep their `.` and `..` components until the kernel resolves the complete path. Validation may canonicalize an existing complete path after the kernel resolves it; Firestone does not lexically erase missing prefixes or symlink semantics. Owned machine, image, binary and seed file names are single path components without control characters. Arbitrary user-supplied absolute paths are not restricted by the owned-name rule.
 
 ```
 ~/.config/firestone/
@@ -380,6 +395,7 @@ cpus   = 2                 # 1..=host cpus (warn above host count; hard error ab
 memory = "2G"              # "512M", "4G", "4096M", or integer MiB
 disk   = "20G"             # virtual size of the overlay; must be >= base image virtual size
 user   = "root"            # login user for `shell`; root works because provisioning enables it
+# clear = ["network.tap"] # explicitly clear inherited optional or vector fields
 
 [network]
 mode    = "passt"          # "passt" | "tap" | "none"
@@ -403,25 +419,32 @@ provisioning = true                      # false: firestone injects nothing; she
 # binary       = "/usr/local/bin/cloud-hypervisor"   # default: vendored pinned binary
 firmware       = "auto"                  # "auto" | "rhf" | "edk2" | "/path/to/firmware"
 extra_args     = []                      # appended verbatim to the cloud-hypervisor argv (process-level flags)
-# config_overlay = { }                   # JSON merge-patch (RFC 7396) onto the generated VmConfig; the escape hatch
+# config_overlay = '''{"memory":{"shared":true},"rng":null}'''
+# JSON object merge-patch (RFC 7396), stored as canonical JSON text in TOML
 ```
 
 Unknown keys are an error (`deny_unknown_fields`) with a did‑you‑mean hint.
+
+`clear = ["arch", "network.tap", ...]` lives at the root of a `MachineSpecPatch`: top-level in `firestone.toml` and REST PATCH, under `[defaults]` in global config, and behind repeatable `--clear FIELD` on the CLI. The allowed values are a closed enum containing every optional leaf and append-vector leaf. Persisting a full effective spec emits clear entries for optional leaves whose value is `None`. A layer may not both clear and set the same leaf.
+
+`vmm.config_overlay` is one object-only merge-patch value on all surfaces. JSON and REST carry the object directly. TOML stores canonical JSON text under the same `config_overlay` key so RFC 7396 nested `null` deletion round-trips without a second key. `--vmm-config JSON` accepts the same JSON text.
 
 ### 7.2 Validation rules
 
 Validation runs on every load. Errors carry the TOML key path.
 
-- `image`: non‑empty; catalog refs must resolve (§8.2); paths must exist and be readable; URLs must be `https://` (v0.1).
+- `image` follows §8.2 order: an existing local candidate wins, then a strict `https://` URL, then catalog resolution. Arbitrary URLs reject parser violations, userinfo, whitespace, a missing host and fragments. A missing-path hint is emitted only after catalog resolution fails.
 - `arch`: if set, must equal the host architecture; message explains that cross‑arch emulation is a non‑goal.
 - `cpus` ≥ 1. `memory` ≥ 128M. `disk` ≥ base image virtual size (checked at overlay creation, where the base size is known).
 - `network.mode = "tap"` requires `network.tap`; the device must exist (`/sys/class/net/<tap>`), and `/dev/net/tun` must be openable. Firestone never creates it.
 - `forward` entries parse per §12.4; guest ports 1–65535; host ports 1–65535 (ports < 1024 are allowed and will fail at passt start without privileges; passt's error is surfaced, not pre‑empted).
 - `mount.host` must exist; `mount.guest` absolute; tags unique.
-- `cloud_init.user_data`: file must exist; first line must be `#cloud-config` or start with `#!`; otherwise error with hint (`provisioning = false` plus a raw user‑data file is the escape hatch, see §10.2).
-- `cloud_init.ssh_keys`: each file must exist and parse as one or more OpenSSH public keys.
+- `cloud_init.user_data`: a symlink to a regular file is allowed; the opened target must be a readable regular file. The first line must be `#cloud-config` or start with `#!`; otherwise error with hint (`provisioning = false` plus a raw user‑data file is the escape hatch, see §10.2).
+- `cloud_init.network_config`: a symlink to a regular file is allowed; the opened target must be a readable regular file.
+- `cloud_init.ssh_keys`: each opened target must be a readable regular file and parse as one or more OpenSSH public keys.
 - `user`: `[a-z_][a-z0-9_-]*`.
-- `vmm.firmware = "edk2"` on x86_64 uses `CLOUDHV.fd`; on aarch64 `CLOUDHV_EFI.fd`; a path must exist.
+- `vmm.firmware = "edk2"` on x86_64 uses `CLOUDHV.fd`; on aarch64 `CLOUDHV_EFI.fd`; a custom path must identify a readable regular file.
+- `vmm.binary`, when set, must identify a regular file executable by the current user.
 - Spec changes while running are accepted and saved with a `Log` warning "takes effect on next start". Nothing is applied live in v0.1.
 
 ### 7.3 Global config `~/.config/firestone/config.toml`
@@ -462,6 +485,7 @@ Generated from `MachineSpecPatch`. Rule: `a.b` → `--a-b`; vectors are repeatab
 | `cloud_init.provisioning=false` | `--no-provisioning` |
 | `vmm.extra_args[]` | `--vmm-arg ARG` (repeatable) |
 | `vmm.config_overlay` | `--vmm-config JSON` |
+| `clear[]` | `--clear FIELD` (repeatable; closed field enum) |
 
 `firestone create` writes the effective spec (defaults + flags) to `firestone.toml` with comments preserved from the template, so a user who started from the CLI can `edit` a fully documented file.
 
@@ -1243,6 +1267,15 @@ Do these in the first milestone, against the pinned versions, and record results
 | [verify 1] firmware mapping at cloud-hypervisor v53.0 | RHF 0.5.0 uses `payload.kernel`; edk2 ch-1e1b96f126 uses `payload.firmware` | pass RHF through `payload.firmware`; pass edk2 through `payload.kernel` | The v53.0 CLI exposes distinct `--kernel` and `--firmware` inputs, `PayloadConfig` exposes the matching JSON fields, and the v53.0 README documents RHF's Xen PVH entry as valid through the kernel input and edk2 through firmware. Source and CLI checks resolve the mapping. Boot behavior remains an M1 runtime check. |
 | [verify 2] API and VmConfig at cloud-hypervisor v53.0 | `/api/v1/vmm.ping` is GET; `vm.create`, `vm.boot`, `vm.power-button`, `vm.pause`, `vm.resume`, `vm.shutdown`, and `vmm.shutdown` are PUT; `vm.info` is GET. Successful `vmm.shutdown` returns 200 even though the OpenAPI document says 204. Use the §9.2 field names and enum casing. Set overlay disks to `image_type: "Qcow2", backing_files: true` and the vfat seed to `image_type: "Raw"`. | rely on image auto-detection; omit `backing_files`; infer methods or success codes from endpoint names | The pinned OpenAPI document and Rust config types agree on the configuration schema and methods. v53.0's dedicated `VmmShutdown` handler returns 200, confirmed on the Linux validation host; its ordinary empty VM-action responses return 204. v53.0 disables qcow2 backing-file traversal unless explicitly enabled, and its integration tests use the same pair of disk settings. Runtime `vmm.ping` returned 200. `vm.create` and boot behavior remain M1 runtime checks. |
 | [verify 12] vsock host handshake at cloud-hypervisor v53.0 | write `CONNECT <guest-port>\n`, then wait for `OK <allocated-host-port>\n` after the guest accepts | treat a successful Unix socket connect as guest readiness; expect the guest port in the acknowledgement | The pinned `docs/vsock.md` specifies the request. The v53.0 muxer source and unit test show that the acknowledgement contains the allocated local port and is sent only after the virtio-vsock response establishes the connection. A raw host-to-guest test remains an M1 runtime check. |
+| Spec flag projection | clap-free field metadata in `firestone-core`; clap introspection in the CLI crate | derive `clap::Args` on the core patch type | Keeps the normative drift checks while preserving the crate boundary in §18.2. |
+| Layer vector semantics | machine-file vectors replace lower values; CLI and REST PATCH vectors append | append every layer; replace every layer | Persisting and reloading a complete machine file remains idempotent, while repeatable command flags and PATCH requests can add values without resending the full list. |
+| Portable patch clears | typed `clear` list shared by TOML, JSON and future `--clear FIELD` | JSON-only null; string sentinels per field | One closed enum keeps every optional and vector clear operation available and rejects unknown paths before dispatch. |
+| Portable VMM merge patch | JSON object on JSON surfaces; canonical JSON text under the same TOML key | second TOML key; TOML null sentinel; omit RFC 7396 deletion | TOML has no null scalar. Canonical object text preserves nested RFC 7396 null deletion without changing the public key or object model. |
+| XDG and HOME path inputs | absolute XDG config/data roots are honored; relative values are ignored; startup HOME is captured once as absolute | ignore XDG config/data; read environment for every expansion | Matches XDG rules and keeps path behavior stable after startup. |
+| Runtime path trust | validate XDG base ownership/mode and explicit-root ancestry before creating the Firestone leaf | recursively create and validate only the leaf | Runtime sockets are authority-bearing files. A safe leaf inside renameable or symlinked ancestry is not safe. |
+| User path resolution | retain `.` and `..` until complete kernel resolution; any canonicalization happens only for an existing complete path | lexical normalization before filesystem access | Lexical collapse changes meaning when a prefix is missing or a symlink participates in resolution. |
+| Relative spec paths | resolve relative paths from `firestone.toml` against the machine directory and relative action patches against their supplied base directory inside `MachineSpec::load` | process working directory at validation time; adapter-side pre-resolution | Machine behavior remains stable across CLI and REST invocations, and callers cannot accidentally skip path provenance handling. |
+| Image removal action payload | `ImageRemove` carries `force` | leave force in CLI/REST adapters | Sections 15.1, 15.4, and 16.2 expose forced image removal. The shared action must carry that choice so every interface dispatches the same operation. |
 
 ---
 

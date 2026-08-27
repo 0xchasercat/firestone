@@ -144,6 +144,13 @@ impl Catalog {
         })
     }
 
+    /// Reports whether a default, version, or alias reference exists before
+    /// selecting a host architecture.
+    #[must_use]
+    pub fn contains_reference(&self, reference: &str) -> bool {
+        self.find(reference).is_some()
+    }
+
     /// Iterates over canonical entries in lexical `distro:version` order.
     pub fn entries(&self) -> impl ExactSizeIterator<Item = &CatalogEntry> {
         self.entries.values()
@@ -528,18 +535,18 @@ fn validate_reference_names(
 
         for selector in selectors {
             let name = (entry.distro.clone(), selector.clone());
-            if let Some(previous) = names.insert(name, canonical_reference.clone())
-                && previous != canonical_reference
-            {
-                return Err(FirestoneError::new(
-                    ErrorKind::InvalidSpec,
-                    format!(
-                        "catalog name '{}:{selector}' is ambiguous between '{previous}' and \
-                         '{canonical_reference}'",
-                        entry.distro
-                    ),
-                )
-                .with_hint(CATALOG_FILE_HINT));
+            if let Some(previous) = names.insert(name, canonical_reference.clone()) {
+                if previous != canonical_reference {
+                    return Err(FirestoneError::new(
+                        ErrorKind::InvalidSpec,
+                        format!(
+                            "catalog name '{}:{selector}' is ambiguous between '{previous}' and \
+                             '{canonical_reference}'",
+                            entry.distro
+                        ),
+                    )
+                    .with_hint(CATALOG_FILE_HINT));
+                }
             }
         }
     }
@@ -735,6 +742,18 @@ checksum_alg = "sha512"
         assert_eq!(default.architecture, "x86_64");
         assert_eq!(alias.canonical_reference, "debian:12");
         assert_eq!(alias.architecture, "aarch64");
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_reference_membership_matches_default_version_and_alias() -> Result<(), Box<dyn Error>>
+    {
+        let catalog = Catalog::built_in()?;
+
+        assert!(catalog.contains_reference("ubuntu"));
+        assert!(catalog.contains_reference("ubuntu:24.04"));
+        assert!(catalog.contains_reference("ubuntu:noble"));
+        assert!(!catalog.contains_reference("ubunut"));
         Ok(())
     }
 
