@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
-    io,
+    io::{self, Read},
     path::{Path, PathBuf},
 };
 
@@ -23,34 +23,24 @@ pub struct SpecWarning {
 pub trait ValidationHost: Send + Sync {
     fn architecture(&self) -> Result<Arch, FirestoneError>;
     fn cpu_count(&self) -> usize;
-    fn home_dir(&self) -> Option<&Path>;
     fn path_exists(&self, path: &Path) -> io::Result<bool>;
     fn path_is_readable(&self, path: &Path) -> io::Result<bool>;
     fn path_is_file(&self, path: &Path) -> io::Result<bool>;
-    fn read_file(&self, path: &Path) -> io::Result<Vec<u8>>;
+    fn path_is_executable(&self, path: &Path) -> io::Result<bool>;
+    fn read_regular_file(&self, path: &Path) -> io::Result<Vec<u8>>;
     fn tap_device_is_tap(&self, name: &str) -> io::Result<bool>;
     fn tun_is_accessible(&self) -> io::Result<()>;
 }
 
 /// Real host checks. Tap validation only inspects sysfs and opens `/dev/net/tun`.
 /// It never opens, creates, or configures the named tap interface.
-#[derive(Debug, Clone)]
-pub struct RealValidationHost {
-    home_dir: Option<PathBuf>,
-}
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RealValidationHost;
 
 impl RealValidationHost {
     #[must_use]
-    pub fn new() -> Self {
-        Self {
-            home_dir: directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()),
-        }
-    }
-}
-
-impl Default for RealValidationHost {
-    fn default() -> Self {
-        Self::new()
+    pub const fn new() -> Self {
+        Self
     }
 }
 
@@ -64,10 +54,6 @@ impl ValidationHost for RealValidationHost {
 
     fn cpu_count(&self) -> usize {
         std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
-    }
-
-    fn home_dir(&self) -> Option<&Path> {
-        self.home_dir.as_deref()
     }
 
     fn path_exists(&self, path: &Path) -> io::Result<bool> {
@@ -90,8 +76,35 @@ impl ValidationHost for RealValidationHost {
         fs::metadata(path).map(|metadata| metadata.is_file())
     }
 
-    fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
-        fs::read(path)
+    fn path_is_executable(&self, path: &Path) -> io::Result<bool> {
+        match nix::unistd::access(path, nix::unistd::AccessFlags::X_OK) {
+            Ok(()) => Ok(true),
+            Err(nix::errno::Errno::EACCES | nix::errno::Errno::EPERM) => Ok(false),
+            Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
+        }
+    }
+
+    fn read_regular_file(&self, path: &Path) -> io::Result<Vec<u8>> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            options.custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits());
+        }
+
+        let mut file = options.open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("'{}' is not a regular file", path.display()),
+            ));
+        }
+
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)?;
+        Ok(contents)
     }
 
     fn tap_device_is_tap(&self, name: &str) -> io::Result<bool> {
@@ -127,6 +140,7 @@ impl ValidationHost for RealValidationHost {
 /// Inputs that keep machine validation deterministic and testable.
 pub struct ValidationContext<'a> {
     pub host: &'a dyn ValidationHost,
+    pub paths: &'a Paths,
     pub machine_dir: &'a Path,
     pub catalog: &'a Catalog,
     pub base_image_virtual_size: Option<ByteSize>,
@@ -136,11 +150,13 @@ impl<'a> ValidationContext<'a> {
     #[must_use]
     pub const fn new(
         host: &'a dyn ValidationHost,
+        paths: &'a Paths,
         machine_dir: &'a Path,
         catalog: &'a Catalog,
     ) -> Self {
         Self {
             host,
+            paths,
             machine_dir,
             catalog,
             base_image_virtual_size: None,
@@ -159,11 +175,19 @@ pub fn validate_machine_spec(
     spec: &mut MachineSpec,
     context: &ValidationContext<'_>,
 ) -> Result<Vec<SpecWarning>, FirestoneError> {
+    validate_machine_spec_with_image_base(spec, context, context.machine_dir)
+}
+
+pub(super) fn validate_machine_spec_with_image_base(
+    spec: &mut MachineSpec,
+    context: &ValidationContext<'_>,
+    image_base_dir: &Path,
+) -> Result<Vec<SpecWarning>, FirestoneError> {
     resolve_spec_paths(spec, context)?;
     let mut warnings = Vec::new();
 
     let arch = validate_arch(spec, context)?;
-    validate_image(spec, arch, context)?;
+    validate_image(spec, arch, context, image_base_dir)?;
     validate_capacity(spec, context, &mut warnings)?;
     validate_user(&spec.user)?;
     validate_network(spec, context)?;
@@ -195,56 +219,40 @@ fn resolve_spec_paths(
     }
     if let Some(path) = spec.vmm.firmware.as_path() {
         let resolved = resolve_input_path(path, "vmm.firmware", context)?;
-        spec.vmm.firmware = super::Firmware::path(resolved);
+        spec.vmm.firmware = super::Firmware::path(resolved).map_err(|error| {
+            invalid_with_source(
+                "vmm.firmware",
+                "firmware path is empty",
+                "set a non-empty firmware path or choose 'auto', 'rhf', or 'edk2'",
+                error,
+            )
+        })?;
     }
     Ok(())
 }
 
 pub(super) fn resolve_patch_paths(
     patch: &mut super::MachineSpecPatch,
-    host: &dyn ValidationHost,
+    paths: &Paths,
     base_dir: &Path,
 ) -> Result<(), FirestoneError> {
-    if let Some(image) = &mut patch.image {
-        let candidate = Paths::resolve_input_path(
-            Path::new(image.as_str()),
-            host.home_dir(),
-            base_dir,
-            "image",
-        )?;
-        let exists = host_path_exists(host, "image", &candidate)?;
-        if exists || looks_like_path(image.as_str()) {
-            *image = image_ref_from_path(&candidate)?;
-        }
-    }
     if let Some(mounts) = &mut patch.mounts {
         for (index, mount) in mounts.iter_mut().enumerate() {
-            mount.host = Paths::resolve_input_path(
-                &mount.host,
-                host.home_dir(),
-                base_dir,
-                &format!("mount[{index}].host"),
-            )?;
+            mount.host =
+                paths.resolve_input_path(&mount.host, base_dir, &format!("mount[{index}].host"))?;
         }
     }
     if let Some(cloud_init) = &mut patch.cloud_init {
         if let Some(path) = &mut cloud_init.user_data {
-            *path =
-                Paths::resolve_input_path(path, host.home_dir(), base_dir, "cloud_init.user_data")?;
+            *path = paths.resolve_input_path(path, base_dir, "cloud_init.user_data")?;
         }
         if let Some(path) = &mut cloud_init.network_config {
-            *path = Paths::resolve_input_path(
-                path,
-                host.home_dir(),
-                base_dir,
-                "cloud_init.network_config",
-            )?;
+            *path = paths.resolve_input_path(path, base_dir, "cloud_init.network_config")?;
         }
-        if let Some(paths) = &mut cloud_init.ssh_keys {
-            for (index, path) in paths.iter_mut().enumerate() {
-                *path = Paths::resolve_input_path(
+        if let Some(key_paths) = &mut cloud_init.ssh_keys {
+            for (index, path) in key_paths.iter_mut().enumerate() {
+                *path = paths.resolve_input_path(
                     path,
-                    host.home_dir(),
                     base_dir,
                     &format!("cloud_init.ssh_keys[{index}]"),
                 )?;
@@ -253,16 +261,23 @@ pub(super) fn resolve_patch_paths(
     }
     if let Some(vmm) = &mut patch.vmm {
         if let Some(path) = &mut vmm.binary {
-            *path = Paths::resolve_input_path(path, host.home_dir(), base_dir, "vmm.binary")?;
+            *path = paths.resolve_input_path(path, base_dir, "vmm.binary")?;
         }
         if let Some(firmware) = &mut vmm.firmware {
             if let Some(path) = firmware.as_path() {
-                *firmware = super::Firmware::path(Paths::resolve_input_path(
+                *firmware = super::Firmware::path(paths.resolve_input_path(
                     path,
-                    host.home_dir(),
                     base_dir,
                     "vmm.firmware",
-                )?);
+                )?)
+                .map_err(|error| {
+                    invalid_with_source(
+                        "vmm.firmware",
+                        "firmware path is empty",
+                        "set a non-empty firmware path or choose 'auto', 'rhf', or 'edk2'",
+                        error,
+                    )
+                })?;
             }
         }
     }
@@ -274,13 +289,16 @@ fn resolve_input_path(
     key: &str,
     context: &ValidationContext<'_>,
 ) -> Result<PathBuf, FirestoneError> {
-    Paths::resolve_input_path(path, context.host.home_dir(), context.machine_dir, key)
+    context
+        .paths
+        .resolve_input_path(path, context.machine_dir, key)
 }
 
 fn validate_image(
     spec: &mut MachineSpec,
     arch: Arch,
     context: &ValidationContext<'_>,
+    image_base_dir: &Path,
 ) -> Result<(), FirestoneError> {
     let reference = spec.image.as_str().to_owned();
     if reference.trim().is_empty() {
@@ -291,33 +309,7 @@ fn validate_image(
         ));
     }
 
-    if reference.contains("://") {
-        let uri = reference.parse::<http::Uri>().map_err(|error| {
-            invalid_with_source(
-                "image",
-                format!("image URL '{reference}' is malformed"),
-                "use a complete https:// URL",
-                error,
-            )
-        })?;
-        if uri.scheme_str() != Some("https") {
-            return Err(invalid(
-                "image",
-                format!("image URL '{reference}' does not use HTTPS"),
-                "use https://; insecure HTTP downloads are not supported",
-            ));
-        }
-        if uri.host().is_none_or(str::is_empty) {
-            return Err(invalid(
-                "image",
-                format!("image URL '{reference}' is incomplete or malformed"),
-                "use a complete https:// URL",
-            ));
-        }
-        return Ok(());
-    }
-
-    let candidate = image_path(&reference, context)?;
+    let candidate = image_path(&reference, context, image_base_dir)?;
     if host_path_exists(context.host, "image", &candidate)? {
         require_regular_file(
             context.host,
@@ -335,31 +327,46 @@ fn validate_image(
         return Ok(());
     }
 
-    if looks_like_path(&reference) {
-        return Err(invalid(
+    if looks_like_url(&reference) {
+        return validate_https_url(&reference);
+    }
+
+    let catalog_match = context.catalog.contains_reference(&reference);
+    match context.catalog.resolve(&reference, arch.as_str()) {
+        Ok(_) => Ok(()),
+        Err(error) if catalog_match => {
+            let message = error.message().to_owned();
+            let hint = error.hint().map_or_else(
+                || "choose an image available for this host architecture".to_owned(),
+                str::to_owned,
+            );
+            Err(invalid_with_source("image", message, hint, error))
+        }
+        Err(error) if looks_like_path(&reference) => Err(invalid_with_source(
             "image",
             format!("local image '{}' does not exist", candidate.display()),
             "correct the image path or choose a catalog reference such as 'ubuntu:24.04'",
-        ));
-    }
-
-    validate_catalog_reference(&reference)?;
-    context
-        .catalog
-        .resolve(&reference, arch.as_str())
-        .map(|_| ())
-        .map_err(|error| {
+            error,
+        )),
+        Err(error) => {
             let message = error.message().to_owned();
             let hint = error.hint().map_or_else(
                 || "choose an image listed by `firestone images ls`".to_owned(),
                 str::to_owned,
             );
-            invalid_with_source("image", message, hint, error)
-        })
+            Err(invalid_with_source("image", message, hint, error))
+        }
+    }
 }
 
-fn image_path(reference: &str, context: &ValidationContext<'_>) -> Result<PathBuf, FirestoneError> {
-    resolve_input_path(Path::new(reference), "image", context)
+fn image_path(
+    reference: &str,
+    context: &ValidationContext<'_>,
+    base_dir: &Path,
+) -> Result<PathBuf, FirestoneError> {
+    context
+        .paths
+        .resolve_input_path(Path::new(reference), base_dir, "image")
 }
 
 fn looks_like_path(reference: &str) -> bool {
@@ -372,6 +379,58 @@ fn looks_like_path(reference: &str) -> bool {
             .any(|suffix| reference.ends_with(suffix))
 }
 
+fn looks_like_url(reference: &str) -> bool {
+    reference.contains("://")
+}
+
+fn validate_https_url(reference: &str) -> Result<(), FirestoneError> {
+    if reference.chars().any(char::is_whitespace) {
+        return Err(invalid(
+            "image",
+            format!("image URL '{reference}' is malformed"),
+            "use a complete https:// URL without whitespace",
+        ));
+    }
+
+    let syntax_violation = std::cell::Cell::new(false);
+    let record_violation = |_| syntax_violation.set(true);
+    let parsed = url::Url::options()
+        .syntax_violation_callback(Some(&record_violation))
+        .parse(reference)
+        .map_err(|error| {
+            invalid_with_source(
+                "image",
+                format!("image URL '{reference}' is malformed"),
+                "use a complete https:// URL",
+                error,
+            )
+        })?;
+
+    if parsed.scheme() != "https" {
+        return Err(invalid(
+            "image",
+            format!("image URL '{reference}' does not use HTTPS"),
+            "use https://; insecure downloads are not supported",
+        ));
+    }
+
+    if syntax_violation.get()
+        || !parsed.has_host()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.authority().contains('@')
+        || parsed.fragment().is_some()
+    {
+        return Err(invalid(
+            "image",
+            format!("image URL '{reference}' is incomplete or malformed"),
+            "use a complete https:// URL with a host and without credentials or a fragment",
+        ));
+    }
+
+    Ok(())
+}
+
 fn image_ref_from_path(path: &Path) -> Result<super::ImageRef, FirestoneError> {
     path.to_str().map(super::ImageRef::new).ok_or_else(|| {
         invalid(
@@ -380,30 +439,6 @@ fn image_ref_from_path(path: &Path) -> Result<super::ImageRef, FirestoneError> {
             "move the image under a UTF-8 path before adding it to firestone.toml",
         )
     })
-}
-
-fn validate_catalog_reference(reference: &str) -> Result<(), FirestoneError> {
-    let mut components = reference.split(':');
-    let distro = components.next().map_or("", |value| value);
-    let version = components.next();
-    if components.next().is_some()
-        || !valid_catalog_component(distro)
-        || version.is_some_and(|value| !valid_catalog_component(value))
-    {
-        return Err(invalid(
-            "image",
-            format!("image reference '{reference}' is not a valid catalog name"),
-            "use 'distro', 'distro:version', an https URL, or an existing local path",
-        ));
-    }
-    Ok(())
-}
-
-fn valid_catalog_component(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn validate_arch(
@@ -450,7 +485,7 @@ fn validate_capacity(
             ),
         });
     }
-    if spec.memory < ByteSize::from_mib(128) {
+    if spec.memory < ByteSize::MINIMUM_MEMORY {
         return Err(invalid(
             "memory",
             format!("memory {} is below the 128M minimum", spec.memory),
@@ -675,11 +710,11 @@ fn validate_vmm(spec: &MachineSpec, context: &ValidationContext<'_>) -> Result<(
             path,
             "set vmm.binary to an executable file or remove the override",
         )?;
-        require_readable(
+        require_executable(
             context.host,
             "vmm.binary",
             path,
-            "make the VMM binary readable or remove the override",
+            "grant execute access to the VMM binary or remove the override",
         )?;
     }
     if let Some(path) = spec.vmm.firmware.as_path() {
@@ -702,6 +737,18 @@ fn validate_vmm(spec: &MachineSpec, context: &ValidationContext<'_>) -> Result<(
             path,
             "make the firmware file readable or choose a named firmware",
         )?;
+    }
+    if spec
+        .vmm
+        .config_overlay
+        .as_ref()
+        .is_some_and(|overlay| !overlay.is_object())
+    {
+        return Err(invalid(
+            "vmm.config_overlay",
+            "VMM config overlay must be a JSON object",
+            "set vmm.config_overlay to a JSON object or remove it",
+        ));
     }
     Ok(())
 }
@@ -765,6 +812,28 @@ fn require_regular_file(
     }
 }
 
+fn require_executable(
+    host: &dyn ValidationHost,
+    key: &str,
+    path: &Path,
+    hint: impl Into<String>,
+) -> Result<(), FirestoneError> {
+    match host.path_is_executable(path) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(invalid(
+            key,
+            format!("'{}' is not executable by the current user", path.display()),
+            hint,
+        )),
+        Err(error) => Err(invalid_with_source(
+            key,
+            format!("cannot check execute access for '{}'", path.display()),
+            hint,
+            error,
+        )),
+    }
+}
+
 fn read_required_file(
     host: &dyn ValidationHost,
     key: &str,
@@ -772,21 +841,33 @@ fn read_required_file(
     hint: impl Into<String>,
 ) -> Result<Vec<u8>, FirestoneError> {
     let hint = hint.into();
-    if !host_path_exists(host, key, path)? {
-        return Err(invalid(
+    match host.read_regular_file(path) {
+        Ok(contents) => Ok(contents),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(invalid_with_source(
             key,
             format!("file '{}' does not exist", path.display()),
             hint,
-        ));
-    }
-    host.read_file(path).map_err(|error| {
-        invalid_with_source(
+            error,
+        )),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Err(invalid_with_source(
+            key,
+            format!("'{}' is not a regular file", path.display()),
+            hint,
+            error,
+        )),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Err(invalid_with_source(
+            key,
+            format!("'{}' is not readable by the current user", path.display()),
+            hint,
+            error,
+        )),
+        Err(error) => Err(invalid_with_source(
             key,
             format!("cannot read '{}'", path.display()),
             hint,
             error,
-        )
-    })
+        )),
+    }
 }
 
 fn invalid(key: &str, message: impl Into<String>, hint: impl Into<String>) -> FirestoneError {
@@ -825,22 +906,26 @@ fn dependency_with_source(
 mod tests {
     use std::{
         collections::{HashMap, HashSet},
-        io,
+        fs, io,
         path::{Path, PathBuf},
     };
 
-    use super::{SpecWarning, ValidationContext, ValidationHost, validate_machine_spec};
+    use super::{
+        RealValidationHost, SpecWarning, ValidationContext, ValidationHost, read_required_file,
+        validate_machine_spec,
+    };
     use crate::{
         Arch, ByteSize, Catalog, CloudInitSpecPatch, ErrorKind, Firmware, MachineSpec,
-        MachineSpecPatch, MountSpec, NetMode, VmmSpecPatch,
+        MachineSpecPatch, MountSpec, NetMode, PathInputs, Paths, VmmSpecPatch,
     };
 
     struct FakeHost {
         arch: Arch,
         cpus: usize,
-        home: PathBuf,
+        paths: Paths,
         existing: HashSet<PathBuf>,
         readable: HashSet<PathBuf>,
+        executable: HashSet<PathBuf>,
         files: HashMap<PathBuf, Vec<u8>>,
         taps: HashSet<String>,
         tun_error: Option<io::ErrorKind>,
@@ -852,9 +937,22 @@ mod tests {
             Self {
                 arch: Arch::X86_64,
                 cpus: 8,
-                home: PathBuf::from("/home/test"),
+                paths: Paths::from_inputs(&PathInputs {
+                    current_dir: PathBuf::from("/work"),
+                    home_dir: Some(PathBuf::from("/home/test")),
+                    firestone_home: Some(PathBuf::from("/firestone")),
+                    firestone_config_dir: None,
+                    firestone_data_dir: None,
+                    firestone_runtime_dir: None,
+                    xdg_config_home: None,
+                    xdg_data_home: None,
+                    xdg_runtime_dir: None,
+                    uid: 1000,
+                })
+                .expect("valid test paths"),
                 existing: HashSet::new(),
                 readable: HashSet::new(),
+                executable: HashSet::new(),
                 files: HashMap::new(),
                 taps: HashSet::new(),
                 tun_error: None,
@@ -872,7 +970,7 @@ mod tests {
         }
 
         fn context(&self) -> ValidationContext<'_> {
-            ValidationContext::new(self, Path::new("/machines/dev"), &self.catalog)
+            ValidationContext::new(self, &self.paths, Path::new("/machines/dev"), &self.catalog)
         }
     }
 
@@ -883,10 +981,6 @@ mod tests {
 
         fn cpu_count(&self) -> usize {
             self.cpus
-        }
-
-        fn home_dir(&self) -> Option<&Path> {
-            Some(&self.home)
         }
 
         fn path_exists(&self, path: &Path) -> io::Result<bool> {
@@ -901,11 +995,24 @@ mod tests {
             Ok(self.files.contains_key(path))
         }
 
-        fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
-            self.files
-                .get(path)
-                .cloned()
-                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+        fn path_is_executable(&self, path: &Path) -> io::Result<bool> {
+            Ok(self.executable.contains(path))
+        }
+
+        fn read_regular_file(&self, path: &Path) -> io::Result<Vec<u8>> {
+            if let Some(contents) = self.files.get(path) {
+                if !self.readable.contains(path) {
+                    return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+                }
+                return Ok(contents.clone());
+            }
+            if self.existing.contains(path) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "not a regular file",
+                ));
+            }
+            Err(io::Error::from(io::ErrorKind::NotFound))
         }
 
         fn tap_device_is_tap(&self, name: &str) -> io::Result<bool> {
@@ -952,11 +1059,11 @@ mod tests {
             ..MachineSpecPatch::default()
         };
 
-        patch.resolve_paths(&host, Path::new("/work"))?;
+        patch.resolve_paths(&host.paths, Path::new("/work"))?;
 
         assert_eq!(
             patch.image.as_ref().map(crate::ImageRef::as_str),
-            Some("/work/base.qcow2")
+            Some("base.qcow2")
         );
         assert_eq!(
             patch
@@ -964,7 +1071,7 @@ mod tests {
                 .as_ref()
                 .and_then(|mounts| mounts.first())
                 .map(|mount| mount.host.as_path()),
-            Some(Path::new("/work/src"))
+            Some(Path::new("/work/./src"))
         );
         assert_eq!(
             patch
@@ -985,6 +1092,63 @@ mod tests {
         assert_eq!(
             patch.vmm.as_ref().and_then(|vmm| vmm.binary.as_deref()),
             Some(Path::new("/work/bin/cloud-hypervisor"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn patch_image_https_url_is_not_rewritten() -> Result<(), crate::FirestoneError> {
+        let host = FakeHost::default();
+        let mut patch = MachineSpecPatch {
+            image: Some("https://images.example.invalid/base.qcow2".into()),
+            ..MachineSpecPatch::default()
+        };
+
+        patch.resolve_paths(&host.paths, Path::new("/work"))?;
+
+        assert_eq!(
+            patch.image.as_ref().map(crate::ImageRef::as_str),
+            Some("https://images.example.invalid/base.qcow2")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn patch_image_existing_url_shaped_path_keeps_origin_until_load()
+    -> Result<(), crate::FirestoneError> {
+        let mut host = FakeHost::default();
+        let reference = "https://images.example.invalid/base.qcow2";
+        let candidate =
+            host.paths
+                .resolve_input_path(Path::new(reference), Path::new("/work"), "image")?;
+        host.add_file(&candidate, Vec::new());
+        let mut patch = MachineSpecPatch {
+            image: Some(reference.into()),
+            ..MachineSpecPatch::default()
+        };
+
+        patch.resolve_paths(&host.paths, Path::new("/work"))?;
+
+        assert_eq!(
+            patch.image.as_ref().map(crate::ImageRef::as_str),
+            Some(reference)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn patch_image_custom_catalog_name_is_not_rewritten() -> Result<(), crate::FirestoneError> {
+        let host = FakeHost::default();
+        let mut patch = MachineSpecPatch {
+            image: Some("custom/os:edge".into()),
+            ..MachineSpecPatch::default()
+        };
+
+        patch.resolve_paths(&host.paths, Path::new("/work"))?;
+
+        assert_eq!(
+            patch.image.as_ref().map(crate::ImageRef::as_str),
+            Some("custom/os:edge")
         );
         Ok(())
     }
@@ -1040,7 +1204,7 @@ mod tests {
     fn memory_below_minimum_returns_keyed_error() {
         let host = FakeHost::default();
         let mut spec = MachineSpec {
-            memory: ByteSize::from_mib(127),
+            memory: ByteSize::from_mib(127).expect("127 MiB"),
             ..MachineSpec::default()
         };
         let error = validate_machine_spec(&mut spec, &host.context()).expect_err("low memory");
@@ -1051,12 +1215,12 @@ mod tests {
     fn disk_below_known_base_size_returns_keyed_error() {
         let host = FakeHost::default();
         let mut spec = MachineSpec {
-            disk: ByteSize::from_gib(4),
+            disk: ByteSize::from_gib(4).expect("4 GiB"),
             ..MachineSpec::default()
         };
         let context = host
             .context()
-            .with_base_image_virtual_size(ByteSize::from_gib(5));
+            .with_base_image_virtual_size(ByteSize::from_gib(5).expect("5 GiB"));
         let error = validate_machine_spec(&mut spec, &context).expect_err("small disk");
         assert_invalid_key(&error, "disk");
     }
@@ -1090,13 +1254,16 @@ mod tests {
     #[test]
     fn image_missing_local_path_returns_keyed_error() {
         let host = FakeHost::default();
+        let candidate =
+            super::image_path("./base.qcow2", &host.context(), Path::new("/machines/dev"))
+                .expect("valid relative image path");
         let mut spec = MachineSpec {
             image: "./base.qcow2".into(),
             ..MachineSpec::default()
         };
         let error = validate_machine_spec(&mut spec, &host.context()).expect_err("missing image");
         assert_invalid_key(&error, "image");
-        assert!(error.message().contains("/machines/dev/base.qcow2"));
+        assert!(error.message().contains(&candidate.display().to_string()));
     }
 
     #[test]
@@ -1117,13 +1284,49 @@ mod tests {
     #[test]
     fn image_readable_relative_path_is_persisted_absolute() -> Result<(), crate::FirestoneError> {
         let mut host = FakeHost::default();
-        host.add_file("/machines/dev/base.qcow2", Vec::new());
+        let candidate = {
+            let context = host.context();
+            super::image_path("./base.qcow2", &context, context.machine_dir)?
+        };
+        host.add_file(&candidate, Vec::new());
         let mut spec = MachineSpec {
             image: "./base.qcow2".into(),
             ..MachineSpec::default()
         };
         validate_machine_spec(&mut spec, &host.context())?;
-        assert_eq!(spec.image.as_str(), "/machines/dev/base.qcow2");
+        assert_eq!(spec.image.as_str(), candidate.to_string_lossy());
+        Ok(())
+    }
+
+    #[test]
+    fn image_existing_url_shaped_path_is_persisted_as_local() -> Result<(), crate::FirestoneError> {
+        let mut host = FakeHost::default();
+        let reference = "https://images.example.invalid/base.qcow2";
+        let candidate = {
+            let context = host.context();
+            super::image_path(reference, &context, context.machine_dir)?
+        };
+        host.add_file(&candidate, Vec::new());
+        let mut spec = MachineSpec {
+            image: reference.into(),
+            ..MachineSpec::default()
+        };
+
+        validate_machine_spec(&mut spec, &host.context())?;
+
+        assert_eq!(spec.image.as_str(), candidate.to_string_lossy());
+        Ok(())
+    }
+
+    #[test]
+    fn image_valid_https_url_is_accepted() -> Result<(), crate::FirestoneError> {
+        let host = FakeHost::default();
+        let mut spec = MachineSpec {
+            image: "https://images.example.invalid/base.qcow2?build=1".into(),
+            ..MachineSpec::default()
+        };
+
+        validate_machine_spec(&mut spec, &host.context())?;
         Ok(())
     }
 
@@ -1136,6 +1339,140 @@ mod tests {
         };
         let error = validate_machine_spec(&mut spec, &host.context()).expect_err("malformed URL");
         assert_invalid_key(&error, "image");
+    }
+
+    #[test]
+    fn image_https_policy_violations_return_keyed_error() {
+        let host = FakeHost::default();
+        for reference in [
+            "https://[2001:db8::1/image.qcow2",
+            "https://user@example.invalid/image.qcow2",
+            " https://example.invalid/image.qcow2",
+            "https:///image.qcow2",
+            "https://example.invalid/image.qcow2#fragment",
+        ] {
+            let mut spec = MachineSpec {
+                image: reference.into(),
+                ..MachineSpec::default()
+            };
+            let error =
+                validate_machine_spec(&mut spec, &host.context()).expect_err("invalid HTTPS URL");
+            assert_invalid_key(&error, "image");
+        }
+    }
+
+    #[test]
+    fn image_custom_catalog_name_with_path_character_is_accepted() {
+        let directory = tempfile::tempdir().expect("temporary catalog directory");
+        let catalog_path = directory.path().join("custom.toml");
+        fs::write(
+            &catalog_path,
+            r#"
+[[image]]
+distro = "custom/os"
+version = "current"
+aliases = ["edge"]
+default = true
+firmware = "rhf"
+format = "qcow2"
+
+[image.arch.x86_64]
+url = "https://images.example.invalid/custom.qcow2"
+checksum_url = "https://images.example.invalid/SHA256SUMS"
+checksum_alg = "sha256"
+"#,
+        )
+        .expect("write custom catalog");
+        let catalog = Catalog::load(
+            &directory.path().join("missing-config.toml"),
+            &[catalog_path],
+        )
+        .expect("load custom catalog");
+        let host = FakeHost {
+            catalog,
+            ..FakeHost::default()
+        };
+        let mut spec = MachineSpec {
+            image: "custom/os:edge".into(),
+            ..MachineSpec::default()
+        };
+
+        validate_machine_spec(&mut spec, &host.context()).expect("custom catalog image");
+    }
+
+    #[test]
+    fn machine_load_catalog_suffix_action_image_remains_catalog_reference()
+    -> Result<(), crate::FirestoneError> {
+        let catalog = catalog_from_document(
+            r#"
+[[image]]
+distro = "acme.qcow2"
+version = "1"
+aliases = []
+default = true
+firmware = "rhf"
+format = "qcow2"
+
+[image.arch.x86_64]
+url = "https://images.example.invalid/acme.qcow2"
+checksum_url = "https://images.example.invalid/SHA256SUMS"
+checksum_alg = "sha256"
+"#,
+        );
+        let host = FakeHost {
+            catalog,
+            ..FakeHost::default()
+        };
+        let patch = MachineSpecPatch {
+            image: Some("acme.qcow2".into()),
+            ..MachineSpecPatch::default()
+        };
+
+        let loaded = MachineSpec::load(
+            "",
+            &crate::GlobalConfig::default(),
+            &patch,
+            Path::new("/work"),
+            &host.context(),
+        )?;
+
+        assert_eq!(loaded.spec.image.as_str(), "acme.qcow2");
+        Ok(())
+    }
+
+    #[test]
+    fn image_path_shaped_catalog_missing_host_arch_preserves_catalog_error() {
+        let catalog = catalog_from_document(
+            r#"
+[[image]]
+distro = "custom/os"
+version = "current"
+aliases = ["edge"]
+default = true
+firmware = "rhf"
+format = "qcow2"
+
+[image.arch.aarch64]
+url = "https://images.example.invalid/custom.qcow2"
+checksum_url = "https://images.example.invalid/SHA256SUMS"
+checksum_alg = "sha256"
+"#,
+        );
+        let host = FakeHost {
+            catalog,
+            ..FakeHost::default()
+        };
+        let mut spec = MachineSpec {
+            image: "custom/os:edge".into(),
+            ..MachineSpec::default()
+        };
+
+        let error = validate_machine_spec(&mut spec, &host.context())
+            .expect_err("missing x86_64 catalog source");
+
+        assert_invalid_key(&error, "image");
+        assert!(error.message().contains("available architectures: aarch64"));
+        assert!(!error.message().contains("local image"));
     }
 
     #[test]
@@ -1334,11 +1671,165 @@ mod tests {
     }
 
     #[test]
+    fn required_file_directory_returns_keyed_error() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let host = RealValidationHost::new();
+
+        let error = read_required_file(
+            &host,
+            "cloud_init.user_data",
+            directory.path(),
+            "choose a regular file",
+        )
+        .expect_err("directory is not a regular file");
+
+        assert_invalid_key(&error, "cloud_init.user_data");
+        assert!(error.message().contains("not a regular file"));
+    }
+
+    #[test]
+    fn required_file_unreadable_regular_file_returns_keyed_error() {
+        let mut host = FakeHost::default();
+        let path = PathBuf::from("/machines/dev/user-data");
+        host.existing.insert(path.clone());
+        host.files.insert(path.clone(), b"#cloud-config\n".to_vec());
+
+        let error = read_required_file(
+            &host,
+            "cloud_init.user_data",
+            &path,
+            "make the file readable",
+        )
+        .expect_err("unreadable regular file");
+
+        assert_invalid_key(&error, "cloud_init.user_data");
+        assert!(error.message().contains("not readable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn required_file_fifo_returns_keyed_error_without_blocking() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("user-data.fifo");
+        nix::unistd::mkfifo(
+            &path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .expect("create FIFO");
+        let host = RealValidationHost::new();
+
+        let error = read_required_file(
+            &host,
+            "cloud_init.user_data",
+            &path,
+            "choose a regular file",
+        )
+        .expect_err("FIFO is not a regular file");
+
+        assert_invalid_key(&error, "cloud_init.user_data");
+        assert!(error.message().contains("not a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn required_file_character_device_returns_keyed_error() {
+        let host = RealValidationHost::new();
+
+        let error = read_required_file(
+            &host,
+            "cloud_init.user_data",
+            Path::new("/dev/null"),
+            "choose a regular file",
+        )
+        .expect_err("character device is not a regular file");
+
+        assert_invalid_key(&error, "cloud_init.user_data");
+        assert!(error.message().contains("not a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn required_file_symlink_to_regular_file_returns_contents() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = directory.path().join("target");
+        let link = directory.path().join("link");
+        fs::write(&target, b"#cloud-config\n").expect("write target");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+        let host = RealValidationHost::new();
+
+        let contents = read_required_file(
+            &host,
+            "cloud_init.user_data",
+            &link,
+            "choose a regular file",
+        )
+        .expect("read symlink target");
+
+        assert_eq!(contents, b"#cloud-config\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vmm_binary_mode_0644_returns_keyed_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let binary = directory.path().join("cloud-hypervisor");
+        fs::write(&binary, []).expect("write VMM binary");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o644))
+            .expect("set non-executable mode");
+        let host = RealValidationHost::new();
+        let paths = test_paths(directory.path());
+        let catalog = Catalog::built_in().expect("valid built-in catalog");
+        let context = ValidationContext::new(&host, &paths, directory.path(), &catalog);
+        let mut spec = MachineSpec::default();
+        spec.vmm.binary = Some(binary);
+
+        let error = validate_machine_spec(&mut spec, &context).expect_err("non-executable VMM");
+
+        assert_invalid_key(&error, "vmm.binary");
+        assert!(error.message().contains("not executable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vmm_binary_execute_only_mode_is_accepted() -> Result<(), crate::FirestoneError> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let binary = directory.path().join("cloud-hypervisor");
+        fs::write(&binary, []).expect("write VMM binary");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o111))
+            .expect("set executable mode");
+        let host = RealValidationHost::new();
+        let paths = test_paths(directory.path());
+        let catalog = Catalog::built_in()?;
+        let context = ValidationContext::new(&host, &paths, directory.path(), &catalog);
+        let mut spec = MachineSpec::default();
+        spec.vmm.binary = Some(binary);
+
+        validate_machine_spec(&mut spec, &context)?;
+        Ok(())
+    }
+
+    #[test]
+    fn vmm_config_overlay_non_object_returns_keyed_error() {
+        let host = FakeHost::default();
+        let mut spec = MachineSpec::default();
+        spec.vmm.config_overlay = Some(serde_json::json!(["not", "an", "object"]));
+
+        let error =
+            validate_machine_spec(&mut spec, &host.context()).expect_err("non-object overlay");
+
+        assert_invalid_key(&error, "vmm.config_overlay");
+    }
+
+    #[test]
     fn firmware_missing_path_returns_keyed_error() {
         let host = FakeHost::default();
         let mut spec = MachineSpec {
             vmm: crate::VmmSpec {
-                firmware: Firmware::path("firmware.fd"),
+                firmware: Firmware::path("firmware.fd").expect("firmware path"),
                 ..crate::VmmSpec::default()
             },
             ..MachineSpec::default()
@@ -1350,20 +1841,6 @@ mod tests {
     }
 
     #[test]
-    fn firmware_empty_path_returns_keyed_error() {
-        let host = FakeHost::default();
-        let mut spec = MachineSpec {
-            vmm: crate::VmmSpec {
-                firmware: Firmware::path(""),
-                ..crate::VmmSpec::default()
-            },
-            ..MachineSpec::default()
-        };
-        let error = validate_machine_spec(&mut spec, &host.context()).expect_err("empty firmware");
-        assert_invalid_key(&error, "vmm.firmware");
-    }
-
-    #[test]
     fn firmware_directory_path_returns_keyed_error() {
         let mut host = FakeHost::default();
         host.existing
@@ -1372,7 +1849,7 @@ mod tests {
             .insert(PathBuf::from("/machines/dev/firmware"));
         let mut spec = MachineSpec {
             vmm: crate::VmmSpec {
-                firmware: Firmware::path("firmware"),
+                firmware: Firmware::path("firmware").expect("firmware path"),
                 ..crate::VmmSpec::default()
             },
             ..MachineSpec::default()
@@ -1391,5 +1868,29 @@ mod tests {
             error.message()
         );
         assert!(error.hint().is_some());
+    }
+
+    fn test_paths(base: &Path) -> Paths {
+        Paths::from_inputs(&PathInputs {
+            current_dir: base.to_path_buf(),
+            home_dir: Some(base.to_path_buf()),
+            firestone_home: Some(base.join("firestone")),
+            firestone_config_dir: None,
+            firestone_data_dir: None,
+            firestone_runtime_dir: None,
+            xdg_config_home: None,
+            xdg_data_home: None,
+            xdg_runtime_dir: None,
+            uid: 1000,
+        })
+        .expect("valid test paths")
+    }
+
+    fn catalog_from_document(document: &str) -> Catalog {
+        let directory = tempfile::tempdir().expect("temporary catalog directory");
+        let path = directory.path().join("catalog.toml");
+        fs::write(&path, document).expect("write catalog document");
+        Catalog::load(&directory.path().join("missing.toml"), &[path])
+            .expect("load catalog document")
     }
 }

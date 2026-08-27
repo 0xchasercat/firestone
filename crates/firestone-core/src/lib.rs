@@ -25,10 +25,10 @@ pub use spec::{
     Arch, ByteSize, CloudInitSpec, CloudInitSpecPatch, ColorMode, Firmware, GlobalConfig,
     HumanDuration, ImageRef, ImagesConfig, LoadedMachineSpec, MacAddr, MachineSpec,
     MachineSpecPatch, MountSpec, NetMode, NetworkSpec, NetworkSpecPatch, ParseByteSizeError,
-    ParseDurationError, ParseFirmwareError, ParseMacAddrError, ParsePortForwardError, PatchMerge,
-    PortForward, PortRange, Protocol, RealValidationHost, SPEC_FIELD_METADATA, SpecFieldMetadata,
-    SpecWarning, StartConfig, StopConfig, UiConfig, ValidationContext, ValidationHost, VmmSpec,
-    VmmSpecPatch, validate_machine_spec,
+    ParseDurationError, ParseFirmwareError, ParseMacAddrError, ParsePortForwardError,
+    ParseSpecClearError, PatchMerge, PortForward, PortRange, Protocol, RealValidationHost,
+    SPEC_FIELD_METADATA, SpecClear, SpecFieldMetadata, SpecWarning, StartConfig, StopConfig,
+    UiConfig, ValidationContext, ValidationHost, VmmSpec, VmmSpecPatch, validate_machine_spec,
 };
 pub use state::{
     ExitReason, LastExit, LivenessObservation, MachineState, MachineStatus, ReconcileReport,

@@ -11,8 +11,6 @@ edition = "2024"
 rust-version = "1.85"
 
 [workspace.dependencies]
-directories = "6"
-http = "1"
 nix = { version = "0.30", features = ["fs", "user"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }

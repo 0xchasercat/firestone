@@ -6,8 +6,6 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-directories.workspace = true
-http.workspace = true
 nix.workspace = true
 schemars.workspace = true
 serde.workspace = true

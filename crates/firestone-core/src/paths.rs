@@ -1,6 +1,8 @@
 use std::env;
+use std::ffi::OsStr;
 use std::fs::{self, DirBuilder, Metadata, Permissions};
 use std::io;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
@@ -67,8 +69,17 @@ pub struct Paths {
     config_dir: PathBuf,
     data_dir: PathBuf,
     runtime_dir: PathBuf,
+    home_dir: Option<PathBuf>,
     runtime_uid: u32,
-    runtime_fallback: bool,
+    runtime_provenance: RuntimeProvenance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeProvenance {
+    FirestoneHome,
+    FirestoneRuntimeDir,
+    XdgRuntimeDir { base: PathBuf },
+    Fallback,
 }
 
 impl Paths {
@@ -90,14 +101,21 @@ impl Paths {
             .with_hint("supply an absolute current directory"));
         }
 
+        let home_dir = inputs
+            .home_dir
+            .as_deref()
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(|path| absolute_path(path, &inputs.current_dir));
+
         if let Some(home) = selected_override(&inputs.firestone_home, FIRESTONE_HOME)? {
             let home = absolute_path(home, &inputs.current_dir);
             return Ok(Self {
                 config_dir: home.join("config"),
                 data_dir: home.join("data"),
                 runtime_dir: home.join("run"),
+                home_dir,
                 runtime_uid: inputs.uid,
-                runtime_fallback: false,
+                runtime_provenance: RuntimeProvenance::FirestoneHome,
             });
         }
 
@@ -106,9 +124,9 @@ impl Paths {
         {
             absolute_path(path, &inputs.current_dir)
         } else if let Some(path) = selected_xdg(&inputs.xdg_config_home) {
-            absolute_path(path, &inputs.current_dir).join("firestone")
+            path.join("firestone")
         } else {
-            home_default(inputs, ".config", "config")?
+            home_default(home_dir.as_deref(), ".config", "config")?
         };
 
         let data_dir = if let Some(path) =
@@ -116,24 +134,28 @@ impl Paths {
         {
             absolute_path(path, &inputs.current_dir)
         } else if let Some(path) = selected_xdg(&inputs.xdg_data_home) {
-            absolute_path(path, &inputs.current_dir).join("firestone")
+            path.join("firestone")
         } else {
-            home_default(inputs, ".local/share", "data")?
+            home_default(home_dir.as_deref(), ".local/share", "data")?
         };
 
-        let (runtime_dir, runtime_fallback) = if let Some(path) =
+        let (runtime_dir, runtime_provenance) = if let Some(path) =
             selected_override(&inputs.firestone_runtime_dir, FIRESTONE_RUNTIME_DIR)?
         {
-            (absolute_path(path, &inputs.current_dir), false)
-        } else if let Some(path) = selected_xdg(&inputs.xdg_runtime_dir) {
             (
-                absolute_path(path, &inputs.current_dir).join("firestone"),
-                false,
+                trim_trailing_separators(&absolute_path(path, &inputs.current_dir)),
+                RuntimeProvenance::FirestoneRuntimeDir,
+            )
+        } else if let Some(path) = selected_xdg(&inputs.xdg_runtime_dir) {
+            let base = trim_trailing_separators(path);
+            (
+                base.join("firestone"),
+                RuntimeProvenance::XdgRuntimeDir { base },
             )
         } else {
             (
                 PathBuf::from(format!("/tmp/firestone-{}", inputs.uid)),
-                true,
+                RuntimeProvenance::Fallback,
             )
         };
 
@@ -141,19 +163,20 @@ impl Paths {
             config_dir,
             data_dir,
             runtime_dir,
+            home_dir,
             runtime_uid: inputs.uid,
-            runtime_fallback,
+            runtime_provenance,
         })
     }
 
     /// Resolves a user-supplied path without reading the filesystem.
     ///
-    /// A bare `~` or `~/` prefix expands to `home_dir`. Other leading-tilde
-    /// forms are rejected. Relative paths resolve under `base_dir`, then `.`
-    /// and `..` components are normalized lexically.
+    /// A bare `~` or `~/` prefix expands to the HOME value captured at startup.
+    /// Other leading-tilde forms are rejected. Relative paths resolve under
+    /// `base_dir`. Dot components remain for the kernel to resolve.
     pub fn resolve_input_path(
+        &self,
         path: &Path,
-        home_dir: Option<&Path>,
         base_dir: &Path,
         key: &str,
     ) -> Result<PathBuf, FirestoneError> {
@@ -164,21 +187,26 @@ impl Paths {
                 "set a non-empty absolute path or a path relative to the input file",
             ));
         }
-        let text = path.to_string_lossy();
-        let expanded = if text == "~" || text.starts_with("~/") {
-            let home = home_dir.ok_or_else(|| {
+
+        let mut components = path.components();
+        let first = components.next();
+        let expanded = if matches!(first, Some(Component::Normal(value)) if value == OsStr::new("~"))
+        {
+            let home = self.home_dir.as_deref().ok_or_else(|| {
                 invalid_input_path(
                     key,
                     "cannot expand '~' because the home directory is unavailable",
                     "use an absolute path or set HOME",
                 )
             })?;
-            if text == "~" {
-                home.to_path_buf()
-            } else {
-                home.join(text.trim_start_matches("~/"))
+
+            let mut expanded = home.to_path_buf();
+            for component in components {
+                expanded.push(component.as_os_str());
             }
-        } else if text.starts_with('~') {
+            expanded
+        } else if matches!(first, Some(Component::Normal(value)) if value.as_bytes().first() == Some(&b'~'))
+        {
             return Err(invalid_input_path(
                 key,
                 format!("user-home syntax is not supported in '{}'", path.display()),
@@ -189,9 +217,9 @@ impl Paths {
         };
 
         if expanded.is_absolute() {
-            Ok(normalize_path(&expanded))
+            Ok(expanded)
         } else {
-            Ok(normalize_path(&base_dir.join(expanded)))
+            Ok(base_dir.join(expanded))
         }
     }
 
@@ -212,7 +240,7 @@ impl Paths {
 
     #[must_use]
     pub fn uses_runtime_fallback(&self) -> bool {
-        self.runtime_fallback
+        self.runtime_provenance == RuntimeProvenance::Fallback
     }
 
     #[must_use]
@@ -377,16 +405,52 @@ impl Paths {
     /// An existing runtime path must be a real directory owned by the captured
     /// uid with exactly mode 0700. Insecure paths are rejected and never repaired.
     pub fn ensure_runtime_dir(&self) -> Result<(), FirestoneError> {
+        self.validate_runtime_prerequisites()?;
+
         match fs::symlink_metadata(&self.runtime_dir) {
-            Ok(metadata) => self.validate_runtime_dir(&metadata),
+            Ok(metadata) => self.validate_runtime_metadata(&metadata),
             Err(source) if source.kind() == io::ErrorKind::NotFound => self.create_runtime_dir(),
             Err(source) => Err(runtime_io_error("inspect", &self.runtime_dir, source)),
         }
     }
 
+    /// Validates the runtime base, ancestry, and final directory without mutation.
+    ///
+    /// Unlike [`Self::ensure_runtime_dir`], this method returns a dependency
+    /// error when the final directory is missing. It never creates a directory
+    /// or changes permissions.
+    pub fn validate_runtime_dir(&self) -> Result<(), FirestoneError> {
+        self.validate_runtime_prerequisites()?;
+        self.inspect_runtime_dir()
+    }
+
+    fn validate_runtime_prerequisites(&self) -> Result<(), FirestoneError> {
+        match &self.runtime_provenance {
+            RuntimeProvenance::XdgRuntimeDir { base } => {
+                let parent = base.parent().ok_or_else(|| {
+                    insecure_runtime_ancestry_error(base, "XDG_RUNTIME_DIR has no parent directory")
+                })?;
+                self.validate_runtime_ancestry(parent)?;
+                self.validate_xdg_runtime_base(base)?;
+            }
+            RuntimeProvenance::FirestoneHome
+            | RuntimeProvenance::FirestoneRuntimeDir
+            | RuntimeProvenance::Fallback => {
+                let parent = self.runtime_dir.parent().ok_or_else(|| {
+                    insecure_runtime_ancestry_error(
+                        &self.runtime_dir,
+                        "runtime directory has no parent directory",
+                    )
+                })?;
+                self.validate_runtime_ancestry(parent)?;
+            }
+        }
+        Ok(())
+    }
+
     fn create_runtime_dir(&self) -> Result<(), FirestoneError> {
         let mut builder = DirBuilder::new();
-        builder.recursive(!self.runtime_fallback).mode(0o700);
+        builder.recursive(false).mode(0o700);
 
         match builder.create(&self.runtime_dir) {
             Ok(()) => {}
@@ -408,13 +472,73 @@ impl Paths {
         self.inspect_runtime_dir()
     }
 
+    fn validate_xdg_runtime_base(&self, base: &Path) -> Result<(), FirestoneError> {
+        let metadata = fs::symlink_metadata(base)
+            .map_err(|source| runtime_io_error("inspect XDG_RUNTIME_DIR", base, source))?;
+        validate_directory_type(base, &metadata)?;
+
+        let actual_uid = metadata.uid();
+        let actual_mode = metadata.mode() & 0o7777;
+        if actual_uid == self.runtime_uid && actual_mode == 0o700 {
+            return Ok(());
+        }
+
+        Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!(
+                "XDG_RUNTIME_DIR '{}' is insecure: expected uid {} and mode 0700, found uid {actual_uid} and mode {actual_mode:04o}",
+                base.display(),
+                self.runtime_uid
+            ),
+        )
+        .with_hint("set XDG_RUNTIME_DIR to the private runtime directory created for this uid"))
+    }
+
+    fn validate_runtime_ancestry(&self, parent: &Path) -> Result<(), FirestoneError> {
+        if !parent.is_absolute() {
+            return Err(insecure_runtime_ancestry_error(
+                parent,
+                "runtime directory ancestry is not absolute",
+            ));
+        }
+
+        let mut current = PathBuf::new();
+        for component in parent.components() {
+            current.push(component.as_os_str());
+            let metadata = fs::symlink_metadata(&current)
+                .map_err(|source| runtime_io_error("inspect ancestor of", &current, source))?;
+            validate_directory_type(&current, &metadata)?;
+
+            let actual_uid = metadata.uid();
+            let actual_mode = metadata.mode() & 0o7777;
+            let trusted_owner = actual_uid == self.runtime_uid || actual_uid == 0;
+            let writable_by_other_users = actual_mode & 0o022 != 0;
+            let sticky = actual_mode & 0o1000 != 0;
+            if !trusted_owner || writable_by_other_users && !sticky {
+                return Err(FirestoneError::new(
+                    ErrorKind::Dependency,
+                    format!(
+                        "runtime directory ancestor '{}' is insecure: expected uid {} or root with protected rename permissions, found uid {actual_uid} and mode {actual_mode:04o}",
+                        current.display(),
+                        self.runtime_uid
+                    ),
+                )
+                .with_hint(
+                    "move the runtime directory below private user-owned ancestry or a root-owned protected directory",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     fn inspect_runtime_dir(&self) -> Result<(), FirestoneError> {
         let metadata = fs::symlink_metadata(&self.runtime_dir)
             .map_err(|source| runtime_io_error("inspect", &self.runtime_dir, source))?;
-        self.validate_runtime_dir(&metadata)
+        self.validate_runtime_metadata(&metadata)
     }
 
-    fn validate_runtime_dir(&self, metadata: &Metadata) -> Result<(), FirestoneError> {
+    fn validate_runtime_metadata(&self, metadata: &Metadata) -> Result<(), FirestoneError> {
         validate_directory_type(&self.runtime_dir, metadata)?;
 
         let expected_uid = self.runtime_uid;
@@ -457,7 +581,8 @@ fn selected_override<'a>(
 }
 
 fn selected_xdg(path: &Option<PathBuf>) -> Option<&Path> {
-    path.as_deref().filter(|path| !path.as_os_str().is_empty())
+    path.as_deref()
+        .filter(|path| !path.as_os_str().is_empty() && path.is_absolute())
 }
 
 fn absolute_path(path: &Path, current_dir: &Path) -> PathBuf {
@@ -468,22 +593,13 @@ fn absolute_path(path: &Path, current_dir: &Path) -> PathBuf {
     }
 }
 
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    normalized.push(component.as_os_str());
-                }
-            }
-            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
-                normalized.push(component.as_os_str());
-            }
-        }
+fn trim_trailing_separators(path: &Path) -> PathBuf {
+    let bytes = path.as_os_str().as_bytes();
+    let mut end = bytes.len();
+    while end > 1 && bytes[end - 1] == b'/' {
+        end -= 1;
     }
-    normalized
+    PathBuf::from(std::ffi::OsString::from_vec(bytes[..end].to_vec()))
 }
 
 fn invalid_input_path(
@@ -499,28 +615,22 @@ fn invalid_input_path(
 }
 
 fn home_default(
-    inputs: &PathInputs,
+    home_dir: Option<&Path>,
     relative_base: &str,
     purpose: &str,
 ) -> Result<PathBuf, FirestoneError> {
-    let home = inputs
-        .home_dir
-        .as_deref()
-        .filter(|path| !path.as_os_str().is_empty())
-        .ok_or_else(|| {
-            FirestoneError::new(
-                ErrorKind::Dependency,
-                format!("cannot resolve the {purpose} directory because HOME is not set"),
-            )
-            .with_hint(format!(
-                "set FIRESTONE_HOME, FIRESTONE_{}_DIR, or HOME",
-                purpose.to_ascii_uppercase()
-            ))
-        })?;
+    let home = home_dir.ok_or_else(|| {
+        FirestoneError::new(
+            ErrorKind::Dependency,
+            format!("cannot resolve the {purpose} directory because HOME is not set"),
+        )
+        .with_hint(format!(
+            "set FIRESTONE_HOME, FIRESTONE_{}_DIR, or HOME",
+            purpose.to_ascii_uppercase()
+        ))
+    })?;
 
-    Ok(absolute_path(home, &inputs.current_dir)
-        .join(relative_base)
-        .join("firestone"))
+    Ok(home.join(relative_base).join("firestone"))
 }
 
 fn checked_join(base: &Path, label: &str, value: &str) -> Result<PathBuf, FirestoneError> {
@@ -528,7 +638,7 @@ fn checked_join(base: &Path, label: &str, value: &str) -> Result<PathBuf, Firest
     let valid = matches!(components.next(), Some(Component::Normal(_)))
         && components.next().is_none()
         && !value.contains(std::path::MAIN_SEPARATOR)
-        && !value.contains('\0');
+        && !value.chars().any(char::is_control);
 
     if valid {
         return Ok(base.join(value));
@@ -538,7 +648,17 @@ fn checked_join(base: &Path, label: &str, value: &str) -> Result<PathBuf, Firest
         ErrorKind::InvalidSpec,
         format!("{label} must be one non-empty path component: {value:?}"),
     )
-    .with_hint("remove path separators, '.' components, and NUL bytes"))
+    .with_hint("remove path separators, '.' components, and control characters"))
+}
+
+fn insecure_runtime_ancestry_error(path: &Path, message: &str) -> FirestoneError {
+    FirestoneError::new(
+        ErrorKind::Dependency,
+        format!("{message}: '{}'", path.display()),
+    )
+    .with_hint(
+        "move the runtime directory below private user-owned ancestry or a root-owned protected directory",
+    )
 }
 
 fn validate_directory_type(path: &Path, metadata: &Metadata) -> Result<(), FirestoneError> {
@@ -575,14 +695,16 @@ fn runtime_io_error(operation: &str, path: &Path, source: io::Error) -> Fireston
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::{OsStr, OsString};
     use std::fs;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
 
     use nix::unistd::getuid;
     use tempfile::tempdir;
 
-    use super::{PathInputs, Paths};
+    use super::{PathInputs, Paths, RuntimeProvenance};
     use crate::ErrorKind;
 
     fn inputs() -> PathInputs {
@@ -678,6 +800,29 @@ mod tests {
     }
 
     #[test]
+    fn paths_xdg_inputs_relative_use_home_and_runtime_fallback() -> Result<(), crate::FirestoneError>
+    {
+        let mut inputs = inputs();
+        inputs.xdg_config_home = Some(PathBuf::from("xdg/config"));
+        inputs.xdg_data_home = Some(PathBuf::from("xdg/data"));
+        inputs.xdg_runtime_dir = Some(PathBuf::from("xdg/run"));
+
+        let paths = Paths::from_inputs(&inputs)?;
+
+        assert_eq!(
+            paths.config_dir(),
+            Path::new("/home/alice/.config/firestone")
+        );
+        assert_eq!(
+            paths.data_dir(),
+            Path::new("/home/alice/.local/share/firestone")
+        );
+        assert_eq!(paths.runtime_dir(), Path::new("/tmp/firestone-1234"));
+        assert!(paths.uses_runtime_fallback());
+        Ok(())
+    }
+
+    #[test]
     fn paths_relative_overrides_set_resolve_against_current_directory()
     -> Result<(), crate::FirestoneError> {
         let mut inputs = inputs();
@@ -733,39 +878,44 @@ mod tests {
 
     #[test]
     fn input_path_bare_tilde_set_expands_home() -> Result<(), crate::FirestoneError> {
-        let resolved = Paths::resolve_input_path(
-            Path::new("~"),
-            Some(Path::new("/home/alice")),
-            Path::new("/machines/demo"),
-            "mount.host",
-        )?;
+        let paths = Paths::from_inputs(&inputs())?;
+        let resolved =
+            paths.resolve_input_path(Path::new("~"), Path::new("/machines/demo"), "mount.host")?;
 
         assert_eq!(resolved, PathBuf::from("/home/alice"));
         Ok(())
     }
 
     #[test]
-    fn input_path_tilde_prefix_set_expands_and_normalizes() -> Result<(), crate::FirestoneError> {
-        let resolved = Paths::resolve_input_path(
+    fn input_path_tilde_prefix_with_parent_preserves_kernel_resolution()
+    -> Result<(), crate::FirestoneError> {
+        let paths = Paths::from_inputs(&inputs())?;
+        let resolved = paths.resolve_input_path(
             Path::new("~/projects/./firestone/../image.qcow2"),
-            Some(Path::new("/home/alice")),
             Path::new("/machines/demo"),
             "image",
         )?;
 
-        assert_eq!(resolved, PathBuf::from("/home/alice/projects/image.qcow2"));
+        assert_eq!(
+            resolved,
+            PathBuf::from("/home/alice/projects/firestone/../image.qcow2")
+        );
         Ok(())
     }
 
     #[test]
-    fn input_path_tilde_home_missing_returns_invalid_spec() {
-        let error = Paths::resolve_input_path(
-            Path::new("~/image.qcow2"),
-            None,
-            Path::new("/machines/demo"),
-            "image",
-        )
-        .err();
+    fn input_path_tilde_home_missing_returns_invalid_spec() -> Result<(), crate::FirestoneError> {
+        let mut inputs = inputs();
+        inputs.home_dir = None;
+        inputs.firestone_home = Some(PathBuf::from("/firestone"));
+        let paths = Paths::from_inputs(&inputs)?;
+        let error = paths
+            .resolve_input_path(
+                Path::new("~/image.qcow2"),
+                Path::new("/machines/demo"),
+                "image",
+            )
+            .err();
 
         assert!(error.is_some());
         assert_eq!(
@@ -782,17 +932,19 @@ mod tests {
                 .and_then(|error| error.hint().map(str::to_owned))
                 .is_some()
         );
+        Ok(())
     }
 
     #[test]
-    fn input_path_named_home_returns_invalid_spec() {
-        let error = Paths::resolve_input_path(
-            Path::new("~root/image.qcow2"),
-            Some(Path::new("/home/alice")),
-            Path::new("/machines/demo"),
-            "image",
-        )
-        .err();
+    fn input_path_named_home_returns_invalid_spec() -> Result<(), crate::FirestoneError> {
+        let paths = Paths::from_inputs(&inputs())?;
+        let error = paths
+            .resolve_input_path(
+                Path::new("~root/image.qcow2"),
+                Path::new("/machines/demo"),
+                "image",
+            )
+            .err();
 
         assert!(error.is_some());
         assert_eq!(
@@ -804,49 +956,137 @@ mod tests {
                 .as_ref()
                 .is_some_and(|error| error.message().contains("~root/image.qcow2"))
         );
+        Ok(())
     }
 
     #[test]
-    fn input_path_relative_set_joins_base_and_normalizes() -> Result<(), crate::FirestoneError> {
-        let resolved = Paths::resolve_input_path(
+    fn input_path_relative_with_dot_components_preserves_kernel_resolution()
+    -> Result<(), crate::FirestoneError> {
+        let paths = Paths::from_inputs(&inputs())?;
+        let resolved = paths.resolve_input_path(
             Path::new("seed/./parts/../user-data.yaml"),
-            None,
             Path::new("/data/machines/demo"),
             "cloud_init.user_data",
         )?;
 
         assert_eq!(
             resolved,
-            PathBuf::from("/data/machines/demo/seed/user-data.yaml")
+            PathBuf::from("/data/machines/demo/seed/./parts/../user-data.yaml")
         );
         Ok(())
     }
 
     #[test]
-    fn input_path_parent_components_set_normalizes_lexically() -> Result<(), crate::FirestoneError>
-    {
-        let resolved = Paths::resolve_input_path(
+    fn input_path_parent_components_set_preserves_kernel_resolution()
+    -> Result<(), crate::FirestoneError> {
+        let paths = Paths::from_inputs(&inputs())?;
+        let resolved = paths.resolve_input_path(
             Path::new("../../images/missing.qcow2"),
-            None,
             Path::new("/data/machines/demo"),
             "image",
         )?;
 
-        assert_eq!(resolved, PathBuf::from("/data/images/missing.qcow2"));
+        assert_eq!(
+            resolved,
+            PathBuf::from("/data/machines/demo/../../images/missing.qcow2")
+        );
         Ok(())
     }
 
     #[test]
-    fn input_path_absolute_missing_set_normalizes_without_filesystem_access()
+    fn input_path_absolute_missing_set_preserves_kernel_resolution()
     -> Result<(), crate::FirestoneError> {
-        let resolved = Paths::resolve_input_path(
+        let paths = Paths::from_inputs(&inputs())?;
+        let resolved = paths.resolve_input_path(
             Path::new("/does/not/exist/./child/../image.qcow2"),
-            None,
             Path::new("/unused"),
             "image",
         )?;
 
-        assert_eq!(resolved, PathBuf::from("/does/not/exist/image.qcow2"));
+        assert_eq!(
+            resolved,
+            PathBuf::from("/does/not/exist/./child/../image.qcow2")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn input_path_tilde_repeated_separators_stays_below_home() -> Result<(), crate::FirestoneError>
+    {
+        let paths = Paths::from_inputs(&inputs())?;
+
+        let resolved =
+            paths.resolve_input_path(Path::new("~//etc"), Path::new("/unused"), "mount.host")?;
+
+        assert_eq!(resolved, PathBuf::from("/home/alice/etc"));
+        Ok(())
+    }
+
+    #[test]
+    fn input_path_relative_home_set_captures_absolute_startup_home()
+    -> Result<(), crate::FirestoneError> {
+        let mut inputs = inputs();
+        inputs.home_dir = Some(PathBuf::from("home/alice"));
+        let paths = Paths::from_inputs(&inputs)?;
+
+        let resolved =
+            paths.resolve_input_path(Path::new("~/image.qcow2"), Path::new("/unused"), "image")?;
+
+        assert_eq!(resolved, PathBuf::from("/work/home/alice/image.qcow2"));
+        Ok(())
+    }
+
+    #[test]
+    fn input_path_non_utf8_component_set_preserves_bytes() -> Result<(), crate::FirestoneError> {
+        let paths = Paths::from_inputs(&inputs())?;
+        let path = PathBuf::from(OsString::from_vec(vec![b'~', b'/', 0xff]));
+
+        let resolved = paths.resolve_input_path(&path, Path::new("/unused"), "mount.host")?;
+
+        assert_eq!(
+            resolved.file_name().map(OsStr::as_bytes),
+            Some([0xff].as_slice())
+        );
+        assert_eq!(resolved.parent(), Some(Path::new("/home/alice")));
+        Ok(())
+    }
+
+    #[test]
+    fn input_path_missing_prefix_before_parent_remains_missing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let base = fs::canonicalize(temporary.path())?;
+        fs::create_dir(base.join("target"))?;
+        let mut inputs = inputs();
+        inputs.current_dir = base.clone();
+        let paths = Paths::from_inputs(&inputs)?;
+
+        let resolved =
+            paths.resolve_input_path(Path::new("missing/../target"), &base, "mount.host")?;
+
+        assert_eq!(resolved, base.join("missing/../target"));
+        assert!(fs::canonicalize(resolved).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn input_path_symlink_before_parent_uses_kernel_target_parent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let base = fs::canonicalize(temporary.path())?;
+        fs::create_dir_all(base.join("real/nested"))?;
+        fs::create_dir(base.join("real/marker"))?;
+        fs::create_dir(base.join("marker"))?;
+        symlink(base.join("real/nested"), base.join("link"))?;
+        let mut inputs = inputs();
+        inputs.current_dir = base.clone();
+        let paths = Paths::from_inputs(&inputs)?;
+
+        let resolved =
+            paths.resolve_input_path(Path::new("link/../marker"), &base, "mount.host")?;
+
+        assert_eq!(resolved, base.join("link/../marker"));
+        assert_eq!(fs::canonicalize(resolved)?, base.join("real/marker"));
         Ok(())
     }
 
@@ -1001,16 +1241,68 @@ mod tests {
     }
 
     #[test]
-    fn runtime_dir_missing_created_with_mode_0700() -> Result<(), Box<dyn std::error::Error>> {
+    fn owned_names_controls_return_invalid_spec() -> Result<(), crate::FirestoneError> {
+        let paths = Paths::from_inputs(&inputs())?;
+
+        let errors = [
+            paths.machine_dir("bad\nname").err(),
+            paths.image_file("bad\timage").err(),
+            paths.binary_file("bad\u{7f}binary").err(),
+            paths.machine_seed_file("demo", "bad\rseed").err(),
+            paths.machine_dir("bad\u{85}name").err(),
+        ];
+
+        assert!(errors.iter().all(Option::is_some));
+        assert!(errors.iter().all(|error| {
+            error.as_ref().map(crate::FirestoneError::kind) == Some(ErrorKind::InvalidSpec)
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn owned_names_invalid_components_return_invalid_spec() -> Result<(), crate::FirestoneError> {
+        let paths = Paths::from_inputs(&inputs())?;
+
+        for value in [
+            "",
+            ".",
+            "..",
+            "/absolute",
+            "nested/name",
+            "nested//name",
+            "nul\0name",
+        ] {
+            let error = paths.machine_dir(value).err();
+            assert_eq!(
+                error.as_ref().map(crate::FirestoneError::kind),
+                Some(ErrorKind::InvalidSpec),
+                "value {value:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn owned_names_unicode_component_returns_joined_path() -> Result<(), crate::FirestoneError> {
+        let paths = Paths::from_inputs(&inputs())?;
+
+        let machine = paths.machine_dir("máquina-猫")?;
+
+        assert_eq!(
+            machine,
+            PathBuf::from("/home/alice/.local/share/firestone/machines/máquina-猫")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_dir_missing_with_parent_existing_creates_mode_0700()
+    -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempdir()?;
-        let runtime_dir = temporary.path().join("nested/run");
-        let paths = Paths {
-            config_dir: temporary.path().join("config"),
-            data_dir: temporary.path().join("data"),
-            runtime_dir: runtime_dir.clone(),
-            runtime_uid: getuid().as_raw(),
-            runtime_fallback: false,
-        };
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))?;
+        let base = fs::canonicalize(temporary.path())?;
+        let runtime_dir = base.join("run");
+        let paths = explicit_paths(runtime_dir.clone(), getuid().as_raw());
 
         paths.ensure_runtime_dir()?;
 
@@ -1021,19 +1313,69 @@ mod tests {
     }
 
     #[test]
+    fn runtime_dir_read_only_missing_returns_dependency_without_creation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let base = fs::canonicalize(temporary.path())?;
+        let runtime_dir = base.join("run");
+        let paths = explicit_paths(runtime_dir.clone(), getuid().as_raw());
+
+        let error = paths.validate_runtime_dir().err();
+
+        assert_eq!(
+            error.as_ref().map(crate::FirestoneError::kind),
+            Some(ErrorKind::Dependency)
+        );
+        assert!(!runtime_dir.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_dir_read_only_valid_returns_ok_without_chmod()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))?;
+        let base = fs::canonicalize(temporary.path())?;
+        let runtime_dir = base.join("run");
+        fs::create_dir(&runtime_dir)?;
+        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700))?;
+        let paths = explicit_paths(runtime_dir.clone(), getuid().as_raw());
+
+        paths.validate_runtime_dir()?;
+
+        assert_eq!(fs::symlink_metadata(runtime_dir)?.mode() & 0o7777, 0o700);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_dir_read_only_insecure_returns_dependency_without_chmod()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let base = fs::canonicalize(temporary.path())?;
+        let runtime_dir = base.join("run");
+        fs::create_dir(&runtime_dir)?;
+        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o755))?;
+        let paths = explicit_paths(runtime_dir.clone(), getuid().as_raw());
+
+        let error = paths.validate_runtime_dir().err();
+
+        assert_eq!(
+            error.as_ref().map(crate::FirestoneError::kind),
+            Some(ErrorKind::Dependency)
+        );
+        assert_eq!(fs::symlink_metadata(runtime_dir)?.mode() & 0o7777, 0o755);
+        Ok(())
+    }
+
+    #[test]
     fn runtime_dir_existing_world_accessible_returns_dependency_without_chmod()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempdir()?;
-        let runtime_dir = temporary.path().join("run");
+        let base = fs::canonicalize(temporary.path())?;
+        let runtime_dir = base.join("run");
         fs::create_dir(&runtime_dir)?;
         fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o755))?;
-        let paths = Paths {
-            config_dir: temporary.path().join("config"),
-            data_dir: temporary.path().join("data"),
-            runtime_dir: runtime_dir.clone(),
-            runtime_uid: getuid().as_raw(),
-            runtime_fallback: false,
-        };
+        let paths = explicit_paths(runtime_dir.clone(), getuid().as_raw());
 
         let error = paths.ensure_runtime_dir().err();
 
@@ -1046,18 +1388,330 @@ mod tests {
     }
 
     #[test]
-    fn fallback_runtime_correct_owner_and_mode_is_accepted()
+    fn runtime_dir_missing_parent_returns_dependency_without_creation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let base = fs::canonicalize(temporary.path())?;
+        let runtime_dir = base.join("missing/run");
+        let paths = explicit_paths(runtime_dir.clone(), getuid().as_raw());
+
+        let error = paths.ensure_runtime_dir().err();
+
+        assert_eq!(
+            error.as_ref().map(crate::FirestoneError::kind),
+            Some(ErrorKind::Dependency)
+        );
+        assert!(!base.join("missing").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_dir_symlink_ancestor_returns_dependency_without_creation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let base = fs::canonicalize(temporary.path())?;
+        let target = base.join("target");
+        let link = base.join("link");
+        fs::create_dir(&target)?;
+        symlink(&target, &link)?;
+        let runtime_dir = link.join("run");
+        let paths = explicit_paths(runtime_dir.clone(), getuid().as_raw());
+
+        let error = paths.ensure_runtime_dir().err();
+
+        assert_eq!(
+            error.as_ref().map(crate::FirestoneError::kind),
+            Some(ErrorKind::Dependency)
+        );
+        assert!(!target.join("run").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_dir_trailing_slash_symlink_returns_dependency()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let base = fs::canonicalize(temporary.path())?;
+        let target = base.join("target");
+        let link = base.join("runtime-link");
+        fs::create_dir(&target)?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700))?;
+        symlink(&target, &link)?;
+        let mut inputs = inputs();
+        inputs.current_dir = base;
+        inputs.home_dir = Some(target);
+        inputs.firestone_runtime_dir = Some(with_trailing_separators(&link, 2));
+        inputs.uid = getuid().as_raw();
+        let paths = Paths::from_inputs(&inputs)?;
+
+        assert_eq!(paths.runtime_dir(), link);
+        assert_eq!(
+            paths
+                .validate_runtime_dir()
+                .err()
+                .as_ref()
+                .map(crate::FirestoneError::kind),
+            Some(ErrorKind::Dependency)
+        );
+        assert_eq!(
+            paths
+                .ensure_runtime_dir()
+                .err()
+                .as_ref()
+                .map(crate::FirestoneError::kind),
+            Some(ErrorKind::Dependency)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_dir_trailing_separators_regular_directory_is_accepted()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempdir()?;
         fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))?;
-        let paths = fallback_paths(temporary.path().to_owned(), getuid().as_raw());
+        let base = fs::canonicalize(temporary.path())?;
+        let runtime = base.join("runtime");
+        fs::create_dir(&runtime)?;
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))?;
+        let mut inputs = inputs();
+        inputs.current_dir = base.clone();
+        inputs.home_dir = Some(base);
+        inputs.firestone_runtime_dir = Some(with_trailing_separators(&runtime, 3));
+        inputs.uid = getuid().as_raw();
+        let paths = Paths::from_inputs(&inputs)?;
+
+        assert_eq!(paths.runtime_dir(), runtime);
+        paths.validate_runtime_dir()?;
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_dir_world_writable_parent_returns_dependency_without_creation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let base = fs::canonicalize(temporary.path())?;
+        let unsafe_parent = base.join("unsafe");
+        fs::create_dir(&unsafe_parent)?;
+        fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o777))?;
+        let runtime_dir = unsafe_parent.join("run");
+        let paths = explicit_paths(runtime_dir.clone(), getuid().as_raw());
+
+        let error = paths.ensure_runtime_dir().err();
+
+        assert_eq!(
+            error.as_ref().map(crate::FirestoneError::kind),
+            Some(ErrorKind::Dependency)
+        );
+        assert!(!runtime_dir.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_dir_root_sticky_tmp_ancestry_creates_leaf() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let shared_tmp = fs::canonicalize(Path::new("/tmp"))?;
+        let temporary = tempfile::tempdir_in(shared_tmp)?;
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))?;
+        let parent = fs::canonicalize(temporary.path())?;
+        let runtime_dir = parent.join("run");
+        let paths = explicit_paths(runtime_dir.clone(), getuid().as_raw());
 
         paths.ensure_runtime_dir()?;
 
+        assert_eq!(fs::symlink_metadata(runtime_dir)?.mode() & 0o7777, 0o700);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_dir_wrong_owner_ancestor_returns_dependency_without_creation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let base = fs::canonicalize(temporary.path())?;
+        let runtime_dir = base.join("run");
+        let uid = getuid().as_raw();
+        let paths = explicit_paths(runtime_dir.clone(), uid.wrapping_add(1));
+
+        let error = paths.ensure_runtime_dir().err();
+
         assert_eq!(
-            fs::symlink_metadata(temporary.path())?.mode() & 0o7777,
-            0o700
+            error.as_ref().map(crate::FirestoneError::kind),
+            Some(ErrorKind::Dependency)
         );
+        assert!(!runtime_dir.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn firestone_home_runtime_parent_private_creates_only_run_leaf()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))?;
+        let home = fs::canonicalize(temporary.path())?;
+        let mut inputs = inputs();
+        inputs.current_dir = home.clone();
+        inputs.home_dir = Some(home.clone());
+        inputs.firestone_home = Some(home.clone());
+        inputs.uid = getuid().as_raw();
+        let paths = Paths::from_inputs(&inputs)?;
+
+        paths.ensure_runtime_dir()?;
+
+        let metadata = fs::symlink_metadata(home.join("run"))?;
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.mode() & 0o7777, 0o700);
+        assert!(!home.join("config").exists());
+        assert!(!home.join("data").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn xdg_runtime_base_missing_returns_dependency_without_creation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let parent = fs::canonicalize(temporary.path())?;
+        let base = parent.join("missing");
+        let paths = xdg_paths(base.clone(), getuid().as_raw())?;
+
+        let error = paths.ensure_runtime_dir().err();
+
+        assert_eq!(
+            error.as_ref().map(crate::FirestoneError::kind),
+            Some(ErrorKind::Dependency)
+        );
+        assert!(!base.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn xdg_runtime_base_symlink_returns_dependency_without_child()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let parent = fs::canonicalize(temporary.path())?;
+        let target = parent.join("target");
+        let link = parent.join("runtime-link");
+        fs::create_dir(&target)?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700))?;
+        symlink(&target, &link)?;
+        let paths = xdg_paths(link, getuid().as_raw())?;
+
+        let error = paths.ensure_runtime_dir().err();
+
+        assert_eq!(
+            error.as_ref().map(crate::FirestoneError::kind),
+            Some(ErrorKind::Dependency)
+        );
+        assert!(!target.join("firestone").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn xdg_runtime_base_trailing_slash_symlink_returns_dependency_without_child()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let parent = fs::canonicalize(temporary.path())?;
+        let target = parent.join("target");
+        let link = parent.join("runtime-link");
+        fs::create_dir(&target)?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700))?;
+        symlink(&target, &link)?;
+        let paths = xdg_paths(with_trailing_separators(&link, 2), getuid().as_raw())?;
+
+        assert_eq!(
+            paths
+                .ensure_runtime_dir()
+                .err()
+                .as_ref()
+                .map(crate::FirestoneError::kind),
+            Some(ErrorKind::Dependency)
+        );
+        assert!(!target.join("firestone").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn xdg_runtime_base_wrong_owner_returns_dependency_without_child()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let shared_tmp = fs::canonicalize(Path::new("/tmp"))?;
+        let temporary = tempfile::tempdir_in(shared_tmp)?;
+        let base = fs::canonicalize(temporary.path())?;
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700))?;
+        let paths = xdg_paths(base.clone(), getuid().as_raw().wrapping_add(1))?;
+
+        let error = paths.ensure_runtime_dir().err();
+
+        assert_eq!(
+            error.as_ref().map(crate::FirestoneError::kind),
+            Some(ErrorKind::Dependency)
+        );
+        assert!(!base.join("firestone").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn xdg_runtime_base_wrong_mode_returns_dependency_without_chmod()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let base = fs::canonicalize(temporary.path())?;
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o755))?;
+        let paths = xdg_paths(base.clone(), getuid().as_raw())?;
+
+        let error = paths.ensure_runtime_dir().err();
+
+        assert_eq!(
+            error.as_ref().map(crate::FirestoneError::kind),
+            Some(ErrorKind::Dependency)
+        );
+        assert_eq!(fs::symlink_metadata(&base)?.mode() & 0o7777, 0o755);
+        assert!(!base.join("firestone").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn xdg_runtime_read_only_insecure_base_returns_dependency_without_child()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let base = fs::canonicalize(temporary.path())?;
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o755))?;
+        let paths = xdg_paths(base.clone(), getuid().as_raw())?;
+
+        let error = paths.validate_runtime_dir().err();
+
+        assert_eq!(
+            error.as_ref().map(crate::FirestoneError::kind),
+            Some(ErrorKind::Dependency)
+        );
+        assert!(!base.join("firestone").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn xdg_runtime_base_private_creates_only_firestone_child()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let base = fs::canonicalize(temporary.path())?;
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700))?;
+        let paths = xdg_paths(base.clone(), getuid().as_raw())?;
+
+        paths.ensure_runtime_dir()?;
+
+        let metadata = fs::symlink_metadata(base.join("firestone"))?;
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.uid(), getuid().as_raw());
+        assert_eq!(metadata.mode() & 0o7777, 0o700);
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_runtime_correct_owner_and_mode_is_accepted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        let runtime_dir = fs::canonicalize(temporary.path())?;
+        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700))?;
+        let paths = fallback_paths(runtime_dir.clone(), getuid().as_raw());
+
+        paths.ensure_runtime_dir()?;
+
+        assert_eq!(fs::symlink_metadata(runtime_dir)?.mode() & 0o7777, 0o700);
         Ok(())
     }
 
@@ -1065,7 +1719,9 @@ mod tests {
     fn fallback_runtime_missing_created_with_owner_and_mode()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempdir()?;
-        let runtime_dir = temporary.path().join("runtime");
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))?;
+        let parent = fs::canonicalize(temporary.path())?;
+        let runtime_dir = parent.join("runtime");
         let uid = getuid().as_raw();
         let paths = fallback_paths(runtime_dir.clone(), uid);
 
@@ -1082,52 +1738,32 @@ mod tests {
     fn fallback_runtime_wrong_mode_returns_dependency_without_chmod()
     -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempdir()?;
-        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o755))?;
-        let paths = fallback_paths(temporary.path().to_owned(), getuid().as_raw());
+        let runtime_dir = fs::canonicalize(temporary.path())?;
+        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o755))?;
+        let paths = fallback_paths(runtime_dir.clone(), getuid().as_raw());
 
         let error = paths.ensure_runtime_dir().err();
 
-        assert!(error.is_some());
         assert_eq!(
             error.as_ref().map(crate::FirestoneError::kind),
             Some(ErrorKind::Dependency)
         );
-        assert_eq!(
-            fs::symlink_metadata(temporary.path())?.mode() & 0o7777,
-            0o755
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn fallback_runtime_wrong_owner_returns_dependency() -> Result<(), Box<dyn std::error::Error>> {
-        let temporary = tempdir()?;
-        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))?;
-        let uid = getuid().as_raw();
-        let paths = fallback_paths(temporary.path().to_owned(), uid.wrapping_add(1));
-
-        let error = paths.ensure_runtime_dir().err();
-
-        assert!(error.is_some());
-        assert_eq!(
-            error.as_ref().map(crate::FirestoneError::kind),
-            Some(ErrorKind::Dependency)
-        );
+        assert_eq!(fs::symlink_metadata(runtime_dir)?.mode() & 0o7777, 0o755);
         Ok(())
     }
 
     #[test]
     fn fallback_runtime_symlink_returns_dependency() -> Result<(), Box<dyn std::error::Error>> {
         let temporary = tempdir()?;
-        let target = temporary.path().join("target");
-        let link = temporary.path().join("runtime");
+        let parent = fs::canonicalize(temporary.path())?;
+        let target = parent.join("target");
+        let link = parent.join("runtime");
         fs::create_dir(&target)?;
         symlink(target, &link)?;
         let paths = fallback_paths(link, getuid().as_raw());
 
         let error = paths.ensure_runtime_dir().err();
 
-        assert!(error.is_some());
         assert_eq!(
             error.as_ref().map(crate::FirestoneError::kind),
             Some(ErrorKind::Dependency)
@@ -1135,13 +1771,39 @@ mod tests {
         Ok(())
     }
 
+    fn explicit_paths(runtime_dir: PathBuf, uid: u32) -> Paths {
+        test_paths(runtime_dir, uid, RuntimeProvenance::FirestoneRuntimeDir)
+    }
+
     fn fallback_paths(runtime_dir: PathBuf, uid: u32) -> Paths {
+        test_paths(runtime_dir, uid, RuntimeProvenance::Fallback)
+    }
+
+    fn xdg_paths(base: PathBuf, uid: u32) -> Result<Paths, crate::FirestoneError> {
+        let mut inputs = inputs();
+        inputs.current_dir = base
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("/"));
+        inputs.xdg_runtime_dir = Some(base);
+        inputs.uid = uid;
+        Paths::from_inputs(&inputs)
+    }
+
+    fn test_paths(runtime_dir: PathBuf, uid: u32, runtime_provenance: RuntimeProvenance) -> Paths {
         Paths {
             config_dir: PathBuf::from("/unused/config"),
             data_dir: PathBuf::from("/unused/data"),
             runtime_dir,
+            home_dir: Some(PathBuf::from("/home/alice")),
             runtime_uid: uid,
-            runtime_fallback: true,
+            runtime_provenance,
         }
+    }
+
+    fn with_trailing_separators(path: &Path, count: usize) -> PathBuf {
+        let mut bytes = path.as_os_str().as_bytes().to_vec();
+        bytes.extend(std::iter::repeat_n(b'/', count));
+        PathBuf::from(OsString::from_vec(bytes))
     }
 }
