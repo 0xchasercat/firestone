@@ -16,13 +16,13 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 | ID | Work | Branch | PR | Status | Depends on | Acceptance |
 |---|---|---|---|---|---|---|
 | M0-00 | Workspace, crate boundaries, typed errors, events, actions, dispatcher seam, CI | `agent/m0-foundation` | [#1](https://github.com/0xchasercat/firestone/pull/1) | complete | baseline | Workspace builds; architecture boundaries compile; CI runs the required gate |
-| M0-01 | Paths, spec and patch model, layering, validation, drift coverage | `agent/m0-spec` | [#6](https://github.com/0xchasercat/firestone/pull/6) | ready for review | M0-00 | SPEC sections 5 through 7 unit coverage passes |
+| M0-01 | Paths, spec and patch model, layering, validation, drift coverage | `agent/m0-spec` | [#6](https://github.com/0xchasercat/firestone/pull/6) | complete | M0-00 | SPEC sections 5 through 7 unit coverage passes |
 | M0-02 | Atomic files, machine state, locking, liveness reconciliation | `agent/m0-state` | [#4](https://github.com/0xchasercat/firestone/pull/4) | complete | M0-00 | Reconcile matrix and lock contention tests pass |
 | M0-03a | Built-in catalog data and authoritative source validation | `agent/m0-catalog-data` | [#2](https://github.com/0xchasercat/firestone/pull/2) | complete | baseline | Initial entries have current per-architecture URLs and checksum sources; unbooted entries are marked as release gates |
 | M0-03b | Image reference parsing, catalog merge, architecture selection, resolution | `agent/m0-catalog` | [#5](https://github.com/0xchasercat/firestone/pull/5) | complete | M0-00, M0-03a | Catalog rules from sections 8.1 and 8.2 pass without network |
-| M0-04 | CLI parser, renderers, create/list/show/edit, dispatcher adapters | `agent/m0-cli` | pending | blocked | M0-01, M0-02, M0-03b | M0 no-KVM command acceptance and renderer snapshots pass |
+| M0-04 | CLI parser, renderers, create/list/show/edit, dispatcher adapters | `agent/m0-cli` | pending | in progress | M0-01, M0-02, M0-03b | M0 no-KVM command acceptance and renderer snapshots pass |
 | M0-05a | Dependency manifest, real pins, download/hash tooling, third-party evidence | `agent/m0-deps` | [#3](https://github.com/0xchasercat/firestone/pull/3) | complete | baseline | Real per-architecture URLs and checksums; verified behavior recorded against exact versions |
-| M0-05b | Host checks, doctor report, unprivileged fixes, deterministic tests | `agent/m0-doctor` | pending | in progress | M0-00, M0-05a | Section 17.3 checks and safe fixes pass without KVM |
+| M0-05b | Host checks, doctor report, unprivileged fixes, deterministic tests | `agent/m0-doctor` | pending | in progress | M0-01, M0-02, M0-05a | Section 17.3 checks and safe fixes pass without KVM |
 | M0-05c | Reproducible virtiofsd builds and Firestone-owned release assets | `agent/m0-virtiofsd-dist` | pending | in progress | M0-05a | Both musl targets build from pinned inputs; published assets have verified immutable URLs and checksums in `deps.toml` |
 | M0-06 | M0 integration, docs, Linux verification | `agent/m0-integration` | pending | blocked | M0-01 through M0-05c | M0 acceptance is green locally, in CI, and on Linux |
 
@@ -52,6 +52,7 @@ The orchestrator reviews each pull request for spec alignment, public contract d
 - M0-05a merged in PR [#3](https://github.com/0xchasercat/firestone/pull/3). It pinned Cloud Hypervisor v53.0, RHF 0.5.0, the VMM-tested edk2 build, and virtiofsd 1.14.0 source. It also resolved the source-level portions of verify items 1, 2, and 12 against exact versions.
 - M0-02 merged in PR [#4](https://github.com/0xchasercat/firestone/pull/4). It added durable atomic state writes, per-machine locking, verified shim identity, and exhaustive liveness reconciliation. Linux subprocess contention and `/proc` checks passed on the Azure host.
 - M0-03b merged in PR [#5](https://github.com/0xchasercat/firestone/pull/5). It added deterministic built-in and override catalog parsing, strict HTTPS/source validation, and default, alias, version, and architecture resolution.
+- M0-01 merged in PR [#6](https://github.com/0xchasercat/firestone/pull/6). It added the shared machine spec and patch model, typed clears, deterministic layering and persistence, startup path resolution, strict validation, scalar and port-forward types, schema/metadata drift gates, and secure runtime-directory ancestry checks.
 
 ## Known risks
 
