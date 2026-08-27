@@ -1,0 +1,93 @@
+# None of these entries has passed SPEC.md [verify 3]. Do not release the
+# built-in catalog until every architecture boots to SSH with its declared
+# firmware under the pinned Firestone runtime.
+
+[[image]]
+distro = "ubuntu"
+version = "24.04"
+aliases = ["noble"]
+default = true
+firmware = "rhf"
+format = "qcow2"
+
+[image.arch.x86_64]
+url = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+checksum_url = "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS"
+checksum_alg = "sha256"
+
+[image.arch.aarch64]
+url = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img"
+checksum_url = "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS"
+checksum_alg = "sha256"
+
+[[image]]
+distro = "ubuntu"
+version = "22.04"
+aliases = ["jammy"]
+default = false
+firmware = "rhf"
+format = "qcow2"
+
+[image.arch.x86_64]
+url = "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
+checksum_url = "https://cloud-images.ubuntu.com/jammy/current/SHA256SUMS"
+checksum_alg = "sha256"
+
+[image.arch.aarch64]
+url = "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-arm64.img"
+checksum_url = "https://cloud-images.ubuntu.com/jammy/current/SHA256SUMS"
+checksum_alg = "sha256"
+
+[[image]]
+distro = "debian"
+version = "12"
+aliases = ["bookworm"]
+default = true
+firmware = "rhf"
+format = "qcow2"
+
+[image.arch.x86_64]
+url = "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
+checksum_url = "https://cloud.debian.org/images/cloud/bookworm/latest/SHA512SUMS"
+checksum_alg = "sha512"
+
+[image.arch.aarch64]
+url = "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-arm64.qcow2"
+checksum_url = "https://cloud.debian.org/images/cloud/bookworm/latest/SHA512SUMS"
+checksum_alg = "sha512"
+
+[[image]]
+distro = "debian"
+version = "13"
+aliases = ["trixie"]
+default = false
+firmware = "rhf"
+format = "qcow2"
+
+[image.arch.x86_64]
+url = "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+checksum_url = "https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS"
+checksum_alg = "sha512"
+
+[image.arch.aarch64]
+url = "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2"
+checksum_url = "https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS"
+checksum_alg = "sha512"
+
+[[image]]
+distro = "fedora"
+version = "44"
+aliases = []
+default = true
+firmware = "rhf"
+format = "qcow2"
+
+[image.arch.x86_64]
+url = "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2"
+checksum_url = "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-44-1.7-x86_64-CHECKSUM"
+checksum_alg = "sha256"
+
+[image.arch.aarch64]
+url = "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/aarch64/images/Fedora-Cloud-Base-Generic-44-1.7.aarch64.qcow2"
+checksum_url = "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/aarch64/images/Fedora-Cloud-44-1.7-aarch64-CHECKSUM"
+checksum_alg = "sha256"
