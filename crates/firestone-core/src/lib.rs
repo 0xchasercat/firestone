@@ -2,6 +2,7 @@
 
 pub mod action;
 pub mod atomic;
+pub mod catalog;
 pub mod dispatcher;
 pub mod error;
 pub mod event;
@@ -9,6 +10,10 @@ pub mod lock;
 pub mod state;
 
 pub use action::Action;
+pub use catalog::{
+    Catalog, CatalogArchSource, CatalogChecksum, CatalogEntry, CatalogFirmware, ChecksumAlgorithm,
+    ImageFormat, ResolvedCatalogEntry,
+};
 pub use dispatcher::{DispatchFuture, Dispatcher, EventSink};
 pub use error::{ErrorInfo, ErrorKind, FirestoneError};
 pub use event::{Event, Level, StepId, Unit};
