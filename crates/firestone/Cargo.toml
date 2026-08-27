@@ -1,0 +1,12 @@
+[package]
+name = "firestone"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+firestone-core = { path = "../firestone-core" }
+
+[lints]
+workspace = true
