@@ -1,0 +1,11 @@
+{
+    "schema_version": 2,
+    "commit": "063e5bdf4077461e777552a68e2e488f02b9dafe",
+    "indexed_at": "2026-08-27T20:19:03Z",
+    "project": "Users-chaser-firestone",
+    "nodes": 119,
+    "edges": 118,
+    "original_size": 2162688,
+    "compressed_size": 19578,
+    "compression_level": 3
+}
