@@ -1,7 +1,7 @@
 /target/
+/.codebase-memory/
 /.idea/
 /.vscode/
 .DS_Store
 *.swp
 *.tmp
-
