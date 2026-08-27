@@ -1,0 +1,71 @@
+name: virtiofsd distribution
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/virtiofsd.yml
+      - build/virtiofsd/**
+      - deps.toml
+      - scripts/build-virtiofsd.sh
+  pull_request:
+    paths:
+      - .github/workflows/virtiofsd.yml
+      - build/virtiofsd/**
+      - deps.toml
+      - scripts/build-virtiofsd.sh
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }} twice
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - x86_64
+          - aarch64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Build from clean state, run 1
+        run: scripts/build-virtiofsd.sh --arch "${{ matrix.arch }}" --output-dir "$RUNNER_TEMP/run-1"
+
+      - name: Build from clean state, run 2
+        run: scripts/build-virtiofsd.sh --arch "${{ matrix.arch }}" --output-dir "$RUNNER_TEMP/run-2"
+
+      - name: Require byte-identical artifacts
+        env:
+          TARGET_X86_64: x86_64-unknown-linux-musl
+          TARGET_AARCH64: aarch64-unknown-linux-musl
+        run: |
+          set -euo pipefail
+          target_var="TARGET_${{ matrix.arch }}"
+          target_var=${target_var^^}
+          target=${!target_var}
+          artifact="virtiofsd-v1.14.0-$target"
+          cmp "$RUNNER_TEMP/run-1/$artifact" "$RUNNER_TEMP/run-2/$artifact"
+          cmp "$RUNNER_TEMP/run-1/$artifact.build-info" "$RUNNER_TEMP/run-2/$artifact.build-info"
+          first_sha=$(sha256sum "$RUNNER_TEMP/run-1/$artifact" | awk '{print $1}')
+          second_sha=$(sha256sum "$RUNNER_TEMP/run-2/$artifact" | awk '{print $1}')
+          test "$first_sha" = "$second_sha"
+          mkdir -p "$RUNNER_TEMP/artifact"
+          cp "$RUNNER_TEMP/run-1/$artifact" "$RUNNER_TEMP/artifact/$artifact"
+          cp "$RUNNER_TEMP/run-1/$artifact.build-info" "$RUNNER_TEMP/artifact/$artifact.build-info"
+          printf '%s  %s\n' "$first_sha" "$artifact" >"$RUNNER_TEMP/artifact/SHA256SUMS"
+          printf 'reproducible sha256 %s\n' "$first_sha"
+
+      - name: Upload candidate and checksum
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: virtiofsd-v1.14.0-${{ matrix.arch }}
+          path: ${{ runner.temp }}/artifact/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
