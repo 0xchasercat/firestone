@@ -51,7 +51,7 @@ The script parses the section 8.1 fields, rejects duplicate references and defau
 
 ## Validation runs
 
-- macOS arm64 local host, Darwin 25.6.0, Python 3.14.7: 10 entries passed. In the final pre-commit run, the Fedora x86_64 image resolved to `mirror.freedif.org` and its checksum to `mirrors.bfsu.edu.cn`, with one redirect each. The aarch64 image resolved to `mirror.twds.com.tw` and its checksum to `mirrors.tuna.tsinghua.edu.cn`, also with one redirect each.
-- Ubuntu 24.04 x86_64 Azure host, kernel 6.17.0-1022-azure, Python 3.12.3: 10 entries passed. The Fedora x86_64 image resolved to `fedora.mirror.constant.com` and its checksum to `solidrock.mm.fcix.net`, with one redirect each. The aarch64 image and checksum both resolved to `ftp2.osuosl.org`, with two redirects each.
+- macOS arm64 local host, Darwin 25.6.0, Python 3.14.7: 10 entries passed. In the final run, the Fedora x86_64 image resolved to `mirror.twds.com.tw` and its checksum to `mirror.freedif.org`, with one redirect each. The aarch64 image resolved to `ftp.yz.yamagata-u.ac.jp` and its checksum to `mirrors.tuna.tsinghua.edu.cn`, also with one redirect each.
+- Ubuntu 24.04 x86_64 Azure host, kernel 6.17.0-1022-azure, Python 3.12.3: 10 entries passed. The Fedora x86_64 image resolved to `ftp2.osuosl.org` after two redirects and its checksum to `nocix.mm.fcix.net` after one. The aarch64 image resolved to `mirror.web-ster.com` and its checksum to `mirror.fcix.net`, with one redirect each.
 
 The Linux run checked network and parser behavior only. It did not use `/dev/kvm` or boot an image.
