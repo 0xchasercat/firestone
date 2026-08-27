@@ -21,6 +21,17 @@ permissions:
   contents: read
 
 jobs:
+  publication-tests:
+    name: Test output publication
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Test atomic publication and deterministic packaging
+        run: |
+          build/virtiofsd/tests/test-publish-output.sh
+          build/virtiofsd/tests/test-package-artifact.sh
+
   build:
     name: Build ${{ matrix.arch }} twice
     runs-on: ubuntu-24.04
@@ -57,16 +68,26 @@ jobs:
           second_sha=$(sha256sum "$RUNNER_TEMP/run-2/$artifact" | awk '{print $1}')
           test "$first_sha" = "$second_sha"
           mkdir -p "$RUNNER_TEMP/artifact"
-          cp "$RUNNER_TEMP/run-1/$artifact" "$RUNNER_TEMP/artifact/$artifact"
-          cp "$RUNNER_TEMP/run-1/$artifact.build-info" "$RUNNER_TEMP/artifact/$artifact.build-info"
-          printf '%s  %s\n' "$first_sha" "$artifact" >"$RUNNER_TEMP/artifact/SHA256SUMS"
+          install -m 0755 "$RUNNER_TEMP/run-1/$artifact" "$RUNNER_TEMP/artifact/$artifact"
+          install -m 0644 "$RUNNER_TEMP/run-1/$artifact.build-info" "$RUNNER_TEMP/artifact/$artifact.build-info"
+          install -m 0644 "$RUNNER_TEMP/run-1/$artifact.sha256" "$RUNNER_TEMP/artifact/SHA256SUMS"
+          build/virtiofsd/package-artifact.sh \
+            "$RUNNER_TEMP/artifact" \
+            "$artifact" \
+            "$RUNNER_TEMP/$artifact.tar"
+          mkdir -p "$RUNNER_TEMP/extracted"
+          tar -xf "$RUNNER_TEMP/$artifact.tar" -C "$RUNNER_TEMP/extracted"
+          test "$(stat -c '%a' "$RUNNER_TEMP/extracted/$artifact")" = 755
+          test "$(stat -c '%a' "$RUNNER_TEMP/extracted/$artifact.build-info")" = 644
+          test "$(stat -c '%a' "$RUNNER_TEMP/extracted/SHA256SUMS")" = 644
+          (cd "$RUNNER_TEMP/extracted" && sha256sum -c SHA256SUMS)
+          cmp "$RUNNER_TEMP/run-1/$artifact" "$RUNNER_TEMP/extracted/$artifact"
           printf 'reproducible sha256 %s\n' "$first_sha"
 
       - name: Upload candidate and checksum
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: virtiofsd-v1.14.0-${{ matrix.arch }}
-          path: ${{ runner.temp }}/artifact/
+          path: ${{ runner.temp }}/virtiofsd-v1.14.0-${{ matrix.arch }}-unknown-linux-musl.tar
+          archive: false
           if-no-files-found: error
-          compression-level: 0
           retention-days: 14

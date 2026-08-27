@@ -62,8 +62,8 @@ libseccomp_archive="$work_dir/inputs/libseccomp-static.apk"
 source_dir="$work_dir/source"
 sysroot_dir="$work_dir/sysroot"
 artifact_name="virtiofsd-${VIRTIOFSD_VERSION}-${target}"
-artifact_path="$output_dir/$artifact_name"
-readonly source_archive libcap_ng_archive libseccomp_archive source_dir sysroot_dir artifact_name artifact_path
+build_info_source="$work_dir/$artifact_name.build-info"
+readonly source_archive libcap_ng_archive libseccomp_archive source_dir sysroot_dir artifact_name build_info_source
 
 require_sha256 "$source_archive" "$VIRTIOFSD_SOURCE_SHA256"
 require_sha256 "$libcap_ng_archive" "$libcap_ng_sha"
@@ -151,15 +151,9 @@ if [ "$architecture" = x86_64 ]; then
         fail "virtiofsd --version returned '$version_output'"
 fi
 
-readonly temporary_artifact="$output_dir/.${artifact_name}.tmp.$$"
-cp "$built_binary" "$temporary_artifact"
-chmod 0755 "$temporary_artifact"
-mv "$temporary_artifact" "$artifact_path"
-
-artifact_sha=$(sha256sum "$artifact_path" | awk '{print $1}')
+artifact_sha=$(sha256sum "$built_binary" | awk '{print $1}')
 readonly artifact_sha
-printf '%s  %s\n' "$artifact_sha" "$artifact_name" >"$artifact_path.sha256"
-cat >"$artifact_path.build-info" <<EOF
+cat >"$build_info_source" <<EOF
 virtiofsd_version=$VIRTIOFSD_VERSION
 virtiofsd_commit=$VIRTIOFSD_COMMIT
 source_url=$VIRTIOFSD_SOURCE_URL
@@ -185,6 +179,6 @@ mode=$mode
 version_output=$version_output
 sha256=$artifact_sha
 EOF
+chmod 0644 "$build_info_source"
 
-printf 'artifact %s\n' "$artifact_path"
-printf 'sha256 %s\n' "$artifact_sha"
+"$recipe_dir/publish-output.sh" "$built_binary" "$build_info_source" "$output_dir" "$artifact_name"
