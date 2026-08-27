@@ -24,6 +24,61 @@ def load_validator() -> ModuleType:
 validator = load_validator()
 
 
+class ChecksumParserTests(unittest.TestCase):
+    def test_checksum_for_gnu_sha512_exact_filename_selected(self) -> None:
+        filename = "debian-13-genericcloud-arm64.qcow2"
+        digest = "a1" * 64
+        manifest = (
+            f"{'b2' * 64}  {filename}.sig\n"
+            f"{digest} *{filename}\n"
+        )
+
+        self.assertEqual(
+            validator.checksum_for(manifest, filename, "sha512"),
+            digest,
+        )
+
+    def test_checksum_for_bsd_sha256_clearsigned_text_selected(self) -> None:
+        filename = "Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2"
+        uppercase_digest = "AB" * 32
+        manifest = f"""-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+# Fedora-Cloud-44-1.7-x86_64-CHECKSUM
+SHA256 ({filename}) = {uppercase_digest}
+-----BEGIN PGP SIGNATURE-----
+representative-signature-data
+-----END PGP SIGNATURE-----
+"""
+
+        self.assertEqual(
+            validator.checksum_for(manifest, filename, "sha256"),
+            uppercase_digest.lower(),
+        )
+
+    def test_checksum_for_missing_filename_rejected(self) -> None:
+        manifest = f"{'a3' * 32}  another-image.qcow2\n"
+
+        with self.assertRaisesRegex(
+            validator.ValidationError,
+            "no sha256 record for missing-image.qcow2",
+        ):
+            validator.checksum_for(manifest, "missing-image.qcow2", "sha256")
+
+    def test_checksum_for_conflicting_duplicate_digest_rejected(self) -> None:
+        filename = "image.qcow2"
+        manifest = (
+            f"{'a4' * 32}  {filename}\n"
+            f"SHA256 ({filename}) = {'b5' * 32}\n"
+        )
+
+        with self.assertRaisesRegex(
+            validator.ValidationError,
+            "conflicting sha256 records for image.qcow2",
+        ):
+            validator.checksum_for(manifest, filename, "sha256")
+
+
 class FedoraOriginTests(unittest.TestCase):
     def test_fedora_redirector_expected_url_accepted(self) -> None:
         validator.require_fedora_redirector_url(
