@@ -15,20 +15,23 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 
 | ID | Work | Branch | PR | Status | Depends on | Acceptance |
 |---|---|---|---|---|---|---|
-| M0-00 | Workspace, crate boundaries, typed errors, events, actions, dispatcher seam, CI | `agent/m0-foundation` | pending | ready | baseline | Workspace builds; architecture boundaries compile; CI runs the required gate |
+| M0-00 | Workspace, crate boundaries, typed errors, events, actions, dispatcher seam, CI | `agent/m0-foundation` | pending | in progress | baseline | Workspace builds; architecture boundaries compile; CI runs the required gate |
 | M0-01 | Paths, spec and patch model, layering, validation, drift coverage | `agent/m0-spec` | pending | blocked | M0-00 | SPEC sections 5 through 7 unit coverage passes |
 | M0-02 | Atomic files, machine state, locking, liveness reconciliation | `agent/m0-state` | pending | blocked | M0-00 | Reconcile matrix and lock contention tests pass |
-| M0-03 | Built-in catalog, image reference parsing, merge and resolution | `agent/m0-catalog` | pending | ready | baseline | Catalog rules from section 8.1 and 8.2 pass without network |
-| M0-04 | CLI parser, renderers, create/list/show/edit, dispatcher adapters | `agent/m0-cli` | pending | blocked | M0-01, M0-02, M0-03 | M0 no-KVM command acceptance and renderer snapshots pass |
-| M0-05 | Host checks, dependency manifest, verified pins, download/install support | `agent/m0-deps` | pending | ready | baseline | Real per-architecture URLs and checksums; doctor checks have deterministic tests |
-| M0-06 | M0 integration, doctor command, docs, Linux verification | `agent/m0-integration` | pending | blocked | M0-01 through M0-05 | M0 acceptance is green locally, in CI, and on Linux |
+| M0-03a | Built-in catalog data and authoritative source validation | `agent/m0-catalog-data` | pending | in progress | baseline | Initial entries have current per-architecture URLs and checksum sources; unbooted entries are marked as release gates |
+| M0-03b | Image reference parsing, catalog merge, architecture selection, resolution | `agent/m0-catalog` | pending | blocked | M0-00, M0-03a | Catalog rules from sections 8.1 and 8.2 pass without network |
+| M0-04 | CLI parser, renderers, create/list/show/edit, dispatcher adapters | `agent/m0-cli` | pending | blocked | M0-01, M0-02, M0-03b | M0 no-KVM command acceptance and renderer snapshots pass |
+| M0-05a | Dependency manifest, real pins, download/hash tooling, third-party evidence | `agent/m0-deps` | pending | in progress | baseline | Real per-architecture URLs and checksums; verified behavior recorded against exact versions |
+| M0-05b | Host checks, doctor report, unprivileged fixes, deterministic tests | `agent/m0-doctor` | pending | blocked | M0-00, M0-05a | Section 17.3 checks and safe fixes pass without KVM |
+| M0-06 | M0 integration, docs, Linux verification | `agent/m0-integration` | pending | blocked | M0-01 through M0-05b | M0 acceptance is green locally, in CI, and on Linux |
 
 ## Merge order
 
 1. M0-00 foundation
-2. M0-01, M0-02, M0-03, and the non-overlapping pin work from M0-05
-3. M0-04 plus remaining doctor work from M0-05
-4. M0-06 integration
+2. M0-03a and M0-05a when their evidence is complete
+3. M0-01, M0-02, M0-03b, and M0-05b
+4. M0-04
+5. M0-06 integration
 
 The orchestrator reviews each pull request for spec alignment, public contract drift, unsafe filesystem or process behavior, test quality, and dependency direction. A passing branch gate is necessary but does not replace review.
 
