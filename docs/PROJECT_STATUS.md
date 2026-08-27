@@ -21,7 +21,7 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 | M0-03a | Built-in catalog data and authoritative source validation | `agent/m0-catalog-data` | [#2](https://github.com/0xchasercat/firestone/pull/2) | complete | baseline | Initial entries have current per-architecture URLs and checksum sources; unbooted entries are marked as release gates |
 | M0-03b | Image reference parsing, catalog merge, architecture selection, resolution | `agent/m0-catalog` | pending | ready | M0-00, M0-03a | Catalog rules from sections 8.1 and 8.2 pass without network |
 | M0-04 | CLI parser, renderers, create/list/show/edit, dispatcher adapters | `agent/m0-cli` | pending | blocked | M0-01, M0-02, M0-03b | M0 no-KVM command acceptance and renderer snapshots pass |
-| M0-05a | Dependency manifest, real pins, download/hash tooling, third-party evidence | `agent/m0-deps` | pending | in progress | baseline | Real per-architecture URLs and checksums; verified behavior recorded against exact versions |
+| M0-05a | Dependency manifest, real pins, download/hash tooling, third-party evidence | `agent/m0-deps` | [#3](https://github.com/0xchasercat/firestone/pull/3) | ready for review | baseline | Real per-architecture URLs and checksums; verified behavior recorded against exact versions |
 | M0-05b | Host checks, doctor report, unprivileged fixes, deterministic tests | `agent/m0-doctor` | pending | blocked | M0-00, M0-05a | Section 17.3 checks and safe fixes pass without KVM |
 | M0-06 | M0 integration, docs, Linux verification | `agent/m0-integration` | pending | blocked | M0-01 through M0-05b | M0 acceptance is green locally, in CI, and on Linux |
 
