@@ -3,7 +3,10 @@
 pub mod action;
 pub mod atomic;
 pub mod catalog;
+pub mod cmd;
+pub mod deps;
 pub mod dispatcher;
+pub mod doctor;
 pub mod error;
 pub mod event;
 pub mod lock;
@@ -16,7 +19,13 @@ pub use catalog::{
     Catalog, CatalogArchSource, CatalogChecksum, CatalogEntry, CatalogFirmware, ChecksumAlgorithm,
     ImageFormat, ResolvedCatalogEntry,
 };
+pub use cmd::{Cmd, CmdOutput};
+pub use deps::{DependencyArtifact, DependencyManifest};
 pub use dispatcher::{DispatchFuture, Dispatcher, EventSink};
+pub use doctor::{
+    DoctorCheck, DoctorCheckId, DoctorContext, DoctorReport, DoctorStatus, RuntimeDirKind,
+    StaleStateObservation, run_doctor,
+};
 pub use error::{ErrorInfo, ErrorKind, FirestoneError};
 pub use event::{Event, Level, StepId, Unit};
 pub use lock::MachineLock;

@@ -11,15 +11,19 @@ edition = "2024"
 rust-version = "1.85"
 
 [workspace.dependencies]
+fs2 = "0.4"
 nix = { version = "0.30", features = ["fs", "user"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_path_to_error = "0.1"
+sha2 = "0.10"
 ssh-key = "0.6"
 tempfile = "3"
 thiserror = "2"
 toml = "0.8"
+tracing = "0.1"
 url = "2"
 
 [workspace.lints.rust]
