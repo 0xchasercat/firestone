@@ -170,6 +170,7 @@ target=$target
 rust_version=$RUST_VERSION
 rustc_commit=$RUSTC_COMMIT
 cargo_commit=$CARGO_COMMIT
+rust_std_aarch64_sha256=$RUST_STD_AARCH64_SHA256
 rust_builder_image=$RUST_BUILDER_IMAGE
 rust_cross_host_image=$RUST_CROSS_HOST_IMAGE
 cross_builder_image=$CROSS_BUILDER_IMAGE

@@ -11,6 +11,7 @@ This record covers the Firestone-owned virtiofsd v1.14.0 build recipe. The first
 | Upstream source | commit `c2540f8db14caba81c1e37fba23fc7bf2cd7f0dd`; archive SHA-256 `52b66e449ca583b4f050a2bff327ff812211a2c349b4130279fcfc6a64540f04` |
 | Cargo lockfile | SHA-256 `995b73803681900135edc1e47127fec62832ec7503c87c4eb1f3b18dc5e1d866` |
 | Rust | 1.98.0, rustc commit `88d9e12ae178fab0fb5cc050a94da85685d449ea`, Cargo commit `797e8a9bca276c1c9f9f738d2a20f484fa4eea9d` |
+| aarch64 Rust standard library | 2026-08-20 release archive SHA-256 `4367ba0e6b8fa5ef9c195d12f0ab4a39b8f08cda627cf121f5f929d47161f4b4` |
 | Rust builder | `rust@sha256:a10e64dd139b7387337c7fbe8aca31b959b57b2fd4c8ae20a02cf1d6ea424dce` |
 | Cross-build Rust host | `rust@sha256:4e4a7e7939c17991ab35f2b8c2e67593980f771d28f6b1254b1850f860fd0c7f` |
 | aarch64 cross builder | `ghcr.io/cross-rs/aarch64-unknown-linux-musl@sha256:f604e399cbb2154ddeb013db99eb4f123d24f09a579c7e8d6ed631d15ffa8b12` |
@@ -55,7 +56,57 @@ The GitHub workflow performs the same four clean builds, compares each target by
 
 ## Linux results
 
-Build results will be recorded here after both repeated builds finish on the Linux Docker host.
+The final build used bare-metal host `w`, an x86_64 Ubuntu machine running Docker 29.7.2 and buildx 0.36.1. The checked-out recipe was rebased onto `origin/main` commit `c49f39b233609e6131336d4a7829861c5a402561` before these commands ran.
+
+```sh
+scripts/build-virtiofsd.sh --arch x86_64 --output-dir /tmp/firestone-virtiofsd-final.bqDPyZ/x86-run-1
+scripts/build-virtiofsd.sh --arch x86_64 --output-dir /tmp/firestone-virtiofsd-final.bqDPyZ/x86-run-2
+scripts/build-virtiofsd.sh --arch aarch64 --output-dir /tmp/firestone-virtiofsd-final.bqDPyZ/arm-run-1
+scripts/build-virtiofsd.sh --arch aarch64 --output-dir /tmp/firestone-virtiofsd-final.bqDPyZ/arm-run-2
+```
+
+Each invocation downloaded and checked its own source and native library archives. The aarch64 invocations also downloaded and checked the pinned Rust target library. Every run used a new Cargo home, target directory, and source extraction directory. Docker reused the reviewed builder layers, but no Cargo or source build state crossed between runs.
+
+| Target | Run | Cargo compile time | Size | SHA-256 |
+|---|---:|---:|---:|---|
+| `x86_64-unknown-linux-musl` | 1 | 36.09 s | 2,728,944 bytes | `9ad3e33c45dd816b24ad483b60ca469974ba54c3b37ef93be3da2a623986646f` |
+| `x86_64-unknown-linux-musl` | 2 | 36.95 s | 2,728,944 bytes | `9ad3e33c45dd816b24ad483b60ca469974ba54c3b37ef93be3da2a623986646f` |
+| `aarch64-unknown-linux-musl` | 1 | 21.55 s | 2,355,632 bytes | `e45bd62e346eca87857279d5680782e80148379fbca524a648089f642ac001d2` |
+| `aarch64-unknown-linux-musl` | 2 | 22.76 s | 2,355,632 bytes | `e45bd62e346eca87857279d5680782e80148379fbca524a648089f642ac001d2` |
+
+`cmp` reported no difference between the two binaries or the two build-info files for either target. Independent host checks produced this evidence:
+
+```text
+virtiofsd-v1.14.0-x86_64-unknown-linux-musl:  ELF 64-bit LSB pie executable, x86-64, static-pie linked, stripped
+  Type: DYN (Position-Independent Executable file)
+  Machine: Advanced Micro Devices X86-64
+  mode=755 PT_INTERP=absent NEEDED=absent build_paths=absent
+  --version: virtiofsd 1.14.0
+
+virtiofsd-v1.14.0-aarch64-unknown-linux-musl: ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped
+  Type: EXEC (Executable file)
+  Machine: AArch64
+  mode=755 PT_INTERP=absent NEEDED=absent build_paths=absent
+```
+
+The preserved release candidates, build-info files, `SHA256SUMS`, and full logs are on `w` under:
+
+```text
+/tmp/firestone-virtiofsd-final.bqDPyZ/release-candidates/
+/tmp/firestone-virtiofsd-final.bqDPyZ/logs/
+```
+
+The aarch64 result has compile-time and ELF verification only. Running it requires an aarch64 Linux host and remains part of the M5 native release matrix.
+
+## Validation
+
+The final recipe passed these checks:
+
+- ShellCheck from `koalaman/shellcheck@sha256:bb596a0d169b85ddd81d8b6d3a2ff6d5baf5fca10b97f575ebc647c3dff62b3d` with external sources enabled.
+- Hadolint 2.15.1 and Actionlint 1.7.12 with no findings.
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on macOS. The test suite reported 47 passing tests.
+- The same Rust gate on `firestone@172.203.242.136` with Rust 1.98.0. The Linux suite reported 48 passing tests, and `/dev/kvm` was readable and writable.
+- Controlled failures for an unsupported architecture, an output path inside the git worktree, a non-HTTPS source URL, and a deliberately wrong source SHA-256. All four stopped before Docker compiled code. No `firestone-virtiofsd-build.*` temporary directories remained afterward.
 
 ## Publication boundary
 

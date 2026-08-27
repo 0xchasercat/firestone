@@ -137,6 +137,7 @@ case "$architecture" in
         libcap_ng_sha=$LIBCAP_NG_AARCH64_SHA256
         libseccomp_url=$LIBSECCOMP_AARCH64_URL
         libseccomp_sha=$LIBSECCOMP_AARCH64_SHA256
+        download "$RUST_STD_AARCH64_URL" "$RUST_STD_AARCH64_SHA256" "$build_work_dir/inputs/rust-std-aarch64.tar.gz"
         ;;
 esac
 readonly target libcap_ng_url libcap_ng_sha libseccomp_url libseccomp_sha
@@ -151,11 +152,12 @@ docker build \
     --build-arg "CROSS_BUILDER_IMAGE=$CROSS_BUILDER_IMAGE" \
     --build-arg "RUST_BUILDER_IMAGE=$RUST_BUILDER_IMAGE" \
     --build-arg "RUST_CROSS_HOST_IMAGE=$RUST_CROSS_HOST_IMAGE" \
+    --build-arg "RUST_STD_AARCH64_SHA256=$RUST_STD_AARCH64_SHA256" \
     --build-arg "RUST_VERSION=$RUST_VERSION" \
     --file "$recipe_dir/Dockerfile" \
     --target "$docker_target" \
     --tag "$image_tag" \
-    "$recipe_dir"
+    "$build_work_dir"
 
 printf 'builder %s\n' "$image_tag"
 docker run \
