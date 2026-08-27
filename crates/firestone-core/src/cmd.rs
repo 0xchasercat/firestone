@@ -1,13 +1,18 @@
 use std::{
     collections::BTreeMap,
     ffi::OsString,
-    fs::OpenOptions,
-    io::Write,
+    fs::{File, OpenOptions},
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
+    time::Duration,
 };
 
+use wait_timeout::ChildExt;
+
 use crate::{ErrorKind, FirestoneError};
+
+const DEFAULT_CAPTURE_LIMIT: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct CmdArg {
@@ -30,6 +35,8 @@ pub struct CmdOutput {
     status: ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
 }
 
 impl CmdOutput {
@@ -51,6 +58,16 @@ impl CmdOutput {
     #[must_use]
     pub fn stderr(&self) -> &[u8] {
         &self.stderr
+    }
+
+    #[must_use]
+    pub const fn stdout_truncated(&self) -> bool {
+        self.stdout_truncated
+    }
+
+    #[must_use]
+    pub const fn stderr_truncated(&self) -> bool {
+        self.stderr_truncated
     }
 
     #[must_use]
@@ -102,6 +119,8 @@ pub struct Cmd {
     stdin: CmdStdin,
     stderr_log: Option<PathBuf>,
     error_kind: ErrorKind,
+    timeout: Option<Duration>,
+    capture_limit: usize,
 }
 
 impl Cmd {
@@ -116,6 +135,8 @@ impl Cmd {
             stdin: CmdStdin::Null,
             stderr_log: None,
             error_kind: ErrorKind::Generic,
+            timeout: None,
+            capture_limit: DEFAULT_CAPTURE_LIMIT,
         }
     }
 
@@ -201,6 +222,18 @@ impl Cmd {
         self
     }
 
+    #[must_use]
+    pub const fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    #[must_use]
+    pub const fn capture_limit(mut self, bytes: usize) -> Self {
+        self.capture_limit = bytes;
+        self
+    }
+
     /// Runs the process and returns captured output regardless of exit status.
     pub fn output(&self) -> Result<CmdOutput, FirestoneError> {
         let logged_argv = std::iter::once(self.program.as_os_str())
@@ -253,6 +286,46 @@ impl Cmd {
             .with_source(source)
         })?;
 
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(FirestoneError::new(
+                self.error_kind,
+                format!(
+                    "cannot capture stdout for command `{}`",
+                    self.program.to_string_lossy()
+                ),
+            ));
+        };
+        let Some(stderr) = child.stderr.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(FirestoneError::new(
+                self.error_kind,
+                format!(
+                    "cannot capture stderr for command `{}`",
+                    self.program.to_string_lossy()
+                ),
+            ));
+        };
+
+        let stderr_log = match &self.stderr_log {
+            Some(path) => match open_log(path, self.error_kind) {
+                Ok(file) => Some(file),
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
+        let capture_limit = self.capture_limit;
+        let stdout_reader =
+            std::thread::spawn(move || capture_stream(stdout, capture_limit, None, false));
+        let stderr_reader =
+            std::thread::spawn(move || capture_stream(stderr, capture_limit, stderr_log, true));
+
         let stdin_writer = if let CmdStdin::Bytes(bytes) = &self.stdin {
             let Some(mut stdin) = child.stdin.take() else {
                 let _ = child.kill();
@@ -271,7 +344,21 @@ impl Cmd {
             None
         };
 
-        let output_result = child.wait_with_output();
+        let (status_result, timed_out) = match self.timeout {
+            Some(timeout) => match child.wait_timeout(timeout) {
+                Ok(Some(status)) => (Ok(status), false),
+                Ok(None) => {
+                    let kill_result = child.kill();
+                    let wait_result = child.wait();
+                    match (kill_result, wait_result) {
+                        (_, Ok(status)) => (Ok(status), true),
+                        (Err(source), _) | (_, Err(source)) => (Err(source), true),
+                    }
+                }
+                Err(source) => (Err(source), false),
+            },
+            None => (child.wait(), false),
+        };
         if let Some(writer) = stdin_writer {
             match writer.join() {
                 Ok(Ok(())) => {}
@@ -296,7 +383,10 @@ impl Cmd {
                 }
             }
         }
-        let output = output_result.map_err(|source| {
+
+        let stdout = join_capture(stdout_reader, &self.program, "stdout", self.error_kind)?;
+        let stderr = join_capture(stderr_reader, &self.program, "stderr", self.error_kind)?;
+        let status = status_result.map_err(|source| {
             FirestoneError::new(
                 self.error_kind,
                 format!(
@@ -306,16 +396,30 @@ impl Cmd {
             )
             .with_source(source)
         })?;
-
-        if let Some(path) = &self.stderr_log {
-            append_log(path, &output.stderr, self.error_kind)?;
+        if timed_out {
+            let detail = last_lines(&stderr.bytes, 10);
+            let suffix = if detail.is_empty() {
+                "last stderr: <empty>".to_owned()
+            } else {
+                format!("last stderr:\n{}", detail.join("\n"))
+            };
+            return Err(FirestoneError::new(
+                ErrorKind::Timeout,
+                format!(
+                    "command `{}` timed out after {} ms; {suffix}",
+                    self.program.to_string_lossy(),
+                    self.timeout.map_or(0, |timeout| timeout.as_millis())
+                ),
+            ));
         }
 
         Ok(CmdOutput {
             program: self.program.clone(),
-            status: output.status,
-            stdout: output.stdout,
-            stderr: output.stderr,
+            status,
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
+            stdout_truncated: stdout.truncated,
+            stderr_truncated: stderr.truncated,
         })
     }
 
@@ -330,8 +434,14 @@ impl Cmd {
     }
 }
 
-fn append_log(path: &Path, bytes: &[u8], kind: ErrorKind) -> Result<(), FirestoneError> {
-    let mut file = OpenOptions::new()
+#[derive(Debug)]
+struct Captured {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn open_log(path: &Path, kind: ErrorKind) -> Result<File, FirestoneError> {
+    OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
@@ -341,14 +451,76 @@ fn append_log(path: &Path, bytes: &[u8], kind: ErrorKind) -> Result<(), Fireston
                 format!("cannot open command log `{}`", path.display()),
             )
             .with_source(source)
-        })?;
-    file.write_all(bytes).map_err(|source| {
-        FirestoneError::new(
+        })
+}
+
+fn capture_stream(
+    mut reader: impl Read,
+    limit: usize,
+    mut log: Option<File>,
+    retain_tail: bool,
+) -> Result<Captured, std::io::Error> {
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+    let mut truncated = false;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        if let Some(file) = &mut log {
+            file.write_all(&buffer[..read])?;
+        }
+        if retain_tail {
+            if read >= limit {
+                bytes.clear();
+                bytes.extend_from_slice(&buffer[read - limit..read]);
+                truncated = true;
+            } else {
+                let overflow = bytes.len().saturating_add(read).saturating_sub(limit);
+                if overflow > 0 {
+                    bytes.drain(..overflow);
+                    truncated = true;
+                }
+                bytes.extend_from_slice(&buffer[..read]);
+            }
+        } else {
+            let remaining = limit.saturating_sub(bytes.len());
+            let retained = remaining.min(read);
+            bytes.extend_from_slice(&buffer[..retained]);
+            truncated |= retained < read;
+        }
+    }
+    if let Some(file) = &mut log {
+        file.flush()?;
+    }
+    Ok(Captured { bytes, truncated })
+}
+
+fn join_capture(
+    reader: std::thread::JoinHandle<Result<Captured, std::io::Error>>,
+    program: &std::ffi::OsStr,
+    stream: &str,
+    kind: ErrorKind,
+) -> Result<Captured, FirestoneError> {
+    match reader.join() {
+        Ok(Ok(captured)) => Ok(captured),
+        Ok(Err(source)) => Err(FirestoneError::new(
             kind,
-            format!("cannot append command log `{}`", path.display()),
+            format!(
+                "cannot capture {stream} for command `{}`",
+                program.to_string_lossy()
+            ),
         )
-        .with_source(source)
-    })
+        .with_source(source)),
+        Err(_) => Err(FirestoneError::new(
+            kind,
+            format!(
+                "{stream} capture panicked for command `{}`",
+                program.to_string_lossy()
+            ),
+        )),
+    }
 }
 
 fn last_lines(bytes: &[u8], count: usize) -> Vec<String> {
@@ -379,7 +551,11 @@ fn status_label(status: ExitStatus) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        time::{Duration, Instant},
+    };
 
     use tempfile::TempDir;
 
@@ -454,5 +630,39 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].len() < 4200);
         assert!(lines[0].ends_with("...[truncated]"));
+    }
+
+    #[test]
+    fn output_capture_limit_drains_and_marks_truncated() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let script = executable(
+            &dir,
+            "noisy",
+            "i=0; while [ \"$i\" -lt 1000 ]; do printf 0123456789; i=$((i + 1)); done",
+        )?;
+
+        let output = Cmd::new(script).capture_limit(128).run()?;
+
+        assert_eq!(output.stdout().len(), 128);
+        assert!(output.stdout_truncated());
+        assert!(!output.stderr_truncated());
+        Ok(())
+    }
+
+    #[test]
+    fn output_timeout_kills_and_reaps_process() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let script = executable(&dir, "hang", "while :; do :; done")?;
+        let started = Instant::now();
+
+        let error = match Cmd::new(script).timeout(Duration::from_millis(100)).run() {
+            Err(error) => error,
+            Ok(_) => return Err(std::io::Error::other("command should time out").into()),
+        };
+
+        assert_eq!(error.kind(), crate::ErrorKind::Timeout);
+        assert!(error.message().contains("timed out after 100 ms"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        Ok(())
     }
 }

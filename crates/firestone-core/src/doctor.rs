@@ -1,9 +1,9 @@
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
-    fs::{self, File, OpenOptions},
+    fs::{self, DirBuilder, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -16,6 +16,8 @@ use tempfile::Builder as TempBuilder;
 use crate::{Cmd, DependencyArtifact, DependencyManifest, ErrorKind, FirestoneError};
 
 const MINIMUM_FREE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+const MAX_DEPENDENCY_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+const DOCTOR_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MINIMUM_PASST_DATE: u32 = 20_241_211;
 const MINIMUM_PASST_VERSION: &str = "2024_12_11.09478d5";
 const CHECK_IDS: [DoctorCheckId; 13] = [
@@ -130,6 +132,13 @@ pub struct StaleStateObservation {
     pub reason: String,
 }
 
+/// A machine state that the caller could not reconcile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleStateFailure {
+    pub machine: String,
+    pub reason: String,
+}
+
 /// Paths and host facts supplied by the CLI's resolved `Paths` and state layer.
 ///
 /// Doctor never derives a Firestone path. Tests can point every field at an
@@ -150,10 +159,10 @@ pub struct DoctorContext {
     pub os_release: PathBuf,
     pub group_file: PathBuf,
     pub search_path: OsString,
-    pub user: String,
     pub hostname: String,
     pub manifest: DependencyManifest,
     pub stale_states: Vec<StaleStateObservation>,
+    pub stale_state_failures: Vec<StaleStateFailure>,
     pub minimum_data_free_bytes: u64,
 }
 
@@ -176,7 +185,7 @@ pub fn run_doctor(context: &DoctorContext, fix: bool) -> Result<DoctorReport, Fi
         Ok(downloader) => Ok(run_doctor_with(context, true, &downloader)),
         Err(error) => {
             let downloader = FailedDownloader {
-                reason: error.message().to_owned(),
+                reason: firestone_error_reason(&error),
                 hint: error.hint().map(str::to_owned),
             };
             Ok(run_doctor_with(context, true, &downloader))
@@ -206,7 +215,7 @@ struct FixFailure {
 impl From<FirestoneError> for FixFailure {
     fn from(error: FirestoneError) -> Self {
         Self {
-            reason: error.message().to_owned(),
+            reason: firestone_error_reason(&error),
             hint: error.hint().map(str::to_owned),
         }
     }
@@ -286,16 +295,48 @@ impl ArtifactFetcher for HttpsDownloader {
                 .with_hint("check network access and retry `firestone doctor --fix`")
                 .with_source(source)
             })?;
-        std::io::copy(&mut response, output).map_err(|source| {
-            FirestoneError::new(
-                ErrorKind::Dependency,
-                format!("cannot write dependency download from {url}"),
-            )
-            .with_hint("check free space and retry `firestone doctor --fix`")
-            .with_source(source)
-        })?;
+        if content_length_exceeds_limit(response.content_length()) {
+            return Err(artifact_too_large(url));
+        }
+        copy_bounded(&mut response, output, MAX_DEPENDENCY_ARTIFACT_BYTES, url)?;
         Ok(())
     }
+}
+
+fn content_length_exceeds_limit(content_length: Option<u64>) -> bool {
+    content_length.is_some_and(|length| length > MAX_DEPENDENCY_ARTIFACT_BYTES)
+}
+
+fn copy_bounded(
+    reader: &mut dyn Read,
+    output: &mut dyn Write,
+    maximum: u64,
+    url: &Url,
+) -> Result<(), FirestoneError> {
+    let mut limited = reader.take(maximum.saturating_add(1));
+    let copied = std::io::copy(&mut limited, output).map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::Dependency,
+            format!("cannot write dependency download from {url}"),
+        )
+        .with_hint("check free space and retry `firestone doctor --fix`")
+        .with_source(source)
+    })?;
+    if copied > maximum {
+        return Err(artifact_too_large(url));
+    }
+    Ok(())
+}
+
+fn artifact_too_large(url: &Url) -> FirestoneError {
+    FirestoneError::new(
+        ErrorKind::Dependency,
+        format!(
+            "dependency artifact from {url} exceeds the {} byte safety limit",
+            MAX_DEPENDENCY_ARTIFACT_BYTES
+        ),
+    )
+    .with_hint("verify the pinned release asset before retrying")
 }
 
 fn inspect(
@@ -306,7 +347,7 @@ fn inspect(
     let mut checks = vec![
         check_architecture(context),
         kvm.check,
-        check_nested_virtualization(context, kvm.device_exists),
+        check_nested_virtualization(context, kvm.device_exists, kvm.device_accessible),
         check_runtime_dir(context),
         check_vendored(context),
         check_virtiofsd(context),
@@ -373,6 +414,7 @@ fn check_architecture(context: &DoctorContext) -> DoctorCheck {
 struct KvmCheck {
     check: DoctorCheck,
     device_exists: bool,
+    device_accessible: bool,
 }
 
 fn check_kvm(context: &DoctorContext) -> KvmCheck {
@@ -387,6 +429,7 @@ fn check_kvm(context: &DoctorContext) -> KvmCheck {
                 )
                 .with_hint("enable hardware virtualization and load kvm_intel or kvm_amd"),
                 device_exists: false,
+                device_accessible: false,
             };
         }
         Err(source) => {
@@ -398,6 +441,7 @@ fn check_kvm(context: &DoctorContext) -> KvmCheck {
                 )
                 .with_hint("run `ls -l /dev/kvm` and repair access to the KVM device"),
                 device_exists: false,
+                device_accessible: false,
             };
         }
     };
@@ -421,6 +465,7 @@ fn check_kvm(context: &DoctorContext) -> KvmCheck {
                 ),
             ),
             device_exists: true,
+            device_accessible: true,
         },
         Err(source) => {
             let mut check = DoctorCheck::new(
@@ -444,12 +489,17 @@ fn check_kvm(context: &DoctorContext) -> KvmCheck {
             KvmCheck {
                 check,
                 device_exists: true,
+                device_accessible: false,
             }
         }
     }
 }
 
-fn check_nested_virtualization(context: &DoctorContext, kvm_exists: bool) -> DoctorCheck {
+fn check_nested_virtualization(
+    context: &DoctorContext,
+    kvm_exists: bool,
+    kvm_accessible: bool,
+) -> DoctorCheck {
     let nested = context
         .nested_parameters
         .iter()
@@ -466,12 +516,19 @@ fn check_nested_virtualization(context: &DoctorContext, kvm_exists: bool) -> Doc
         },
     );
 
-    if kvm_exists {
+    if kvm_accessible {
         DoctorCheck::new(
             DoctorCheckId::NestedVirtualization,
             DoctorStatus::Ok,
-            detail,
+            format!("KVM is usable; {detail}"),
         )
+    } else if kvm_exists {
+        DoctorCheck::new(
+            DoctorCheckId::NestedVirtualization,
+            DoctorStatus::Warn,
+            format!("KVM exists but is not usable; {detail}"),
+        )
+        .with_hint("repair read/write access to /dev/kvm before starting a machine")
     } else {
         DoctorCheck::new(
             DoctorCheckId::NestedVirtualization,
@@ -525,7 +582,7 @@ fn check_vendored(context: &DoctorContext) -> DoctorCheck {
                 Err(reason) => failures.push(reason),
             },
             Err(error) => {
-                failures.push(error.message().to_owned());
+                failures.push(firestone_error_reason(&error));
                 if hint.is_none() {
                     hint = error.hint().map(str::to_owned);
                 }
@@ -571,7 +628,7 @@ fn check_virtiofsd(context: &DoctorContext) -> DoctorCheck {
             let mut check = DoctorCheck::new(
                 DoctorCheckId::Virtiofsd,
                 DoctorStatus::Fail,
-                error.message().to_owned(),
+                firestone_error_reason(&error),
             );
             if let Some(hint) = error.hint() {
                 check = check.with_hint(hint);
@@ -581,13 +638,19 @@ fn check_virtiofsd(context: &DoctorContext) -> DoctorCheck {
     }
 }
 
+/// Checks the local passt capability required by `[verify 14]`.
+///
+/// Version and help output establish only that the installed binary exposes
+/// vhost-user mode. They do not resolve runtime interoperability with Cloud
+/// Hypervisor; the M3 network test remains the verify-14 gate.
 fn check_passt(context: &DoctorContext) -> DoctorCheck {
     let Some(program) = find_on_path("passt", &context.search_path) else {
-        return missing_program_check(context, DoctorCheckId::Passt, Package::Passt, "passt");
+        return missing_passt_check(context);
     };
     let version_output = match Cmd::new(&program)
         .arg("--version")
         .stdin_null()
+        .timeout(DOCTOR_PROBE_TIMEOUT)
         .error_kind(ErrorKind::Dependency)
         .output()
     {
@@ -596,7 +659,7 @@ fn check_passt(context: &DoctorContext) -> DoctorCheck {
             return DoctorCheck::new(
                 DoctorCheckId::Passt,
                 DoctorStatus::Fail,
-                error.message().to_owned(),
+                firestone_error_reason(&error),
             )
             .with_hint("repair the passt installation and retry");
         }
@@ -612,6 +675,35 @@ fn check_passt(context: &DoctorContext) -> DoctorCheck {
         )
         .with_hint("repair the passt installation and retry");
     }
+    let help_output = match Cmd::new(program)
+        .arg("--help")
+        .stdin_null()
+        .timeout(DOCTOR_PROBE_TIMEOUT)
+        .error_kind(ErrorKind::Dependency)
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return DoctorCheck::new(
+                DoctorCheckId::Passt,
+                DoctorStatus::Fail,
+                firestone_error_reason(&error),
+            )
+            .with_hint("repair the passt installation and retry");
+        }
+    };
+    if !help_output.success() {
+        return DoctorCheck::new(
+            DoctorCheckId::Passt,
+            DoctorStatus::Fail,
+            format!(
+                "passt --help failed: {}",
+                command_failure_reason(&help_output)
+            ),
+        )
+        .with_hint("repair the passt installation and retry");
+    }
+
     let combined_version = format!(
         "{}\n{}",
         version_output.stdout_lossy(),
@@ -621,35 +713,18 @@ fn check_passt(context: &DoctorContext) -> DoctorCheck {
         return DoctorCheck::new(
             DoctorCheckId::Passt,
             DoctorStatus::Fail,
-            "passt version output has no release tag",
+            "passt version output has no date-and-hash release tag",
         )
         .with_hint(format!("install passt {MINIMUM_PASST_VERSION} or newer"));
-    };
-
-    let help_output = match Cmd::new(program)
-        .arg("--help")
-        .stdin_null()
-        .error_kind(ErrorKind::Dependency)
-        .output()
-    {
-        Ok(output) => output,
-        Err(error) => {
-            return DoctorCheck::new(
-                DoctorCheckId::Passt,
-                DoctorStatus::Fail,
-                error.message().to_owned(),
-            )
-            .with_hint("repair the passt installation and retry");
-        }
     };
     let help = format!(
         "{}\n{}",
         help_output.stdout_lossy(),
         help_output.stderr_lossy()
     );
-    if version.date < MINIMUM_PASST_DATE || !help.contains("--vhost-user") {
-        let fix = install_command(context, Package::Passt);
-        let mut check = DoctorCheck::new(
+    let has_vhost_user = help.split_whitespace().any(|token| token == "--vhost-user");
+    if version.date < MINIMUM_PASST_DATE || !has_vhost_user {
+        return DoctorCheck::new(
             DoctorCheckId::Passt,
             DoctorStatus::Fail,
             format!(
@@ -660,10 +735,6 @@ fn check_passt(context: &DoctorContext) -> DoctorCheck {
         .with_hint(format!(
             "install passt {MINIMUM_PASST_VERSION} or newer with --vhost-user support"
         ));
-        if let Some(fix) = fix {
-            check = check.with_fix(fix);
-        }
-        return check;
     }
 
     DoctorCheck::new(
@@ -689,6 +760,7 @@ fn check_program(
     match Cmd::new(program_path)
         .arg("--version")
         .stdin_null()
+        .timeout(DOCTOR_PROBE_TIMEOUT)
         .error_kind(ErrorKind::Dependency)
         .output()
     {
@@ -702,32 +774,27 @@ fn check_program(
             ),
         )
         .with_hint(format!("repair the {program} installation and retry")),
-        Err(error) => DoctorCheck::new(id, DoctorStatus::Fail, error.message().to_owned())
+        Err(error) => DoctorCheck::new(id, DoctorStatus::Fail, firestone_error_reason(&error))
             .with_hint(format!("repair the {program} installation and retry")),
     }
 }
 
 fn check_ssh(context: &DoctorContext) -> DoctorCheck {
-    let ssh = find_on_path("ssh", &context.search_path).is_some();
-    let keygen = find_on_path("ssh-keygen", &context.search_path).is_some();
-    if ssh && keygen {
+    let ssh = probe_ssh_tool(context, "ssh", &["-V"], true);
+    let keygen = probe_ssh_tool(context, "ssh-keygen", &["-?"], false);
+    if ssh.is_ok() && keygen.is_ok() {
         DoctorCheck::new(
             DoctorCheckId::Ssh,
             DoctorStatus::Ok,
             "ssh and ssh-keygen are available",
         )
     } else {
-        let missing = match (ssh, keygen) {
-            (false, false) => "ssh and ssh-keygen",
-            (false, true) => "ssh",
-            (true, false) => "ssh-keygen",
-            (true, true) => "",
-        };
-        let mut check = DoctorCheck::new(
-            DoctorCheckId::Ssh,
-            DoctorStatus::Fail,
-            format!("{missing} not found on PATH"),
-        );
+        let reasons = [ssh.err(), keygen.err()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("; ");
+        let mut check = DoctorCheck::new(DoctorCheckId::Ssh, DoctorStatus::Fail, reasons);
         if let Some(fix) = install_command(context, Package::OpenSsh) {
             check = check.with_fix(fix);
         } else {
@@ -737,6 +804,31 @@ fn check_ssh(context: &DoctorContext) -> DoctorCheck {
     }
 }
 
+fn probe_ssh_tool(
+    context: &DoctorContext,
+    program: &str,
+    args: &[&str],
+    require_success: bool,
+) -> Result<(), String> {
+    let path = find_on_path(program, &context.search_path)
+        .ok_or_else(|| format!("{program} not found on PATH"))?;
+    let output = Cmd::new(path)
+        .args(args)
+        .stdin_null()
+        .timeout(DOCTOR_PROBE_TIMEOUT)
+        .error_kind(ErrorKind::Dependency)
+        .output()
+        .map_err(|error| firestone_error_reason(&error))?;
+    if require_success && !output.success() {
+        return Err(format!(
+            "{program} probe failed: {}",
+            command_failure_reason(&output)
+        ));
+    }
+    Ok(())
+}
+
+/// Checks the host prerequisite for virtiofsd's `[verify 16]` namespace sandbox.
 fn check_user_namespaces(context: &DoctorContext) -> DoctorCheck {
     let max_namespaces = match fs::read_to_string(&context.user_namespace_sysctl) {
         Ok(value) => value.trim().parse::<u64>().ok(),
@@ -761,6 +853,7 @@ fn check_user_namespaces(context: &DoctorContext) -> DoctorCheck {
     let output = match Cmd::new(unshare)
         .args(["-U", "true"])
         .stdin_null()
+        .timeout(DOCTOR_PROBE_TIMEOUT)
         .error_kind(ErrorKind::Dependency)
         .output()
     {
@@ -769,7 +862,7 @@ fn check_user_namespaces(context: &DoctorContext) -> DoctorCheck {
             return DoctorCheck::new(
                 DoctorCheckId::UserNamespaces,
                 DoctorStatus::Warn,
-                error.message().to_owned(),
+                firestone_error_reason(&error),
             )
             .with_hint("virtiofsd will run with --sandbox none");
         }
@@ -798,8 +891,8 @@ fn check_user_namespaces(context: &DoctorContext) -> DoctorCheck {
 }
 
 fn check_ssh_key(context: &DoctorContext) -> DoctorCheck {
-    let private = fs::metadata(&context.ssh_private_key);
-    let public = fs::metadata(&context.ssh_public_key);
+    let private = fs::symlink_metadata(&context.ssh_private_key);
+    let public = fs::symlink_metadata(&context.ssh_public_key);
     match (private, public) {
         (Ok(private), Ok(public)) if private.is_file() && public.is_file() => {
             let mode = private.permissions().mode() & 0o777;
@@ -821,7 +914,10 @@ fn check_ssh_key(context: &DoctorContext) -> DoctorCheck {
                         context.ssh_private_key.display()
                     ),
                 )
-                .with_fix(format!("chmod 600 {}", context.ssh_private_key.display()))
+                .with_fix(format!(
+                    "chmod 600 -- {}",
+                    shell_quote(&context.ssh_private_key)
+                ))
             }
         }
         (Err(private_error), Err(public_error))
@@ -889,6 +985,25 @@ fn check_data_space(context: &DoctorContext) -> DoctorCheck {
 }
 
 fn check_stale_state(context: &DoctorContext) -> DoctorCheck {
+    let mut failures = context.stale_state_failures.clone();
+    failures.sort_by(|left, right| {
+        left.machine
+            .cmp(&right.machine)
+            .then_with(|| left.reason.cmp(&right.reason))
+    });
+    if !failures.is_empty() {
+        let details = failures
+            .iter()
+            .map(|failure| format!("{} ({})", failure.machine, failure.reason))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return DoctorCheck::new(
+            DoctorCheckId::StaleState,
+            DoctorStatus::Fail,
+            format!("could not reconcile machine states: {details}"),
+        )
+        .with_hint("repair the named machine state or lock error and rerun doctor");
+    }
     if context.stale_states.is_empty() {
         return DoctorCheck::new(
             DoctorCheckId::StaleState,
@@ -909,7 +1024,7 @@ fn check_stale_state(context: &DoctorContext) -> DoctorCheck {
         .join(", ");
     DoctorCheck::new(
         DoctorCheckId::StaleState,
-        DoctorStatus::Warn,
+        DoctorStatus::Ok,
         format!("reconciled stale machine states: {details}"),
     )
 }
@@ -920,46 +1035,70 @@ fn perform_fixes(
 ) -> BTreeMap<DoctorCheckId, FixFailure> {
     let mut failures = BTreeMap::new();
 
-    for (path, mode, check_id) in [
-        (&context.data_dir, 0o700, DoctorCheckId::DataSpace),
-        (&context.bin_dir, 0o700, DoctorCheckId::VendoredBinaries),
-        (&context.runtime_dir, 0o700, DoctorCheckId::RuntimeDir),
-    ] {
-        if let Err(error) = create_firestone_dir(path, mode) {
-            record_fix_failure(&mut failures, check_id, error);
-        }
-    }
-    if let Some(key_dir) = context.ssh_private_key.parent()
-        && let Err(error) = create_firestone_dir(key_dir, 0o700)
-    {
-        record_fix_failure(&mut failures, DoctorCheckId::SshKey, error);
-    }
+    let data_ready =
+        record_directory_fix(&mut failures, &context.data_dir, DoctorCheckId::DataSpace);
+    let bin_ready = data_ready
+        && record_directory_fix(
+            &mut failures,
+            &context.bin_dir,
+            DoctorCheckId::VendoredBinaries,
+        );
+    record_directory_fix(
+        &mut failures,
+        &context.runtime_dir,
+        DoctorCheckId::RuntimeDir,
+    );
+    let key_ready = if data_ready {
+        context.ssh_private_key.parent().is_some_and(|key_dir| {
+            record_directory_fix(&mut failures, key_dir, DoctorCheckId::SshKey)
+        })
+    } else {
+        false
+    };
 
-    for dependency in VENDORED_DEPENDENCIES {
+    if bin_ready {
+        for dependency in VENDORED_DEPENDENCIES {
+            fix_artifact(
+                context,
+                dependency,
+                DoctorCheckId::VendoredBinaries,
+                fetcher,
+                &mut failures,
+            );
+        }
         fix_artifact(
             context,
-            dependency,
-            DoctorCheckId::VendoredBinaries,
+            "virtiofsd",
+            DoctorCheckId::Virtiofsd,
             fetcher,
             &mut failures,
         );
     }
-    fix_artifact(
-        context,
-        "virtiofsd",
-        DoctorCheckId::Virtiofsd,
-        fetcher,
-        &mut failures,
-    );
 
-    if path_is_missing(&context.ssh_private_key)
+    if key_ready
+        && path_is_missing(&context.ssh_private_key)
         && path_is_missing(&context.ssh_public_key)
-        && let Err(error) = generate_ssh_key(context)
     {
-        record_fix_failure(&mut failures, DoctorCheckId::SshKey, error);
+        if let Err(error) = generate_ssh_key(context) {
+            record_fix_failure(&mut failures, DoctorCheckId::SshKey, error);
+        }
     }
 
     failures
+}
+
+fn record_directory_fix(
+    failures: &mut BTreeMap<DoctorCheckId, FixFailure>,
+    path: &Path,
+    check_id: DoctorCheckId,
+) -> bool {
+    match create_firestone_dir(path, 0o700) {
+        Ok(()) => true,
+        Err(error) => {
+            record_fix_failure(failures, check_id, error);
+            false
+        }
+    }
 }
 
 fn fix_artifact(
@@ -1134,6 +1273,7 @@ fn generate_ssh_key(context: &DoctorContext) -> Result<(), FirestoneError> {
             context.ssh_private_key.as_os_str(),
         ])
         .stdin_null()
+        .timeout(Duration::from_secs(30))
         .error_kind(ErrorKind::Dependency)
         .run()?;
     fs::set_permissions(&context.ssh_private_key, fs::Permissions::from_mode(0o600)).map_err(
@@ -1164,20 +1304,68 @@ fn generate_ssh_key(context: &DoctorContext) -> Result<(), FirestoneError> {
 }
 
 fn create_firestone_dir(path: &Path, mode: u32) -> Result<(), FirestoneError> {
-    fs::create_dir_all(path).map_err(|source| {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => return Ok(()),
+        Ok(_) => {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "refusing to replace non-directory Firestone path {}",
+                    path.display()
+                ),
+            )
+            .with_hint("move the existing path aside and rerun `firestone doctor --fix`"));
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!("cannot inspect Firestone directory {}", path.display()),
+            )
+            .with_source(source));
+        }
+    }
+
+    let mut builder = DirBuilder::new();
+    builder.recursive(true).mode(mode);
+    if let Err(source) = builder.create(path) {
+        if source.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!("cannot create Firestone directory {}", path.display()),
+            )
+            .with_source(source));
+        }
+    }
+
+    let metadata = fs::symlink_metadata(path).map_err(|source| {
         FirestoneError::new(
             ErrorKind::Dependency,
-            format!("cannot create Firestone directory {}", path.display()),
+            format!("cannot read back Firestone directory {}", path.display()),
         )
         .with_source(source)
     })?;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|source| {
-        FirestoneError::new(
+    if !metadata.is_dir() {
+        return Err(FirestoneError::new(
             ErrorKind::Dependency,
-            format!("cannot set mode {mode:04o} on {}", path.display()),
+            format!(
+                "Firestone directory {} changed to a non-directory during creation",
+                path.display()
+            ),
+        ));
+    }
+    let actual_mode = metadata.permissions().mode() & 0o777;
+    if actual_mode != mode {
+        return Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!(
+                "created Firestone directory {} has mode {actual_mode:04o}; expected {mode:04o}",
+                path.display()
+            ),
         )
-        .with_source(source)
-    })
+        .with_hint(format!("run `chmod {mode:04o} {}`", path.display())));
+    }
+    Ok(())
 }
 
 fn artifact_state(bin_dir: &Path, artifact: &DependencyArtifact) -> Result<(), String> {
@@ -1286,6 +1474,29 @@ fn command_failure_reason(output: &crate::CmdOutput) -> String {
     }
 }
 
+fn firestone_error_reason(error: &FirestoneError) -> String {
+    let mut reason = error.message().to_owned();
+    let mut source = std::error::Error::source(error);
+    for _ in 0..4 {
+        let Some(next) = source else {
+            break;
+        };
+        reason.push_str(": ");
+        reason.push_str(&bounded_detail(&next.to_string()));
+        source = next.source();
+    }
+    reason
+}
+
+fn bounded_detail(detail: &str) -> String {
+    let mut characters = detail.chars();
+    let mut bounded = characters.by_ref().take(1024).collect::<String>();
+    if characters.next().is_some() {
+        bounded.push_str("...[truncated]");
+    }
+    bounded
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PasstVersion {
     raw: String,
@@ -1297,7 +1508,11 @@ fn parse_passt_version(output: &str) -> Option<PasstVersion> {
         let trimmed = token.trim_matches(|character: char| {
             !character.is_ascii_alphanumeric() && character != '_' && character != '.'
         });
-        let date_part = trimmed.split('.').next()?;
+        let (date_part, commit) = trimmed.split_once('.')?;
+        if !(7..=40).contains(&commit.len()) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
         let mut components = date_part.split('_');
         let year = components.next()?.parse::<u32>().ok()?;
         let month = components.next()?.parse::<u32>().ok()?;
@@ -1310,6 +1525,20 @@ fn parse_passt_version(output: &str) -> Option<PasstVersion> {
             date: year * 10_000 + month * 100 + day,
         })
     })
+}
+
+fn missing_passt_check(context: &DoctorContext) -> DoctorCheck {
+    let package_hint = install_command(context, Package::Passt)
+        .map(|command| format!("the detected package command is `{command}`, but verify that its candidate is new enough"))
+        .unwrap_or_else(|| "install the passt package for this distribution".to_owned());
+    DoctorCheck::new(
+        DoctorCheckId::Passt,
+        DoctorStatus::Fail,
+        "passt not found on PATH",
+    )
+    .with_hint(format!(
+        "{package_hint}; Firestone requires {MINIMUM_PASST_VERSION} or newer with --vhost-user support"
+    ))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1411,6 +1640,10 @@ fn nearest_existing_ancestor(path: &Path) -> Option<&Path> {
     path.ancestors().find(|ancestor| ancestor.exists())
 }
 
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
+}
+
 fn sync_directory(path: &Path) -> Result<(), FirestoneError> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
@@ -1430,7 +1663,7 @@ mod tests {
         collections::BTreeMap,
         ffi::OsString,
         fs,
-        io::Write,
+        io::{Cursor, Write},
         os::unix::fs::{MetadataExt, PermissionsExt},
         path::{Path, PathBuf},
     };
@@ -1440,10 +1673,11 @@ mod tests {
 
     use super::{
         ArtifactFetcher, CHECK_IDS, DoctorCheck, DoctorCheckId, DoctorContext, DoctorReport,
-        DoctorStatus, MINIMUM_PASST_DATE, Package, RuntimeDirKind, StaleStateObservation,
-        artifact_state, check_kvm, check_passt, check_user_namespaces, distro_family,
-        install_artifact, install_command, parse_passt_version, redirect_rejection, require_https,
-        run_doctor_with,
+        DoctorStatus, MAX_DEPENDENCY_ARTIFACT_BYTES, MINIMUM_PASST_DATE, Package, RuntimeDirKind,
+        StaleStateFailure, StaleStateObservation, artifact_state, check_kvm, check_passt,
+        check_user_namespaces, content_length_exceeds_limit, copy_bounded, create_firestone_dir,
+        distro_family, firestone_error_reason, install_artifact, install_command,
+        parse_passt_version, redirect_rejection, require_https, run_doctor_with,
     };
     use crate::{DependencyArtifact, DependencyManifest, ErrorKind, FirestoneError};
 
@@ -1584,10 +1818,10 @@ mod tests {
                 os_release,
                 group_file,
                 search_path: OsString::from(fake_bin),
-                user: "firestone-test".to_owned(),
                 hostname: "fixture".to_owned(),
                 manifest,
                 stale_states: Vec::new(),
+                stale_state_failures: Vec::new(),
                 minimum_data_free_bytes: 0,
             };
 
@@ -1985,6 +2219,29 @@ mod tests {
     }
 
     #[test]
+    fn download_declared_and_streamed_oversize_are_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert!(content_length_exceeds_limit(Some(
+            MAX_DEPENDENCY_ARTIFACT_BYTES + 1
+        )));
+        assert!(!content_length_exceeds_limit(Some(
+            MAX_DEPENDENCY_ARTIFACT_BYTES
+        )));
+
+        let url = reqwest::Url::parse("https://example.invalid/oversize")?;
+        let mut reader = Cursor::new(b"123456".to_vec());
+        let mut output = Vec::new();
+        let error = match copy_bounded(&mut reader, &mut output, 4, &url) {
+            Err(error) => error,
+            Ok(()) => return Err(std::io::Error::other("oversize body should fail").into()),
+        };
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert_eq!(output, b"12345");
+        assert!(error.message().contains("safety limit"));
+        Ok(())
+    }
+
+    #[test]
     fn passt_version_and_capability_parsing_enforces_authoritative_minimum()
     -> Result<(), Box<dyn std::error::Error>> {
         let minimum = parse_passt_version("passt 2024_12_11.09478d5")
@@ -2003,6 +2260,61 @@ mod tests {
         let check = check_passt(&fixture.context);
         assert_eq!(check.status, DoctorStatus::Fail);
         assert!(check.reason.contains("vhost-user minimum"));
+        Ok(())
+    }
+
+    #[test]
+    fn passt_bare_date_substring_option_and_nonzero_help_are_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert!(parse_passt_version("passt 2024_12_11").is_none());
+        assert!(parse_passt_version("passt 2024_12_11.not-hash").is_none());
+
+        let fixture = Fixture::healthy()?;
+        let passt = PathBuf::from(&fixture.context.search_path).join("passt");
+        write_executable(
+            &passt,
+            "case \"$1\" in --version) printf 'passt 2024_12_11.09478d5\\n' ;; --help) printf '%s\\n' '--vhost-user-old' ;; esac",
+        )?;
+        let substring = check_passt(&fixture.context);
+        assert_eq!(substring.status, DoctorStatus::Fail);
+
+        write_executable(
+            &passt,
+            "case \"$1\" in --version) printf 'passt 2024_12_11.09478d5\\n' ;; --help) printf '%s\\n' '--vhost-user'; exit 2 ;; esac",
+        )?;
+        let nonzero = check_passt(&fixture.context);
+        assert_eq!(nonzero.status, DoctorStatus::Fail);
+        assert!(nonzero.reason.contains("--help failed"));
+        Ok(())
+    }
+
+    #[test]
+    fn passt_missing_on_unverified_distro_has_no_ineffective_fix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::healthy()?;
+        let passt = PathBuf::from(&fixture.context.search_path).join("passt");
+        fs::remove_file(passt)?;
+        fs::write(
+            &fixture.context.os_release,
+            "ID=ubuntu\nVERSION_ID=\"24.04\"\nID_LIKE=debian\n",
+        )?;
+
+        let check = check_passt(&fixture.context);
+
+        assert_eq!(check.status, DoctorStatus::Fail);
+        assert!(check.fix.is_none());
+        assert!(
+            check
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("apt-get"))
+        );
+        assert!(
+            check
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("2024_12_11"))
+        );
         Ok(())
     }
 
@@ -2067,6 +2379,107 @@ mod tests {
         assert_eq!(kvm.check.fix.as_deref(), Some("sudo usermod -aG kvm $USER"));
         assert!(kvm.check.reason.contains("device group is kvm"));
         Ok(())
+    }
+
+    #[test]
+    fn directory_fix_rejects_symlink_without_changing_target_mode()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        fs::create_dir(&target)?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755))?;
+        std::os::unix::fs::symlink(&target, &link)?;
+
+        let error = match create_firestone_dir(&link, 0o700) {
+            Err(error) => error,
+            Ok(()) => return Err(std::io::Error::other("directory symlink should fail").into()),
+        };
+
+        assert!(error.message().contains("non-directory"));
+        assert_eq!(fs::metadata(target)?.permissions().mode() & 0o777, 0o755);
+        Ok(())
+    }
+
+    #[test]
+    fn ssh_key_complete_symlink_pair_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::healthy()?;
+        let private_target = fixture.context.data_dir.join("private-target");
+        let public_target = fixture.context.data_dir.join("public-target");
+        fs::write(&private_target, "private")?;
+        fs::write(&public_target, "public")?;
+        fs::set_permissions(&private_target, fs::Permissions::from_mode(0o600))?;
+        fs::remove_file(&fixture.context.ssh_private_key)?;
+        fs::remove_file(&fixture.context.ssh_public_key)?;
+        std::os::unix::fs::symlink(&private_target, &fixture.context.ssh_private_key)?;
+        std::os::unix::fs::symlink(&public_target, &fixture.context.ssh_public_key)?;
+
+        let report = run_doctor_with(
+            &fixture.context,
+            true,
+            &FakeFetcher::new(fixture.payloads.clone()),
+        );
+
+        assert_eq!(
+            check(&report, DoctorCheckId::SshKey).status,
+            DoctorStatus::Fail
+        );
+        assert!(
+            fs::symlink_metadata(&fixture.context.ssh_private_key)?
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(private_target)?, b"private");
+        Ok(())
+    }
+
+    #[test]
+    fn stale_state_failure_is_sorted_and_fails_only_that_check()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut fixture = Fixture::healthy()?;
+        fixture.context.stale_state_failures = vec![
+            StaleStateFailure {
+                machine: "zeta".to_owned(),
+                reason: "lock timeout".to_owned(),
+            },
+            StaleStateFailure {
+                machine: "alpha".to_owned(),
+                reason: "invalid state".to_owned(),
+            },
+        ];
+
+        let report = run_doctor_with(
+            &fixture.context,
+            false,
+            &FakeFetcher::new(fixture.payloads.clone()),
+        );
+
+        let stale = check(&report, DoctorCheckId::StaleState);
+        assert_eq!(stale.status, DoctorStatus::Fail);
+        assert!(
+            stale.reason.find("alpha").is_some_and(|alpha| {
+                stale.reason.find("zeta").is_some_and(|zeta| alpha < zeta)
+            })
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .filter(|check| check.id != DoctorCheckId::StaleState)
+                .all(|check| check.status == DoctorStatus::Ok)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn report_error_reason_includes_bounded_source_context() {
+        let error = FirestoneError::new(ErrorKind::Dependency, "cannot run probe")
+            .with_source(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+
+        let reason = firestone_error_reason(&error);
+
+        assert!(reason.contains("cannot run probe"));
+        assert!(reason.contains("permission denied"));
     }
 
     #[test]

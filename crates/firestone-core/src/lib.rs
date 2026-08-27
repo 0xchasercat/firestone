@@ -24,7 +24,7 @@ pub use deps::{DependencyArtifact, DependencyManifest};
 pub use dispatcher::{DispatchFuture, Dispatcher, EventSink};
 pub use doctor::{
     DoctorCheck, DoctorCheckId, DoctorContext, DoctorReport, DoctorStatus, RuntimeDirKind,
-    StaleStateObservation, run_doctor,
+    StaleStateFailure, StaleStateObservation, run_doctor,
 };
 pub use error::{ErrorInfo, ErrorKind, FirestoneError};
 pub use event::{Event, Level, StepId, Unit};

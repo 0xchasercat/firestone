@@ -25,6 +25,7 @@ thiserror = "2"
 toml = "0.8"
 tracing = "0.1"
 url = "2"
+wait-timeout = "0.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
