@@ -79,6 +79,8 @@ download() {
     curl \
         --fail \
         --location \
+        --proto '=https' \
+        --proto-redir '=https' \
         --silent \
         --show-error \
         --retry 3 \

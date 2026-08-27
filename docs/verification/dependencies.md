@@ -4,7 +4,7 @@ This record covers the M0 dependency manifest and the source-level portions of S
 
 ## Pinned releases and downloaded hashes
 
-`scripts/pin-deps.sh` uses only the URLs in `deps.toml`. It never queries a latest-release endpoint. The checksums below came from downloaded bytes, then a second `verify --arch all` run downloaded and checked every URL again.
+`scripts/pin-deps.sh` uses only the URLs in `deps.toml`. It never queries a latest-release endpoint, and curl rejects any initial or redirected download that is not HTTPS. The checksums below came from downloaded bytes, then a second `verify --arch all` run downloaded and checked every URL again.
 
 | Dependency | Architecture | Release asset | SHA-256 |
 |---|---|---|---|
