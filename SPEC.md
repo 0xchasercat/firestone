@@ -563,8 +563,10 @@ Target mapping for the default machine (field names to be validated against the 
   "memory":  { "size": 2147483648, "shared": true },
   "payload": { "kernel": "/home/u/.local/share/firestone/bin/hypervisor-fw-0.5.0" },
   "disks": [
-    { "path": "/home/u/.local/share/firestone/machines/ubuntu/disk.qcow2" },
-    { "path": "/home/u/.local/share/firestone/machines/ubuntu/seed.img", "readonly": true }
+    { "path": "/home/u/.local/share/firestone/machines/ubuntu/disk.qcow2",
+      "image_type": "Qcow2", "backing_files": true },
+    { "path": "/home/u/.local/share/firestone/machines/ubuntu/seed.img",
+      "readonly": true, "image_type": "Raw" }
   ],
   "net": [
     { "vhost_user": true, "vhost_socket": "/run/user/1000/firestone/ubuntu/net.sock",
@@ -1237,6 +1239,10 @@ Do these in the first milestone, against the pinned versions, and record results
 | CID | fixed 3 | allocation table | CH's vsock is userspace; the CID is not host‑global. |
 | REST transport | unix socket only in v0.1 | TCP with token | Auth by file permissions is simple and correct; TCP later with a token. |
 | Language | Rust | Go | Same ecosystem as the VMM; one static binary. Go would also work. |
+| Dependency pins | cloud-hypervisor v53.0; Rust Hypervisor Firmware 0.5.0; cloud-hypervisor edk2 ch-1e1b96f126; virtiofsd v1.14.0 source only | moving `latest` URLs; edk2 newer than the VMM-tested tag; mutable virtiofsd main-branch artifact; distro virtiofsd | Exact release URLs and downloaded SHA-256 values make refreshes reproducible. Cloud Hypervisor v53.0 pins edk2 ch-1e1b96f126 in its integration assets. The pinned virtiofsd source builds for both required musl targets, but the release has no versioned binaries and its CI artifact is x86_64-only and mutable. Binary distribution remains blocked until Firestone owns a reproducible two-target build. |
+| [verify 1] firmware mapping at cloud-hypervisor v53.0 | RHF 0.5.0 uses `payload.kernel`; edk2 ch-1e1b96f126 uses `payload.firmware` | pass RHF through `payload.firmware`; pass edk2 through `payload.kernel` | The v53.0 CLI exposes distinct `--kernel` and `--firmware` inputs, `PayloadConfig` exposes the matching JSON fields, and the v53.0 README documents RHF's Xen PVH entry as valid through the kernel input and edk2 through firmware. Source and CLI checks resolve the mapping. Boot behavior remains an M1 runtime check. |
+| [verify 2] API and VmConfig at cloud-hypervisor v53.0 | `/api/v1/vmm.ping` is GET; `vm.create`, `vm.boot`, `vm.power-button`, `vm.pause`, `vm.resume`, `vm.shutdown`, and `vmm.shutdown` are PUT; `vm.info` is GET. Successful `vmm.shutdown` returns 200 even though the OpenAPI document says 204. Use the §9.2 field names and enum casing. Set overlay disks to `image_type: "Qcow2", backing_files: true` and the vfat seed to `image_type: "Raw"`. | rely on image auto-detection; omit `backing_files`; infer methods or success codes from endpoint names | The pinned OpenAPI document and Rust config types agree on the configuration schema and methods. v53.0's dedicated `VmmShutdown` handler returns 200, confirmed on the Linux validation host; its ordinary empty VM-action responses return 204. v53.0 disables qcow2 backing-file traversal unless explicitly enabled, and its integration tests use the same pair of disk settings. Runtime `vmm.ping` returned 200. `vm.create` and boot behavior remain M1 runtime checks. |
+| [verify 12] vsock host handshake at cloud-hypervisor v53.0 | write `CONNECT <guest-port>\n`, then wait for `OK <allocated-host-port>\n` after the guest accepts | treat a successful Unix socket connect as guest readiness; expect the guest port in the acknowledgement | The pinned `docs/vsock.md` specifies the request. The v53.0 muxer source and unit test show that the acknowledgement contains the allocated local port and is sent only after the virtio-vsock response establishes the connection. A raw host-to-guest test remains an M1 runtime check. |
 
 ---
 
