@@ -5,6 +5,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::{ErrorKind, FirestoneError};
 
@@ -260,7 +261,7 @@ fn merge_catalog_file(
 ) -> Result<(), FirestoneError> {
     let input = match fs::read_to_string(path) {
         Ok(input) => input,
-        Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if optional && optional_catalog_file_is_absent(path, &error) => return Ok(()),
         Err(error) => {
             let kind = if error.kind() == std::io::ErrorKind::NotFound {
                 ErrorKind::NotFound
@@ -347,7 +348,7 @@ fn convert_entry(
 
     let mut arch = BTreeMap::new();
     for (architecture, raw_source) in raw.arch {
-        validate_architecture_name(&architecture, source, user_editable)?;
+        validate_architecture_name(&architecture, &canonical_reference, source, user_editable)?;
         let catalog_source = convert_arch_source(
             raw_source,
             &canonical_reference,
@@ -380,7 +381,11 @@ fn convert_arch_source(
     if !is_https_url(&raw.url) {
         return Err(invalid_catalog(
             source,
-            format!("{field_context} has non-HTTPS image URL '{}'", raw.url),
+            format!(
+                "{field_context} has invalid image URL '{}'; expected HTTPS with a host and \
+                 without credentials or a fragment",
+                raw.url
+            ),
             user_editable,
         ));
     }
@@ -390,7 +395,10 @@ fn convert_arch_source(
             if !is_https_url(&checksum_url) {
                 return Err(invalid_catalog(
                     source,
-                    format!("{field_context} has non-HTTPS checksum URL '{checksum_url}'"),
+                    format!(
+                        "{field_context} has invalid checksum URL '{checksum_url}'; expected \
+                         HTTPS with a host and without credentials or a fragment"
+                    ),
                     user_editable,
                 ));
             }
@@ -458,16 +466,17 @@ fn validate_reference_component(
 
 fn validate_architecture_name(
     architecture: &str,
+    canonical_reference: &str,
     source: &str,
     user_editable: bool,
 ) -> Result<(), FirestoneError> {
-    if architecture.is_empty()
-        || architecture.trim() != architecture
-        || architecture.chars().any(char::is_whitespace)
-    {
+    if !matches!(architecture, "x86_64" | "aarch64") {
         return Err(invalid_catalog(
             source,
-            format!("architecture name '{architecture}' is invalid"),
+            format!(
+                "image '{canonical_reference}' key 'image.arch.{architecture}' is unsupported; \
+                 expected x86_64 or aarch64"
+            ),
             user_editable,
         ));
     }
@@ -566,14 +575,34 @@ fn with_catalog_hint(error: FirestoneError, user_editable: bool) -> FirestoneErr
     }
 }
 
+fn optional_catalog_file_is_absent(path: &Path, read_error: &std::io::Error) -> bool {
+    read_error.kind() == std::io::ErrorKind::NotFound
+        && matches!(
+            fs::symlink_metadata(path),
+            Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound
+        )
+}
+
 fn is_https_url(value: &str) -> bool {
-    let Some(rest) = value.strip_prefix("https://") else {
+    if value.chars().any(char::is_whitespace) {
+        return false;
+    }
+
+    let syntax_violation = std::cell::Cell::new(false);
+    let record_violation = |_| syntax_violation.set(true);
+    let Ok(parsed) = Url::options()
+        .syntax_violation_callback(Some(&record_violation))
+        .parse(value)
+    else {
         return false;
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    !authority.is_empty()
-        && !authority.starts_with(['?', '#'])
-        && !value.chars().any(char::is_whitespace)
+    !syntax_violation.get()
+        && parsed.scheme() == "https"
+        && parsed.has_host()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && !parsed.authority().contains('@')
+        && parsed.fragment().is_none()
 }
 
 fn levenshtein(left: &str, right: &str) -> usize {
@@ -607,7 +636,7 @@ mod tests {
 
     use super::{
         BUILT_IN_CATALOG, Catalog, CatalogChecksum, CatalogFirmware, ChecksumAlgorithm,
-        ImageFormat, entries_by_reference, parse_document,
+        ImageFormat, entries_by_reference, is_https_url, parse_document,
     };
     use crate::ErrorKind;
 
@@ -858,6 +887,87 @@ checksum_alg = "sha512"
         );
         assert_eq!(error.hint(), Some("fix the catalog file and retry"));
         Ok(())
+    }
+
+    #[test]
+    fn catalog_missing_optional_file_uses_built_in() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("missing-optional")?;
+        let missing_config = directory.path().join("catalog.toml");
+
+        let catalog = Catalog::load(&missing_config, &[])?;
+
+        assert_eq!(catalog.len(), 5);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_optional_broken_symlink_returns_read_error() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("broken-symlink")?;
+        let missing_target = directory.path().join("missing-target.toml");
+        let config = directory.path().join("catalog.toml");
+        std::os::unix::fs::symlink(&missing_target, &config)?;
+
+        let error = error_from(Catalog::load(&config, &[]));
+
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+        assert!(error.message().contains(&config.display().to_string()));
+        assert_eq!(
+            error.hint(),
+            Some("check the catalog path and file permissions")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_supported_https_urls_are_accepted() {
+        let urls = [
+            "https://images.example.invalid/image.qcow2",
+            "https://192.0.2.1:8443/image.qcow2?build=1",
+            "https://[2001:db8::1]/image.qcow2",
+        ];
+
+        for value in urls {
+            assert!(is_https_url(value), "expected valid HTTPS URL: {value:?}");
+        }
+    }
+
+    #[test]
+    fn catalog_invalid_https_urls_are_rejected() {
+        let urls = [
+            "http://images.example.invalid/image.qcow2",
+            "https:///image.qcow2",
+            "https://:443/image.qcow2",
+            "https://@images.example.invalid/image.qcow2",
+            "https://user@images.example.invalid/image.qcow2",
+            "https://user:password@images.example.invalid/image.qcow2",
+            "https://images.example.invalid/image.qcow2#digest",
+            "https://images.example.invalid/image name.qcow2",
+            " https://images.example.invalid/image.qcow2",
+            "https://images.example.invalid/image.qcow2\n",
+            "https://[2001:db8::1/image.qcow2",
+        ];
+
+        for value in urls {
+            assert!(
+                !is_https_url(value),
+                "expected invalid HTTPS URL: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_unsupported_architecture_key_is_rejected() {
+        let input = TEST_SOURCE.replace("image.arch.x86_64", "image.arch.riscv64");
+
+        let error = error_from(catalog_from_toml(&input));
+
+        assert_eq!(error.kind(), ErrorKind::InvalidSpec);
+        assert!(
+            error
+                .message()
+                .contains("key 'image.arch.riscv64' is unsupported")
+        );
     }
 
     #[test]
