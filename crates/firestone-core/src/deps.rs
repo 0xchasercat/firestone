@@ -111,17 +111,29 @@ impl DependencyManifest {
         architecture: &str,
     ) -> Result<DependencyArtifact, FirestoneError> {
         let entry = self.entry(dependency)?;
-        if entry.availability != "binary" {
-            let reason = entry
-                .reason
-                .as_deref()
-                .unwrap_or("the release does not publish an immutable binary");
-            return Err(source_only_error(
-                dependency,
-                &entry.version,
-                architecture,
-                reason,
-            ));
+        match entry.availability.as_str() {
+            "binary" => {}
+            "source-only" => {
+                let reason = entry
+                    .reason
+                    .as_deref()
+                    .unwrap_or("the release does not publish an immutable binary");
+                return Err(source_only_error(
+                    dependency,
+                    &entry.version,
+                    architecture,
+                    reason,
+                ));
+            }
+            availability => {
+                return Err(FirestoneError::new(
+                    ErrorKind::Dependency,
+                    format!(
+                        "dependency `{dependency}` has unsupported availability `{availability}`"
+                    ),
+                )
+                .with_hint("use `binary` or `source-only` in deps.toml"));
+            }
         }
 
         let value = entry.fields.get(architecture).ok_or_else(|| {
@@ -321,6 +333,25 @@ sha256 = "{hash}"
             ))?;
             assert!(manifest.artifact("test", "x86_64").is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_unknown_availability_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = DependencyManifest::parse(
+            r#"
+manifest_version = 1
+[dependency.test]
+version = "1"
+availability = "sometimes"
+"#,
+        )?;
+
+        let error = match manifest.artifact("test", "x86_64") {
+            Err(error) => error,
+            Ok(_) => return Err(std::io::Error::other("availability should fail").into()),
+        };
+        assert!(error.message().contains("unsupported availability"));
         Ok(())
     }
 }

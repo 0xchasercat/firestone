@@ -502,22 +502,15 @@ fn check_runtime_dir(context: &DoctorContext) -> DoctorCheck {
             ),
         )
         .with_hint("set XDG_RUNTIME_DIR to a user-owned runtime directory"),
-        (_, Err(reason)) => {
-            let status = if context.runtime_dir_kind == RuntimeDirKind::TmpFallback {
-                DoctorStatus::Warn
-            } else {
-                DoctorStatus::Fail
-            };
-            DoctorCheck::new(
-                DoctorCheckId::RuntimeDir,
-                status,
-                format!(
-                    "runtime directory {} is not writable: {reason}",
-                    context.runtime_dir.display()
-                ),
-            )
-            .with_fix("firestone doctor --fix")
-        }
+        (_, Err(reason)) => DoctorCheck::new(
+            DoctorCheckId::RuntimeDir,
+            DoctorStatus::Fail,
+            format!(
+                "runtime directory {} is not writable: {reason}",
+                context.runtime_dir.display()
+            ),
+        )
+        .with_fix("firestone doctor --fix"),
     }
 }
 
@@ -959,8 +952,8 @@ fn perform_fixes(
         &mut failures,
     );
 
-    if !context.ssh_private_key.exists()
-        && !context.ssh_public_key.exists()
+    if path_is_missing(&context.ssh_private_key)
+        && path_is_missing(&context.ssh_public_key)
         && let Err(error) = generate_ssh_key(context)
     {
         record_fix_failure(&mut failures, DoctorCheckId::SshKey, error);
@@ -1189,7 +1182,7 @@ fn create_firestone_dir(path: &Path, mode: u32) -> Result<(), FirestoneError> {
 
 fn artifact_state(bin_dir: &Path, artifact: &DependencyArtifact) -> Result<(), String> {
     let path = bin_dir.join(&artifact.install_name);
-    let metadata = fs::metadata(&path)
+    let metadata = fs::symlink_metadata(&path)
         .map_err(|source| format!("{} is unavailable: {source}", path.display()))?;
     if !metadata.is_file() {
         return Err(format!("{} is not a regular file", path.display()));
@@ -1212,6 +1205,13 @@ fn artifact_state(bin_dir: &Path, artifact: &DependencyArtifact) -> Result<(), S
         ));
     }
     Ok(())
+}
+
+fn path_is_missing(path: &Path) -> bool {
+    matches!(
+        fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
 }
 
 fn sha256_path(path: &Path) -> Result<String, std::io::Error> {
@@ -1787,6 +1787,26 @@ mod tests {
     }
 
     #[test]
+    fn runtime_unwritable_fallback_fails_instead_of_warning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut fixture = Fixture::healthy()?;
+        fs::remove_dir(&fixture.context.runtime_dir)?;
+        fixture.context.runtime_dir_kind = RuntimeDirKind::TmpFallback;
+
+        let report = run_doctor_with(
+            &fixture.context,
+            false,
+            &FakeFetcher::new(fixture.payloads.clone()),
+        );
+
+        assert_eq!(
+            check(&report, DoctorCheckId::RuntimeDir).status,
+            DoctorStatus::Fail
+        );
+        Ok(())
+    }
+
+    #[test]
     fn report_serialization_preserves_stable_ids_and_order()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::healthy()?;
@@ -1920,6 +1940,29 @@ mod tests {
                 & 0o777,
             0o755
         );
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_matching_symlink_is_not_trusted() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::healthy()?;
+        let artifact = fixture
+            .context
+            .manifest
+            .artifact("cloud-hypervisor", "x86_64")?;
+        let path = fixture.context.bin_dir.join(&artifact.install_name);
+        let outside = fixture.context.data_dir.join("outside-tool");
+        fs::write(&outside, fs::read(&path)?)?;
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755))?;
+        fs::remove_file(&path)?;
+        std::os::unix::fs::symlink(&outside, &path)?;
+
+        let reason = match artifact_state(&fixture.context.bin_dir, &artifact) {
+            Err(reason) => reason,
+            Ok(()) => return Err(std::io::Error::other("symlink should not be accepted").into()),
+        };
+
+        assert!(reason.contains("not a regular file"));
         Ok(())
     }
 

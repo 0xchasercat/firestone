@@ -253,7 +253,7 @@ impl Cmd {
             .with_source(source)
         })?;
 
-        if let CmdStdin::Bytes(bytes) = &self.stdin {
+        let stdin_writer = if let CmdStdin::Bytes(bytes) = &self.stdin {
             let Some(mut stdin) = child.stdin.take() else {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -265,22 +265,38 @@ impl Cmd {
                     ),
                 ));
             };
-            if let Err(source) = stdin.write_all(bytes) {
-                drop(stdin);
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(FirestoneError::new(
-                    self.error_kind,
-                    format!(
-                        "cannot write stdin for command `{}`",
-                        self.program.to_string_lossy()
-                    ),
-                )
-                .with_source(source));
+            let bytes = bytes.clone();
+            Some(std::thread::spawn(move || stdin.write_all(&bytes)))
+        } else {
+            None
+        };
+
+        let output_result = child.wait_with_output();
+        if let Some(writer) = stdin_writer {
+            match writer.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(source)) => {
+                    return Err(FirestoneError::new(
+                        self.error_kind,
+                        format!(
+                            "cannot write stdin for command `{}`",
+                            self.program.to_string_lossy()
+                        ),
+                    )
+                    .with_source(source));
+                }
+                Err(_) => {
+                    return Err(FirestoneError::new(
+                        self.error_kind,
+                        format!(
+                            "stdin writer panicked for command `{}`",
+                            self.program.to_string_lossy()
+                        ),
+                    ));
+                }
             }
         }
-
-        let output = child.wait_with_output().map_err(|source| {
+        let output = output_result.map_err(|source| {
             FirestoneError::new(
                 self.error_kind,
                 format!(
@@ -341,7 +357,14 @@ fn last_lines(bytes: &[u8], count: usize) -> Vec<String> {
         .lines()
         .rev()
         .take(count)
-        .map(str::to_owned)
+        .map(|line| {
+            let mut characters = line.chars();
+            let mut bounded = characters.by_ref().take(4096).collect::<String>();
+            if characters.next().is_some() {
+                bounded.push_str("...[truncated]");
+            }
+            bounded
+        })
         .collect::<Vec<_>>();
     lines.reverse();
     lines
@@ -360,7 +383,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::Cmd;
+    use super::{Cmd, last_lines};
 
     fn executable(
         dir: &TempDir,
@@ -422,5 +445,14 @@ mod tests {
         assert!(message.contains("line-3"));
         assert!(message.contains("line-12"));
         Ok(())
+    }
+
+    #[test]
+    fn stderr_single_long_line_is_bounded() {
+        let lines = last_lines(&vec![b'x'; 10_000], 10);
+
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].len() < 4200);
+        assert!(lines[0].ends_with("...[truncated]"));
     }
 }
