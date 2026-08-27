@@ -333,9 +333,9 @@ pub fn verify_shim_identity(
 /// Pure reconciliation over persisted status and direct liveness evidence.
 ///
 /// A `Running` report always comes from a successful VMM ping. With a verified
-/// shim but no ping, `starting` and `stopping` remain unchanged. A previously
-/// `running` state reports `starting` because no running VMM was observed and
-/// no stop transition was recorded. No state file is changed in those cases.
+/// shim but no ping, a recorded stop remains `stopping` and a recorded failure
+/// remains `failed`; every other stored status reports `starting`. No state
+/// file is changed in those cases.
 #[must_use]
 pub fn reconcile(
     stored_status: MachineStatus,
@@ -355,8 +355,12 @@ pub fn reconcile(
 
     if observation.shim_verified {
         let status = match stored_status {
-            MachineStatus::Running => MachineStatus::Starting,
-            status => status,
+            MachineStatus::Stopping => MachineStatus::Stopping,
+            MachineStatus::Failed => MachineStatus::Failed,
+            MachineStatus::Created
+            | MachineStatus::Starting
+            | MachineStatus::Running
+            | MachineStatus::Stopped => MachineStatus::Starting,
         };
         return ReconcileReport {
             status,
@@ -399,6 +403,8 @@ pub fn reconciled_state(
             reconciled.shim_pid = None;
             reconciled.vmm_pid = None;
             reconciled.sidecar_pids.clear();
+            reconciled.started_at = None;
+            reconciled.degraded.clear();
             reconciled.last_exit = Some(LastExit {
                 at: reconciled_at.to_owned(),
                 code: None,
@@ -437,14 +443,16 @@ impl StateStore {
             .with_hint("check that the machine state file exists and is readable")
             .with_source(error)
         })?;
-        serde_json::from_slice(&bytes).map_err(|error| {
+        let state: MachineState = serde_json::from_slice(&bytes).map_err(|error| {
             FirestoneError::new(
                 ErrorKind::Generic,
                 format!("cannot parse machine state {}", self.path.display()),
             )
             .with_hint("inspect state.json for corruption or an unsupported version")
             .with_source(error)
-        })
+        })?;
+        state.validate()?;
+        Ok(state)
     }
 
     /// Writes state while the current process is the machine shim.
@@ -742,14 +750,15 @@ mod tests {
                             );
                             assert_eq!(report.rewrite, None);
                         } else if shim_verified {
-                            assert_eq!(
-                                report.status,
-                                if stored == MachineStatus::Running {
-                                    MachineStatus::Starting
-                                } else {
-                                    stored
-                                }
-                            );
+                            let expected = match stored {
+                                MachineStatus::Stopping => MachineStatus::Stopping,
+                                MachineStatus::Failed => MachineStatus::Failed,
+                                MachineStatus::Created
+                                | MachineStatus::Starting
+                                | MachineStatus::Running
+                                | MachineStatus::Stopped => MachineStatus::Starting,
+                            };
+                            assert_eq!(report.status, expected);
                             assert_eq!(report.supervision, None);
                             assert_eq!(report.rewrite, None);
                         } else if stored.is_active() {
@@ -774,9 +783,44 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_created_or_stopped_with_verified_shim_reports_starting_without_rewrite() {
+        for stored in [MachineStatus::Created, MachineStatus::Stopped] {
+            let report = reconcile(
+                stored,
+                LivenessObservation {
+                    vmm_ping: false,
+                    shim_verified: true,
+                    runtime_dir_exists: true,
+                },
+            );
+
+            assert_eq!(report.status, MachineStatus::Starting);
+            assert_eq!(report.supervision, None);
+            assert_eq!(report.rewrite, None);
+        }
+    }
+
+    #[test]
+    fn reconcile_failed_with_verified_shim_preserves_failed_without_rewrite() {
+        let report = reconcile(
+            MachineStatus::Failed,
+            LivenessObservation {
+                vmm_ping: false,
+                shim_verified: true,
+                runtime_dir_exists: true,
+            },
+        );
+
+        assert_eq!(report.status, MachineStatus::Failed);
+        assert_eq!(report.supervision, None);
+        assert_eq!(report.rewrite, None);
+    }
+
+    #[test]
     fn reconciled_state_stale_active_state_clears_process_identity()
     -> Result<(), Box<dyn std::error::Error>> {
-        let state = populated_state();
+        let mut state = populated_state();
+        state.degraded = vec!["passt exited (code 1)".to_owned()];
         let report = reconcile(
             state.status,
             LivenessObservation {
@@ -793,6 +837,8 @@ mod tests {
         assert_eq!(reconciled.shim_pid, None);
         assert_eq!(reconciled.vmm_pid, None);
         assert!(reconciled.sidecar_pids.is_empty());
+        assert_eq!(reconciled.started_at, None);
+        assert!(reconciled.degraded.is_empty());
         assert_eq!(
             reconciled.last_exit,
             Some(LastExit {
@@ -802,6 +848,31 @@ mod tests {
                 reason: ExitReason::Stale,
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn state_store_zero_process_pid_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let state_path = directory.path().join("state.json");
+        let store = StateStore::new(&state_path);
+
+        for (field, value) in [
+            ("shim_pid", json!(0)),
+            ("vmm_pid", json!(0)),
+            ("sidecar_pids", json!({"passt": 0})),
+        ] {
+            let mut persisted = serde_json::to_value(populated_state())?;
+            persisted[field] = value;
+            fs::write(&state_path, serde_json::to_vec_pretty(&persisted)?)?;
+
+            let error = match store.read() {
+                Err(error) => error,
+                Ok(_) => panic!("zero {field} must be rejected"),
+            };
+            assert_eq!(error.kind(), crate::ErrorKind::Generic);
+            assert!(error.message().contains("process ids"));
+        }
         Ok(())
     }
 
@@ -852,6 +923,8 @@ mod tests {
             .ok_or("host reboot did not request a rewrite")?;
 
         assert_eq!(written.status, MachineStatus::Stopped);
+        assert_eq!(written.started_at, None);
+        assert!(written.degraded.is_empty());
         assert_eq!(store.read()?, written);
         assert!(!machine.join("state.json.tmp").exists());
         Ok(())
