@@ -227,7 +227,7 @@ pub struct VmmSpec {
 }
 ```
 
-The CLI does not parse flags into `MachineSpec` directly. It parses into `MachineSpecPatch`, a mirror struct in which every leaf is `Option<T>` and vectors are append lists, derived with `clap::Args`. Effective spec = built‑in defaults ← global config `[defaults]` ← `firestone.toml` ← CLI patch. The same patch type is the body of REST `PATCH`.
+The CLI does not parse flags into `MachineSpec` directly. It parses into `MachineSpecPatch`, a mirror struct in which every leaf is `Option<T>` and vectors are append lists; `firestone-core` exposes clap-free field metadata and the CLI crate owns the `clap::Args` projection. Effective spec = built‑in defaults ← global config `[defaults]` ← `firestone.toml` ← CLI patch. The same patch type is the body of REST `PATCH`.
 
 ### 5.2 `Action` — one enum, two transports
 
@@ -242,7 +242,7 @@ pub enum Action {
     Show { name: String },
     SetSpec { name: String, spec: MachineSpec },        // PUT
     PatchSpec { name: String, patch: MachineSpecPatch }, // PATCH
-    ImageList, ImagePull { r#ref: ImageRef }, ImageRemove { id: String }, ImagePrune,
+    ImageList, ImagePull { r#ref: ImageRef }, ImageRemove { id: String, force: bool }, ImagePrune,
     Doctor { fix: bool },
     Version,
 }
@@ -273,7 +273,7 @@ Every action emits `Result` exactly once on success, or returns an error (which 
 
 ### 5.4 The drift test (normative)
 
-A unit test serializes a fully populated `MachineSpec` and a fully populated `MachineSpecPatch` to JSON and asserts the recursive key sets are identical, and that every leaf key has a corresponding clap flag (introspected via `clap::Command::get_arguments()` on the patch struct, mapping `a.b.c` → `--a-b-c` with documented exceptions such as `mount` → `--mount host:guest[:ro]`). The surfaces cannot drift without this test failing.
+A core unit test serializes a fully populated `MachineSpec` and a fully populated `MachineSpecPatch` to JSON and asserts the recursive key sets are identical. A CLI unit test asserts that every core field-metadata entry has a corresponding clap flag by introspecting `clap::Command::get_arguments()`, mapping `a.b.c` → `--a-b-c` with documented exceptions such as `mount` → `--mount host:guest[:ro]`. The surfaces cannot drift without these tests failing.
 
 ---
 
@@ -1243,6 +1243,11 @@ Do these in the first milestone, against the pinned versions, and record results
 | [verify 1] firmware mapping at cloud-hypervisor v53.0 | RHF 0.5.0 uses `payload.kernel`; edk2 ch-1e1b96f126 uses `payload.firmware` | pass RHF through `payload.firmware`; pass edk2 through `payload.kernel` | The v53.0 CLI exposes distinct `--kernel` and `--firmware` inputs, `PayloadConfig` exposes the matching JSON fields, and the v53.0 README documents RHF's Xen PVH entry as valid through the kernel input and edk2 through firmware. Source and CLI checks resolve the mapping. Boot behavior remains an M1 runtime check. |
 | [verify 2] API and VmConfig at cloud-hypervisor v53.0 | `/api/v1/vmm.ping` is GET; `vm.create`, `vm.boot`, `vm.power-button`, `vm.pause`, `vm.resume`, `vm.shutdown`, and `vmm.shutdown` are PUT; `vm.info` is GET. Successful `vmm.shutdown` returns 200 even though the OpenAPI document says 204. Use the §9.2 field names and enum casing. Set overlay disks to `image_type: "Qcow2", backing_files: true` and the vfat seed to `image_type: "Raw"`. | rely on image auto-detection; omit `backing_files`; infer methods or success codes from endpoint names | The pinned OpenAPI document and Rust config types agree on the configuration schema and methods. v53.0's dedicated `VmmShutdown` handler returns 200, confirmed on the Linux validation host; its ordinary empty VM-action responses return 204. v53.0 disables qcow2 backing-file traversal unless explicitly enabled, and its integration tests use the same pair of disk settings. Runtime `vmm.ping` returned 200. `vm.create` and boot behavior remain M1 runtime checks. |
 | [verify 12] vsock host handshake at cloud-hypervisor v53.0 | write `CONNECT <guest-port>\n`, then wait for `OK <allocated-host-port>\n` after the guest accepts | treat a successful Unix socket connect as guest readiness; expect the guest port in the acknowledgement | The pinned `docs/vsock.md` specifies the request. The v53.0 muxer source and unit test show that the acknowledgement contains the allocated local port and is sent only after the virtio-vsock response establishes the connection. A raw host-to-guest test remains an M1 runtime check. |
+| Spec flag projection | clap-free field metadata in `firestone-core`; clap introspection in the CLI crate | derive `clap::Args` on the core patch type | Keeps the normative drift checks while preserving the crate boundary in §18.2. |
+| Relative spec paths | resolve relative paths from `firestone.toml` against the machine directory | process working directory | Machine behavior remains stable across CLI and REST invocations launched from different directories. `~` still expands from the current user's home. |
+| Image removal action payload | `ImageRemove` carries `force` | leave force in CLI/REST adapters | Sections 15.1, 15.4, and 16.2 expose forced image removal. The shared action must carry that choice so every interface dispatches the same operation. |
+| Clearing optional spec values | v0.1 patches only set values; full `PUT` or edit can remove a machine-local value and fall back to lower layers | JSON-only `null`; new TOML sentinel values and CLI unset flags | `MachineSpecPatch` stays one `Option<T>` per leaf on all three surfaces. An optional value inherited from global defaults can only be cleared by changing those defaults in v0.1. The spec defines no portable TOML or CLI clear syntax, so accepting JSON-only clears would create drift. |
+| `config_overlay` null deletion in TOML | CLI `--vmm-config JSON` and REST may carry RFC 7396 null deletion; TOML inline tables cover additions and replacements only | invent a TOML null sentinel; serialize the whole overlay as a JSON string | TOML has no null value. A new sentinel would no longer be RFC 7396 and a JSON string would make ordinary TOML editing worse. This is the one v0.1 representation limit for the VMM escape hatch. |
 
 ---
 

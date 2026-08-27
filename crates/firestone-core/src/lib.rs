@@ -7,6 +7,8 @@ pub mod dispatcher;
 pub mod error;
 pub mod event;
 pub mod lock;
+pub mod paths;
+pub mod spec;
 pub mod state;
 
 pub use action::Action;
@@ -18,6 +20,16 @@ pub use dispatcher::{DispatchFuture, Dispatcher, EventSink};
 pub use error::{ErrorInfo, ErrorKind, FirestoneError};
 pub use event::{Event, Level, StepId, Unit};
 pub use lock::MachineLock;
+pub use paths::{PathInputs, Paths};
+pub use spec::{
+    Arch, ByteSize, CloudInitSpec, CloudInitSpecPatch, ColorMode, Firmware, GlobalConfig,
+    HumanDuration, ImageRef, ImagesConfig, LoadedMachineSpec, MacAddr, MachineSpec,
+    MachineSpecPatch, MountSpec, NetMode, NetworkSpec, NetworkSpecPatch, ParseByteSizeError,
+    ParseDurationError, ParseFirmwareError, ParseMacAddrError, ParsePortForwardError, PatchMerge,
+    PortForward, PortRange, Protocol, RealValidationHost, SPEC_FIELD_METADATA, SpecFieldMetadata,
+    SpecWarning, StartConfig, StopConfig, UiConfig, ValidationContext, ValidationHost, VmmSpec,
+    VmmSpecPatch, validate_machine_spec,
+};
 pub use state::{
     ExitReason, LastExit, LivenessObservation, MachineState, MachineStatus, ReconcileReport,
     ReconcileRewrite, StateImage, StateStore, StateVersion, Supervision, VmmPingProbe,
