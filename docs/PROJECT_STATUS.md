@@ -36,9 +36,9 @@ The orchestrator reviews each pull request for spec alignment, public contract d
 
 | Resource | State | Next action |
 |---|---|---|
-| GitHub remote | `git@github.com:0xchasercat/firestone.git` configured; baseline push pending | Push `main`, then require pull-request integration |
+| GitHub remote | `git@github.com:0xchasercat/firestone.git`; `main` baseline pushed | All implementation enters through reviewed pull requests |
 | Local macOS toolchain | Rust 1.97.1, Cargo 1.97.0 | Use for fast unit feedback; Linux behavior requires remote validation |
-| Azure Linux host | Reachable; KVM device exists; user not yet in `kvm` group | Add `firestone` to `kvm`, install Rust and M0 host tools |
+| Azure Linux host | Reachable; fresh SSH sessions have KVM read/write access; Rust 1.98.0 and M0 build/runtime tools installed | Run every integration candidate here before merge |
 | Bare-metal host `w` | Available | Use only for behavior that nested Azure KVM cannot validate |
 
 ## Completed work
