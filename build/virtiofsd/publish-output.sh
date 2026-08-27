@@ -133,4 +133,3 @@ move_exclusive "$stage_binary" "$artifact_path"
 
 printf 'artifact %s\n' "$artifact_path"
 printf 'sha256 %s\n' "$artifact_sha"
-
