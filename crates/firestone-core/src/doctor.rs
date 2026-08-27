@@ -906,18 +906,20 @@ fn check_ssh_key(context: &DoctorContext) -> DoctorCheck {
                     ),
                 )
             } else {
-                DoctorCheck::new(
+                let check = DoctorCheck::new(
                     DoctorCheckId::SshKey,
                     DoctorStatus::Fail,
                     format!(
                         "Firestone SSH private key {} has mode {mode:04o}",
                         context.ssh_private_key.display()
                     ),
-                )
-                .with_fix(format!(
-                    "chmod 600 -- {}",
-                    shell_quote(&context.ssh_private_key)
-                ))
+                );
+                match shell_quote(&context.ssh_private_key) {
+                    Some(path) => check.with_fix(format!("chmod 600 -- {path}")),
+                    None => check.with_hint(
+                        "set mode 0600 with a filesystem tool that preserves non-UTF-8 paths",
+                    ),
+                }
             }
         }
         (Err(private_error), Err(public_error))
@@ -1640,8 +1642,9 @@ fn nearest_existing_ancestor(path: &Path) -> Option<&Path> {
     path.ancestors().find(|ancestor| ancestor.exists())
 }
 
-fn shell_quote(path: &Path) -> String {
-    format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
+fn shell_quote(path: &Path) -> Option<String> {
+    path.to_str()
+        .map(|path| format!("'{}'", path.replace('\'', "'\"'\"'")))
 }
 
 fn sync_directory(path: &Path) -> Result<(), FirestoneError> {
