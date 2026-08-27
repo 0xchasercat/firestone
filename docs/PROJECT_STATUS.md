@@ -18,8 +18,8 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 | M0-00 | Workspace, crate boundaries, typed errors, events, actions, dispatcher seam, CI | `agent/m0-foundation` | [#1](https://github.com/0xchasercat/firestone/pull/1) | complete | baseline | Workspace builds; architecture boundaries compile; CI runs the required gate |
 | M0-01 | Paths, spec and patch model, layering, validation, drift coverage | `agent/m0-spec` | pending | in progress | M0-00 | SPEC sections 5 through 7 unit coverage passes |
 | M0-02 | Atomic files, machine state, locking, liveness reconciliation | `agent/m0-state` | pending | in progress | M0-00 | Reconcile matrix and lock contention tests pass |
-| M0-03a | Built-in catalog data and authoritative source validation | `agent/m0-catalog-data` | pending | in progress | baseline | Initial entries have current per-architecture URLs and checksum sources; unbooted entries are marked as release gates |
-| M0-03b | Image reference parsing, catalog merge, architecture selection, resolution | `agent/m0-catalog` | pending | blocked | M0-00, M0-03a | Catalog rules from sections 8.1 and 8.2 pass without network |
+| M0-03a | Built-in catalog data and authoritative source validation | `agent/m0-catalog-data` | [#2](https://github.com/0xchasercat/firestone/pull/2) | complete | baseline | Initial entries have current per-architecture URLs and checksum sources; unbooted entries are marked as release gates |
+| M0-03b | Image reference parsing, catalog merge, architecture selection, resolution | `agent/m0-catalog` | pending | ready | M0-00, M0-03a | Catalog rules from sections 8.1 and 8.2 pass without network |
 | M0-04 | CLI parser, renderers, create/list/show/edit, dispatcher adapters | `agent/m0-cli` | pending | blocked | M0-01, M0-02, M0-03b | M0 no-KVM command acceptance and renderer snapshots pass |
 | M0-05a | Dependency manifest, real pins, download/hash tooling, third-party evidence | `agent/m0-deps` | pending | in progress | baseline | Real per-architecture URLs and checksums; verified behavior recorded against exact versions |
 | M0-05b | Host checks, doctor report, unprivileged fixes, deterministic tests | `agent/m0-doctor` | pending | blocked | M0-00, M0-05a | Section 17.3 checks and safe fixes pass without KVM |
@@ -47,6 +47,7 @@ The orchestrator reviews each pull request for spec alignment, public contract d
 ## Completed work
 
 - M0-00 merged in PR [#1](https://github.com/0xchasercat/firestone/pull/1). It established the Rust workspace, closed shared action and event contracts, typed errors, the dispatcher seam, and the required CI gate. The merge passed local, GitHub-hosted Ubuntu, and Azure Linux verification.
+- M0-03a merged in PR [#2](https://github.com/0xchasercat/firestone/pull/2). It added ten source-validated Ubuntu, Debian, and Fedora catalog entries plus a bounded HTTPS validator. All entries remain behind the explicit boot-to-SSH release gate.
 
 ## Known risks
 
