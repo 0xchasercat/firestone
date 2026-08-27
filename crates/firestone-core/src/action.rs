@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 /// An imperative operation accepted by the shared dispatcher.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
-#[non_exhaustive]
 pub enum Action {
     Start {
         name: String,

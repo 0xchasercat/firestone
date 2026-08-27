@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 /// Stable machine-readable categories shared by every Firestone interface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[non_exhaustive]
 pub enum ErrorKind {
     Generic,
     Usage,

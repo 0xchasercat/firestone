@@ -39,7 +39,6 @@ impl std::fmt::Display for StepId {
 /// Unit attached to a progress count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[non_exhaustive]
 pub enum Unit {
     Bytes,
 }
@@ -47,7 +46,6 @@ pub enum Unit {
 /// Severity for secondary action output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[non_exhaustive]
 pub enum Level {
     Trace,
     Debug,
@@ -59,7 +57,6 @@ pub enum Level {
 /// One structured progress message emitted by an action.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
-#[non_exhaustive]
 pub enum Event {
     StepStart {
         id: StepId,
