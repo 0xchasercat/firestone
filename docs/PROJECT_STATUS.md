@@ -15,9 +15,9 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 
 | ID | Work | Branch | PR | Status | Depends on | Acceptance |
 |---|---|---|---|---|---|---|
-| M0-00 | Workspace, crate boundaries, typed errors, events, actions, dispatcher seam, CI | `agent/m0-foundation` | pending | in progress | baseline | Workspace builds; architecture boundaries compile; CI runs the required gate |
-| M0-01 | Paths, spec and patch model, layering, validation, drift coverage | `agent/m0-spec` | pending | blocked | M0-00 | SPEC sections 5 through 7 unit coverage passes |
-| M0-02 | Atomic files, machine state, locking, liveness reconciliation | `agent/m0-state` | pending | blocked | M0-00 | Reconcile matrix and lock contention tests pass |
+| M0-00 | Workspace, crate boundaries, typed errors, events, actions, dispatcher seam, CI | `agent/m0-foundation` | [#1](https://github.com/0xchasercat/firestone/pull/1) | complete | baseline | Workspace builds; architecture boundaries compile; CI runs the required gate |
+| M0-01 | Paths, spec and patch model, layering, validation, drift coverage | `agent/m0-spec` | pending | in progress | M0-00 | SPEC sections 5 through 7 unit coverage passes |
+| M0-02 | Atomic files, machine state, locking, liveness reconciliation | `agent/m0-state` | pending | in progress | M0-00 | Reconcile matrix and lock contention tests pass |
 | M0-03a | Built-in catalog data and authoritative source validation | `agent/m0-catalog-data` | pending | in progress | baseline | Initial entries have current per-architecture URLs and checksum sources; unbooted entries are marked as release gates |
 | M0-03b | Image reference parsing, catalog merge, architecture selection, resolution | `agent/m0-catalog` | pending | blocked | M0-00, M0-03a | Catalog rules from sections 8.1 and 8.2 pass without network |
 | M0-04 | CLI parser, renderers, create/list/show/edit, dispatcher adapters | `agent/m0-cli` | pending | blocked | M0-01, M0-02, M0-03b | M0 no-KVM command acceptance and renderer snapshots pass |
@@ -46,7 +46,7 @@ The orchestrator reviews each pull request for spec alignment, public contract d
 
 ## Completed work
 
-No implementation work has merged yet.
+- M0-00 merged in PR [#1](https://github.com/0xchasercat/firestone/pull/1). It established the Rust workspace, closed shared action and event contracts, typed errors, the dispatcher seam, and the required CI gate. The merge passed local, GitHub-hosted Ubuntu, and Azure Linux verification.
 
 ## Known risks
 
