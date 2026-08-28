@@ -147,13 +147,12 @@ struct SerialConfig {
 #[derive(Debug, Serialize)]
 struct ConsoleConfig {
     mode: ConsoleMode,
-    socket: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
 enum ConsoleMode {
     File,
-    Socket,
+    Pty,
 }
 
 #[derive(Debug, Serialize)]
@@ -340,8 +339,7 @@ fn base_vm_config(
             file: paths.machine_console_log(input.name)?,
         },
         console: ConsoleConfig {
-            mode: ConsoleMode::Socket,
-            socket: paths.machine_console_socket(input.name)?,
+            mode: ConsoleMode::Pty,
         },
         rng: RngConfig {
             src: PathBuf::from("/dev/urandom"),
@@ -429,11 +427,11 @@ fn resolve_payload(
     }
 }
 
-fn effective_firmware<'a>(
-    firmware: &'a Firmware,
+fn effective_firmware(
+    firmware: &Firmware,
     architecture: Arch,
     catalog_firmware: Option<CatalogFirmware>,
-) -> EffectiveFirmware<'a> {
+) -> EffectiveFirmware<'_> {
     if let Some(path) = firmware.as_path() {
         return EffectiveFirmware::Custom(path);
     }
@@ -810,9 +808,30 @@ mod tests {
                     "mode": "File",
                     "file": "/firestone/data/machines/demo/console.log"
                 },
-                "console": {"mode": "Socket", "socket": "/firestone/run/demo/console.sock"},
+                "console": {"mode": "Pty"},
                 "rng": {"src": "/dev/urandom"}
             })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn default_vmconfig_uses_v53_supported_pty_console() -> Result<(), Box<dyn std::error::Error>> {
+        let paths = paths_for_root(PathBuf::from("/firestone"))?;
+        let spec = MachineSpec::default();
+        let state = state(&paths)?;
+        let config = base_vm_config(
+            &paths,
+            input(&spec, &state, Arch::X86_64, None),
+            PayloadConfig {
+                firmware: None,
+                kernel: Some(PathBuf::from("/firestone/data/bin/hypervisor-fw-0.5.0")),
+            },
+        )?;
+
+        assert_eq!(
+            serde_json::to_value(config)?["console"],
+            json!({"mode": "Pty"})
         );
         Ok(())
     }
@@ -1093,7 +1112,7 @@ mod tests {
         )?;
         let text = std::str::from_utf8(config.as_bytes())?;
 
-        assert!(text.starts_with(r#"{"alpha":true,"console":{"mode":"Socket""#));
+        assert!(text.starts_with(r#"{"alpha":true,"console":{"mode":"Pty""#));
         assert!(text.contains(r#""memory":{"hugepages":true,"shared":true,"size":2147483648}"#));
         assert!(text.ends_with(r#","zeta":{"a":2,"z":1}}"#));
         assert_eq!(serde_json::to_vec(config.as_value())?, config.as_bytes());

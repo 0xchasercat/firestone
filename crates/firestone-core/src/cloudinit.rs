@@ -482,7 +482,7 @@ mod tests {
     const USER_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN6eVqR0T6lRuT6aGvdMVhZkcNrD1s8g8J3RYfLZBuo5 user@test\n";
     const GOLDEN_MULTIPART: &[u8] = include_bytes!("../testdata/cloud-init.multipart");
     const GOLDEN_SEED_SHA256: &str =
-        "2a30a56a100c8c8897b8d7457fa322ed35f0f2c5a6268915e0bfd09db5264b37";
+        "3f787cde89e47e5fd05c2cf2cd8c62a3901628868c6f4488704dc3f5aa673587";
 
     struct Fixture {
         _temp: TempDir,
@@ -576,8 +576,18 @@ mod tests {
 
         let rendered = render_cloud_init(&fixture.paths, "demo", &spec)?;
 
-        assert_eq!(rendered.user_data, GOLDEN_MULTIPART);
-        assert_eq!(rendered.instance_id, "iid-demo-e3195d705953");
+        let mismatch = rendered
+            .user_data
+            .iter()
+            .zip(GOLDEN_MULTIPART)
+            .position(|(actual, expected)| actual != expected);
+        assert!(
+            rendered.user_data == GOLDEN_MULTIPART,
+            "first mismatch at {mismatch:?}; actual length {}, golden length {}",
+            rendered.user_data.len(),
+            GOLDEN_MULTIPART.len()
+        );
+        assert_eq!(rendered.instance_id, "iid-demo-fdd1d6011b92");
         assert_eq!(
             rendered.meta_data,
             format!(
@@ -587,6 +597,26 @@ mod tests {
             .as_bytes()
         );
         assert!(rendered.network_config.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_cloud_init_restarts_hvc0_after_installing_dropin()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(true)?;
+        let rendered = render_cloud_init(&fixture.paths, "demo", &MachineSpec::default())?;
+        let user_data = std::str::from_utf8(&rendered.user_data)?;
+        let reload = user_data
+            .find("systemctl daemon-reload")
+            .ok_or("rendered cloud-init did not reload systemd")?;
+        let enable = user_data
+            .find("systemctl enable serial-getty@hvc0.service")
+            .ok_or("rendered cloud-init did not enable hvc0 getty")?;
+        let restart = user_data
+            .find("systemctl restart serial-getty@hvc0.service")
+            .ok_or("rendered cloud-init did not restart hvc0 getty")?;
+
+        assert!(reload < enable && enable < restart);
         Ok(())
     }
 
@@ -810,7 +840,7 @@ mod tests {
 
     fn hex_digest(bytes: &[u8]) -> String {
         let digest = Sha256::digest(bytes);
-        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+        format!("{digest:x}")
     }
 
     fn verify_seed_filesystem(

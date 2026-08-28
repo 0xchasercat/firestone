@@ -30,7 +30,7 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 | M1-03 | Bounded Cloud Hypervisor Unix-socket API client | `agent/m1-vmm-api` | [#11](https://github.com/0xchasercat/firestone/pull/11) | complete | M0 | Exact v53 methods, status codes, framing limits, and error bodies are covered against a fake server |
 | M1-04 | Shim process supervision, launch, status, stop, and cleanup | `agent/m1-shim` | [#14](https://github.com/0xchasercat/firestone/pull/14) | complete | M1-01, M1-02, M1-03 | Linux x86_64 acceptance uses pinned Cloud Hypervisor v53 + edk2; ordered launch/stop, ownership cleanup, deadlines, lock lifetime, client detachment, child reaping, and verified crash recovery pass. aarch64 runtime, non-Linux authority, and hostile wrapper containment are deferred |
 | M1-05 | Lifecycle and image CLI integration | `agent/m1-lifecycle` | [#15](https://github.com/0xchasercat/firestone/pull/15) | complete | M1-01 through M1-04 | Linux x86_64 fake-VMM lifecycle covers shared start/stop/restart/rm/images/logs/show-vmconfig actions, deterministic rendering, bounded secure logs, safe deletion, and supervised/unsupervised stop; real KVM evidence remains M1-06 |
-| M1-06 | M1 KVM integration and verify evidence | `agent/m1-integration` | pending | ready | M1-01 through M1-05 | E2E 1, 5, 6, 7, console login prompt, and verify 1, 2, 4, 5, 6, 9, 12 close |
+| M1-06 | M1 KVM integration and verify evidence | `agent/m1-integration` | [#16](https://github.com/0xchasercat/firestone/pull/16) | in review | M1-01 through M1-05 | Linux x86_64 E2E 1, 5, 6, and 7 pass under pinned Cloud Hypervisor v53 + edk2; serial login and verify 1, 2, 4, 5, 6, 9, and 12 are resolved |
 
 ## Merge order
 
