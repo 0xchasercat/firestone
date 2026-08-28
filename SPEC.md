@@ -673,8 +673,8 @@ The NoCloud datasource is fed from a small vfat image labeled `CIDATA` containin
 `meta-data`:
 
 ```yaml
-instance-id: iid-<name>-<sha256(user-data)[0..12]>
-local-hostname: <name>
+instance-id: "iid-<name>-<sha256(user-data)[0..12]>"
+local-hostname: "<name>"
 ```
 
 ### 10.2 Multipart user-data and merge rules (normative)
@@ -1297,6 +1297,10 @@ Do these in the first milestone, against the pinned versions, and record results
 | Deterministic CIDATA publication | 4 MiB vfat, label `CIDATA`, volume id `0x46530001`, 512-byte sectors and clusters, 1980-01-01 00:00:00 file times, and creation order `meta-data`, `user-data`, then optional `network-config`; stream directly into the atomic sibling file | variable image size; wall-clock timestamps; build a 4 MiB in-memory buffer; ISO | The complete image is byte-identical across rebuilds and still uses the existing fsync + rename publication boundary without a second full-size allocation. |
 | M1 firmware path mapping | resolve RHF and edk2 install names from `DependencyManifest` for the selected architecture; map RHF to `payload.kernel`, edk2 to `payload.firmware`; an absolute validated custom firmware path also maps to `payload.firmware` | derive install names in the mapper; map every firmware through `kernel`; reject custom firmware | Manifest resolution keeps paths aligned with pinned artifacts. Cloud Hypervisor v53 treats a custom firmware image like edk2's firmware input and rejects simultaneous kernel and firmware payloads. |
 | M1 canonical VmConfig overlay boundary | serialize a typed v53 base, apply the RFC 7396 object patch last, require every Firestone base field and managed device prefix to remain unchanged, preserve `net`/`fs` absence for disabled devices and payload exclusivity, recursively sort keys, and atomically persist the exact compact bytes sent | let overlays delete boot devices or disable shared memory; persist pretty JSON separately; compare only selected scalar fields | The overlay can add advanced Cloud Hypervisor fields but cannot disconnect sidecars or invalidate boot assumptions. One canonical byte sequence prevents inspection output from drifting from the API request. |
+| NoCloud metadata scalar encoding | JSON-quote `instance-id` and `local-hostname`, which is valid YAML double-quoted scalar syntax | interpolate machine names as bare YAML; restrict otherwise valid machine names to a smaller character set | Firestone machine names may contain YAML metacharacters such as `:`. Quoting preserves every accepted name exactly and prevents a name from changing metadata structure. |
+| Machine artifact publication trust | immediately before seed or VmConfig atomic writes, revalidate the data directory, machines directory, and final machine directory through `Paths`; seed publication also validates before and after creating its inspection directory | rely on validation performed during machine creation; canonicalize the final path; follow symlinks | Any of the owned ancestors can be replaced between actions. Revalidation rejects symlinks, wrong ownership, unsafe modes, and renameable ancestry before a write can reach an external path. |
+| M1 overlay default invariants | treat required absent/default values as semantic invariants: the root disk stays writable, the seed has no backing chain, disks stay non-vhost-user, and mapped network backends retain their required absent/default fields | compare only keys serialized in the typed base; serialize every Cloud Hypervisor default explicitly | RFC 7396 can add a key that the base omitted. Checking the effective default semantics blocks changes such as root `readonly = true` without bloating the canonical request with server defaults. |
+| M1 vsock CID | require exactly CID 3 in generated VmConfig | accept every Cloud Hypervisor CID of 3 or greater | Firestone's userspace-vsock design fixes CID 3 for every machine (§11.1); accepting other values would create state/config drift without any allocator or public configuration contract. |
 
 ---
 

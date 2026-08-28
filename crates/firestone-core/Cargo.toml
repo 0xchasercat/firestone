@@ -25,6 +25,7 @@ url.workspace = true
 wait-timeout.workspace = true
 
 [dev-dependencies]
+serde_yaml = "0.9"
 tempfile.workspace = true
 
 [lints]

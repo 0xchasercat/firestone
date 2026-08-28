@@ -113,7 +113,12 @@ pub fn render_cloud_init(
     };
 
     let instance_id = instance_id(name, &user_data);
-    let meta_data = format!("instance-id: {instance_id}\nlocal-hostname: {name}\n").into_bytes();
+    let meta_data = format!(
+        "instance-id: {}\nlocal-hostname: {}\n",
+        json_string(&instance_id)?,
+        json_string(name)?
+    )
+    .into_bytes();
 
     Ok(RenderedCloudInit {
         instance_id,
@@ -130,8 +135,10 @@ pub fn publish_seed(
     spec: &MachineSpec,
 ) -> Result<RenderedCloudInit, FirestoneError> {
     let rendered = render_cloud_init(paths, name, spec)?;
+    paths.validate_machine_data_directory(name)?;
     let seed_dir = paths.machine_seed_dir(name)?;
     ensure_seed_directory(&seed_dir)?;
+    paths.validate_machine_data_directory(name)?;
 
     atomic::write(
         &paths.machine_seed_file(name, "meta-data")?,
@@ -440,6 +447,7 @@ mod tests {
     use std::{
         fs,
         io::{Cursor, Read},
+        os::unix::fs::{PermissionsExt, symlink},
         path::PathBuf,
     };
 
@@ -455,7 +463,7 @@ mod tests {
     const USER_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN6eVqR0T6lRuT6aGvdMVhZkcNrD1s8g8J3RYfLZBuo5 user@test\n";
     const GOLDEN_MULTIPART: &[u8] = include_bytes!("../testdata/cloud-init.multipart");
     const GOLDEN_SEED_SHA256: &str =
-        "a7cbb21f5b704ebb8f4661ff64bcf42ae035ce32e2c29b0faa652be051b0cdbe";
+        "2a30a56a100c8c8897b8d7457fa322ed35f0f2c5a6268915e0bfd09db5264b37";
 
     struct Fixture {
         _temp: TempDir,
@@ -485,6 +493,27 @@ mod tests {
             }
             Ok(Self { _temp: temp, paths })
         }
+    }
+
+    #[test]
+    fn metadata_machine_name_yaml_metacharacters_round_trip_exactly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        #[derive(serde::Deserialize)]
+        struct Metadata {
+            #[serde(rename = "instance-id")]
+            instance_id: String,
+            #[serde(rename = "local-hostname")]
+            local_hostname: String,
+        }
+
+        let fixture = Fixture::new(true)?;
+        let rendered = render_cloud_init(&fixture.paths, "demo: bad", &MachineSpec::default())?;
+        let metadata: Metadata = serde_yaml::from_slice(&rendered.meta_data)?;
+
+        assert_eq!(metadata.instance_id, rendered.instance_id);
+        assert_eq!(metadata.local_hostname, "demo: bad");
+        assert!(std::str::from_utf8(&rendered.meta_data)?.contains("\"demo: bad\""));
+        Ok(())
     }
 
     #[test]
@@ -522,7 +551,7 @@ mod tests {
         assert_eq!(
             rendered.meta_data,
             format!(
-                "instance-id: {}\nlocal-hostname: demo\n",
+                "instance-id: \"{}\"\nlocal-hostname: \"demo\"\n",
                 rendered.instance_id
             )
             .as_bytes()
@@ -563,6 +592,45 @@ mod tests {
         );
 
         verify_seed_filesystem(&second, &second_render)?;
+        Ok(())
+    }
+
+    #[test]
+    fn publish_seed_symlinked_machine_directory_preserves_external_sentinel()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(true)?;
+        let outside = tempfile::tempdir()?;
+        let sentinel = outside.path().join("sentinel");
+        fs::write(&sentinel, b"keep")?;
+        let machine_dir = fixture.paths.machine_dir("demo")?;
+        fs::remove_dir(&machine_dir)?;
+        symlink(outside.path(), &machine_dir)?;
+
+        let error = publish_seed(&fixture.paths, "demo", &MachineSpec::default())
+            .err()
+            .ok_or("symlinked machine directory should fail")?;
+
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert_eq!(fs::read(&sentinel)?, b"keep");
+        assert!(!outside.path().join("seed.img").exists());
+        assert!(!outside.path().join("seed").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn publish_seed_world_writable_machine_directory_refuses_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(true)?;
+        let machine_dir = fixture.paths.machine_dir("demo")?;
+        fs::set_permissions(&machine_dir, fs::Permissions::from_mode(0o777))?;
+
+        let error = publish_seed(&fixture.paths, "demo", &MachineSpec::default())
+            .err()
+            .ok_or("world-writable machine directory should fail")?;
+
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert!(!machine_dir.join("seed.img").exists());
+        assert!(!machine_dir.join("seed").exists());
         Ok(())
     }
 

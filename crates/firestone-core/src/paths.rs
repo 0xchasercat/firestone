@@ -445,6 +445,19 @@ impl Paths {
         self.validate_directory_path(path, label, allow_missing, true)
     }
 
+    /// Revalidates every owned directory that contains a machine publication.
+    ///
+    /// Writers call this immediately before atomic publication so a replaced
+    /// data, machines, or machine directory cannot redirect output.
+    pub fn validate_machine_data_directory(&self, name: &str) -> Result<PathBuf, FirestoneError> {
+        self.validate_owned_data_directory(self.data_dir(), "data directory", false)?;
+        let machines_dir = self.machines_dir();
+        self.validate_owned_data_directory(&machines_dir, "machines directory", false)?;
+        let machine_dir = self.machine_dir(name)?;
+        self.validate_owned_data_directory(&machine_dir, "machine directory", false)?;
+        Ok(machine_dir)
+    }
+
     fn validate_runtime_prerequisites(&self) -> Result<(), FirestoneError> {
         match &self.runtime_provenance {
             RuntimeProvenance::XdgRuntimeDir { base } => {

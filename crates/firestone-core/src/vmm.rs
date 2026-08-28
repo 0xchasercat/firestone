@@ -228,6 +228,7 @@ pub fn publish_vm_config(
     input: VmConfigInput<'_>,
 ) -> Result<CanonicalVmConfig, FirestoneError> {
     let config = canonical_vm_config(paths, manifest, input)?;
+    paths.validate_machine_data_directory(input.name)?;
     atomic::write(&paths.machine_vmconfig(input.name)?, config.as_bytes())?;
     Ok(config)
 }
@@ -267,12 +268,15 @@ fn base_vm_config(
         NetMode::None => None,
     };
 
-    if input.state.cid < 3 {
+    if input.state.cid != 3 {
         return Err(FirestoneError::new(
             ErrorKind::InvalidSpec,
-            format!("machine state has invalid vsock CID {}", input.state.cid),
+            format!(
+                "machine state must use fixed vsock CID 3, found {}",
+                input.state.cid
+            ),
         )
-        .with_hint("assign and persist a vsock CID of 3 or greater before building VmConfig"));
+        .with_hint("persist vsock CID 3 before building VmConfig"));
     }
 
     let fs = if input.spec.mounts.is_empty() {
@@ -529,6 +533,7 @@ fn validate_required_invariants(
     if let Err(path) = required_subset(base, candidate, "") {
         return Err(required_overlay_error(&path));
     }
+    validate_required_defaults(candidate, input)?;
     let Some(object) = candidate.as_object() else {
         return Err(required_overlay_error("<root>"));
     };
@@ -550,6 +555,68 @@ fn validate_required_invariants(
         }
     }
     Ok(())
+}
+
+fn validate_required_defaults(
+    candidate: &Value,
+    input: VmConfigInput<'_>,
+) -> Result<(), FirestoneError> {
+    for path in [
+        "/disks/0/readonly",
+        "/disks/0/vhost_user",
+        "/disks/1/backing_files",
+        "/disks/1/vhost_user",
+    ] {
+        require_false_or_absent(candidate, path)?;
+    }
+
+    match input.spec.network.mode {
+        NetMode::Passt => {
+            for path in ["/net/0/tap", "/net/0/ip", "/net/0/mask"] {
+                require_absent(candidate, path)?;
+            }
+        }
+        NetMode::Tap => {
+            require_false_or_absent(candidate, "/net/0/vhost_user")?;
+            for path in ["/net/0/ip", "/net/0/mask", "/net/0/vhost_socket"] {
+                require_absent(candidate, path)?;
+            }
+        }
+        NetMode::None => {}
+    }
+    Ok(())
+}
+
+fn require_false_or_absent(candidate: &Value, pointer: &str) -> Result<(), FirestoneError> {
+    match candidate.pointer(pointer) {
+        None | Some(Value::Bool(false)) => Ok(()),
+        Some(_) => Err(required_overlay_error(&display_pointer(pointer))),
+    }
+}
+
+fn require_absent(candidate: &Value, pointer: &str) -> Result<(), FirestoneError> {
+    if candidate.pointer(pointer).is_none() {
+        Ok(())
+    } else {
+        Err(required_overlay_error(&display_pointer(pointer)))
+    }
+}
+
+fn display_pointer(pointer: &str) -> String {
+    let mut display = String::new();
+    for component in pointer.trim_start_matches('/').split('/') {
+        if component.bytes().all(|byte| byte.is_ascii_digit()) {
+            display.push('[');
+            display.push_str(component);
+            display.push(']');
+        } else {
+            if !display.is_empty() {
+                display.push('.');
+            }
+            display.push_str(component);
+        }
+    }
+    display
 }
 
 fn required_subset(required: &Value, candidate: &Value, path: &str) -> Result<(), String> {
@@ -630,7 +697,12 @@ fn sort_json(value: &mut Value) {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs, path::PathBuf};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        os::unix::fs::{PermissionsExt, symlink},
+        path::PathBuf,
+    };
 
     use serde_json::{Value, json};
     use tempfile::TempDir;
@@ -1037,6 +1109,48 @@ mod tests {
                 ]}),
                 "disks[0].backing_files",
             ),
+            (
+                json!({"disks": [
+                    {
+                        "path": fixture.paths.machine_disk("demo")?,
+                        "readonly": true,
+                        "image_type": "Qcow2",
+                        "backing_files": true
+                    },
+                    {
+                        "path": fixture.paths.machine_seed_image("demo")?,
+                        "readonly": true,
+                        "image_type": "Raw"
+                    }
+                ]}),
+                "disks[0].readonly",
+            ),
+            (
+                json!({"disks": [
+                    {
+                        "path": fixture.paths.machine_disk("demo")?,
+                        "image_type": "Qcow2",
+                        "backing_files": true
+                    },
+                    {
+                        "path": fixture.paths.machine_seed_image("demo")?,
+                        "readonly": true,
+                        "image_type": "Raw",
+                        "backing_files": true
+                    }
+                ]}),
+                "disks[1].backing_files",
+            ),
+            (
+                json!({"net": [{
+                    "vhost_user": true,
+                    "vhost_socket": fixture.paths.machine_net_socket("demo")?,
+                    "vhost_mode": "Client",
+                    "mac": "52:54:00:9a:1f:c3",
+                    "ip": "192.168.249.1"
+                }]}),
+                "net[0].ip",
+            ),
         ] {
             let mut spec = MachineSpec::default();
             spec.vmm.config_overlay = Some(overlay);
@@ -1083,6 +1197,59 @@ mod tests {
     }
 
     #[test]
+    fn publish_vmconfig_symlinked_machine_directory_preserves_external_sentinel()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        fixture.install("rust-hypervisor-firmware", Arch::X86_64)?;
+        let spec = MachineSpec::default();
+        let state = state(&fixture.paths)?;
+        let outside = tempfile::tempdir()?;
+        let sentinel = outside.path().join("sentinel");
+        fs::write(&sentinel, b"keep")?;
+        let machine_dir = fixture.paths.machine_dir("demo")?;
+        fs::remove_dir(&machine_dir)?;
+        symlink(outside.path(), &machine_dir)?;
+
+        let error = publish_vm_config(
+            &fixture.paths,
+            &fixture.manifest,
+            input(&spec, &state, Arch::X86_64, None),
+        )
+        .err()
+        .ok_or("symlinked machine directory should fail")?;
+
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert_eq!(fs::read(&sentinel)?, b"keep");
+        assert!(!outside.path().join("vmconfig.json").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn publish_vmconfig_world_writable_machines_ancestry_refuses_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        fixture.install("rust-hypervisor-firmware", Arch::X86_64)?;
+        let spec = MachineSpec::default();
+        let state = state(&fixture.paths)?;
+        fs::set_permissions(
+            fixture.paths.machines_dir(),
+            fs::Permissions::from_mode(0o777),
+        )?;
+
+        let error = publish_vm_config(
+            &fixture.paths,
+            &fixture.manifest,
+            input(&spec, &state, Arch::X86_64, None),
+        )
+        .err()
+        .ok_or("world-writable machines ancestry should fail")?;
+
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert!(!fixture.paths.machine_vmconfig("demo")?.exists());
+        Ok(())
+    }
+
+    #[test]
     fn missing_installed_firmware_returns_actionable_dependency_error()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::new()?;
@@ -1103,6 +1270,37 @@ mod tests {
             error.hint(),
             Some("run `firestone doctor --fix` to install the pinned firmware")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn vmconfig_cid_other_than_fixed_three_returns_invalid_spec()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        fixture.install("rust-hypervisor-firmware", Arch::X86_64)?;
+        let spec = MachineSpec::default();
+
+        for cid in [2, 4] {
+            let mut state = state(&fixture.paths)?;
+            state.cid = cid;
+            let error = canonical_vm_config(
+                &fixture.paths,
+                &fixture.manifest,
+                input(&spec, &state, Arch::X86_64, None),
+            )
+            .err()
+            .ok_or("non-fixed CID should fail")?;
+
+            assert_eq!(error.kind(), ErrorKind::InvalidSpec);
+            assert_eq!(
+                error.message(),
+                format!("machine state must use fixed vsock CID 3, found {cid}")
+            );
+            assert_eq!(
+                error.hint(),
+                Some("persist vsock CID 3 before building VmConfig")
+            );
+        }
         Ok(())
     }
 
