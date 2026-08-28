@@ -351,6 +351,9 @@ impl Paths {
     pub fn machine_seed_image(&self, name: &str) -> Result<PathBuf, FirestoneError> {
         Ok(self.machine_dir(name)?.join("seed.img"))
     }
+    pub fn machine_vmconfig(&self, name: &str) -> Result<PathBuf, FirestoneError> {
+        Ok(self.machine_dir(name)?.join("vmconfig.json"))
+    }
 
     pub fn machine_seed_dir(&self, name: &str) -> Result<PathBuf, FirestoneError> {
         Ok(self.machine_dir(name)?.join("seed"))
@@ -731,6 +734,37 @@ impl Paths {
         Ok(())
     }
 
+    /// Revalidates every owned directory that contains a machine publication.
+    ///
+    /// Writers call this immediately before atomic publication so a replaced
+    /// data, machines, or machine directory cannot redirect output.
+    pub fn validate_machine_data_directory(&self, name: &str) -> Result<PathBuf, FirestoneError> {
+        self.validate_owned_data_directory(self.data_dir(), "data directory", false)?;
+        let machines_dir = self.machines_dir();
+        self.validate_owned_data_directory(&machines_dir, "machines directory", false)?;
+        let machine_dir = self.machine_dir(name)?;
+        self.validate_owned_data_directory(&machine_dir, "machine directory", false)?;
+        Ok(machine_dir)
+    }
+
+    /// Revalidates the owned data and SSH directories before key access.
+    pub fn validate_ssh_data_directory(&self) -> Result<(), FirestoneError> {
+        self.validate_owned_data_subdirectory(&self.ssh_dir(), "SSH directory")
+    }
+
+    /// Revalidates the owned data and binary directories before artifact access.
+    pub fn validate_bin_data_directory(&self) -> Result<(), FirestoneError> {
+        self.validate_owned_data_subdirectory(&self.bin_dir(), "binary directory")
+    }
+
+    fn validate_owned_data_subdirectory(
+        &self,
+        path: &Path,
+        label: &str,
+    ) -> Result<(), FirestoneError> {
+        self.validate_owned_data_directory(self.data_dir(), "data directory", false)?;
+        self.validate_owned_data_directory(path, label, false)
+    }
     fn validate_runtime_prerequisites(&self) -> Result<(), FirestoneError> {
         match &self.runtime_provenance {
             RuntimeProvenance::XdgRuntimeDir { base } => {

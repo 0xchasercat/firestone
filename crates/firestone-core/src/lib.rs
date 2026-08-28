@@ -4,6 +4,7 @@ pub mod action;
 pub mod atomic;
 mod bounded;
 pub mod catalog;
+pub mod cloudinit;
 pub mod cmd;
 pub mod deps;
 pub mod dispatcher;
@@ -16,12 +17,14 @@ pub mod paths;
 pub mod result;
 pub mod spec;
 pub mod state;
+pub mod vmm;
 
 pub use action::Action;
 pub use catalog::{
     Catalog, CatalogArchSource, CatalogChecksum, CatalogEntry, CatalogFirmware, ChecksumAlgorithm,
     ImageFormat, ResolvedCatalogEntry,
 };
+pub use cloudinit::{RenderedCloudInit, SEED_IMAGE_SIZE, publish_seed, render_cloud_init};
 pub use cmd::{Cmd, CmdOutput};
 pub use deps::{DependencyArtifact, DependencyManifest};
 pub use dispatcher::{DispatchFuture, Dispatcher, EventSink};
@@ -54,3 +57,4 @@ pub use state::{
     StateVersion, Supervision, VmmPingProbe, observe_liveness, reconcile, reconciled_state,
     verify_shim_identity,
 };
+pub use vmm::{CanonicalVmConfig, VmConfigInput, canonical_vm_config, publish_vm_config};

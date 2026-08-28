@@ -56,22 +56,33 @@ pub fn write(path: &Path, bytes: &[u8]) -> Result<(), FirestoneError> {
 
 /// Writes bytes atomically while creating the published file with the supplied mode.
 pub fn write_with_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<(), FirestoneError> {
-    write_with_options(path, bytes, Some(mode), |file, contents| {
+    write_with_options(path, bytes, Some(mode), false, |file, contents| {
         file.write_all(contents)
     })
 }
 
+/// Streams bytes through a sibling temporary file and durably replaces `path`.
+///
+/// The callback writes directly to the temporary file, so fixed-size artifacts
+/// do not need a second in-memory copy before publication.
+pub fn write_stream<F>(path: &Path, write_bytes: F) -> Result<(), FirestoneError>
+where
+    F: FnOnce(&mut File) -> io::Result<()>,
+{
+    write_with_options(path, &[], None, true, |file, _contents| write_bytes(file))
+}
 fn write_with<F>(path: &Path, bytes: &[u8], write_bytes: F) -> Result<(), FirestoneError>
 where
     F: FnOnce(&mut File, &[u8]) -> io::Result<()>,
 {
-    write_with_options(path, bytes, None, write_bytes)
+    write_with_options(path, bytes, None, false, write_bytes)
 }
 
 fn write_with_options<F>(
     path: &Path,
     bytes: &[u8],
     mode: Option<u32>,
+    readable: bool,
     write_bytes: F,
 ) -> Result<(), FirestoneError>
 where
@@ -94,7 +105,7 @@ where
     remove_known_temp(&temp_path)?;
 
     let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
+    options.read(readable).write(true).create_new(true);
     if let Some(mode) = mode {
         options.mode(mode);
     }
