@@ -2066,6 +2066,36 @@ fn preflight_launch_argv(argv: &[OsString]) -> Result<(), FirestoneError> {
     Ok(())
 }
 
+fn capture_launch_process_record(
+    vmm: &OwnedVmm,
+    plan: &LaunchPlan,
+    launch_argv: &[OsString],
+    launch_binding: &str,
+    work_deadline: Instant,
+) -> Result<ProcessRecord, FirestoneError> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(250))
+        .map_or(work_deadline, |deadline| deadline.min(work_deadline));
+    loop {
+        match process_record(
+            vmm.id(),
+            vmm.record.process_group,
+            plan.vmm_binary.clone(),
+            Some(plan.vmm_binary_sha256.clone()),
+            launch_argv.to_vec(),
+            Some(launch_binding.to_owned()),
+        ) {
+            Ok(record) => return Ok(record),
+            Err(error) => {
+                if vmm.observe_exit()? || Instant::now() >= deadline {
+                    return Err(error);
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn launch_vmm(
     paths: &Paths,
@@ -2118,14 +2148,8 @@ fn launch_vmm(
     let mut vmm = OwnedVmm::from_spawn(process, plan.vmm_binary.clone());
     state.vmm_pid = Some(vmm.id());
     StateStore::new(paths.machine_state(name)?).write_from_shim(state)?;
-    let record = process_record(
-        vmm.id(),
-        vmm.record.process_group,
-        plan.vmm_binary.clone(),
-        Some(plan.vmm_binary_sha256.clone()),
-        launch_argv.clone(),
-        Some(launch_binding.clone()),
-    )?;
+    let record =
+        capture_launch_process_record(&vmm, plan, &launch_argv, &launch_binding, work_deadline)?;
     vmm.bind_record(record.clone());
     identity.vmm = Some(record);
     publish_process_identity(paths, name, identity)?;
