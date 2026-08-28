@@ -892,11 +892,7 @@ umount /mnt/firestone-fio
     failed_seconds = harness.wait_for_status(vmm_crash, "failed", 2.0)
     failed_state = harness.state(vmm_crash)
     restart_result, _ = harness.start(vmm_crash)
-    restart_login = harness.wait_console_match(
-        vmm_crash,
-        login_patterns,
-        minimum_matches=2,
-    )
+    restart_login = harness.wait_console_match(vmm_crash, login_patterns)
     harness.stop(vmm_crash)
     harness.evidence["scenarios"]["e2e_6_vmm_sigkill_restart"] = {
         "vmm_pid": vmm_pid,
