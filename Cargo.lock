@@ -421,6 +421,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "shlex",
+ "signal-hook",
  "tempfile",
  "tokio",
  "unicode-width",

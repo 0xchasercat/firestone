@@ -6,7 +6,8 @@ use std::{
 
 use firestone_core::{
     DoctorCheckId, DoctorReport, DoctorStatus, ErrorInfo, ErrorKind, Event, EventSink,
-    FirestoneError, Level, MachineSummary, MachineView, Unit,
+    FirestoneError, Level, LogsResult, MachineStatus, MachineSummary, MachineView, RemoveResult,
+    StartResult, StopResult, Unit,
 };
 
 use unicode_width::UnicodeWidthChar;
@@ -101,6 +102,13 @@ where
     #[must_use]
     pub fn into_writers(self) -> (Stdout, Stderr) {
         (self.stdout, self.stderr)
+    }
+
+    /// Writes one interactive confirmation prompt to stderr.
+    pub fn prompt(&mut self, message: &str) -> Result<(), FirestoneError> {
+        write_safe_arguments(&mut self.stderr, format_args!("{message}"))
+            .and_then(|()| self.stderr.flush())
+            .map_err(write_output_failure)
     }
 
     /// Writes a terminal action error to the stream selected by the output mode.
@@ -239,6 +247,13 @@ where
                 }
                 self.render_log(level, &message)
             }
+            Event::Output { data } => {
+                if self.options.quiet {
+                    Ok(())
+                } else {
+                    write_safe_output(&mut self.stdout, &data).map_err(write_output_failure)
+                }
+            }
             Event::Result { action, payload } => self.render_result(&action, payload),
         }
     }
@@ -368,6 +383,32 @@ where
     ) -> Result<(), FirestoneError> {
         match action {
             "create" | "edit" => Ok(()),
+            "start" | "restart" => {
+                let result: StartResult = serde_json::from_value(payload)
+                    .map_err(|error| invalid_result_payload(action, error))?;
+                write_line(&mut self.stdout, format_args!("{} is running", result.name))
+            }
+            "stop" => {
+                let result: StopResult = serde_json::from_value(payload)
+                    .map_err(|error| invalid_result_payload("stop", error))?;
+                write_line(
+                    &mut self.stdout,
+                    format_args!("{} is {}", result.name, machine_status_label(result.status)),
+                )
+            }
+            "rm" => {
+                let result: RemoveResult = serde_json::from_value(payload)
+                    .map_err(|error| invalid_result_payload("rm", error))?;
+                for name in result.removed {
+                    write_line(&mut self.stdout, format_args!("removed {name}"))?;
+                }
+                Ok(())
+            }
+            "logs" => {
+                let _: LogsResult = serde_json::from_value(payload)
+                    .map_err(|error| invalid_result_payload("logs", error))?;
+                Ok(())
+            }
             "list" => {
                 let mut machines: Vec<MachineSummary> = serde_json::from_value(payload)
                     .map_err(|error| invalid_result_payload("list", error))?;
@@ -381,6 +422,13 @@ where
                     .map_err(json_output_failure)?;
                 finish_record(&mut self.stdout)
             }
+            "show-vmconfig" => {
+                serde_json::to_writer(&mut self.stdout, &payload).map_err(json_output_failure)?;
+                finish_record(&mut self.stdout)
+            }
+            "images-pull" => self.render_image_pull_result(&payload),
+            "images-rm" => self.render_image_remove_result(&payload),
+            "images-prune" => self.render_image_prune_result(&payload),
             "doctor" => {
                 let report: DoctorReport = serde_json::from_value(payload)
                     .map_err(|error| invalid_result_payload("doctor", error))?;
@@ -391,6 +439,78 @@ where
         }
     }
 
+    fn render_image_pull_result(
+        &mut self,
+        payload: &serde_json::Value,
+    ) -> Result<(), FirestoneError> {
+        let metadata = payload
+            .get("metadata")
+            .and_then(serde_json::Value::as_object);
+        let source = metadata
+            .and_then(|metadata| metadata.get("source_ref"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| invalid_result_value("images-pull", "missing metadata.source_ref"))?;
+        let architecture = metadata
+            .and_then(|metadata| metadata.get("architecture"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| invalid_result_value("images-pull", "missing metadata.architecture"))?;
+        let size = metadata
+            .and_then(|metadata| metadata.get("size"))
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| invalid_result_value("images-pull", "missing metadata.size"))?;
+        let cached = payload
+            .get("cached")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| invalid_result_value("images-pull", "missing cached"))?;
+        let disposition = if cached { "cached" } else { "pulled" };
+        write_line(
+            &mut self.stdout,
+            format_args!(
+                "{source} · {architecture} · {} · {disposition}",
+                HumanBytes(size)
+            ),
+        )
+    }
+
+    fn render_image_remove_result(
+        &mut self,
+        payload: &serde_json::Value,
+    ) -> Result<(), FirestoneError> {
+        let id = payload
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| invalid_result_value("images-rm", "missing id"))?;
+        let bytes = payload
+            .get("bytes_freed")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| invalid_result_value("images-rm", "missing bytes_freed"))?;
+        write_line(
+            &mut self.stdout,
+            format_args!("removed {id} · {} freed", HumanBytes(bytes)),
+        )
+    }
+
+    fn render_image_prune_result(
+        &mut self,
+        payload: &serde_json::Value,
+    ) -> Result<(), FirestoneError> {
+        let removed = payload
+            .get("removed")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| invalid_result_value("images-prune", "missing removed"))?;
+        let bytes = payload
+            .get("bytes_freed")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| invalid_result_value("images-prune", "missing bytes_freed"))?;
+        write_line(
+            &mut self.stdout,
+            format_args!(
+                "pruned {} image(s) · {} freed",
+                removed.len(),
+                HumanBytes(bytes)
+            ),
+        )
+    }
     fn render_other_result(&mut self, payload: serde_json::Value) -> Result<(), FirestoneError> {
         if let serde_json::Value::String(message) = payload {
             return write_line(&mut self.stdout, format_args!("{message}"));
@@ -463,6 +583,17 @@ const fn doctor_status_label(status: DoctorStatus) -> &'static str {
         DoctorStatus::Ok => "ok",
         DoctorStatus::Warn => "warn",
         DoctorStatus::Fail => "fail",
+    }
+}
+
+const fn machine_status_label(status: MachineStatus) -> &'static str {
+    match status {
+        MachineStatus::Created => "created",
+        MachineStatus::Starting => "starting",
+        MachineStatus::Running => "running",
+        MachineStatus::Stopping => "stopping",
+        MachineStatus::Stopped => "stopped",
+        MachineStatus::Failed => "failed",
     }
 }
 
@@ -553,6 +684,22 @@ fn write_safe_text<W: Write>(writer: &mut W, value: &str) -> io::Result<()> {
         writer.write_all(character.encode_utf8(&mut encoded).as_bytes())?;
     }
     Ok(())
+}
+fn write_safe_output<W: Write>(writer: &mut W, value: &str) -> io::Result<()> {
+    let mut encoded = [0_u8; 4];
+    for character in value.chars() {
+        if character == '\n' {
+            writer.write_all(b"\n")?;
+            continue;
+        }
+        let character = if character.is_control() {
+            '\u{fffd}'
+        } else {
+            character
+        };
+        writer.write_all(character.encode_utf8(&mut encoded).as_bytes())?;
+    }
+    writer.flush()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -738,6 +885,12 @@ fn invalid_result_payload(action: &str, error: serde_json::Error) -> FirestoneEr
     )
     .with_source(error)
 }
+fn invalid_result_value(action: &str, detail: &str) -> FirestoneError {
+    FirestoneError::new(
+        ErrorKind::Generic,
+        format!("invalid {action} result payload: {detail}"),
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -755,6 +908,127 @@ mod tests {
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    #[test]
+    fn lifecycle_and_log_results_render_exact_human_output() -> TestResult {
+        let mut renderer =
+            Renderer::new(Vec::new(), Vec::new(), RenderOptions::human(false, false));
+        renderer.emit(Event::Output {
+            data: "first\nbad\u{1b}[31m\n".to_owned(),
+        })?;
+        renderer.emit(Event::Result {
+            action: "start".to_owned(),
+            payload: json!({
+                "name": "dev",
+                "status": "running",
+                "elapsed_ms": 12,
+                "forwards": [],
+                "mounts": []
+            }),
+        })?;
+        renderer.emit(Event::Result {
+            action: "stop".to_owned(),
+            payload: json!({"name": "dev", "status": "stopped", "elapsed_ms": 20}),
+        })?;
+        renderer.emit(Event::Result {
+            action: "rm".to_owned(),
+            payload: json!({"removed": ["dev"]}),
+        })?;
+        renderer.emit(Event::Result {
+            action: "logs".to_owned(),
+            payload: json!({"name": "dev", "source": "console", "lines": 2, "follow": false}),
+        })?;
+
+        let (stdout, stderr) = renderer.into_writers();
+        assert_eq!(
+            String::from_utf8(stdout)?,
+            "first\nbad�[31m\ndev is running\ndev is stopped\nremoved dev\n"
+        );
+        assert!(stderr.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn output_event_json_is_exact_and_quiet_suppresses_data_only() -> TestResult {
+        let mut json_renderer = Renderer::new(Vec::new(), Vec::new(), RenderOptions::json());
+        json_renderer.emit(Event::Output {
+            data: "line\n".to_owned(),
+        })?;
+        let (stdout, stderr) = json_renderer.into_writers();
+        assert_eq!(stdout, b"{\"type\":\"Output\",\"data\":\"line\\n\"}\n");
+        assert!(stderr.is_empty());
+
+        let mut quiet = Renderer::new(Vec::new(), Vec::new(), RenderOptions::human(true, false));
+        quiet.emit(Event::Output {
+            data: "hidden\n".to_owned(),
+        })?;
+        quiet.emit(Event::Result {
+            action: "start".to_owned(),
+            payload: json!({
+                "name": "dev",
+                "status": "running",
+                "elapsed_ms": 0,
+                "forwards": [],
+                "mounts": []
+            }),
+        })?;
+        let (stdout, stderr) = quiet.into_writers();
+        assert_eq!(stdout, b"dev is running\n");
+        assert!(stderr.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn vmconfig_result_writes_canonical_object_bytes() -> TestResult {
+        let mut renderer =
+            Renderer::new(Vec::new(), Vec::new(), RenderOptions::human(false, false));
+        renderer.emit(Event::Result {
+            action: "show-vmconfig".to_owned(),
+            payload: json!({"a": 1, "nested": {"b": 2}}),
+        })?;
+
+        let (stdout, stderr) = renderer.into_writers();
+        assert_eq!(
+            stdout,
+            br#"{"a":1,"nested":{"b":2}}
+"#
+        );
+        assert!(stderr.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn image_mutation_results_report_bytes_freed() -> TestResult {
+        let mut renderer =
+            Renderer::new(Vec::new(), Vec::new(), RenderOptions::human(false, false));
+        renderer.emit(Event::Result {
+            action: "images-pull".to_owned(),
+            payload: json!({
+                "metadata": {
+                    "source_ref": "ubuntu:24.04",
+                    "architecture": "x86_64",
+                    "size": 1000
+                },
+                "cached": true
+            }),
+        })?;
+        renderer.emit(Event::Result {
+            action: "images-rm".to_owned(),
+            payload: json!({"id": "image-id", "bytes_freed": 10, "referenced_by": []}),
+        })?;
+        renderer.emit(Event::Result {
+            action: "images-prune".to_owned(),
+            payload: json!({"removed": ["one", "two"], "bytes_freed": 2000}),
+        })?;
+
+        let (stdout, stderr) = renderer.into_writers();
+        assert_eq!(
+            String::from_utf8(stdout)?,
+            "ubuntu:24.04 · x86_64 · 1 kB · cached\nremoved image-id · 10 B freed\npruned 2 image(s) · 2 kB freed\n"
+        );
+        assert!(stderr.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn json_mode_is_byte_exact_ndjson_on_stdout() -> TestResult {

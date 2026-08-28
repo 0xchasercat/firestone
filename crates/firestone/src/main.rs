@@ -5,26 +5,30 @@ mod store;
 use std::{
     env,
     ffi::{OsStr, OsString},
-    fs, io,
+    fs,
+    future::Future,
+    io,
     io::IsTerminal,
     path::Path,
     process::ExitCode,
+    sync::Arc,
+    task::{Context, Poll, Wake, Waker},
+    thread,
 };
 
 use clap::{Parser, error::ErrorKind as ClapErrorKind};
 use firestone_core::{
-    Action, Catalog, Dispatcher, ErrorKind, Event, EventSink, FirestoneError, GlobalConfig, Level,
-    MachineSpec, PathInputs, Paths, RealValidationHost, ValidationContext,
+    Action, Catalog, Dispatcher, ErrorKind, Event, EventSink, FirestoneError, GlobalConfig,
+    ImageRef, Level, MachineSpec, PathInputs, Paths, RealValidationHost, ValidationContext,
 };
 
 use crate::{
-    cli::{Cli, Command, CreateRequest},
+    cli::{Cli, Command, CreateRequest, ImageCommand},
     render::{RenderOptions, Renderer, error_exit_code},
     store::LocalDispatcher,
 };
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let arguments = env::args_os().collect::<Vec<_>>();
     if let Some(name) = hidden_shim_name(&arguments) {
         let result = Paths::from_process().and_then(|paths| firestone_core::run_shim(&paths, name));
@@ -80,8 +84,31 @@ async fn main() -> ExitCode {
         stderr.is_terminal(),
     );
     let mut renderer = Renderer::new(stdout, stderr, options);
-    let result = run(cli, &mut renderer).await;
+    let result = block_on(run(cli, &mut renderer));
     ExitCode::from(finish_command(result, &mut renderer))
+}
+struct ThreadWake(thread::Thread);
+
+impl Wake for ThreadWake {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    let waker = Waker::from(Arc::new(ThreadWake(thread::current())));
+    let mut context = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => thread::park(),
+        }
+    }
 }
 
 fn hidden_shim_name(arguments: &[std::ffi::OsString]) -> Option<&str> {
@@ -178,13 +205,28 @@ where
     Stderr: io::Write + Send,
 {
     let inputs = PathInputs::capture()?;
-    run_with_inputs(cli, renderer, inputs).await
+    let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
+    run_with_inputs_mode(cli, renderer, inputs, interactive).await
 }
 
+#[cfg(test)]
 async fn run_with_inputs<Stdout, Stderr>(
     cli: Cli,
     renderer: &mut Renderer<Stdout, Stderr>,
+    inputs: PathInputs,
+) -> Result<(), FirestoneError>
+where
+    Stdout: io::Write + Send,
+    Stderr: io::Write + Send,
+{
+    run_with_inputs_mode(cli, renderer, inputs, false).await
+}
+
+async fn run_with_inputs_mode<Stdout, Stderr>(
+    cli: Cli,
+    renderer: &mut Renderer<Stdout, Stderr>,
     mut inputs: PathInputs,
+    interactive: bool,
 ) -> Result<(), FirestoneError>
 where
     Stdout: io::Write + Send,
@@ -195,7 +237,7 @@ where
         quiet: _,
         verbose: _,
         no_color: _,
-        yes: _,
+        yes,
         home,
         command,
     } = cli;
@@ -203,13 +245,14 @@ where
         inputs.firestone_home = Some(home);
     }
     let paths = Paths::from_inputs(&inputs)?;
+    let source_base = inputs.current_dir.clone();
 
     match command {
         Command::Create(arguments) => {
             let (global, catalog) = load_user_configuration(&paths)?;
             let request = arguments.into_request().map_err(|error| {
                 FirestoneError::new(ErrorKind::Usage, clap_error_message(&error))
-                    .with_hint("run `firestone create --help` for valid forms")
+                    .with_hint("run firestone create --help for valid forms")
             })?;
             let edit = request.edit;
             let (name, loaded) =
@@ -220,7 +263,8 @@ where
                     message: format!("{}: {}", warning.key, warning.message),
                 })?;
             }
-            let dispatcher = LocalDispatcher::new(paths, global, catalog);
+            let dispatcher =
+                LocalDispatcher::new(paths, global, catalog).with_source_base(source_base);
             if edit {
                 dispatcher.create_with_edit(&name, loaded.spec, renderer)
             } else {
@@ -235,25 +279,94 @@ where
                     .await
             }
         }
+        Command::Start(arguments) => {
+            let (global, catalog) = load_user_configuration(&paths)?;
+            let timeout = arguments.timeout.unwrap_or(global.start.timeout).get();
+            LocalDispatcher::new(paths, global, catalog)
+                .with_source_base(source_base)
+                .run(
+                    Action::Start {
+                        name: arguments.name,
+                        wait: !arguments.no_wait,
+                        timeout,
+                    },
+                    renderer,
+                )
+                .await
+        }
+        Command::Stop(arguments) => {
+            let (global, catalog) = load_user_configuration(&paths)?;
+            let timeout = arguments.timeout.unwrap_or(global.stop.timeout).get();
+            LocalDispatcher::new(paths, global, catalog)
+                .with_source_base(source_base)
+                .run(
+                    Action::Stop {
+                        name: arguments.name,
+                        timeout,
+                        force: arguments.force,
+                    },
+                    renderer,
+                )
+                .await
+        }
+        Command::Restart(arguments) => {
+            let (global, catalog) = load_user_configuration(&paths)?;
+            let timeout = global.start.timeout.get();
+            LocalDispatcher::new(paths, global, catalog)
+                .with_source_base(source_base)
+                .run(
+                    Action::Restart {
+                        name: arguments.name,
+                        timeout,
+                    },
+                    renderer,
+                )
+                .await
+        }
+        Command::Remove(arguments) => {
+            let (global, catalog) = load_user_configuration(&paths)?;
+            let dispatcher =
+                LocalDispatcher::new(paths, global, catalog).with_source_base(source_base);
+            let mut force = arguments.force || yes;
+            if !force && interactive {
+                let running = dispatcher.remove_confirmation_names(&arguments.names)?;
+                if !running.is_empty() {
+                    let prompt =
+                        format!("remove running machine(s) {}? [y/N] ", running.join(", "));
+                    force = confirm(renderer, &prompt)?;
+                    if !force {
+                        return Err(FirestoneError::new(
+                            ErrorKind::Generic,
+                            "machine removal cancelled",
+                        ));
+                    }
+                }
+            }
+            dispatcher
+                .run(
+                    Action::Remove {
+                        names: arguments.names,
+                        force,
+                    },
+                    renderer,
+                )
+                .await
+        }
         Command::List => {
             let (global, catalog) = load_user_configuration(&paths)?;
             LocalDispatcher::new(paths, global, catalog)
+                .with_source_base(source_base)
                 .run(Action::List, renderer)
                 .await
         }
         Command::Show(arguments) => {
-            if arguments.vmconfig {
-                return Err(FirestoneError::new(
-                    ErrorKind::Usage,
-                    "--vmconfig is unavailable before the M1 VMM configuration implementation",
-                )
-                .with_hint("omit --vmconfig to show the machine spec and state"));
-            }
             let (global, catalog) = load_user_configuration(&paths)?;
             LocalDispatcher::new(paths, global, catalog)
+                .with_source_base(source_base)
                 .run(
                     Action::Show {
                         name: arguments.name,
+                        vmconfig: arguments.vmconfig,
                     },
                     renderer,
                 )
@@ -261,16 +374,108 @@ where
         }
         Command::Edit(arguments) => {
             let (global, catalog) = load_user_configuration(&paths)?;
-            LocalDispatcher::new(paths, global, catalog).edit(&arguments.name, renderer)
+            LocalDispatcher::new(paths, global, catalog)
+                .with_source_base(source_base)
+                .edit(&arguments.name, renderer)
+        }
+        Command::Logs(arguments) => {
+            let (global, catalog) = load_user_configuration(&paths)?;
+            LocalDispatcher::new(paths, global, catalog)
+                .with_source_base(source_base)
+                .run(
+                    Action::Logs {
+                        name: arguments.name,
+                        source: arguments.source,
+                        lines: arguments.lines,
+                        follow: arguments.follow,
+                    },
+                    renderer,
+                )
+                .await
+        }
+        Command::Images(arguments) => {
+            let (global, catalog) = load_user_configuration(&paths)?;
+            let dispatcher =
+                LocalDispatcher::new(paths, global, catalog).with_source_base(source_base);
+            match arguments.command {
+                ImageCommand::List => dispatcher.run(Action::ImageList, renderer).await,
+                ImageCommand::Pull(arguments) => {
+                    dispatcher
+                        .run(
+                            Action::ImagePull {
+                                r#ref: ImageRef::from(arguments.reference),
+                                sha256: arguments.sha256,
+                            },
+                            renderer,
+                        )
+                        .await
+                }
+                ImageCommand::Inspect(arguments) => {
+                    dispatcher
+                        .run(Action::ImageInspect { id: arguments.id }, renderer)
+                        .await
+                }
+                ImageCommand::Remove(arguments) => {
+                    let mut force = arguments.force || yes;
+                    if !force && interactive {
+                        let references = dispatcher.image_remove_confirmation(&arguments.id)?;
+                        if !references.is_empty() {
+                            let prompt = format!(
+                                "remove image {} referenced by machine(s) {}? [y/N] ",
+                                arguments.id,
+                                references.join(", ")
+                            );
+                            force = confirm(renderer, &prompt)?;
+                            if !force {
+                                return Err(FirestoneError::new(
+                                    ErrorKind::Generic,
+                                    "image removal cancelled",
+                                ));
+                            }
+                        }
+                    }
+                    dispatcher
+                        .run(
+                            Action::ImageRemove {
+                                id: arguments.id,
+                                force,
+                            },
+                            renderer,
+                        )
+                        .await
+                }
+                ImageCommand::Prune => dispatcher.run(Action::ImagePrune, renderer).await,
+            }
         }
         Command::Doctor(arguments) => {
             let dispatcher =
-                LocalDispatcher::new(paths, GlobalConfig::default(), Catalog::built_in()?);
+                LocalDispatcher::new(paths, GlobalConfig::default(), Catalog::built_in()?)
+                    .with_source_base(source_base);
             dispatcher
                 .run(Action::Doctor { fix: arguments.fix }, renderer)
                 .await
         }
     }
+}
+
+fn confirm<Stdout, Stderr>(
+    renderer: &mut Renderer<Stdout, Stderr>,
+    prompt: &str,
+) -> Result<bool, FirestoneError>
+where
+    Stdout: io::Write,
+    Stderr: io::Write,
+{
+    renderer.prompt(prompt)?;
+    let mut response = String::new();
+    io::stdin().read_line(&mut response).map_err(|source| {
+        FirestoneError::new(ErrorKind::Generic, "cannot read confirmation response")
+            .with_source(source)
+    })?;
+    Ok(matches!(
+        response.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 fn load_user_configuration(paths: &Paths) -> Result<(GlobalConfig, Catalog), FirestoneError> {

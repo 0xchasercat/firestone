@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{MachineSpec, MachineState, SpecWarning, Supervision};
+use crate::{LogSource, MachineSpec, MachineState, MachineStatus, SpecWarning, Supervision};
 
 /// One machine row shared by CLI list output and the REST collection route.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +28,39 @@ pub struct MachineRecord {
     pub name: String,
     pub spec: MachineSpec,
     pub state: MachineState,
+}
+
+/// A machine that reached the M1 running contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartResult {
+    pub name: String,
+    pub status: MachineStatus,
+    pub elapsed_ms: u64,
+    pub forwards: Vec<String>,
+    pub mounts: Vec<String>,
+}
+
+/// A completed or idempotently skipped stop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopResult {
+    pub name: String,
+    pub status: MachineStatus,
+    pub elapsed_ms: u64,
+}
+
+/// Machine publications removed by one atomic CLI action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoveResult {
+    pub removed: Vec<String>,
+}
+
+/// Terminal metadata for a bounded log read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogsResult {
+    pub name: String,
+    pub source: LogSource,
+    pub lines: u32,
+    pub follow: bool,
 }
 
 /// Owned form of a non-fatal spec validation warning.

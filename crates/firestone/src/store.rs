@@ -1,35 +1,74 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::{OsStr, OsString},
-    fs,
+    fs::{self, File, OpenOptions},
+    io::{Read, Seek, SeekFrom},
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 use firestone_core::{
     Action, Arch, Catalog, Cmd, DependencyManifest, DispatchFuture, Dispatcher, DoctorContext,
-    ErrorKind, Event, EventSink, FirestoneError, GlobalConfig, Level, LiveMachineState,
-    MachineLock, MachineRecord, MachineSpec, MachineSpecPatch, MachineState, MachineStatus,
-    MachineSummary, MachineView, Paths, RealValidationHost, SpecResult, SpecWarningPayload,
-    StateImage, StateStore, StateVersion, Supervision, ValidationContext, atomic,
-    read_reconciled_machine_state_live, read_reconciled_machine_state_live_locked, run_doctor,
+    ErrorKind, Event, EventSink, FirestoneError, GlobalConfig, ImagePullRequest, ImageStore, Level,
+    LiveMachineState, LogSource, LogsResult, MachineLock, MachineRecord, MachineSpec,
+    MachineSpecPatch, MachineState, MachineStatus, MachineSummary, MachineView, Paths,
+    RealValidationHost, RemoveResult, ShimClient, ShimTimeouts, SpecResult, SpecWarningPayload,
+    StartResult, StateImage, StateStore, StateVersion, StopResult, Supervision, ValidationContext,
+    atomic, launch_prepared, prepare_start, read_reconciled_machine_state_live,
+    read_reconciled_machine_state_live_locked, run_doctor, stop_unsupervised,
+    validate_m1_start_scope,
 };
 
 const SPEC_TEMPLATE: &str = include_str!("../../../templates/firestone.toml");
+const MAX_VMCONFIG_BYTES: u64 = 51_200;
+const MAX_LOG_LINES: u32 = 100_000;
+const MAX_LOG_TAIL_BYTES: u64 = 8 * 1024 * 1024;
+const LOG_FOLLOW_CHUNK_BYTES: u64 = 256 * 1024;
+const LOG_FOLLOW_INTERVAL: Duration = Duration::from_millis(100);
 
 pub struct LocalDispatcher {
     paths: Paths,
     global: GlobalConfig,
     catalog: Catalog,
+    source_base: PathBuf,
+    qemu_img: PathBuf,
+    shim_program: Option<PathBuf>,
 }
 
 impl LocalDispatcher {
     pub fn new(paths: Paths, global: GlobalConfig, catalog: Catalog) -> Self {
+        let source_base = match env::current_dir() {
+            Ok(path) => path,
+            Err(_) => paths.data_dir().to_path_buf(),
+        };
         Self {
             paths,
             global,
             catalog,
+            source_base,
+            qemu_img: PathBuf::from("qemu-img"),
+            shim_program: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_source_base(mut self, source_base: PathBuf) -> Self {
+        self.source_base = source_base;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_programs(mut self, qemu_img: PathBuf, shim_program: PathBuf) -> Self {
+        self.qemu_img = qemu_img;
+        self.shim_program = Some(shim_program);
+        self
     }
 
     fn validate_machine_storage(&self) -> Result<(), FirestoneError> {
@@ -577,6 +616,656 @@ impl LocalDispatcher {
         Ok(owned_file_ready(&self.paths.machine_spec(name)?)?
             && owned_file_ready(&self.paths.machine_state(name)?)?)
     }
+    fn image_store(&self) -> Result<ImageStore, FirestoneError> {
+        ImageStore::for_host(
+            self.paths.clone(),
+            self.catalog.clone(),
+            self.qemu_img.clone(),
+        )
+    }
+
+    fn shim_program(&self) -> Result<PathBuf, FirestoneError> {
+        match &self.shim_program {
+            Some(path) => Ok(path.clone()),
+            None => env::current_exe().map_err(|source| {
+                FirestoneError::new(
+                    ErrorKind::Dependency,
+                    "cannot locate the firestone executable for the machine shim",
+                )
+                .with_hint("run start from an installed firestone executable")
+                .with_source(source)
+            }),
+        }
+    }
+
+    fn load_machine_spec(
+        &self,
+        name: &str,
+        state: &MachineState,
+    ) -> Result<MachineSpec, FirestoneError> {
+        let machine_dir = self.paths.machine_dir(name)?;
+        let source = read_file(
+            &self.paths.machine_spec(name)?,
+            "machine spec",
+            ErrorKind::NotFound,
+        )?;
+        let text = std::str::from_utf8(&source).map_err(|source| {
+            FirestoneError::new(
+                ErrorKind::InvalidSpec,
+                format!("machine spec for {name:?} is not UTF-8"),
+            )
+            .with_hint("save firestone.toml as UTF-8 TOML")
+            .with_source(source)
+        })?;
+        let pinned_image_ref = if state.image.id.is_some() && state.image.sha256.is_some() {
+            Some(state.image.r#ref.as_str())
+        } else {
+            None
+        };
+        self.load_spec_text_with_pinned(text, &machine_dir, &machine_dir, pinned_image_ref)
+            .map(|loaded| loaded.spec)
+    }
+
+    fn start(
+        &self,
+        name: &str,
+        wait: bool,
+        timeout: Duration,
+        events: &mut dyn EventSink,
+    ) -> Result<StartResult, FirestoneError> {
+        let started = Instant::now();
+        self.validate_machine_storage()?;
+        let machine_dir = self.paths.machine_dir(name)?;
+        ensure_machine_exists(&self.paths, name, &machine_dir)?;
+        let preliminary = self.read_live_state(name)?;
+        ensure_startable(name, &preliminary.state)?;
+
+        let lock_path = self.paths.machine_lock(name)?;
+        self.paths
+            .validate_owned_data_file(&lock_path, "machine lock", 0o600, false)?;
+        let lock = MachineLock::acquire(name, &lock_path, events)?;
+        ensure_machine_exists(&self.paths, name, &machine_dir)?;
+        let live = self.read_live_state_locked(name, &lock)?;
+        ensure_startable(name, &live.state)?;
+        let spec = self.load_machine_spec(name, &live.state)?;
+        validate_m1_start_scope(&spec)?;
+
+        let image_store = self.image_store()?;
+        let manifest = DependencyManifest::bundled()?;
+        let timeouts = ShimTimeouts {
+            launch_request: timeout,
+            launch_overall: timeout,
+            ..ShimTimeouts::default()
+        };
+        let prepared = prepare_start(
+            &self.paths,
+            &image_store,
+            &manifest,
+            name,
+            &spec,
+            live.state,
+            &machine_dir,
+            &lock,
+            events,
+            timeouts,
+        )?;
+        let status = launch_prepared(&self.paths, &self.shim_program()?, prepared, lock, events)?;
+        if status.status != MachineStatus::Running {
+            return Err(FirestoneError::new(
+                ErrorKind::Conflict,
+                format!(
+                    "machine {name:?} did not reach the M1 running contract; shim reported {:?}",
+                    status.status
+                ),
+            )
+            .with_hint(format!("inspect firestone logs {name} --source shim")));
+        }
+
+        let _ = wait;
+        Ok(StartResult {
+            name: name.to_owned(),
+            status: MachineStatus::Running,
+            elapsed_ms: elapsed_millis(started.elapsed()),
+            forwards: spec
+                .network
+                .forward
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            mounts: spec
+                .mounts
+                .iter()
+                .map(|mount| format!("{} -> {}", mount.host.display(), mount.guest.display()))
+                .collect(),
+        })
+    }
+
+    fn stop(
+        &self,
+        name: &str,
+        timeout: Duration,
+        force: bool,
+        events: &mut dyn EventSink,
+    ) -> Result<StopResult, FirestoneError> {
+        let started = Instant::now();
+        let state = self.stop_machine(name, timeout, force, events)?;
+        Ok(StopResult {
+            name: name.to_owned(),
+            status: state.status,
+            elapsed_ms: elapsed_millis(started.elapsed()),
+        })
+    }
+
+    fn stop_machine(
+        &self,
+        name: &str,
+        timeout: Duration,
+        force: bool,
+        events: &mut dyn EventSink,
+    ) -> Result<MachineState, FirestoneError> {
+        self.validate_machine_storage()?;
+        let machine_dir = self.paths.machine_dir(name)?;
+        ensure_machine_exists(&self.paths, name, &machine_dir)?;
+        let live = self.read_live_state(name)?;
+        if !live.state.status.is_active() {
+            events.emit(Event::StepSkip {
+                id: "stop".into(),
+                reason: "not running".to_owned(),
+            })?;
+            return Ok(live.state);
+        }
+
+        let client = ShimClient::new(
+            self.paths.machine_shim_socket(name)?,
+            ShimTimeouts::default().control_io,
+        );
+        match client.stop(timeout, force, events) {
+            Ok(()) => {
+                let state = StateStore::new(self.paths.machine_state(name)?).read()?;
+                if state.status.is_active() {
+                    return Err(FirestoneError::new(
+                        ErrorKind::Conflict,
+                        format!("machine {name:?} remained active after shim stop"),
+                    )
+                    .with_hint(format!("retry firestone stop {name}")));
+                }
+                return Ok(state);
+            }
+            Err(error) if error.kind() == ErrorKind::NotRunning => {}
+            Err(error) => return Err(error),
+        }
+
+        let lock_path = self.paths.machine_lock(name)?;
+        self.paths
+            .validate_owned_data_file(&lock_path, "machine lock", 0o600, false)?;
+        let lock = MachineLock::acquire(name, &lock_path, events)?;
+        let current = self.read_live_state_locked(name, &lock)?;
+        if !current.state.status.is_active() {
+            events.emit(Event::StepSkip {
+                id: "stop".into(),
+                reason: "not running".to_owned(),
+            })?;
+            return Ok(current.state);
+        }
+        stop_unsupervised(
+            &self.paths,
+            name,
+            current.state,
+            &lock,
+            timeout,
+            force,
+            events,
+        )
+    }
+
+    fn restart(
+        &self,
+        name: &str,
+        timeout: Duration,
+        events: &mut dyn EventSink,
+    ) -> Result<StartResult, FirestoneError> {
+        self.stop_machine(name, self.global.stop.timeout.get(), false, events)?;
+        self.start(name, true, timeout, events)
+    }
+
+    pub fn remove_confirmation_names(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<String>, FirestoneError> {
+        validate_remove_names(names)?;
+        let mut running = Vec::new();
+        for name in names {
+            self.validate_machine_storage()?;
+            let machine_dir = self.paths.machine_dir(name)?;
+            ensure_machine_exists(&self.paths, name, &machine_dir)?;
+            if self.read_live_state(name)?.state.status.is_active() {
+                running.push(name.clone());
+            }
+        }
+        Ok(running)
+    }
+
+    fn remove(
+        &self,
+        names: &[String],
+        force: bool,
+        events: &mut dyn EventSink,
+    ) -> Result<RemoveResult, FirestoneError> {
+        let running = self.remove_confirmation_names(names)?;
+        if !force && !running.is_empty() {
+            return Err(FirestoneError::new(
+                ErrorKind::Conflict,
+                format!(
+                    "running machine(s) require confirmation: {}",
+                    running.join(", ")
+                ),
+            )
+            .with_hint("retry with --force or --yes"));
+        }
+        for name in names {
+            let machine_dir = self.paths.validate_machine_data_directory(name)?;
+            self.paths.validate_owned_data_file(
+                &self.paths.machine_lock(name)?,
+                "machine lock",
+                0o600,
+                false,
+            )?;
+            validate_removal_tree(&self.paths, &machine_dir, "machine directory")?;
+        }
+
+        let mut removed = Vec::with_capacity(names.len());
+        for name in names {
+            let live = self.read_live_state(name)?;
+            if live.state.status.is_active() {
+                self.stop_machine(name, self.global.stop.timeout.get(), false, events)?;
+            }
+            self.remove_one(name, events)?;
+            removed.push(name.clone());
+        }
+        Ok(RemoveResult { removed })
+    }
+
+    fn remove_one(&self, name: &str, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
+        let machine_dir = self.paths.machine_dir(name)?;
+        let lock_path = self.paths.machine_lock(name)?;
+        self.paths
+            .validate_owned_data_file(&lock_path, "machine lock", 0o600, false)?;
+        let lock = MachineLock::acquire(name, &lock_path, events)?;
+        ensure_machine_exists(&self.paths, name, &machine_dir)?;
+        let live = self.read_live_state_locked(name, &lock)?;
+        if live.state.status.is_active() {
+            return Err(FirestoneError::new(
+                ErrorKind::Conflict,
+                format!("machine {name:?} became active during removal"),
+            )
+            .with_hint(format!("stop {name} and retry")));
+        }
+        self.paths.validate_machine_data_directory(name)?;
+        validate_removal_tree(&self.paths, &machine_dir, "machine directory")?;
+        match fs::symlink_metadata(self.paths.runtime_dir()) {
+            Ok(_) => self.paths.clear_machine_runtime_dir(name, true)?,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(filesystem_error(
+                    ErrorKind::Dependency,
+                    format!(
+                        "cannot inspect runtime directory {}",
+                        self.paths.runtime_dir().display()
+                    ),
+                    "check the Firestone runtime directory permissions",
+                    source,
+                ));
+            }
+        }
+
+        let tombstone = self.paths.machine_removal_dir(name)?;
+        match fs::symlink_metadata(&tombstone) {
+            Ok(_) => {
+                validate_removal_tree(&self.paths, &tombstone, "machine removal directory")?;
+                fs::remove_dir_all(&tombstone).map_err(|source| {
+                    filesystem_error(
+                        ErrorKind::Generic,
+                        format!("cannot clear stale removal {}", tombstone.display()),
+                        "remove the stale owned directory and retry",
+                        source,
+                    )
+                })?;
+                sync_directory(&self.paths.machines_dir())?;
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(filesystem_error(
+                    ErrorKind::Generic,
+                    format!("cannot inspect removal path {}", tombstone.display()),
+                    "check the machines directory permissions",
+                    source,
+                ));
+            }
+        }
+
+        fs::rename(&machine_dir, &tombstone).map_err(|source| {
+            filesystem_error(
+                ErrorKind::Generic,
+                format!("cannot unpublish machine {name:?}"),
+                "check the machines directory permissions",
+                source,
+            )
+        })?;
+        sync_directory(&self.paths.machines_dir())?;
+        drop(lock);
+        fs::remove_dir_all(&tombstone).map_err(|source| {
+            filesystem_error(
+                ErrorKind::Generic,
+                format!("cannot finish removing machine {name:?}"),
+                "remove the owned removal directory and retry",
+                source,
+            )
+        })?;
+        sync_directory(&self.paths.machines_dir())
+    }
+
+    pub fn image_remove_confirmation(&self, id: &str) -> Result<Vec<String>, FirestoneError> {
+        self.image_store()?.referencing_machines(id)
+    }
+
+    fn image_list(&self, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
+        emit_result(events, "images-ls", &self.image_store()?.list()?)
+    }
+
+    fn image_pull(
+        &self,
+        image: firestone_core::ImageRef,
+        sha256: Option<String>,
+        events: &mut dyn EventSink,
+    ) -> Result<(), FirestoneError> {
+        let mut request = ImagePullRequest::new(image, self.source_base.clone());
+        request.sha256 = sha256;
+        let pulled = self.image_store()?.pull(&request, events)?;
+        emit_result(events, "images-pull", &pulled)
+    }
+
+    fn image_inspect(&self, id: &str, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
+        emit_result(events, "images-inspect", &self.image_store()?.inspect(id)?)
+    }
+
+    fn image_remove(
+        &self,
+        id: &str,
+        force: bool,
+        events: &mut dyn EventSink,
+    ) -> Result<(), FirestoneError> {
+        let store = self.image_store()?;
+        if !force {
+            let referenced_by = store.referencing_machines(id)?;
+            if !referenced_by.is_empty() {
+                return Err(FirestoneError::new(
+                    ErrorKind::Conflict,
+                    format!(
+                        "image {id:?} is referenced by machine(s): {}",
+                        referenced_by.join(", ")
+                    ),
+                )
+                .with_hint("remove the machines first or retry with --force or --yes"));
+            }
+        }
+        emit_result(events, "images-rm", &store.remove(id, force)?)
+    }
+
+    fn image_prune(&self, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
+        emit_result(events, "images-prune", &self.image_store()?.prune()?)
+    }
+
+    fn show_vmconfig(&self, name: &str, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
+        self.validate_machine_storage()?;
+        let machine_dir = self.paths.machine_dir(name)?;
+        ensure_machine_exists(&self.paths, name, &machine_dir)?;
+        let path = self.paths.machine_vmconfig(name)?;
+        let mut file = open_owned_data_file(
+            &self.paths,
+            &path,
+            "machine VmConfig",
+            ErrorKind::NotFound,
+            Some(format!(
+                "start machine {name:?} before requesting --vmconfig"
+            )),
+        )?;
+        let mut bytes = Vec::new();
+        file.by_ref()
+            .take(MAX_VMCONFIG_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|source| {
+                filesystem_error(
+                    ErrorKind::Generic,
+                    format!("cannot read machine VmConfig {}", path.display()),
+                    "check the machine directory permissions",
+                    source,
+                )
+            })?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_VMCONFIG_BYTES {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "machine VmConfig {} exceeds the {MAX_VMCONFIG_BYTES} byte limit",
+                    path.display()
+                ),
+            )
+            .with_hint(format!(
+                "restart machine {name:?} to republish canonical VmConfig"
+            )));
+        }
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|source| {
+            FirestoneError::new(
+                ErrorKind::Dependency,
+                format!("persisted VmConfig {} is invalid JSON", path.display()),
+            )
+            .with_hint(format!(
+                "restart machine {name:?} to republish canonical VmConfig"
+            ))
+            .with_source(source)
+        })?;
+        let canonical = serde_json::to_vec(&value).map_err(|source| {
+            FirestoneError::new(ErrorKind::Generic, "cannot encode persisted VmConfig")
+                .with_source(source)
+        })?;
+        if canonical != bytes {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!("persisted VmConfig {} is not canonical", path.display()),
+            )
+            .with_hint(format!(
+                "restart machine {name:?} to republish canonical VmConfig"
+            )));
+        }
+        emit_result(events, "show-vmconfig", &value)
+    }
+
+    fn logs(
+        &self,
+        name: &str,
+        source: LogSource,
+        lines: u32,
+        follow: bool,
+        events: &mut dyn EventSink,
+    ) -> Result<(), FirestoneError> {
+        if !follow {
+            let cancelled = AtomicBool::new(false);
+            return self.logs_until(name, source, lines, false, &cancelled, events);
+        }
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal =
+            signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&cancelled))
+                .map_err(|source| {
+                    FirestoneError::new(
+                        ErrorKind::Generic,
+                        "cannot install log-follow interrupt handler",
+                    )
+                    .with_source(source)
+                })?;
+        let result = self.logs_until(name, source, lines, true, &cancelled, events);
+        signal_hook::low_level::unregister(signal);
+        result
+    }
+
+    fn logs_until(
+        &self,
+        name: &str,
+        source: LogSource,
+        lines: u32,
+        follow: bool,
+        cancelled: &AtomicBool,
+        events: &mut dyn EventSink,
+    ) -> Result<(), FirestoneError> {
+        if lines > MAX_LOG_LINES {
+            return Err(FirestoneError::new(
+                ErrorKind::Usage,
+                format!("log line count exceeds the {MAX_LOG_LINES} line limit"),
+            )
+            .with_hint(format!("pass -n {MAX_LOG_LINES} or fewer")));
+        }
+        self.validate_machine_storage()?;
+        let machine_dir = self.paths.machine_dir(name)?;
+        ensure_machine_exists(&self.paths, name, &machine_dir)?;
+        let path = self.log_path(name, source)?;
+        let mut file = open_owned_data_file(
+            &self.paths,
+            &path,
+            "machine log",
+            ErrorKind::NotFound,
+            Some(format!("start machine {name:?} or choose another --source")),
+        )?;
+        let (initial, emitted_lines, mut offset) = tail_log(&mut file, lines, &path)?;
+        if !initial.is_empty() {
+            events.emit(Event::Output {
+                data: String::from_utf8_lossy(&initial).into_owned(),
+            })?;
+        }
+        if !follow {
+            return emit_result(
+                events,
+                "logs",
+                &LogsResult {
+                    name: name.to_owned(),
+                    source,
+                    lines: emitted_lines,
+                    follow: false,
+                },
+            );
+        }
+
+        let mut identity = file.metadata().map_err(|source| {
+            filesystem_error(
+                ErrorKind::Generic,
+                format!("cannot inspect open log {}", path.display()),
+                "check the machine log permissions",
+                source,
+            )
+        })?;
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(FirestoneError::new(
+                    ErrorKind::Interrupted,
+                    format!("log follow for machine {name:?} was interrupted"),
+                ));
+            }
+
+            match fs::symlink_metadata(&path) {
+                Ok(metadata)
+                    if metadata.dev() != identity.dev() || metadata.ino() != identity.ino() =>
+                {
+                    file = open_owned_data_file(
+                        &self.paths,
+                        &path,
+                        "machine log",
+                        ErrorKind::NotFound,
+                        Some(format!("start machine {name:?} or choose another --source")),
+                    )?;
+                    identity = file.metadata().map_err(|source| {
+                        filesystem_error(
+                            ErrorKind::Generic,
+                            format!("cannot inspect reopened log {}", path.display()),
+                            "check the machine log permissions",
+                            source,
+                        )
+                    })?;
+                    offset = 0;
+                }
+                Ok(_) => {}
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    thread::sleep(LOG_FOLLOW_INTERVAL);
+                    continue;
+                }
+                Err(source) => {
+                    return Err(filesystem_error(
+                        ErrorKind::Generic,
+                        format!("cannot inspect followed log {}", path.display()),
+                        "check the machine log permissions",
+                        source,
+                    ));
+                }
+            }
+
+            let length = file
+                .metadata()
+                .map_err(|source| {
+                    filesystem_error(
+                        ErrorKind::Generic,
+                        format!("cannot inspect followed log {}", path.display()),
+                        "check the machine log permissions",
+                        source,
+                    )
+                })?
+                .len();
+            if length < offset {
+                offset = 0;
+            }
+            if length > offset {
+                file.seek(SeekFrom::Start(offset)).map_err(|source| {
+                    filesystem_error(
+                        ErrorKind::Generic,
+                        format!("cannot seek followed log {}", path.display()),
+                        "check the machine log permissions",
+                        source,
+                    )
+                })?;
+                let count = (length - offset).min(LOG_FOLLOW_CHUNK_BYTES);
+                let capacity = usize::try_from(count).map_err(|_| {
+                    FirestoneError::new(ErrorKind::Generic, "log chunk length overflowed usize")
+                })?;
+                let mut chunk = Vec::with_capacity(capacity);
+                file.by_ref()
+                    .take(count)
+                    .read_to_end(&mut chunk)
+                    .map_err(|source| {
+                        filesystem_error(
+                            ErrorKind::Generic,
+                            format!("cannot read followed log {}", path.display()),
+                            "check the machine log permissions",
+                            source,
+                        )
+                    })?;
+                offset = offset.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+                if !chunk.is_empty() {
+                    events.emit(Event::Output {
+                        data: String::from_utf8_lossy(&chunk).into_owned(),
+                    })?;
+                }
+            }
+            thread::sleep(LOG_FOLLOW_INTERVAL);
+        }
+    }
+
+    fn log_path(&self, name: &str, source: LogSource) -> Result<PathBuf, FirestoneError> {
+        match source {
+            LogSource::Console => self.paths.machine_console_log(name),
+            LogSource::Vmm => self.paths.machine_vmm_log(name),
+            LogSource::Shim => self.paths.machine_shim_log(name),
+            LogSource::Passt => self.paths.machine_passt_log(name),
+            LogSource::Virtiofsd(index) => {
+                self.paths.machine_virtiofsd_log(name, usize::from(index))
+            }
+        }
+    }
 }
 
 impl Dispatcher for LocalDispatcher {
@@ -584,20 +1273,303 @@ impl Dispatcher for LocalDispatcher {
         Box::pin(async move {
             match action {
                 Action::Create { name, spec } => self.create(&name, spec, events),
+                Action::Start {
+                    name,
+                    wait,
+                    timeout,
+                } => {
+                    let result = self.start(&name, wait, timeout, events)?;
+                    emit_result(events, "start", &result)
+                }
+                Action::Stop {
+                    name,
+                    timeout,
+                    force,
+                } => {
+                    let result = self.stop(&name, timeout, force, events)?;
+                    emit_result(events, "stop", &result)
+                }
+                Action::Restart { name, timeout } => {
+                    let result = self.restart(&name, timeout, events)?;
+                    emit_result(events, "restart", &result)
+                }
+                Action::Remove { names, force } => {
+                    let result = self.remove(&names, force, events)?;
+                    emit_result(events, "rm", &result)
+                }
                 Action::List => self.list(events),
-                Action::Show { name } => self.show(&name, events),
+                Action::Show { name, vmconfig } => {
+                    if vmconfig {
+                        self.show_vmconfig(&name, events)
+                    } else {
+                        self.show(&name, events)
+                    }
+                }
                 Action::SetSpec { name, spec } => self.set_spec(&name, spec, events),
+                Action::Logs {
+                    name,
+                    source,
+                    lines,
+                    follow,
+                } => self.logs(&name, source, lines, follow, events),
+                Action::ImageList => self.image_list(events),
+                Action::ImagePull { r#ref, sha256 } => self.image_pull(r#ref, sha256, events),
+                Action::ImageRemove { id, force } => self.image_remove(&id, force, events),
+                Action::ImageInspect { id } => self.image_inspect(&id, events),
+                Action::ImagePrune => self.image_prune(events),
                 Action::Doctor { fix } => self.doctor(fix, events),
-                _ => Err(FirestoneError::new(
+                Action::PatchSpec { .. } | Action::Version => Err(FirestoneError::new(
                     ErrorKind::Usage,
-                    "this action is not implemented in the M0 CLI",
+                    "this action is not implemented by the M1 local dispatcher",
                 )
-                .with_hint("use create, ls, show, edit, or doctor")),
+                .with_hint("use a supported lifecycle, image, machine, or doctor action")),
             }
         })
     }
 }
 
+fn ensure_startable(name: &str, state: &MachineState) -> Result<(), FirestoneError> {
+    match state.status {
+        MachineStatus::Created | MachineStatus::Stopped | MachineStatus::Failed => Ok(()),
+        MachineStatus::Starting | MachineStatus::Running | MachineStatus::Stopping => {
+            Err(FirestoneError::new(
+                ErrorKind::AlreadyRunning,
+                format!("machine {name:?} is already active"),
+            )
+            .with_hint(format!(
+                "use firestone stop {name} before starting it again"
+            )))
+        }
+    }
+}
+
+fn elapsed_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn validate_remove_names(names: &[String]) -> Result<(), FirestoneError> {
+    if names.is_empty() {
+        return Err(FirestoneError::new(
+            ErrorKind::Usage,
+            "rm requires at least one machine name",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for name in names {
+        if !seen.insert(name) {
+            return Err(FirestoneError::new(
+                ErrorKind::Usage,
+                format!("machine {name:?} is repeated in rm arguments"),
+            )
+            .with_hint("list each machine once"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_removal_tree(paths: &Paths, root: &Path, label: &str) -> Result<(), FirestoneError> {
+    paths.validate_owned_data_directory(root, label, false)?;
+    validate_removal_entry(paths, root)
+}
+
+fn validate_removal_entry(paths: &Paths, path: &Path) -> Result<(), FirestoneError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| {
+        filesystem_error(
+            ErrorKind::Dependency,
+            format!("cannot inspect removal entry {}", path.display()),
+            "repair the owned machine directory before removing it",
+            source,
+        )
+    })?;
+    if metadata.uid() != paths.uid() {
+        return Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!(
+                "refusing to remove {} because uid {} does not match Firestone uid {}",
+                path.display(),
+                metadata.uid(),
+                paths.uid()
+            ),
+        )
+        .with_hint("move the unsafe machine directory aside and inspect it manually"));
+    }
+    if metadata.file_type().is_symlink() {
+        return Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!("refusing to remove symlink {}", path.display()),
+        )
+        .with_hint("remove the symlink manually and retry"));
+    }
+    if metadata.is_dir() {
+        if metadata.mode() & 0o7777 != 0o700 {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "refusing to remove directory {} with mode {:04o}; expected 0700",
+                    path.display(),
+                    metadata.mode() & 0o7777
+                ),
+            )
+            .with_hint("restore the owned directory mode to 0700 and retry"));
+        }
+        let mut entries = fs::read_dir(path)
+            .map_err(|source| {
+                filesystem_error(
+                    ErrorKind::Dependency,
+                    format!("cannot read removal directory {}", path.display()),
+                    "repair the owned machine directory before removing it",
+                    source,
+                )
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| {
+                filesystem_error(
+                    ErrorKind::Dependency,
+                    format!("cannot read removal directory {}", path.display()),
+                    "repair the owned machine directory before removing it",
+                    source,
+                )
+            })?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            validate_removal_entry(paths, &entry.path())?;
+        }
+        return Ok(());
+    }
+    if !metadata.is_file() {
+        return Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!("refusing to remove special file {}", path.display()),
+        )
+        .with_hint("remove the special file manually and retry"));
+    }
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<(), FirestoneError> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| {
+            filesystem_error(
+                ErrorKind::Generic,
+                format!("cannot sync directory {}", path.display()),
+                "check the Firestone data directory permissions",
+                source,
+            )
+        })
+}
+
+fn open_owned_data_file(
+    paths: &Paths,
+    path: &Path,
+    label: &str,
+    missing_kind: ErrorKind,
+    missing_hint: Option<String>,
+) -> Result<File, FirestoneError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|source| {
+            let mut error = FirestoneError::new(
+                if source.kind() == std::io::ErrorKind::NotFound {
+                    missing_kind
+                } else {
+                    ErrorKind::Dependency
+                },
+                format!("cannot open {label} {}", path.display()),
+            )
+            .with_source(source);
+            if let Some(hint) = &missing_hint {
+                error = error.with_hint(hint.clone());
+            }
+            error
+        })?;
+    paths.validate_owned_data_file_handle(path, label, 0o600, &file)?;
+    Ok(file)
+}
+
+fn tail_log(
+    file: &mut File,
+    lines: u32,
+    path: &Path,
+) -> Result<(Vec<u8>, u32, u64), FirestoneError> {
+    let end = file
+        .metadata()
+        .map_err(|source| {
+            filesystem_error(
+                ErrorKind::Generic,
+                format!("cannot inspect machine log {}", path.display()),
+                "check the machine log permissions",
+                source,
+            )
+        })?
+        .len();
+    if lines == 0 || end == 0 {
+        return Ok((Vec::new(), 0, end));
+    }
+    let window_start = end.saturating_sub(MAX_LOG_TAIL_BYTES);
+    let window_len = end - window_start;
+    file.seek(SeekFrom::Start(window_start)).map_err(|source| {
+        filesystem_error(
+            ErrorKind::Generic,
+            format!("cannot seek machine log {}", path.display()),
+            "check the machine log permissions",
+            source,
+        )
+    })?;
+    let capacity = usize::try_from(window_len)
+        .map_err(|_| FirestoneError::new(ErrorKind::Generic, "log tail length overflowed usize"))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.by_ref()
+        .take(window_len)
+        .read_to_end(&mut bytes)
+        .map_err(|source| {
+            filesystem_error(
+                ErrorKind::Generic,
+                format!("cannot read machine log {}", path.display()),
+                "check the machine log permissions",
+                source,
+            )
+        })?;
+
+    let mut cursor = bytes.len();
+    if bytes.last() == Some(&b'\n') {
+        cursor = cursor.saturating_sub(1);
+    }
+    let mut separators = 0_u32;
+    let mut start = 0_usize;
+    while cursor > 0 {
+        cursor -= 1;
+        if bytes[cursor] == b'\n' {
+            separators = separators.saturating_add(1);
+            if separators == lines {
+                start = cursor + 1;
+                break;
+            }
+        }
+    }
+    if separators < lines && window_start != 0 {
+        return Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!(
+                "requested log tail in {} exceeds the {MAX_LOG_TAIL_BYTES} byte scan limit",
+                path.display()
+            ),
+        )
+        .with_hint("request fewer lines or inspect the owned log file directly"));
+    }
+    let selected = bytes.split_off(start);
+    let logical_lines = if selected.is_empty() {
+        0
+    } else {
+        let newlines = selected.iter().filter(|byte| **byte == b'\n').count();
+        let trailing = usize::from(selected.last() != Some(&b'\n'));
+        u32::try_from(newlines.saturating_add(trailing))
+            .map_err(|_| FirestoneError::new(ErrorKind::Generic, "log line count overflowed u32"))?
+    };
+    Ok((selected, logical_lines, end))
+}
 fn parse_editor_command(value: OsString) -> Result<(String, Vec<String>), FirestoneError> {
     let value = value.into_string().map_err(|_| {
         FirestoneError::new(ErrorKind::Dependency, "VISUAL or EDITOR is not valid UTF-8")
@@ -967,20 +1939,24 @@ mod tests {
     use std::{
         fs,
         os::unix::fs::{MetadataExt, PermissionsExt, symlink},
-        sync::mpsc,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use firestone_core::{
         Action, Catalog, Dispatcher, ErrorKind, Event, EventSink, FirestoneError, GlobalConfig,
-        MachineLock, MachineSpec, MachineSpecPatch, MachineStatus, PathInputs, Paths,
-        RealValidationHost, StateStore, Supervision, ValidationContext,
+        ImageRef, LogSource, MachineLock, MachineSpec, MachineSpecPatch, MachineStatus, PathInputs,
+        Paths, RealValidationHost, StateStore, Supervision, ValidationContext,
     };
 
     use super::{
-        LocalDispatcher, display_forward, display_status, format_uptime_seconds,
-        parse_editor_command,
+        LocalDispatcher, MAX_LOG_TAIL_BYTES, display_forward, display_status,
+        format_uptime_seconds, parse_editor_command,
     };
     struct WaitingSink(mpsc::Sender<()>);
 
@@ -1019,6 +1995,518 @@ mod tests {
         let dispatcher =
             LocalDispatcher::new(paths.clone(), GlobalConfig::default(), Catalog::built_in()?);
         Ok((directory, dispatcher, paths))
+    }
+
+    async fn create_machine(
+        dispatcher: &LocalDispatcher,
+        name: &str,
+        spec: MachineSpec,
+    ) -> Result<(), FirestoneError> {
+        let mut events = Vec::new();
+        dispatcher
+            .run(
+                Action::Create {
+                    name: name.to_owned(),
+                    spec,
+                },
+                &mut events,
+            )
+            .await
+    }
+
+    fn write_owned(path: &std::path::Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+        fs::write(path, bytes)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+    }
+
+    fn fake_qemu(root: &std::path::Path) -> Result<std::path::PathBuf, std::io::Error> {
+        let program = root.join("fake-qemu-img");
+        fs::write(
+            &program,
+            br#"#!/bin/sh
+case "$1" in
+  info)
+    printf '%s\n' '{"format":"qcow2","virtual-size":1048576,"dirty-flag":false,"format-specific":{"type":"qcow2","data":{"corrupt":false}}}'
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+"#,
+        )?;
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700))?;
+        Ok(program)
+    }
+
+    #[tokio::test]
+    async fn stop_created_machine_emits_skip_and_one_result()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        create_machine(&dispatcher, "created-stop", MachineSpec::default()).await?;
+        let mut events = Vec::new();
+
+        dispatcher
+            .run(
+                Action::Stop {
+                    name: "created-stop".to_owned(),
+                    timeout: Duration::from_secs(1),
+                    force: false,
+                },
+                &mut events,
+            )
+            .await?;
+
+        assert!(matches!(
+            events.first(),
+            Some(Event::StepSkip { id, reason }) if id.as_str() == "stop" && reason == "not running"
+        ));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::Result { action, .. } if action == "stop"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            StateStore::new(paths.machine_state("created-stop")?)
+                .read()?
+                .status,
+            MachineStatus::Created
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn start_deferred_network_scope_fails_before_side_effects()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (directory, dispatcher, paths) = fixture()?;
+        let program = fake_qemu(directory.path())?;
+        let dispatcher = dispatcher.with_programs(program.clone(), program);
+        create_machine(&dispatcher, "deferred-net", MachineSpec::default()).await?;
+        let mut events = Vec::new();
+
+        let error = dispatcher
+            .run(
+                Action::Start {
+                    name: "deferred-net".to_owned(),
+                    wait: true,
+                    timeout: Duration::from_secs(1),
+                },
+                &mut events,
+            )
+            .await
+            .err()
+            .ok_or("start unexpectedly accepted M3 networking")?;
+
+        assert_eq!(error.kind(), ErrorKind::InvalidSpec);
+        assert_eq!(
+            error.hint(),
+            Some("set network.mode to none until M3 networking is available")
+        );
+        assert_eq!(
+            StateStore::new(paths.machine_state("deferred-net")?)
+                .read()?
+                .status,
+            MachineStatus::Created
+        );
+        assert!(!paths.machine_vmconfig("deferred-net")?.exists());
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Result { .. }))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn show_vmconfig_missing_then_canonical_returns_exact_object()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        create_machine(&dispatcher, "vmconfig", MachineSpec::default()).await?;
+        let mut events = Vec::new();
+        let action = Action::Show {
+            name: "vmconfig".to_owned(),
+            vmconfig: true,
+        };
+
+        let missing = dispatcher
+            .run(action.clone(), &mut events)
+            .await
+            .err()
+            .ok_or("missing VmConfig unexpectedly succeeded")?;
+        assert_eq!(missing.kind(), ErrorKind::NotFound);
+        assert!(
+            missing
+                .hint()
+                .is_some_and(|hint| hint.contains("start machine"))
+        );
+
+        let exact = br#"{"a":1,"nested":{"b":2}}"#;
+        write_owned(&paths.machine_vmconfig("vmconfig")?, exact)?;
+        events.clear();
+        dispatcher.run(action, &mut events).await?;
+        let payload = events
+            .iter()
+            .find_map(|event| match event {
+                Event::Result { action, payload } if action == "show-vmconfig" => Some(payload),
+                _ => None,
+            })
+            .ok_or("missing show-vmconfig result")?;
+        assert_eq!(serde_json::to_vec(payload)?, exact);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn show_vmconfig_symlink_and_mode_are_refused() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (directory, dispatcher, paths) = fixture()?;
+        create_machine(&dispatcher, "unsafe-vmconfig", MachineSpec::default()).await?;
+        let target = directory.path().join("outside.json");
+        write_owned(&target, br#"{}"#)?;
+        let vmconfig = paths.machine_vmconfig("unsafe-vmconfig")?;
+        symlink(&target, &vmconfig)?;
+        let action = Action::Show {
+            name: "unsafe-vmconfig".to_owned(),
+            vmconfig: true,
+        };
+        let mut events = Vec::new();
+
+        let symlink_error = dispatcher
+            .run(action.clone(), &mut events)
+            .await
+            .err()
+            .ok_or("VmConfig symlink unexpectedly succeeded")?;
+        assert_eq!(symlink_error.kind(), ErrorKind::Dependency);
+        fs::remove_file(&vmconfig)?;
+        write_owned(&vmconfig, br#"{}"#)?;
+        fs::set_permissions(&vmconfig, fs::Permissions::from_mode(0o644))?;
+        let mode_error = dispatcher
+            .run(action, &mut events)
+            .await
+            .err()
+            .ok_or("permissive VmConfig unexpectedly succeeded")?;
+        assert_eq!(mode_error.kind(), ErrorKind::Dependency);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logs_tail_returns_last_lines_and_one_result() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_directory, dispatcher, paths) = fixture()?;
+        create_machine(&dispatcher, "logs", MachineSpec::default()).await?;
+        write_owned(
+            &paths.machine_console_log("logs")?,
+            b"one\ntwo\nthree\nfour\n",
+        )?;
+        let mut events = Vec::new();
+
+        dispatcher
+            .run(
+                Action::Logs {
+                    name: "logs".to_owned(),
+                    source: LogSource::Console,
+                    lines: 2,
+                    follow: false,
+                },
+                &mut events,
+            )
+            .await?;
+
+        assert!(matches!(
+            events.first(),
+            Some(Event::Output { data }) if data == "three\nfour\n"
+        ));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::Result { action, .. } if action == "logs"))
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logs_follow_cancellation_is_bounded_without_result()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        create_machine(&dispatcher, "follow", MachineSpec::default()).await?;
+        write_owned(&paths.machine_console_log("follow")?, b"ready\n")?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let setter = Arc::clone(&cancelled);
+        let thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(120));
+            setter.store(true, Ordering::Relaxed);
+        });
+        let mut events = Vec::new();
+        let started = Instant::now();
+
+        let error = dispatcher
+            .logs_until(
+                "follow",
+                LogSource::Console,
+                1,
+                true,
+                &cancelled,
+                &mut events,
+            )
+            .err()
+            .ok_or("follow did not cancel")?;
+        thread.join().map_err(|_| "cancellation thread panicked")?;
+
+        assert_eq!(error.kind(), ErrorKind::Interrupted);
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Result { .. }))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logs_symlink_and_permissive_mode_are_refused() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (directory, dispatcher, paths) = fixture()?;
+        create_machine(&dispatcher, "unsafe-log", MachineSpec::default()).await?;
+        let target = directory.path().join("outside.log");
+        write_owned(&target, b"outside\n")?;
+        let log = paths.machine_console_log("unsafe-log")?;
+        symlink(&target, &log)?;
+        let action = Action::Logs {
+            name: "unsafe-log".to_owned(),
+            source: LogSource::Console,
+            lines: 1,
+            follow: false,
+        };
+        let mut events = Vec::new();
+
+        let symlink_error = dispatcher
+            .run(action.clone(), &mut events)
+            .await
+            .err()
+            .ok_or("log symlink unexpectedly succeeded")?;
+        assert_eq!(symlink_error.kind(), ErrorKind::Dependency);
+        fs::remove_file(&log)?;
+        write_owned(&log, b"owned\n")?;
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o666))?;
+        let mode_error = dispatcher
+            .run(action, &mut events)
+            .await
+            .err()
+            .ok_or("permissive log unexpectedly succeeded")?;
+        assert_eq!(mode_error.kind(), ErrorKind::Dependency);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logs_single_line_beyond_scan_bound_is_refused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        create_machine(&dispatcher, "bounded-log", MachineSpec::default()).await?;
+        let length = usize::try_from(MAX_LOG_TAIL_BYTES)?.saturating_add(1);
+        write_owned(
+            &paths.machine_console_log("bounded-log")?,
+            &vec![b'x'; length],
+        )?;
+        let mut events = Vec::new();
+
+        let error = dispatcher
+            .run(
+                Action::Logs {
+                    name: "bounded-log".to_owned(),
+                    source: LogSource::Console,
+                    lines: 1,
+                    follow: false,
+                },
+                &mut events,
+            )
+            .await
+            .err()
+            .ok_or("oversized log line unexpectedly succeeded")?;
+
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert!(error.message().contains("scan limit"));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Result { .. }))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rm_duplicate_and_symlink_refuse_without_partial_deletion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (directory, dispatcher, paths) = fixture()?;
+        create_machine(&dispatcher, "one", MachineSpec::default()).await?;
+        create_machine(&dispatcher, "two", MachineSpec::default()).await?;
+        let mut events = Vec::new();
+        let duplicate = dispatcher
+            .run(
+                Action::Remove {
+                    names: vec!["one".to_owned(), "one".to_owned()],
+                    force: false,
+                },
+                &mut events,
+            )
+            .await
+            .err()
+            .ok_or("duplicate rm unexpectedly succeeded")?;
+        assert_eq!(duplicate.kind(), ErrorKind::Usage);
+        assert!(paths.machine_dir("one")?.exists());
+        assert!(paths.machine_dir("two")?.exists());
+
+        let outside = directory.path().join("outside");
+        fs::create_dir(&outside)?;
+        symlink(&outside, paths.machine_dir("two")?.join("redirect"))?;
+        let unsafe_error = dispatcher
+            .run(
+                Action::Remove {
+                    names: vec!["one".to_owned(), "two".to_owned()],
+                    force: false,
+                },
+                &mut events,
+            )
+            .await
+            .err()
+            .ok_or("rm with symlink unexpectedly succeeded")?;
+        assert_eq!(unsafe_error.kind(), ErrorKind::Dependency);
+        assert!(paths.machine_dir("one")?.exists());
+        assert!(paths.machine_dir("two")?.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rm_stopped_machines_removes_publications_but_preserves_images()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        create_machine(&dispatcher, "one", MachineSpec::default()).await?;
+        create_machine(&dispatcher, "two", MachineSpec::default()).await?;
+        paths.ensure_owned_data_directory(&paths.images_dir(), "images directory", false)?;
+        let shared = paths.images_dir().join("shared-sentinel");
+        write_owned(&shared, b"shared")?;
+        let mut events = Vec::new();
+
+        dispatcher
+            .run(
+                Action::Remove {
+                    names: vec!["one".to_owned(), "two".to_owned()],
+                    force: false,
+                },
+                &mut events,
+            )
+            .await?;
+
+        assert!(!paths.machine_dir("one")?.exists());
+        assert!(!paths.machine_dir("two")?.exists());
+        assert!(shared.exists());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::Result { action, .. } if action == "rm"))
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn images_actions_pull_list_inspect_reference_and_remove()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (directory, dispatcher, paths) = fixture()?;
+        let qemu = fake_qemu(directory.path())?;
+        let dispatcher = dispatcher
+            .with_programs(qemu.clone(), qemu)
+            .with_source_base(directory.path().to_path_buf());
+        let source = directory.path().join("base.qcow2");
+        write_owned(&source, b"QFI\xfbowned-image")?;
+        let mut events = Vec::new();
+
+        dispatcher.image_pull(
+            ImageRef::from(source.to_string_lossy().into_owned()),
+            None,
+            &mut events,
+        )?;
+        let pull = events
+            .iter()
+            .find_map(|event| match event {
+                Event::Result { action, payload } if action == "images-pull" => Some(payload),
+                _ => None,
+            })
+            .ok_or("missing image pull result")?;
+        let id = pull
+            .pointer("/metadata/id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("missing image id")?
+            .to_owned();
+        let source_sha = pull
+            .pointer("/metadata/source_sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("missing source sha")?
+            .to_owned();
+
+        events.clear();
+        dispatcher.image_list(&mut events)?;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Result { action, payload }
+                if action == "images-ls" && payload.as_array().is_some_and(|images| images.len() == 1)
+        )));
+        events.clear();
+        dispatcher.image_inspect(&id, &mut events)?;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Result { action, payload }
+                if action == "images-inspect" && payload["image"]["metadata"]["id"] == id
+        )));
+
+        dispatcher.create("image-user", MachineSpec::default(), &mut events)?;
+        let state_path = paths.machine_state("image-user")?;
+        let mut state = StateStore::new(state_path.clone()).read()?;
+        state.image.id = Some(id.clone());
+        state.image.sha256 = Some(source_sha);
+        StateStore::new(state_path).write_from_shim(&state)?;
+        let referenced = dispatcher
+            .image_remove(&id, false, &mut events)
+            .err()
+            .ok_or("referenced image unexpectedly removed")?;
+        assert_eq!(referenced.kind(), ErrorKind::Conflict);
+        dispatcher.image_remove(&id, true, &mut events)?;
+        Ok(())
+    }
+
+    #[test]
+    fn images_pull_sha256_on_local_file_returns_usage() -> Result<(), Box<dyn std::error::Error>> {
+        let (directory, dispatcher, _paths) = fixture()?;
+        let qemu = fake_qemu(directory.path())?;
+        let dispatcher = dispatcher
+            .with_programs(qemu.clone(), qemu)
+            .with_source_base(directory.path().to_path_buf());
+        let source = directory.path().join("base.qcow2");
+        write_owned(&source, b"QFI\xfbowned-image")?;
+        let mut events = Vec::new();
+
+        let error = dispatcher
+            .image_pull(
+                ImageRef::from(source.to_string_lossy().into_owned()),
+                Some("a".repeat(64)),
+                &mut events,
+            )
+            .err()
+            .ok_or("local --sha256 unexpectedly succeeded")?;
+        assert_eq!(error.kind(), ErrorKind::Usage);
+        assert_eq!(
+            error.hint(),
+            Some("remove --sha256 when pulling a local file")
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Result { .. }))
+        );
+        Ok(())
     }
 
     #[test]
@@ -1148,6 +2636,7 @@ mod tests {
             .run(
                 Action::Show {
                     name: "local-pin".to_owned(),
+                    vmconfig: false,
                 },
                 &mut events,
             )
@@ -1205,6 +2694,7 @@ mod tests {
             .run(
                 Action::Show {
                     name: "retired".to_owned(),
+                    vmconfig: false,
                 },
                 &mut events,
             )
@@ -1611,6 +3101,7 @@ mod tests {
             Action::List,
             Action::Show {
                 name: "redirected".to_owned(),
+                vmconfig: false,
             },
             Action::SetSpec {
                 name: "redirected".to_owned(),
@@ -1658,6 +3149,7 @@ mod tests {
             .run(
                 Action::Show {
                     name: "linked".to_owned(),
+                    vmconfig: false,
                 },
                 &mut events,
             )

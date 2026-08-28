@@ -21,7 +21,7 @@ pub mod state;
 pub mod vmm;
 pub mod vmm_api;
 
-pub use action::Action;
+pub use action::{Action, LogSource, ParseLogSourceError};
 pub use catalog::{
     Catalog, CatalogArchSource, CatalogChecksum, CatalogEntry, CatalogFirmware, ChecksumAlgorithm,
     ImageFormat, ResolvedCatalogEntry,
@@ -43,7 +43,10 @@ pub use image::{
 };
 pub use lock::MachineLock;
 pub use paths::{PathInputs, Paths};
-pub use result::{MachineRecord, MachineSummary, MachineView, SpecResult, SpecWarningPayload};
+pub use result::{
+    LogsResult, MachineRecord, MachineSummary, MachineView, RemoveResult, SpecResult,
+    SpecWarningPayload, StartResult, StopResult,
+};
 pub use shim::{
     PreparedStart, ShimClient, ShimPids, ShimStatus, ShimTimeouts, launch_prepared, prepare_start,
     recover_shim, run_shim, stop_unsupervised, validate_m1_start_scope,
