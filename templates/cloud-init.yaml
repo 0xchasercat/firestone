@@ -55,4 +55,5 @@ mounts:
 runcmd:
   - systemctl daemon-reload
   - systemctl enable --now firestone-sshd.socket
-  - systemctl enable --now serial-getty@hvc0.service
+  - systemctl enable serial-getty@hvc0.service
+  - systemctl restart serial-getty@hvc0.service
