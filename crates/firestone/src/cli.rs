@@ -4,6 +4,7 @@ use clap::{ArgAction, Args, Parser, Subcommand, error::ErrorKind};
 use firestone_core::{
     Arch, ByteSize, CloudInitSpecPatch, Firmware, HumanDuration, ImageRef, LogSource, MacAddr,
     MachineSpecPatch, MountSpec, NetMode, NetworkSpecPatch, PortForward, SpecClear, VmmSpecPatch,
+    VsockPort,
 };
 
 /// Firestone's command-line interface.
@@ -80,6 +81,10 @@ pub enum Command {
 
     /// Check host requirements and optional safe repairs.
     Doctor(DoctorArgs),
+
+    /// Relay one SSH ProxyCommand connection through the machine's vsock socket.
+    #[command(name = "_vsock-proxy", hide = true)]
+    VsockProxy(VsockProxyArgs),
 }
 
 /// Arguments accepted by firestone start.
@@ -94,6 +99,13 @@ pub struct StartArgs {
     /// Override the configured start deadline.
     #[arg(long, value_name = "DURATION")]
     pub timeout: Option<HumanDuration>,
+}
+
+/// Arguments accepted by the hidden Cloud Hypervisor vsock proxy.
+#[derive(Debug, Args)]
+pub struct VsockProxyArgs {
+    pub name: String,
+    pub port: VsockPort,
 }
 
 /// Arguments accepted by firestone stop.

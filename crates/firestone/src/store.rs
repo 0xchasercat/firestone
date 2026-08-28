@@ -2388,6 +2388,7 @@ esac
         let (_directory, dispatcher, paths) = fixture()?;
         create_machine(&dispatcher, "one", MachineSpec::default()).await?;
         create_machine(&dispatcher, "two", MachineSpec::default()).await?;
+        write_owned(&paths.machine_known_hosts("one")?, b"trusted-host-key")?;
         paths.ensure_owned_data_directory(&paths.images_dir(), "images directory", false)?;
         let shared = paths.images_dir().join("shared-sentinel");
         write_owned(&shared, b"shared")?;

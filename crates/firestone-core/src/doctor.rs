@@ -952,32 +952,40 @@ fn check_ssh_key(context: &DoctorContext) -> DoctorCheck {
     let private = fs::symlink_metadata(&private_path);
     let public = fs::symlink_metadata(&public_path);
     match (private, public) {
-        (Ok(private), Ok(public)) if private.is_file() && public.is_file() => {
-            let mode = private.permissions().mode() & 0o777;
-            if mode == 0o600 {
+        (Ok(private), Ok(public))
+            if private.is_file()
+                && !private.file_type().is_symlink()
+                && public.is_file()
+                && !public.file_type().is_symlink() =>
+        {
+            let private_mode = private.permissions().mode() & 0o7777;
+            let public_mode = public.permissions().mode() & 0o7777;
+            if private.uid() == context.paths.uid()
+                && public.uid() == context.paths.uid()
+                && private_mode == 0o600
+                && public_mode == 0o644
+            {
                 DoctorCheck::new(
                     DoctorCheckId::SshKey,
                     DoctorStatus::Ok,
                     format!(
-                        "Firestone SSH key is present at {} with mode 0600",
+                        "Firestone SSH key is present at {} with private mode 0600 and public mode 0644",
                         private_path.display()
                     ),
                 )
             } else {
-                let check = DoctorCheck::new(
+                DoctorCheck::new(
                     DoctorCheckId::SshKey,
                     DoctorStatus::Fail,
                     format!(
-                        "Firestone SSH private key {} has mode {mode:04o}",
-                        private_path.display()
+                        "Firestone SSH key pair is insecure: private uid {} mode {private_mode:04o}; public uid {} mode {public_mode:04o}",
+                        private.uid(),
+                        public.uid()
                     ),
-                );
-                match shell_quote(&private_path) {
-                    Some(path) => check.with_fix(format!("chmod 600 -- {path}")),
-                    None => check.with_hint(
-                        "set mode 0600 with a filesystem tool that preserves non-UTF-8 paths",
-                    ),
-                }
+                )
+                .with_hint(
+                    "use current-user regular files with private mode 0600 and public mode 0644",
+                )
             }
         }
         (Err(private_error), Err(public_error))
@@ -994,7 +1002,7 @@ fn check_ssh_key(context: &DoctorContext) -> DoctorCheck {
         _ => DoctorCheck::new(
             DoctorCheckId::SshKey,
             DoctorStatus::Fail,
-            "Firestone SSH key pair is incomplete or unreadable",
+            "Firestone SSH key pair is incomplete, symlinked, or unreadable",
         )
         .with_hint(format!(
             "move the incomplete key pair out of {} and run `firestone doctor --fix`",
@@ -1581,148 +1589,8 @@ fn generate_ssh_key(context: &DoctorContext) -> Result<(), FirestoneError> {
         )
         .with_hint("install the OpenSSH client package")
     })?;
-    let private_key = context.paths.ssh_private_key();
-    let public_key = context.paths.ssh_public_key();
-    let key_dir = private_key.parent().ok_or_else(|| {
-        FirestoneError::new(
-            ErrorKind::Dependency,
-            format!(
-                "Firestone SSH key path {} has no parent",
-                private_key.display()
-            ),
-        )
-        .with_hint("choose a Firestone data directory with a key parent directory")
-    })?;
-    let temporary = TempBuilder::new()
-        .prefix(".ssh-key.")
-        .tempdir_in(key_dir)
-        .map_err(|source| {
-            FirestoneError::new(
-                ErrorKind::Dependency,
-                format!(
-                    "cannot create temporary SSH key directory in {}",
-                    key_dir.display()
-                ),
-            )
-            .with_hint("check directory permissions and retry 'firestone doctor --fix'")
-            .with_source(source)
-        })?;
-    let temporary_private = temporary.path().join("id_ed25519");
-    let temporary_public = temporary.path().join("id_ed25519.pub");
-
-    Cmd::new(keygen)
-        .args([OsStr::new("-t"), OsStr::new("ed25519"), OsStr::new("-N")])
-        .secret_arg(OsString::new())
-        .args([
-            OsStr::new("-C"),
-            OsStr::new(&format!("firestone@{}", context.hostname)),
-            OsStr::new("-f"),
-            temporary_private.as_os_str(),
-        ])
-        .stdin_null()
-        .timeout(Duration::from_secs(30))
-        .error_kind(ErrorKind::Dependency)
-        .run()?;
-
-    for (kind, path) in [
-        ("private", temporary_private.as_path()),
-        ("public", temporary_public.as_path()),
-    ] {
-        let metadata = fs::symlink_metadata(path).map_err(|source| {
-            FirestoneError::new(
-                ErrorKind::Dependency,
-                format!("generated SSH {kind} key {} is unavailable", path.display()),
-            )
-            .with_source(source)
-        })?;
-        if !metadata.is_file() {
-            return Err(FirestoneError::new(
-                ErrorKind::Dependency,
-                format!(
-                    "generated SSH {kind} key {} is not a regular file",
-                    path.display()
-                ),
-            ));
-        }
-    }
-    fs::set_permissions(&temporary_private, fs::Permissions::from_mode(0o600)).map_err(
-        |source| {
-            FirestoneError::new(
-                ErrorKind::Dependency,
-                format!("cannot set mode 0600 on {}", temporary_private.display()),
-            )
-            .with_source(source)
-        },
-    )?;
-
-    fs::hard_link(&temporary_private, &private_key).map_err(|source| {
-        FirestoneError::new(
-            ErrorKind::Dependency,
-            format!(
-                "cannot install Firestone SSH private key at {}",
-                private_key.display()
-            ),
-        )
-        .with_hint("move any existing key pair aside and retry 'firestone doctor --fix'")
-        .with_source(source)
-    })?;
-    if let Err(source) = fs::hard_link(&temporary_public, &public_key) {
-        let cleanup = remove_generated_key(&private_key).err();
-        let mut error = FirestoneError::new(
-            ErrorKind::Dependency,
-            format!(
-                "cannot install Firestone SSH public key at {}",
-                public_key.display()
-            ),
-        )
-        .with_source(source);
-        if let Some(cleanup) = cleanup {
-            error = error.with_hint(format!(
-                "remove partial private key {}; cleanup failed: {}",
-                private_key.display(),
-                bounded_detail(&cleanup.to_string())
-            ));
-        }
-        return Err(error);
-    }
-
-    let check = check_ssh_key(context);
-    if check.status == DoctorStatus::Ok {
-        return Ok(());
-    }
-
-    let mut cleanup_failures = Vec::new();
-    for path in [&public_key, &private_key] {
-        if let Err(source) = remove_generated_key(path) {
-            cleanup_failures.push(format!(
-                "{}: {}",
-                path.display(),
-                bounded_detail(&source.to_string())
-            ));
-        }
-    }
-    let mut error = FirestoneError::new(
-        ErrorKind::Dependency,
-        format!(
-            "generated Firestone SSH key failed readback: {}",
-            check.reason
-        ),
-    );
-    if !cleanup_failures.is_empty() {
-        error = error.with_hint(format!(
-            "remove the partial key pair; cleanup failed for {}",
-            cleanup_failures.join(", ")
-        ));
-    }
-    Err(error)
-}
-
-fn remove_generated_key(path: &Path) -> Result<(), std::io::Error> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(source),
-    }
+    crate::ssh::ensure_ssh_identity_with(&context.paths, keygen.as_os_str(), &context.hostname)
+        .map(|_| ())
 }
 
 fn create_firestone_dir(paths: &Paths, path: &Path, label: &str) -> Result<(), FirestoneError> {
@@ -1996,11 +1864,6 @@ fn nearest_existing_ancestor(path: &Path) -> Option<&Path> {
     path.ancestors().find(|ancestor| ancestor.exists())
 }
 
-fn shell_quote(path: &Path) -> Option<String> {
-    path.to_str()
-        .map(|path| format!("'{}'", path.replace('\'', "'\"'\"'")))
-}
-
 fn sync_directory(path: &Path) -> Result<(), FirestoneError> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
@@ -2190,7 +2053,7 @@ mod tests {
             write_executable(&fake_bin.join("ssh"), "printf 'OpenSSH fixture\\n' >&2")?;
             write_executable(
                 &fake_bin.join("ssh-keygen"),
-                "key=''; while [ \"$#\" -gt 0 ]; do if [ \"$1\" = '-f' ]; then shift; key=$1; fi; shift; done; [ -n \"$key\" ] || exit 2; umask 077; printf private > \"$key\"; printf public > \"$key.pub\"",
+                "key=''; while [ \"$#\" -gt 0 ]; do if [ \"$1\" = '-f' ]; then shift; key=$1; fi; shift; done; [ -n \"$key\" ] || exit 2; umask 077; printf private > \"$key\"; printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKg0J8YPh7wARkZSlBzFAoJez6gssTQUuPu4Qy3z8T1P firestone@test\n' > \"$key.pub\"",
             )?;
             write_executable(&fake_bin.join("unshare"), "exit 0")?;
 
@@ -3285,7 +3148,7 @@ mod tests {
 
         write_executable(
             &keygen,
-            r#"key=''; while [ "$#" -gt 0 ]; do if [ "$1" = '-f' ]; then shift; key=$1; fi; shift; done; [ -n "$key" ] || exit 2; umask 077; printf private > "$key"; printf public > "$key.pub""#,
+            r#"key=''; while [ "$#" -gt 0 ]; do if [ "$1" = '-f' ]; then shift; key=$1; fi; shift; done; [ -n "$key" ] || exit 2; umask 077; printf private > "$key"; printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKg0J8YPh7wARkZSlBzFAoJez6gssTQUuPu4Qy3z8T1P firestone@test\n' > "$key.pub""#,
         )?;
         generate_ssh_key(&fixture.context)?;
 

@@ -73,6 +73,9 @@ fn main() -> ExitCode {
             return ExitCode::from(render_terminal_error(&mut renderer, &error));
         }
     };
+    if matches!(&cli.command, Command::VsockProxy(_)) {
+        return run_hidden_vsock_proxy(cli);
+    }
 
     let stdout = io::stdout();
     let stderr = io::stderr();
@@ -118,6 +121,44 @@ fn hidden_shim_name(arguments: &[std::ffi::OsString]) -> Option<&str> {
         return None;
     }
     arguments.get(2).and_then(|name| name.to_str())
+}
+
+fn run_hidden_vsock_proxy(cli: Cli) -> ExitCode {
+    let (home, arguments) = match cli.command {
+        Command::VsockProxy(arguments) => (cli.home, arguments),
+        _ => return ExitCode::FAILURE,
+    };
+    let result = (|| {
+        let mut inputs = PathInputs::capture()?;
+        if let Some(home) = home {
+            inputs.firestone_home = Some(home);
+        }
+        let paths = Paths::from_inputs(&inputs)?;
+        firestone_core::run_vsock_proxy(
+            &paths,
+            &arguments.name,
+            arguments.port,
+            io::stdin(),
+            io::stdout(),
+        )
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            use io::Write as _;
+            let mut stderr = io::stderr().lock();
+            let _ = writeln!(
+                stderr,
+                "firestone _vsock-proxy: {}: {}",
+                error.kind(),
+                error.message()
+            );
+            if let Some(hint) = error.hint() {
+                let _ = writeln!(stderr, "hint: {hint}");
+            }
+            ExitCode::from(error_exit_code(&error))
+        }
+    }
 }
 
 fn render_options(
@@ -455,6 +496,10 @@ where
                 .run(Action::Doctor { fix: arguments.fix }, renderer)
                 .await
         }
+        Command::VsockProxy(_) => Err(FirestoneError::new(
+            ErrorKind::Generic,
+            "hidden vsock proxy reached event dispatch",
+        )),
     }
 }
 
