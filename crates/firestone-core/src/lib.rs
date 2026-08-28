@@ -15,6 +15,7 @@ pub mod image;
 pub mod lock;
 pub mod paths;
 pub mod result;
+pub mod shim;
 pub mod spec;
 pub mod state;
 pub mod vmm;
@@ -26,7 +27,7 @@ pub use catalog::{
     ImageFormat, ResolvedCatalogEntry,
 };
 pub use cloudinit::{RenderedCloudInit, SEED_IMAGE_SIZE, publish_seed, render_cloud_init};
-pub use cmd::{Cmd, CmdOutput};
+pub use cmd::{Cmd, CmdOutput, ManagedProcess, ProcessSignal};
 pub use deps::{DependencyArtifact, DependencyManifest};
 pub use dispatcher::{DispatchFuture, Dispatcher, EventSink};
 pub use doctor::{
@@ -43,6 +44,10 @@ pub use image::{
 pub use lock::MachineLock;
 pub use paths::{PathInputs, Paths};
 pub use result::{MachineRecord, MachineSummary, MachineView, SpecResult, SpecWarningPayload};
+pub use shim::{
+    PreparedStart, ShimClient, ShimPids, ShimStatus, ShimTimeouts, launch_prepared, prepare_start,
+    run_shim, stop_unsupervised, validate_m1_start_scope,
+};
 pub use spec::{
     Arch, ByteSize, CloudInitSpec, CloudInitSpecPatch, ColorMode, Firmware, GlobalConfig,
     HumanDuration, ImageRef, ImagesConfig, LoadedMachineSpec, MacAddr, MachineSpec,

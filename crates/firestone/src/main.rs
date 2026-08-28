@@ -2,7 +2,14 @@ mod cli;
 mod render;
 mod store;
 
-use std::{env, ffi::OsStr, fs, io, io::IsTerminal, path::Path, process::ExitCode};
+use std::{
+    env,
+    ffi::{OsStr, OsString},
+    fs, io,
+    io::IsTerminal,
+    path::Path,
+    process::ExitCode,
+};
 
 use clap::{Parser, error::ErrorKind as ClapErrorKind};
 use firestone_core::{
@@ -19,6 +26,19 @@ use crate::{
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let arguments = env::args_os().collect::<Vec<_>>();
+    if let Some(name) = hidden_shim_name(&arguments) {
+        let result = Paths::from_process().and_then(|paths| firestone_core::run_shim(&paths, name));
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("firestone shim: {}", error.message());
+                if let Some(hint) = error.hint() {
+                    eprintln!("hint: {hint}");
+                }
+                ExitCode::FAILURE
+            }
+        };
+    }
     let requested_json = requested_flag(&arguments, "--json");
     let requested_quiet = requested_flag(&arguments, "--quiet") || requested_flag(&arguments, "-q");
     let requested_no_color = requested_flag(&arguments, "--no-color");
@@ -62,6 +82,15 @@ async fn main() -> ExitCode {
     let mut renderer = Renderer::new(stdout, stderr, options);
     let result = run(cli, &mut renderer).await;
     ExitCode::from(finish_command(result, &mut renderer))
+}
+
+fn hidden_shim_name(arguments: &[std::ffi::OsString]) -> Option<&str> {
+    if arguments.len() != 3
+        || arguments.get(1).map(OsString::as_os_str) != Some(OsStr::new("_shim"))
+    {
+        return None;
+    }
+    arguments.get(2).and_then(|name| name.to_str())
 }
 
 fn render_options(

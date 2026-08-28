@@ -249,6 +249,11 @@ impl Paths {
     }
 
     #[must_use]
+    pub const fn uid(&self) -> u32 {
+        self.runtime_uid
+    }
+
+    #[must_use]
     pub fn config_file(&self) -> PathBuf {
         self.config_dir.join("config.toml")
     }
@@ -379,6 +384,10 @@ impl Paths {
         Ok(self.machine_dir(name)?.join("console.log"))
     }
 
+    pub fn machine_console_previous_log(&self, name: &str) -> Result<PathBuf, FirestoneError> {
+        Ok(self.machine_dir(name)?.join("console.log.previous"))
+    }
+
     pub fn machine_vmm_log(&self, name: &str) -> Result<PathBuf, FirestoneError> {
         Ok(self.machine_dir(name)?.join("vmm.log"))
     }
@@ -438,6 +447,133 @@ impl Paths {
 
     pub fn machine_shim_pid(&self, name: &str) -> Result<PathBuf, FirestoneError> {
         Ok(self.machine_runtime_dir(name)?.join("shim.pid"))
+    }
+
+    pub fn machine_shim_plan(&self, name: &str) -> Result<PathBuf, FirestoneError> {
+        Ok(self.machine_runtime_dir(name)?.join("launch.json"))
+    }
+
+    pub fn machine_process_identity(&self, name: &str) -> Result<PathBuf, FirestoneError> {
+        Ok(self.machine_runtime_dir(name)?.join("identity.json"))
+    }
+
+    /// Creates or validates one private per-machine runtime directory.
+    pub fn ensure_machine_runtime_dir(&self, name: &str) -> Result<PathBuf, FirestoneError> {
+        self.ensure_runtime_dir()?;
+        let path = self.machine_runtime_dir(name)?;
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => self.validate_private_runtime_directory(&path, &metadata)?,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                let mut builder = DirBuilder::new();
+                builder.recursive(false).mode(0o700);
+                let created = match builder.create(&path) {
+                    Ok(()) => true,
+                    Err(source) if source.kind() == io::ErrorKind::AlreadyExists => false,
+                    Err(source) => return Err(runtime_io_error("create", &path, source)),
+                };
+                if created {
+                    fs::set_permissions(&path, Permissions::from_mode(0o700))
+                        .map_err(|source| runtime_io_error("set mode 0700 on", &path, source))?;
+                    let parent = File::open(self.runtime_dir())
+                        .map_err(|source| runtime_io_error("open", self.runtime_dir(), source))?;
+                    parent
+                        .sync_all()
+                        .map_err(|source| runtime_io_error("fsync", self.runtime_dir(), source))?;
+                }
+                let metadata = fs::symlink_metadata(&path)
+                    .map_err(|source| runtime_io_error("inspect", &path, source))?;
+                self.validate_private_runtime_directory(&path, &metadata)?;
+            }
+            Err(source) => return Err(runtime_io_error("inspect", &path, source)),
+        }
+        Ok(path)
+    }
+
+    /// Validates one existing private per-machine runtime directory.
+    pub fn validate_machine_runtime_dir(&self, name: &str) -> Result<PathBuf, FirestoneError> {
+        self.validate_runtime_dir()?;
+        let path = self.machine_runtime_dir(name)?;
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|source| runtime_io_error("inspect", &path, source))?;
+        self.validate_private_runtime_directory(&path, &metadata)?;
+        Ok(path)
+    }
+
+    /// Unlinks every non-directory entry from a validated machine runtime dir.
+    ///
+    /// This never follows symlinks and refuses nested directories. With
+    /// `remove_directory`, the now-empty machine directory is removed as well.
+    pub fn clear_machine_runtime_dir(
+        &self,
+        name: &str,
+        remove_directory: bool,
+    ) -> Result<(), FirestoneError> {
+        self.validate_runtime_dir()?;
+        let path = self.machine_runtime_dir(name)?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(runtime_io_error("inspect", &path, source)),
+        };
+        self.validate_private_runtime_directory(&path, &metadata)?;
+        let mut entries = fs::read_dir(&path)
+            .map_err(|source| runtime_io_error("read", &path, source))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| runtime_io_error("read", &path, source))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let entry_path = entry.path();
+            let metadata = fs::symlink_metadata(&entry_path)
+                .map_err(|source| runtime_io_error("inspect", &entry_path, source))?;
+            if metadata.file_type().is_dir() {
+                return Err(FirestoneError::new(
+                    ErrorKind::Dependency,
+                    format!(
+                        "machine runtime debris '{}' is a directory",
+                        entry_path.display()
+                    ),
+                )
+                .with_hint("remove the unexpected nested directory and retry"));
+            }
+            fs::remove_file(&entry_path)
+                .map_err(|source| runtime_io_error("remove", &entry_path, source))?;
+        }
+        let directory =
+            File::open(&path).map_err(|source| runtime_io_error("open", &path, source))?;
+        directory
+            .sync_all()
+            .map_err(|source| runtime_io_error("fsync", &path, source))?;
+        if remove_directory {
+            fs::remove_dir(&path).map_err(|source| runtime_io_error("remove", &path, source))?;
+            let parent = File::open(self.runtime_dir())
+                .map_err(|source| runtime_io_error("open", self.runtime_dir(), source))?;
+            parent
+                .sync_all()
+                .map_err(|source| runtime_io_error("fsync", self.runtime_dir(), source))?;
+        }
+        Ok(())
+    }
+
+    fn validate_private_runtime_directory(
+        &self,
+        path: &Path,
+        metadata: &Metadata,
+    ) -> Result<(), FirestoneError> {
+        validate_directory_type(path, "machine runtime directory", metadata)?;
+        let mode = metadata.mode() & 0o7777;
+        if metadata.uid() != self.runtime_uid || mode != 0o700 {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "machine runtime directory '{}' is insecure: expected uid {} and mode 0700, found uid {} and mode {mode:04o}",
+                    path.display(),
+                    self.runtime_uid,
+                    metadata.uid()
+                ),
+            )
+            .with_hint("remove the stale runtime directory and retry"));
+        }
+        Ok(())
     }
 
     /// Creates the runtime directory with mode 0700 when missing.
@@ -2291,6 +2427,31 @@ mod tests {
         assert!(!root.join("missing").exists());
         Ok(())
     }
+
+    #[test]
+    fn machine_runtime_existing_wrong_mode_returns_dependency_without_chmod()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))?;
+        let root = fs::canonicalize(temporary.path())?;
+        let runtime = root.join("run");
+        fs::create_dir(&runtime)?;
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))?;
+        let machine = runtime.join("demo");
+        fs::create_dir(&machine)?;
+        fs::set_permissions(&machine, fs::Permissions::from_mode(0o755))?;
+        let paths = explicit_paths(runtime, fs::metadata(&root)?.uid());
+
+        let error = paths.ensure_machine_runtime_dir("demo").err();
+
+        assert_eq!(
+            error.as_ref().map(crate::FirestoneError::kind),
+            Some(ErrorKind::Dependency)
+        );
+        assert_eq!(fs::symlink_metadata(machine)?.mode() & 0o7777, 0o755);
+        Ok(())
+    }
+
     fn explicit_paths(runtime_dir: PathBuf, uid: u32) -> Paths {
         test_paths(runtime_dir, uid, RuntimeProvenance::FirestoneRuntimeDir)
     }

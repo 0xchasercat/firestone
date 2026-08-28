@@ -3,7 +3,10 @@ use std::{
     ffi::OsString,
     fs::{File, OpenOptions},
     io::{Read, Write},
-    os::unix::process::CommandExt,
+    os::unix::{
+        fs::{MetadataExt, OpenOptionsExt},
+        process::CommandExt,
+    },
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     thread::JoinHandle,
@@ -12,8 +15,8 @@ use std::{
 
 use nix::{
     errno::Errno,
-    sys::signal::{Signal, killpg},
-    unistd::Pid,
+    sys::signal::{Signal, kill, killpg},
+    unistd::{Pid, getpgid, getuid},
 };
 use wait_timeout::ChildExt;
 
@@ -127,6 +130,8 @@ pub struct Cmd {
     env: BTreeMap<OsString, OsString>,
     stdin: CmdStdin,
     stderr_log: Option<PathBuf>,
+    stdout_append: Option<PathBuf>,
+    stderr_append: Option<PathBuf>,
     error_kind: ErrorKind,
     timeout: Option<Duration>,
     capture_limit: usize,
@@ -144,6 +149,8 @@ impl Cmd {
             env: BTreeMap::new(),
             stdin: CmdStdin::Null,
             stderr_log: None,
+            stdout_append: None,
+            stderr_append: None,
             error_kind: ErrorKind::Generic,
             timeout: None,
             capture_limit: DEFAULT_CAPTURE_LIMIT,
@@ -231,6 +238,20 @@ impl Cmd {
     #[must_use]
     pub fn stderr_log(mut self, path: impl Into<PathBuf>) -> Self {
         self.stderr_log = Some(path.into());
+        self
+    }
+
+    /// Routes a long-running child's stdout directly to an append-only log.
+    #[must_use]
+    pub fn stdout_append(mut self, path: impl Into<PathBuf>) -> Self {
+        self.stdout_append = Some(path.into());
+        self
+    }
+
+    /// Routes a long-running child's stderr directly to an append-only log.
+    #[must_use]
+    pub fn stderr_append(mut self, path: impl Into<PathBuf>) -> Self {
+        self.stderr_append = Some(path.into());
         self
     }
 
@@ -475,6 +496,120 @@ impl Cmd {
             Err(output.failure(self.error_kind))
         }
     }
+
+    /// Starts a long-running child in a new process group.
+    ///
+    /// The caller owns supervision and must eventually reap the returned child.
+    /// Stdin defaults to `/dev/null`; stdout and stderr must be explicitly routed
+    /// with [`Self::stdout_append`] and [`Self::stderr_append`].
+    pub fn spawn_process_group(&self) -> Result<ManagedProcess, FirestoneError> {
+        self.spawn_long_running(true)
+    }
+
+    /// Starts a child which will call `setsid(2)` immediately after exec.
+    ///
+    /// Unlike [`Self::spawn_process_group`], this does not make the child a
+    /// process-group leader before exec, because a group leader cannot create a
+    /// new session. This primitive is reserved for the Firestone shim entrypoint.
+    pub fn spawn_session_candidate(&self) -> Result<ManagedProcess, FirestoneError> {
+        self.spawn_long_running(false)
+    }
+
+    fn spawn_long_running(&self, process_group: bool) -> Result<ManagedProcess, FirestoneError> {
+        if matches!(self.stdin, CmdStdin::Bytes(_)) {
+            return Err(FirestoneError::new(
+                ErrorKind::Generic,
+                "long-running commands cannot use buffered stdin",
+            )
+            .with_hint("use stdin_null or stdin_inherit"));
+        }
+        if self.stderr_log.is_some() {
+            return Err(FirestoneError::new(
+                ErrorKind::Generic,
+                "long-running commands cannot use captured stderr logging",
+            )
+            .with_hint("use stderr_append for supervised processes"));
+        }
+
+        let stdout_path = self.stdout_append.as_ref().ok_or_else(|| {
+            FirestoneError::new(
+                ErrorKind::Generic,
+                "long-running command stdout has no append log",
+            )
+            .with_hint("route stdout with stdout_append")
+        })?;
+        let stderr_path = self.stderr_append.as_ref().ok_or_else(|| {
+            FirestoneError::new(
+                ErrorKind::Generic,
+                "long-running command stderr has no append log",
+            )
+            .with_hint("route stderr with stderr_append")
+        })?;
+        let stdout = open_log(stdout_path, self.error_kind)?;
+        let stderr = open_log(stderr_path, self.error_kind)?;
+
+        let logged_argv = std::iter::once(self.program.as_os_str())
+            .chain(self.args.iter().map(|arg| arg.logged.as_os_str()))
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let env_keys = self
+            .env
+            .keys()
+            .map(|key| key.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        tracing::debug!(
+            argv = ?logged_argv,
+            cwd = ?self.cwd,
+            env_clear = self.clear_env,
+            env_keys = ?env_keys,
+            process_group,
+            "starting supervised external process"
+        );
+
+        let mut command = Command::new(&self.program);
+        command.args(self.args.iter().map(|arg| &arg.value));
+        command
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+        if process_group {
+            command.process_group(0);
+        }
+        if let Some(cwd) = &self.cwd {
+            command.current_dir(cwd);
+        }
+        if self.clear_env {
+            command.env_clear();
+        }
+        command.envs(&self.env);
+        match self.stdin {
+            CmdStdin::Null => {
+                command.stdin(Stdio::null());
+            }
+            CmdStdin::Inherit => {
+                command.stdin(Stdio::inherit());
+            }
+            CmdStdin::Bytes(_) => {
+                return Err(FirestoneError::new(
+                    ErrorKind::Generic,
+                    "long-running commands cannot use buffered stdin",
+                ));
+            }
+        }
+
+        let deadline = self.timeout.map(|timeout| Instant::now() + timeout);
+        let child = spawn_with_busy_retry(&mut command, deadline).map_err(|source| {
+            FirestoneError::new(
+                self.error_kind,
+                format!("cannot start command `{}`", self.program.to_string_lossy()),
+            )
+            .with_source(source)
+        })?;
+        let process_group = process_group.then_some(child.id());
+        Ok(ManagedProcess {
+            child,
+            process_group,
+        })
+    }
     /// Runs a terminal-facing process with inherited stdout and stderr.
     ///
     /// This is for editors and other interactive tools whose terminal protocol
@@ -540,7 +675,12 @@ impl Cmd {
             CmdStdin::Inherit => {
                 command.stdin(Stdio::inherit());
             }
-            CmdStdin::Bytes(_) => unreachable!("buffered stdin was rejected"),
+            CmdStdin::Bytes(_) => {
+                return Err(FirestoneError::new(
+                    ErrorKind::Generic,
+                    "interactive commands cannot use buffered stdin",
+                ));
+            }
         }
         if let Some(cwd) = &self.cwd {
             command.current_dir(cwd);
@@ -639,6 +779,141 @@ impl Cmd {
     }
 }
 
+/// Signals accepted by the shared supervised-process primitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessSignal {
+    Interrupt,
+    Terminate,
+    Kill,
+}
+
+impl ProcessSignal {
+    const fn as_nix(self) -> Signal {
+        match self {
+            Self::Interrupt => Signal::SIGINT,
+            Self::Terminate => Signal::SIGTERM,
+            Self::Kill => Signal::SIGKILL,
+        }
+    }
+}
+
+/// A long-running child and the process group created for it.
+///
+/// Dropping this value deliberately does not kill the child. Supervisors must
+/// make their teardown policy explicit and reap every direct child.
+#[derive(Debug)]
+pub struct ManagedProcess {
+    child: Child,
+    process_group: Option<u32>,
+}
+
+impl ManagedProcess {
+    #[must_use]
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    #[must_use]
+    pub const fn process_group(&self) -> Option<u32> {
+        self.process_group
+    }
+
+    /// Confirms that a session-candidate child made its pid the process-group id.
+    pub fn confirm_session(&mut self) -> Result<(), FirestoneError> {
+        let pid = process_pid(self.id())?;
+        let actual = getpgid(Some(pid)).map_err(|source| {
+            FirestoneError::new(
+                ErrorKind::Generic,
+                format!("cannot inspect process group for pid {}", self.id()),
+            )
+            .with_source(std::io::Error::from_raw_os_error(source as i32))
+        })?;
+        if actual != pid {
+            return Err(FirestoneError::new(
+                ErrorKind::Generic,
+                format!(
+                    "process {} did not create its required session and process group",
+                    self.id()
+                ),
+            ));
+        }
+        self.process_group = Some(self.id());
+        Ok(())
+    }
+
+    pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, FirestoneError> {
+        self.child.try_wait().map_err(|source| {
+            FirestoneError::new(
+                ErrorKind::Generic,
+                format!("cannot inspect child process {}", self.id()),
+            )
+            .with_source(source)
+        })
+    }
+
+    pub fn wait(&mut self) -> Result<ExitStatus, FirestoneError> {
+        self.child.wait().map_err(|source| {
+            FirestoneError::new(
+                ErrorKind::Generic,
+                format!("cannot reap child process {}", self.id()),
+            )
+            .with_source(source)
+        })
+    }
+
+    pub fn wait_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<ExitStatus>, FirestoneError> {
+        self.child.wait_timeout(timeout).map_err(|source| {
+            FirestoneError::new(
+                ErrorKind::Generic,
+                format!("cannot wait for child process {}", self.id()),
+            )
+            .with_source(source)
+        })
+    }
+
+    pub fn signal_process(&self, signal: ProcessSignal) -> Result<(), FirestoneError> {
+        let pid = process_pid(self.id())?;
+        match kill(pid, signal.as_nix()) {
+            Ok(()) | Err(Errno::ESRCH) => Ok(()),
+            Err(source) => Err(FirestoneError::new(
+                ErrorKind::Generic,
+                format!("cannot signal child process {}", self.id()),
+            )
+            .with_source(std::io::Error::from_raw_os_error(source as i32))),
+        }
+    }
+
+    pub fn signal_group(&self, signal: ProcessSignal) -> Result<(), FirestoneError> {
+        let group = self.process_group.ok_or_else(|| {
+            FirestoneError::new(
+                ErrorKind::Generic,
+                format!("process {} has no verified process group", self.id()),
+            )
+        })?;
+        let group = process_pid(group)?;
+        match killpg(group, signal.as_nix()) {
+            Ok(()) | Err(Errno::ESRCH) => Ok(()),
+            Err(source) => Err(FirestoneError::new(
+                ErrorKind::Generic,
+                format!("cannot signal process group {}", group.as_raw()),
+            )
+            .with_source(std::io::Error::from_raw_os_error(source as i32))),
+        }
+    }
+}
+
+fn process_pid(pid: u32) -> Result<Pid, FirestoneError> {
+    i32::try_from(pid).map(Pid::from_raw).map_err(|_| {
+        FirestoneError::new(
+            ErrorKind::Generic,
+            format!("process id {pid} does not fit pid_t"),
+        )
+    })
+}
+
 #[derive(Debug)]
 struct Captured {
     bytes: Vec<u8>,
@@ -680,9 +955,11 @@ fn spawn_with_busy_retry(
     }
 }
 fn open_log(path: &Path, kind: ErrorKind) -> Result<File, FirestoneError> {
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
         .open(path)
         .map_err(|source| {
             FirestoneError::new(
@@ -690,7 +967,34 @@ fn open_log(path: &Path, kind: ErrorKind) -> Result<File, FirestoneError> {
                 format!("cannot open command log `{}`", path.display()),
             )
             .with_source(source)
-        })
+        })?;
+    let metadata = file.metadata().map_err(|source| {
+        FirestoneError::new(
+            kind,
+            format!("cannot inspect command log `{}`", path.display()),
+        )
+        .with_source(source)
+    })?;
+    if !metadata.is_file() {
+        return Err(FirestoneError::new(
+            kind,
+            format!("command log `{}` is not a regular file", path.display()),
+        ));
+    }
+    let mode = metadata.mode() & 0o7777;
+    let uid = getuid().as_raw();
+    if metadata.uid() != uid || mode & 0o077 != 0 {
+        return Err(FirestoneError::new(
+            kind,
+            format!(
+                "command log `{}` is insecure: expected uid {uid} and no group/world access, found uid {} and mode {mode:04o}",
+                path.display(),
+                metadata.uid()
+            ),
+        )
+        .with_hint("replace the log with a private regular file owned by the Firestone user"));
+    }
+    Ok(file)
 }
 
 fn capture_stream(

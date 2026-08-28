@@ -11,9 +11,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::{
     errno::Errno,
-    fcntl::{FcntlArg, FdFlag, OFlag, fcntl},
     poll::{PollFd, PollFlags, PollTimeout, poll},
     sys::socket::{
         AddressFamily, SockFlag, SockProtocol, SockType, UnixAddr, connect, getsockopt, socket,
@@ -91,15 +92,16 @@ impl<'a> VmmApi<'a> {
             .map_err(|failure| self.firestone_error(Endpoint::VmmPing, failure))
     }
 
-    /// Creates a VM from a JSON-serializable v53 `VmConfig`.
-    pub fn vm_create<T>(&self, config: &T) -> Result<(), FirestoneError>
-    where
-        T: Serialize + ?Sized,
-    {
+    /// Creates a VM from the exact persisted v53 `VmConfig` JSON bytes.
+    ///
+    /// The body is not parsed or reserialized here. Callers can therefore prove
+    /// that `vm.create` received the byte sequence published as vmconfig.json.
+    pub fn vm_create(&self, config: &[u8]) -> Result<(), FirestoneError> {
         let endpoint = Endpoint::VmCreate;
-        let body = serialize_create_body(config)
-            .map_err(|failure| self.firestone_error(endpoint, failure))?;
-        self.request_inner(endpoint, Some(&body))
+        if config.len() > MAX_CREATE_BODY_BYTES {
+            return Err(self.firestone_error(endpoint, ClientFailure::RequestBodyTooLarge));
+        }
+        self.request_inner(endpoint, Some(config))
             .map(|_| ())
             .map_err(|failure| self.firestone_error(endpoint, failure))
     }
@@ -237,12 +239,6 @@ impl<'a> VmmApi<'a> {
                 ),
             )
             .with_hint("reduce the VMM configuration or config overlay"),
-            ClientFailure::InvalidRequestJson(source) => FirestoneError::new(
-                ErrorKind::InvalidSpec,
-                format!("cannot serialize the JSON body for VMM API {request}"),
-            )
-            .with_hint("inspect the generated VMM configuration")
-            .with_source(source),
         }
     }
 }
@@ -345,7 +341,6 @@ enum ClientFailure {
         source: serde_json::Error,
     },
     RequestBodyTooLarge,
-    InvalidRequestJson(serde_json::Error),
 }
 
 impl ClientFailure {
@@ -356,9 +351,7 @@ impl ClientFailure {
             | Self::UnexpectedStatus { .. }
             | Self::InvalidJson { .. } => true,
             Self::Io { source, .. } => socket_error_is_unresponsive(source.kind()),
-            Self::DeadlineOutOfRange | Self::RequestBodyTooLarge | Self::InvalidRequestJson(_) => {
-                false
-            }
+            Self::DeadlineOutOfRange | Self::RequestBodyTooLarge => false,
         }
     }
 }
@@ -377,53 +370,6 @@ impl HttpResponse {
 struct ParsedHead {
     status: u16,
     content_length: Option<usize>,
-}
-
-struct BoundedJsonWriter {
-    bytes: Vec<u8>,
-    exceeded: bool,
-}
-
-impl BoundedJsonWriter {
-    fn new() -> Self {
-        Self {
-            bytes: Vec::with_capacity(4096),
-            exceeded: false,
-        }
-    }
-}
-
-impl Write for BoundedJsonWriter {
-    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
-        let Some(total) = self.bytes.len().checked_add(input.len()) else {
-            self.exceeded = true;
-            return Err(io::Error::other("VMM API request body limit exceeded"));
-        };
-        if total > MAX_CREATE_BODY_BYTES {
-            self.exceeded = true;
-            return Err(io::Error::other("VMM API request body limit exceeded"));
-        }
-        self.bytes.extend_from_slice(input);
-        Ok(input.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-fn serialize_create_body<T>(config: &T) -> Result<Vec<u8>, ClientFailure>
-where
-    T: Serialize + ?Sized,
-{
-    let mut writer = BoundedJsonWriter::new();
-    if let Err(source) = serde_json::to_writer(&mut writer, config) {
-        if writer.exceeded {
-            return Err(ClientFailure::RequestBodyTooLarge);
-        }
-        return Err(ClientFailure::InvalidRequestJson(source));
-    }
-    Ok(writer.bytes)
 }
 
 fn decode_json<T>(body: &[u8], label: &'static str) -> Result<T, ClientFailure>
@@ -462,29 +408,41 @@ fn connect_socket(api_socket: &Path, deadline: Instant) -> Result<UnixStream, Cl
 
     loop {
         ensure_before_deadline(deadline, "connecting")?;
+        let flags = {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            {
+                SockFlag::empty()
+            }
+        };
         let descriptor = socket(
             AddressFamily::Unix,
             SockType::Stream,
-            SockFlag::empty(),
+            flags,
             None::<SockProtocol>,
         )
         .map_err(|source| ClientFailure::Io {
             phase: "create socket",
             source: io::Error::from(source),
         })?;
-        fcntl(&descriptor, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).map_err(|source| {
-            ClientFailure::Io {
-                phase: "set socket nonblocking",
-                source: io::Error::from(source),
-            }
-        })?;
-        fcntl(&descriptor, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(|source| {
-            ClientFailure::Io {
-                phase: "set socket close-on-exec",
-                source: io::Error::from(source),
-            }
-        })?;
-
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            fcntl(&descriptor, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).map_err(|source| {
+                ClientFailure::Io {
+                    phase: "set socket nonblocking",
+                    source: io::Error::from(source),
+                }
+            })?;
+            fcntl(&descriptor, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(|source| {
+                ClientFailure::Io {
+                    phase: "set socket close-on-exec",
+                    source: io::Error::from(source),
+                }
+            })?;
+        }
         match connect(descriptor.as_raw_fd(), &address) {
             Ok(()) => return Ok(UnixStream::from(descriptor)),
             Err(Errno::EINPROGRESS | Errno::EALREADY) => {
@@ -882,8 +840,6 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use serde::Serialize;
-    use serde_json::json;
     use tempfile::TempDir;
 
     use super::{
@@ -1060,7 +1016,7 @@ mod tests {
 
         let create_body = br#"{"answer":42}"#;
         let create_server = FakeServer::spawn(vec![no_content_response()], false)?;
-        VmmApi::new(create_server.path(), TEST_TIMEOUT).vm_create(&json!({"answer": 42}))?;
+        VmmApi::new(create_server.path(), TEST_TIMEOUT).vm_create(create_body)?;
         let mut create_request = format!(
             "PUT /api/v1/vm.create HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
             create_body.len()
@@ -1126,39 +1082,32 @@ mod tests {
         Ok(())
     }
 
-    #[derive(Serialize)]
-    struct LargeConfig<'a> {
-        data: &'a str,
-    }
-
     #[test]
     fn vm_create_body_limit_accepts_51200_and_rejects_51201_before_connect()
     -> Result<(), Box<dyn std::error::Error>> {
-        let accepted_data = "a".repeat(MAX_CREATE_BODY_BYTES - br#"{"data":""}"#.len());
+        let accepted_body = vec![b'a'; MAX_CREATE_BODY_BYTES];
         let accepted_server = FakeServer::spawn(vec![no_content_response()], false)?;
-        VmmApi::new(accepted_server.path(), TEST_TIMEOUT).vm_create(&LargeConfig {
-            data: &accepted_data,
-        })?;
+        VmmApi::new(accepted_server.path(), TEST_TIMEOUT).vm_create(&accepted_body)?;
         let accepted_request = accepted_server.finish()?;
         let body_start = find_header_terminator(&accepted_request)
             .ok_or_else(|| io::Error::other("request header terminator missing"))?
             + 4;
         assert_eq!(accepted_request.len() - body_start, MAX_CREATE_BODY_BYTES);
+        assert_eq!(&accepted_request[body_start..], accepted_body);
+        let expected_length = b"Content-Length: 51200\x0d\x0a";
         assert!(
             accepted_request[..body_start]
-                .windows(b"Content-Length: 51200\r\n".len())
-                .any(|window| window == b"Content-Length: 51200\r\n")
+                .windows(expected_length.len())
+                .any(|window| window == expected_length)
         );
 
         let directory = TempDir::new()?;
         let socket = directory.path().join("api.sock");
         let listener = UnixListener::bind(&socket)?;
         listener.set_nonblocking(true)?;
-        let rejected_data = "a".repeat(MAX_CREATE_BODY_BYTES + 1 - br#"{"data":""}"#.len());
+        let rejected_body = vec![b'a'; MAX_CREATE_BODY_BYTES + 1];
         let error = require_error(
-            VmmApi::new(&socket, TEST_TIMEOUT).vm_create(&LargeConfig {
-                data: &rejected_data,
-            }),
+            VmmApi::new(&socket, TEST_TIMEOUT).vm_create(&rejected_body),
             "oversized create body must fail locally",
         )?;
         assert_eq!(error.kind(), ErrorKind::InvalidSpec);
