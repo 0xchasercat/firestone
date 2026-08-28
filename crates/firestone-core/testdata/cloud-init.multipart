@@ -28,6 +28,8 @@ write_files:
     content: |
       [Unit]
       Description=firestone: sshd over vsock
+      After=sshd-vsock.socket
+      ConditionPathExists=!/run/systemd/generator/sshd-vsock.socket
       [Socket]
       ListenStream=vsock::22
       Accept=yes
@@ -40,7 +42,10 @@ write_files:
       Description=firestone: sshd over vsock (%i)
       After=sshd-keygen.service ssh.service
       [Service]
-      ExecStart=-/usr/sbin/sshd -i
+      RuntimeDirectory=sshd
+      RuntimeDirectoryMode=0755
+      RuntimeDirectoryPreserve=yes
+      ExecStart=/usr/sbin/sshd -i
       StandardInput=socket
       StandardError=journal
   - path: /etc/systemd/system/serial-getty@hvc0.service.d/firestone-autologin.conf
@@ -55,6 +60,7 @@ mounts:
 runcmd:
   - systemctl daemon-reload
   - systemctl enable --now firestone-sshd.socket
+  - systemctl is-active --quiet sshd-vsock.socket || systemctl is-active --quiet firestone-sshd.socket
   - systemctl enable serial-getty@hvc0.service
   - systemctl restart serial-getty@hvc0.service
 --===============firestone==--

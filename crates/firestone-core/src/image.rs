@@ -29,7 +29,7 @@ use crate::{
     Event, EventSink, FirestoneError, ImageFormat, ImageRef, Level, MachineLock, MachineState,
     Paths, StateImage, StateStore, StepId, Unit, atomic,
     bounded::{self, BoundedReadError},
-    catalog::parse_https_url,
+    catalog::{SshdPath, parse_https_url},
 };
 const IMAGE_METADATA_VERSION: u32 = 1;
 const IMAGE_ID_PREFIX: &str = "image-";
@@ -98,6 +98,8 @@ pub struct ImageMetadata {
     pub stored_sha256: String,
     pub architecture: Arch,
     pub firmware: Option<CatalogFirmware>,
+    #[serde(default, skip_serializing_if = "SshdPath::is_default")]
+    pub sshd_path: SshdPath,
     pub source_format: ImageFormat,
     pub stored_format: ImageFormat,
     pub verification_algorithm: Option<ChecksumAlgorithm>,
@@ -126,6 +128,8 @@ impl<'de> Deserialize<'de> for ImageMetadata {
             stored_sha256: String,
             architecture: Arch,
             firmware: RequiredNullable<CatalogFirmware>,
+            #[serde(default)]
+            sshd_path: SshdPath,
             source_format: ImageFormat,
             stored_format: ImageFormat,
             verification_algorithm: RequiredNullable<ChecksumAlgorithm>,
@@ -145,6 +149,7 @@ impl<'de> Deserialize<'de> for ImageMetadata {
             stored_sha256: wire.stored_sha256,
             architecture: wire.architecture,
             firmware: wire.firmware.0,
+            sshd_path: wire.sshd_path,
             source_format: wire.source_format,
             stored_format: wire.stored_format,
             verification_algorithm: wire.verification_algorithm.0,
@@ -337,6 +342,7 @@ pub struct ResolvedImageSource {
     pub architecture: Arch,
     pub source_format: Option<ImageFormat>,
     pub firmware: Option<CatalogFirmware>,
+    pub sshd_path: SshdPath,
     pub verification: Option<ImageVerification>,
     pub location: ImageSourceLocation,
     checksum: ExpectedChecksum,
@@ -583,6 +589,7 @@ impl ImageStore {
                 architecture: self.architecture,
                 source_format: None,
                 firmware: None,
+                sshd_path: SshdPath::default(),
                 verification: None,
                 location: ImageSourceLocation::Local(opened.path.clone()),
                 checksum: ExpectedChecksum::None,
@@ -605,6 +612,7 @@ impl ImageStore {
                 architecture: self.architecture,
                 source_format: None,
                 firmware: None,
+                sshd_path: SshdPath::default(),
                 verification: verification.clone(),
                 location: ImageSourceLocation::Https(source_url),
                 checksum: verification.map_or(ExpectedChecksum::None, ExpectedChecksum::Digest),
@@ -655,6 +663,7 @@ impl ImageStore {
                     architecture: self.architecture,
                     source_format: Some(resolved.format),
                     firmware: Some(resolved.firmware),
+                    sshd_path: resolved.sshd_path,
                     verification,
                     location: ImageSourceLocation::Https(source_url),
                     checksum,
@@ -684,6 +693,7 @@ impl ImageStore {
                 architecture: self.architecture,
                 source_format: None,
                 firmware: None,
+                sshd_path: SshdPath::default(),
                 verification: None,
                 location: ImageSourceLocation::Https(source_url),
                 checksum: ExpectedChecksum::None,
@@ -704,6 +714,7 @@ impl ImageStore {
                 architecture: self.architecture,
                 source_format: None,
                 firmware: None,
+                sshd_path: SshdPath::default(),
                 verification: None,
                 location: ImageSourceLocation::Local(opened.path.clone()),
                 checksum: ExpectedChecksum::None,
@@ -744,6 +755,7 @@ impl ImageStore {
             architecture: self.architecture,
             source_format: Some(resolved.format),
             firmware: Some(resolved.firmware),
+            sshd_path: resolved.sshd_path,
             verification,
             location: ImageSourceLocation::Https(source_url),
             checksum,
@@ -1082,6 +1094,7 @@ impl ImageStore {
             stored_sha256,
             architecture: source.architecture,
             firmware: source.firmware,
+            sshd_path: source.sshd_path.clone(),
             source_format,
             stored_format: ImageFormat::Qcow2,
             verification_algorithm: source.verification.as_ref().map(|value| value.algorithm),
@@ -1487,6 +1500,10 @@ impl ImageStore {
                 }
                 if source.firmware.is_some() && metadata.firmware != source.firmware {
                     metadata.firmware = source.firmware;
+                    changed = true;
+                }
+                if source.source_format.is_some() && metadata.sshd_path != source.sshd_path {
+                    metadata.sshd_path = source.sshd_path.clone();
                     changed = true;
                 }
                 if changed {
@@ -2732,6 +2749,7 @@ fn metadata_matches_source(
         && metadata.source_url == source.source_url
         && metadata.architecture == source.architecture
         && metadata.firmware == source.firmware
+        && metadata.sshd_path == source.sshd_path
         && source
             .source_format
             .is_none_or(|format| format == metadata.source_format)
@@ -5113,6 +5131,7 @@ else:
                     architecture: Arch::X86_64,
                     source_format: Some(ImageFormat::Qcow2),
                     firmware: None,
+                    sshd_path: SshdPath::default(),
                     verification: Some(ImageVerification {
                         algorithm: ChecksumAlgorithm::Sha512,
                         digest: sha512.clone(),
@@ -5235,13 +5254,13 @@ else:
     }
 
     #[test]
-    fn catalog_firmware_is_durable_across_warm_cache_upgrade_and_catalog_removal()
+    fn catalog_guest_boot_metadata_is_durable_across_cache_upgrade_and_catalog_removal()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::new(false)?;
         let url = "https://firmware.example.invalid/base.qcow2";
         let bytes = b"QFI\xFBFIRMWARE".to_vec();
         let digest = sha256_bytes(&bytes);
-        let catalog_source = |firmware: &str| {
+        let catalog_source = |firmware: &str, sshd_path: &str| {
             format!(
                 concat!(
                     "[[image]]\n",
@@ -5249,17 +5268,24 @@ else:
                     "version = \"1\"\n",
                     "aliases = []\n",
                     "default = true\n",
-                    "firmware = \"{}\"\n",
-                    "format = \"qcow2\"\n\n",
+                    r#"firmware = "{}"
+format = "qcow2"
+sshd_path = "{}"
+
+"#,
                     "[image.arch.x86_64]\n",
                     "url = \"{}\"\n",
                     "sha256 = \"{}\"\n",
                     "checksum_alg = \"sha256\"\n"
                 ),
-                firmware, url, digest,
+                firmware, sshd_path, url, digest,
             )
         };
-        let old_catalog = custom_catalog(&fixture.root, "firm-rhf", &catalog_source("rhf"))?;
+        let old_catalog = custom_catalog(
+            &fixture.root,
+            "firm-rhf",
+            &catalog_source("rhf", "/usr/sbin/sshd"),
+        )?;
         let old_store = store_with_catalog(&fixture, old_catalog, Arc::new(FixedClock));
         fixture
             .http
@@ -5269,8 +5295,13 @@ else:
             &mut Vec::new(),
         )?;
         assert_eq!(old.metadata.firmware, Some(CatalogFirmware::Rhf));
+        assert_eq!(old.metadata.sshd_path.as_str(), "/usr/sbin/sshd");
 
-        let new_catalog = custom_catalog(&fixture.root, "firm-edk2", &catalog_source("edk2"))?;
+        let new_catalog = custom_catalog(
+            &fixture.root,
+            "firm-edk2",
+            &catalog_source("edk2", "/usr/libexec/openssh/sshd"),
+        )?;
         let new_store = store_with_catalog(&fixture, new_catalog, Arc::new(FixedClock));
         let name = "firmware-cache";
         let mut state = machine_state(
@@ -5293,6 +5324,7 @@ else:
         )?;
         assert_eq!(warm.image.metadata.id, old.metadata.id);
         assert_eq!(warm.image.firmware, Some(CatalogFirmware::Rhf));
+        assert_eq!(warm.image.metadata.sshd_path.as_str(), "/usr/sbin/sshd");
         assert_eq!(warm.image.metadata.generation, 1);
 
         fixture
@@ -5304,6 +5336,10 @@ else:
         )?;
         assert_eq!(upgraded.metadata.id, old.metadata.id);
         assert_eq!(upgraded.metadata.firmware, Some(CatalogFirmware::Edk2));
+        assert_eq!(
+            upgraded.metadata.sshd_path.as_str(),
+            "/usr/libexec/openssh/sshd"
+        );
         assert_eq!(upgraded.metadata.generation, 2);
 
         let catalog_removed =
@@ -5317,6 +5353,10 @@ else:
             &mut Vec::new(),
         )?;
         assert_eq!(pinned.image.firmware, Some(CatalogFirmware::Edk2));
+        assert_eq!(
+            pinned.image.metadata.sshd_path.as_str(),
+            "/usr/libexec/openssh/sshd"
+        );
         assert_eq!(pinned.image.metadata.generation, 2);
         Ok(())
     }
@@ -5806,6 +5846,7 @@ else:
                 stored_sha256: digest.clone(),
                 architecture: Arch::X86_64,
                 firmware: Some(CatalogFirmware::Rhf),
+                sshd_path: SshdPath::default(),
                 source_format: ImageFormat::Qcow2,
                 stored_format: ImageFormat::Qcow2,
                 verification_algorithm: Some(ChecksumAlgorithm::Sha256),

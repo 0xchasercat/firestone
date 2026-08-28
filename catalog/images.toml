@@ -9,6 +9,7 @@ aliases = ["noble"]
 default = true
 firmware = "rhf"
 format = "qcow2"
+sshd_path = "/usr/sbin/sshd"
 
 [image.arch.x86_64]
 firmware = "edk2"

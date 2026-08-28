@@ -25,9 +25,12 @@ pub mod vmm_api;
 pub use action::{Action, LogSource, ParseLogSourceError};
 pub use catalog::{
     Catalog, CatalogArchSource, CatalogChecksum, CatalogEntry, CatalogFirmware, ChecksumAlgorithm,
-    ImageFormat, ResolvedCatalogEntry,
+    ImageFormat, ResolvedCatalogEntry, SshdPath,
 };
-pub use cloudinit::{RenderedCloudInit, SEED_IMAGE_SIZE, publish_seed, render_cloud_init};
+pub use cloudinit::{
+    RenderedCloudInit, SEED_IMAGE_SIZE, publish_seed, publish_seed_with_sshd_path,
+    render_cloud_init, render_cloud_init_with_guest_ssh,
+};
 pub use cmd::{Cmd, CmdOutput, ManagedProcess, ProcessSignal};
 pub use deps::{DependencyArtifact, DependencyManifest};
 pub use dispatcher::{DispatchFuture, Dispatcher, EventSink};

@@ -540,7 +540,7 @@ fn validate_capacity(
     Ok(())
 }
 
-fn validate_user(user: &str) -> Result<(), FirestoneError> {
+pub(super) fn validate_user(user: &str) -> Result<(), FirestoneError> {
     let mut bytes = user.bytes();
     let valid_first = bytes
         .next()

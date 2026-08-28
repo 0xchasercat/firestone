@@ -23,6 +23,10 @@ pub use value::{
     ParseDurationError, ParseFirmwareError, ParseMacAddrError,
 };
 
+pub(crate) fn validate_guest_user(user: &str) -> Result<(), FirestoneError> {
+    validation::validate_user(user)
+}
+
 /// Desired state of a machine. The same type is TOML on disk and JSON over REST.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
