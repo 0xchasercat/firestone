@@ -1649,7 +1649,13 @@ mod tests {
         let (_directory, dispatcher, paths) = fixture()?;
         let machine_dir = paths.machine_dir("pending")?;
         fs::create_dir_all(&machine_dir)?;
-        fs::set_permissions(&machine_dir, fs::Permissions::from_mode(0o700))?;
+        for path in [
+            paths.data_dir().to_path_buf(),
+            paths.machines_dir(),
+            machine_dir.clone(),
+        ] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
         fs::write(machine_dir.join(".creating"), b"creating\n")?;
 
         let error = dispatcher.load_machine("pending").err();
