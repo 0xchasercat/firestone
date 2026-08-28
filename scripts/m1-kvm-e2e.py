@@ -232,8 +232,26 @@ class Harness:
         except (OSError, json.JSONDecodeError) as error:
             raise AcceptanceError(f"cannot read VmConfig for {name}: {error}") from error
 
-    def list_status(self, name: str) -> str:
-        records = self.firestone("ls")
+    def list_status(self, name: str) -> str | None:
+        completed = self.run([self.binary, "--json", "ls"], check=False)
+        require(not completed.stderr, f"JSON list command wrote stderr: {compact_output(completed.stderr)}")
+        try:
+            records = [json.loads(line) for line in completed.stdout.splitlines() if line]
+        except json.JSONDecodeError as error:
+            raise AcceptanceError("list returned invalid NDJSON while polling state") from error
+        require(records, "list returned no records while polling state")
+        if completed.returncode != 0:
+            error = records[-1].get("error")
+            if (
+                completed.returncode == 4
+                and isinstance(error, dict)
+                and error.get("kind") == "conflict"
+                and "VMM liveness is ambiguous" in str(error.get("message"))
+            ):
+                return None
+            raise AcceptanceError(
+                f"list failed with exit {completed.returncode} while polling state: {records[-1]!r}"
+            )
         payload = self.result_payload(records, "list")
         matches = [machine for machine in payload if machine.get("name") == name]
         require(len(matches) == 1, f"list did not return exactly one {name} machine")
