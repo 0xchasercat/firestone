@@ -1,0 +1,1402 @@
+//! Bounded Cloud Hypervisor v53 HTTP client over a Unix socket.
+
+use std::{
+    fmt::Write as _,
+    io::{self, Read, Write},
+    os::{
+        fd::{AsFd, AsRawFd},
+        unix::net::UnixStream,
+    },
+    path::Path,
+    time::{Duration, Instant},
+};
+
+use nix::{
+    errno::Errno,
+    fcntl::{FcntlArg, FdFlag, OFlag, fcntl},
+    poll::{PollFd, PollFlags, PollTimeout, poll},
+    sys::socket::{
+        AddressFamily, SockFlag, SockProtocol, SockType, UnixAddr, connect, getsockopt, socket,
+        sockopt::SocketError,
+    },
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::{ErrorKind, FirestoneError, VmmPingProbe};
+
+const MAX_CREATE_BODY_BYTES: usize = 51_200;
+const MAX_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
+const MAX_PING_BODY_BYTES: usize = 64 * 1024;
+const MAX_INFO_BODY_BYTES: usize = 1024 * 1024;
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+const IO_CHUNK_BYTES: usize = 8 * 1024;
+
+/// Cloud Hypervisor's v53 response to `GET /api/v1/vmm.ping`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VmmPingResponse {
+    pub build_version: String,
+    pub version: String,
+    pub pid: i64,
+    pub features: Vec<String>,
+}
+
+/// Cloud Hypervisor v53 VM states returned by `GET /api/v1/vm.info`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VmState {
+    Created,
+    Running,
+    Shutdown,
+    Paused,
+    BreakPoint,
+}
+
+/// The bounded subset of Cloud Hypervisor's v53 `VmInfoResponse` used by Firestone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VmInfo {
+    pub config: Value,
+    pub state: VmState,
+    pub memory_actual_size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_tree: Option<Value>,
+}
+
+/// A one-request-per-connection Cloud Hypervisor v53 API client.
+///
+/// Each method uses one absolute deadline for connect, all partial writes, and
+/// all response reads. Response headers are limited to 16 KiB. Ping and error
+/// bodies are limited to 64 KiB, while `vm.info` is limited to 1 MiB. The
+/// `vm.create` JSON request is limited to the pinned micro-http maximum of
+/// 51,200 bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct VmmApi<'a> {
+    api_socket: &'a Path,
+    timeout: Duration,
+}
+
+impl<'a> VmmApi<'a> {
+    #[must_use]
+    pub const fn new(api_socket: &'a Path, timeout: Duration) -> Self {
+        Self {
+            api_socket,
+            timeout,
+        }
+    }
+
+    /// Pings the VMM and decodes its v53 identity response.
+    pub fn vmm_ping(&self) -> Result<VmmPingResponse, FirestoneError> {
+        self.vmm_ping_inner()
+            .map_err(|failure| self.firestone_error(Endpoint::VmmPing, failure))
+    }
+
+    /// Creates a VM from a JSON-serializable v53 `VmConfig`.
+    pub fn vm_create<T>(&self, config: &T) -> Result<(), FirestoneError>
+    where
+        T: Serialize + ?Sized,
+    {
+        let endpoint = Endpoint::VmCreate;
+        let body = serialize_create_body(config)
+            .map_err(|failure| self.firestone_error(endpoint, failure))?;
+        self.request_inner(endpoint, Some(&body))
+            .map(|_| ())
+            .map_err(|failure| self.firestone_error(endpoint, failure))
+    }
+
+    /// Boots the VM previously created through `vm.create`.
+    pub fn vm_boot(&self) -> Result<(), FirestoneError> {
+        self.empty_request(Endpoint::VmBoot)
+    }
+
+    /// Returns the VM's v53 configuration and runtime state.
+    pub fn vm_info(&self) -> Result<VmInfo, FirestoneError> {
+        let endpoint = Endpoint::VmInfo;
+        let response = self
+            .request_inner(endpoint, None)
+            .map_err(|failure| self.firestone_error(endpoint, failure))?;
+        decode_json(response.body(), "vm.info JSON response")
+            .map_err(|failure| self.firestone_error(endpoint, failure))
+    }
+
+    /// Triggers the guest ACPI power button.
+    pub fn vm_power_button(&self) -> Result<(), FirestoneError> {
+        self.empty_request(Endpoint::VmPowerButton)
+    }
+
+    /// Tears down the VM while leaving the VMM process available.
+    pub fn vm_shutdown(&self) -> Result<(), FirestoneError> {
+        self.empty_request(Endpoint::VmShutdown)
+    }
+
+    /// Terminates the VMM process.
+    ///
+    /// Cloud Hypervisor v53 returns HTTP 200 with `Content-Length: 0` here,
+    /// despite its OpenAPI document advertising 204.
+    pub fn vmm_shutdown(&self) -> Result<(), FirestoneError> {
+        self.empty_request(Endpoint::VmmShutdown)
+    }
+
+    fn empty_request(&self, endpoint: Endpoint) -> Result<(), FirestoneError> {
+        self.request_inner(endpoint, None)
+            .map(|_| ())
+            .map_err(|failure| self.firestone_error(endpoint, failure))
+    }
+
+    fn vmm_ping_inner(&self) -> Result<VmmPingResponse, ClientFailure> {
+        let response = self.request_inner(Endpoint::VmmPing, None)?;
+        decode_json(response.body(), "vmm.ping JSON response")
+    }
+
+    fn vmm_ping_for_liveness(&self) -> Result<bool, FirestoneError> {
+        match self.request_inner(Endpoint::VmmPing, None) {
+            Ok(_) => Ok(true),
+            Err(failure) if failure.is_liveness_negative() => Ok(false),
+            Err(failure) => Err(self.firestone_error(Endpoint::VmmPing, failure)),
+        }
+    }
+
+    fn request_inner(
+        &self,
+        endpoint: Endpoint,
+        body: Option<&[u8]>,
+    ) -> Result<HttpResponse, ClientFailure> {
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(self.timeout)
+            .ok_or(ClientFailure::DeadlineOutOfRange)?;
+        ensure_before_deadline(deadline, "starting request")?;
+
+        let mut stream = connect_socket(self.api_socket, deadline)?;
+        let request_header = request_header(endpoint, body.map_or(0, <[u8]>::len))?;
+        write_until_deadline(
+            &mut stream,
+            request_header.as_bytes(),
+            deadline,
+            "writing request headers",
+        )?;
+        if let Some(body) = body {
+            write_until_deadline(&mut stream, body, deadline, "writing request body")?;
+        }
+
+        read_response(&mut stream, endpoint, deadline)
+    }
+
+    fn firestone_error(&self, endpoint: Endpoint, failure: ClientFailure) -> FirestoneError {
+        let request = format!("{} {}", endpoint.method(), endpoint.path());
+        let socket = self.api_socket.display();
+        match failure {
+            ClientFailure::Deadline { phase } => FirestoneError::new(
+                ErrorKind::Timeout,
+                format!(
+                    "VMM API {request} timed out after {} ms while {phase} on socket {socket}",
+                    self.timeout.as_millis()
+                ),
+            )
+            .with_hint("check the cloud-hypervisor process and its API socket"),
+            ClientFailure::DeadlineOutOfRange => FirestoneError::new(
+                ErrorKind::Usage,
+                format!("VMM API {request} deadline is out of range"),
+            )
+            .with_hint("use a finite VMM API timeout"),
+            ClientFailure::Io { phase, source } => {
+                let kind = if socket_error_is_unresponsive(source.kind()) {
+                    ErrorKind::NotRunning
+                } else {
+                    ErrorKind::Generic
+                };
+                FirestoneError::new(
+                    kind,
+                    format!("cannot {phase} for VMM API {request} on socket {socket}"),
+                )
+                .with_hint("start the machine or inspect its cloud-hypervisor log")
+                .with_source(source)
+            }
+            ClientFailure::Protocol(detail) => FirestoneError::new(
+                ErrorKind::Generic,
+                format!("invalid VMM API {request} response from socket {socket}: {detail}"),
+            )
+            .with_hint("the socket must speak the pinned Cloud Hypervisor v53.0 HTTP contract"),
+            ClientFailure::UnexpectedStatus { status, diagnostic } => FirestoneError::new(
+                ErrorKind::Generic,
+                format!(
+                    "VMM API {request} returned unexpected HTTP status {status}: {diagnostic:?}"
+                ),
+            )
+            .with_hint("inspect the cloud-hypervisor log for this machine"),
+            ClientFailure::InvalidJson { label, source } => FirestoneError::new(
+                ErrorKind::Generic,
+                format!("cannot decode {label} from VMM API {request} on socket {socket}"),
+            )
+            .with_hint("the response must match the pinned Cloud Hypervisor v53.0 JSON schema")
+            .with_source(source),
+            ClientFailure::RequestBodyTooLarge => FirestoneError::new(
+                ErrorKind::InvalidSpec,
+                format!(
+                    "VMM API {request} JSON body exceeds the {MAX_CREATE_BODY_BYTES}-byte micro-http limit"
+                ),
+            )
+            .with_hint("reduce the VMM configuration or config overlay"),
+            ClientFailure::InvalidRequestJson(source) => FirestoneError::new(
+                ErrorKind::InvalidSpec,
+                format!("cannot serialize the JSON body for VMM API {request}"),
+            )
+            .with_hint("inspect the generated VMM configuration")
+            .with_source(source),
+        }
+    }
+}
+
+/// Liveness adapter that uses the same bounded v53 client as lifecycle calls.
+#[derive(Debug, Clone, Copy)]
+pub struct VmmApiLivenessProbe {
+    timeout: Duration,
+}
+
+impl VmmApiLivenessProbe {
+    #[must_use]
+    pub const fn new(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+}
+
+impl VmmPingProbe for VmmApiLivenessProbe {
+    fn ping(&self, api_socket: &Path) -> Result<bool, FirestoneError> {
+        VmmApi::new(api_socket, self.timeout).vmm_ping_for_liveness()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Endpoint {
+    VmmPing,
+    VmCreate,
+    VmBoot,
+    VmInfo,
+    VmPowerButton,
+    VmShutdown,
+    VmmShutdown,
+}
+
+impl Endpoint {
+    const fn method(self) -> &'static str {
+        match self {
+            Self::VmmPing | Self::VmInfo => "GET",
+            Self::VmCreate
+            | Self::VmBoot
+            | Self::VmPowerButton
+            | Self::VmShutdown
+            | Self::VmmShutdown => "PUT",
+        }
+    }
+
+    const fn path(self) -> &'static str {
+        match self {
+            Self::VmmPing => "/api/v1/vmm.ping",
+            Self::VmCreate => "/api/v1/vm.create",
+            Self::VmBoot => "/api/v1/vm.boot",
+            Self::VmInfo => "/api/v1/vm.info",
+            Self::VmPowerButton => "/api/v1/vm.power-button",
+            Self::VmShutdown => "/api/v1/vm.shutdown",
+            Self::VmmShutdown => "/api/v1/vmm.shutdown",
+        }
+    }
+
+    const fn expected_status(self) -> u16 {
+        match self {
+            Self::VmmPing | Self::VmInfo | Self::VmmShutdown => 200,
+            Self::VmCreate | Self::VmBoot | Self::VmPowerButton | Self::VmShutdown => 204,
+        }
+    }
+
+    const fn success_body_limit(self) -> usize {
+        match self {
+            Self::VmmPing => MAX_PING_BODY_BYTES,
+            Self::VmInfo => MAX_INFO_BODY_BYTES,
+            Self::VmCreate
+            | Self::VmBoot
+            | Self::VmPowerButton
+            | Self::VmShutdown
+            | Self::VmmShutdown => 0,
+        }
+    }
+
+    const fn has_request_body(self) -> bool {
+        matches!(self, Self::VmCreate)
+    }
+}
+
+#[derive(Debug)]
+enum ClientFailure {
+    Deadline {
+        phase: &'static str,
+    },
+    DeadlineOutOfRange,
+    Io {
+        phase: &'static str,
+        source: io::Error,
+    },
+    Protocol(String),
+    UnexpectedStatus {
+        status: u16,
+        diagnostic: String,
+    },
+    InvalidJson {
+        label: &'static str,
+        source: serde_json::Error,
+    },
+    RequestBodyTooLarge,
+    InvalidRequestJson(serde_json::Error),
+}
+
+impl ClientFailure {
+    fn is_liveness_negative(&self) -> bool {
+        match self {
+            Self::Deadline { .. }
+            | Self::Protocol(_)
+            | Self::UnexpectedStatus { .. }
+            | Self::InvalidJson { .. } => true,
+            Self::Io { source, .. } => socket_error_is_unresponsive(source.kind()),
+            Self::DeadlineOutOfRange | Self::RequestBodyTooLarge | Self::InvalidRequestJson(_) => {
+                false
+            }
+        }
+    }
+}
+
+struct HttpResponse {
+    bytes: Vec<u8>,
+    body_start: usize,
+}
+
+impl HttpResponse {
+    fn body(&self) -> &[u8] {
+        &self.bytes[self.body_start..]
+    }
+}
+
+struct ParsedHead {
+    status: u16,
+    content_length: Option<usize>,
+}
+
+struct BoundedJsonWriter {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+impl BoundedJsonWriter {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::with_capacity(4096),
+            exceeded: false,
+        }
+    }
+}
+
+impl Write for BoundedJsonWriter {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        let Some(total) = self.bytes.len().checked_add(input.len()) else {
+            self.exceeded = true;
+            return Err(io::Error::other("VMM API request body limit exceeded"));
+        };
+        if total > MAX_CREATE_BODY_BYTES {
+            self.exceeded = true;
+            return Err(io::Error::other("VMM API request body limit exceeded"));
+        }
+        self.bytes.extend_from_slice(input);
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_create_body<T>(config: &T) -> Result<Vec<u8>, ClientFailure>
+where
+    T: Serialize + ?Sized,
+{
+    let mut writer = BoundedJsonWriter::new();
+    if let Err(source) = serde_json::to_writer(&mut writer, config) {
+        if writer.exceeded {
+            return Err(ClientFailure::RequestBodyTooLarge);
+        }
+        return Err(ClientFailure::InvalidRequestJson(source));
+    }
+    Ok(writer.bytes)
+}
+
+fn decode_json<T>(body: &[u8], label: &'static str) -> Result<T, ClientFailure>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    serde_json::from_slice(body).map_err(|source| ClientFailure::InvalidJson { label, source })
+}
+
+fn request_header(endpoint: Endpoint, body_len: usize) -> Result<String, ClientFailure> {
+    let mut header = format!(
+        "{} {} HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n",
+        endpoint.method(),
+        endpoint.path()
+    );
+    if endpoint.has_request_body() {
+        write!(
+            header,
+            "Content-Type: application/json\r\nContent-Length: {body_len}\r\n"
+        )
+        .map_err(|_| ClientFailure::Protocol("cannot build request headers".to_string()))?;
+    } else if body_len != 0 {
+        return Err(ClientFailure::Protocol(
+            "body supplied for a bodyless VMM API endpoint".to_string(),
+        ));
+    }
+    header.push_str("\r\n");
+    Ok(header)
+}
+
+fn connect_socket(api_socket: &Path, deadline: Instant) -> Result<UnixStream, ClientFailure> {
+    let address = UnixAddr::new(api_socket).map_err(|source| ClientFailure::Io {
+        phase: "address socket",
+        source: io::Error::from(source),
+    })?;
+
+    loop {
+        ensure_before_deadline(deadline, "connecting")?;
+        let descriptor = socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::empty(),
+            None::<SockProtocol>,
+        )
+        .map_err(|source| ClientFailure::Io {
+            phase: "create socket",
+            source: io::Error::from(source),
+        })?;
+        fcntl(&descriptor, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).map_err(|source| {
+            ClientFailure::Io {
+                phase: "set socket nonblocking",
+                source: io::Error::from(source),
+            }
+        })?;
+        fcntl(&descriptor, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(|source| {
+            ClientFailure::Io {
+                phase: "set socket close-on-exec",
+                source: io::Error::from(source),
+            }
+        })?;
+
+        match connect(descriptor.as_raw_fd(), &address) {
+            Ok(()) => return Ok(UnixStream::from(descriptor)),
+            Err(Errno::EINPROGRESS | Errno::EALREADY) => {
+                let stream = UnixStream::from(descriptor);
+                wait_for_socket(&stream, PollFlags::POLLOUT, deadline, "connecting")?;
+                let pending =
+                    getsockopt(&stream, SocketError).map_err(|source| ClientFailure::Io {
+                        phase: "inspect connection",
+                        source: io::Error::from(source),
+                    })?;
+                if pending == 0 {
+                    return Ok(stream);
+                }
+                return Err(ClientFailure::Io {
+                    phase: "connect",
+                    source: io::Error::from_raw_os_error(pending),
+                });
+            }
+            Err(Errno::EAGAIN) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(ClientFailure::Deadline {
+                        phase: "connecting",
+                    });
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+            Err(source) => {
+                return Err(ClientFailure::Io {
+                    phase: "connect",
+                    source: io::Error::from(source),
+                });
+            }
+        }
+    }
+}
+
+fn write_until_deadline(
+    stream: &mut UnixStream,
+    bytes: &[u8],
+    deadline: Instant,
+    phase: &'static str,
+) -> Result<(), ClientFailure> {
+    let mut written = 0;
+    while written < bytes.len() {
+        ensure_before_deadline(deadline, phase)?;
+        match stream.write(&bytes[written..]) {
+            Ok(0) => {
+                return Err(ClientFailure::Io {
+                    phase,
+                    source: io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "VMM API socket wrote zero bytes",
+                    ),
+                });
+            }
+            Ok(count) => written += count,
+            Err(source) if source.kind() == io::ErrorKind::Interrupted => {}
+            Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
+                wait_for_socket(stream, PollFlags::POLLOUT, deadline, phase)?;
+            }
+            Err(source) if source.kind() == io::ErrorKind::TimedOut => {
+                return Err(ClientFailure::Deadline { phase });
+            }
+            Err(source) => return Err(ClientFailure::Io { phase, source }),
+        }
+    }
+    ensure_before_deadline(deadline, phase)
+}
+
+fn read_response(
+    stream: &mut UnixStream,
+    endpoint: Endpoint,
+    deadline: Instant,
+) -> Result<HttpResponse, ClientFailure> {
+    let mut bytes = Vec::with_capacity(MAX_RESPONSE_HEADER_BYTES + 1);
+    let body_start = loop {
+        if let Some(offset) = find_header_terminator(&bytes) {
+            let body_start = offset + 4;
+            if body_start > MAX_RESPONSE_HEADER_BYTES {
+                return Err(ClientFailure::Protocol(format!(
+                    "response headers exceed {MAX_RESPONSE_HEADER_BYTES} bytes"
+                )));
+            }
+            break body_start;
+        }
+        if bytes.len() > MAX_RESPONSE_HEADER_BYTES {
+            return Err(ClientFailure::Protocol(format!(
+                "response headers exceed {MAX_RESPONSE_HEADER_BYTES} bytes"
+            )));
+        }
+        let remaining = MAX_RESPONSE_HEADER_BYTES + 1 - bytes.len();
+        let mut chunk = [0_u8; IO_CHUNK_BYTES];
+        let chunk_length = remaining.min(chunk.len());
+        let read = read_until_deadline(
+            stream,
+            &mut chunk[..chunk_length],
+            deadline,
+            "reading response headers",
+        )?;
+        if read == 0 {
+            return Err(ClientFailure::Protocol(
+                "response ended before the header terminator".to_string(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    };
+
+    let head = parse_response_head(&bytes[..body_start - 4])?;
+    let buffered_body = bytes.len() - body_start;
+    let body_length = if head.status == 204 {
+        if head.content_length.is_some() {
+            return Err(ClientFailure::Protocol(
+                "HTTP 204 response must not include Content-Length".to_string(),
+            ));
+        }
+        if buffered_body != 0 {
+            return Err(ClientFailure::Protocol(
+                "HTTP 204 response includes unexpected body bytes".to_string(),
+            ));
+        }
+        0
+    } else {
+        head.content_length.ok_or_else(|| {
+            ClientFailure::Protocol(format!(
+                "HTTP {} response is missing Content-Length",
+                head.status
+            ))
+        })?
+    };
+
+    let body_limit = if head.status == endpoint.expected_status() {
+        endpoint.success_body_limit()
+    } else {
+        MAX_ERROR_BODY_BYTES
+    };
+    if body_length > body_limit {
+        return Err(ClientFailure::Protocol(format!(
+            "HTTP {} response body length {body_length} exceeds the {body_limit}-byte limit",
+            head.status
+        )));
+    }
+    if buffered_body > body_length {
+        return Err(ClientFailure::Protocol(format!(
+            "HTTP {} response includes {} extra body bytes beyond Content-Length",
+            head.status,
+            buffered_body - body_length
+        )));
+    }
+
+    bytes.reserve(body_length - buffered_body);
+    while bytes.len() - body_start < body_length {
+        let remaining = body_length - (bytes.len() - body_start);
+        let mut chunk = [0_u8; IO_CHUNK_BYTES];
+        let chunk_length = remaining.min(chunk.len());
+        let read = read_until_deadline(
+            stream,
+            &mut chunk[..chunk_length],
+            deadline,
+            "reading response body",
+        )?;
+        if read == 0 {
+            return Err(ClientFailure::Protocol(format!(
+                "HTTP {} response body ended before Content-Length {body_length}",
+                head.status
+            )));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    ensure_before_deadline(deadline, "reading response body")?;
+
+    if head.status != endpoint.expected_status() {
+        let diagnostic = std::str::from_utf8(&bytes[body_start..]).map_err(|_| {
+            ClientFailure::Protocol(format!(
+                "HTTP {} diagnostic body is not valid UTF-8",
+                head.status
+            ))
+        })?;
+        return Err(ClientFailure::UnexpectedStatus {
+            status: head.status,
+            diagnostic: diagnostic.to_string(),
+        });
+    }
+
+    Ok(HttpResponse { bytes, body_start })
+}
+
+fn parse_response_head(bytes: &[u8]) -> Result<ParsedHead, ClientFailure> {
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        ClientFailure::Protocol("response status or headers are not valid UTF-8".to_string())
+    })?;
+    let mut lines = text.split("\r\n");
+    let status_line = lines
+        .next()
+        .ok_or_else(|| ClientFailure::Protocol("response status line is missing".to_string()))?;
+    let status = parse_status_line(status_line)?;
+    let mut content_length = None;
+
+    for line in lines {
+        if line.is_empty() {
+            return Err(ClientFailure::Protocol(
+                "response contains an empty line before the header terminator".to_string(),
+            ));
+        }
+        if line.starts_with([' ', '\t']) {
+            return Err(ClientFailure::Protocol(
+                "folded response header lines are not supported".to_string(),
+            ));
+        }
+        let (name, value) = line.split_once(':').ok_or_else(|| {
+            ClientFailure::Protocol(format!("malformed response header line {line:?}"))
+        })?;
+        if name.is_empty() || !name.bytes().all(is_header_name_byte) {
+            return Err(ClientFailure::Protocol(format!(
+                "malformed response header name {name:?}"
+            )));
+        }
+        let value = value.trim_matches([' ', '\t']);
+        if value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() && byte != b'\t')
+        {
+            return Err(ClientFailure::Protocol(format!(
+                "malformed response header value for {name:?}"
+            )));
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(ClientFailure::Protocol(
+                "Transfer-Encoding responses are not supported".to_string(),
+            ));
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(ClientFailure::Protocol(format!(
+                    "malformed Content-Length value {value:?}"
+                )));
+            }
+            let parsed = value.parse::<usize>().map_err(|_| {
+                ClientFailure::Protocol(format!("Content-Length value {value:?} is out of range"))
+            })?;
+            if let Some(previous) = content_length {
+                let qualifier = if previous == parsed {
+                    "duplicate"
+                } else {
+                    "conflicting"
+                };
+                return Err(ClientFailure::Protocol(format!(
+                    "{qualifier} Content-Length headers ({previous} and {parsed})"
+                )));
+            }
+            content_length = Some(parsed);
+        }
+    }
+
+    Ok(ParsedHead {
+        status,
+        content_length,
+    })
+}
+
+fn parse_status_line(line: &str) -> Result<u16, ClientFailure> {
+    let mut fields = line.splitn(3, ' ');
+    if fields.next() != Some("HTTP/1.1") {
+        return Err(ClientFailure::Protocol(format!(
+            "malformed HTTP/1.1 status line {line:?}"
+        )));
+    }
+    let code = fields.next().ok_or_else(|| {
+        ClientFailure::Protocol(format!("malformed HTTP/1.1 status line {line:?}"))
+    })?;
+    if fields.next().is_none() || code.len() != 3 || !code.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(ClientFailure::Protocol(format!(
+            "malformed HTTP/1.1 status line {line:?}"
+        )));
+    }
+    let status = code
+        .parse::<u16>()
+        .map_err(|_| ClientFailure::Protocol(format!("malformed HTTP/1.1 status code {code:?}")))?;
+    if !(100..=599).contains(&status) {
+        return Err(ClientFailure::Protocol(format!(
+            "HTTP status code {status} is out of range"
+        )));
+    }
+    Ok(status)
+}
+
+fn is_header_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn find_header_terminator(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn read_until_deadline(
+    stream: &mut UnixStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+    phase: &'static str,
+) -> Result<usize, ClientFailure> {
+    loop {
+        ensure_before_deadline(deadline, phase)?;
+        match stream.read(buffer) {
+            Ok(read) => return Ok(read),
+            Err(source) if source.kind() == io::ErrorKind::Interrupted => {}
+            Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
+                wait_for_socket(stream, PollFlags::POLLIN, deadline, phase)?;
+            }
+            Err(source) if source.kind() == io::ErrorKind::TimedOut => {
+                return Err(ClientFailure::Deadline { phase });
+            }
+            Err(source) => return Err(ClientFailure::Io { phase, source }),
+        }
+    }
+}
+
+fn wait_for_socket(
+    stream: &UnixStream,
+    events: PollFlags,
+    deadline: Instant,
+    phase: &'static str,
+) -> Result<(), ClientFailure> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ClientFailure::Deadline { phase });
+        }
+        let timeout = match PollTimeout::try_from(remaining) {
+            Ok(timeout) => timeout,
+            Err(_) => PollTimeout::MAX,
+        };
+        let mut descriptors = [PollFd::new(stream.as_fd(), events)];
+        match poll(&mut descriptors, timeout) {
+            Ok(0) => return Err(ClientFailure::Deadline { phase }),
+            Ok(_) => return ensure_before_deadline(deadline, phase),
+            Err(Errno::EINTR) => {}
+            Err(source) => {
+                return Err(ClientFailure::Io {
+                    phase,
+                    source: io::Error::from(source),
+                });
+            }
+        }
+    }
+}
+
+fn ensure_before_deadline(deadline: Instant, phase: &'static str) -> Result<(), ClientFailure> {
+    if Instant::now() >= deadline {
+        Err(ClientFailure::Deadline { phase })
+    } else {
+        Ok(())
+    }
+}
+
+fn socket_error_is_unresponsive(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::NotFound
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{self, Read, Write},
+        os::unix::net::{UnixListener, UnixStream},
+        path::{Path, PathBuf},
+        sync::mpsc::{self, Sender},
+        thread::{self, JoinHandle},
+        time::{Duration, Instant},
+    };
+
+    use serde::Serialize;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::{
+        MAX_CREATE_BODY_BYTES, MAX_ERROR_BODY_BYTES, MAX_INFO_BODY_BYTES, MAX_PING_BODY_BYTES,
+        VmState, VmmApi, VmmApiLivenessProbe, VmmPingResponse, find_header_terminator,
+    };
+    use crate::{ErrorKind, VmmPingProbe};
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(1);
+
+    struct FakeServer {
+        _directory: TempDir,
+        socket: PathBuf,
+        release: Option<Sender<()>>,
+        thread: JoinHandle<io::Result<Vec<u8>>>,
+    }
+
+    impl FakeServer {
+        fn spawn(response_chunks: Vec<Vec<u8>>, hold_open: bool) -> io::Result<Self> {
+            Self::spawn_with_delay(response_chunks, hold_open, Duration::ZERO)
+        }
+
+        fn spawn_with_delay(
+            response_chunks: Vec<Vec<u8>>,
+            hold_open: bool,
+            delay: Duration,
+        ) -> io::Result<Self> {
+            let directory = TempDir::new()?;
+            let socket = directory.path().join("api.sock");
+            let listener = UnixListener::bind(&socket)?;
+            let (release, wait_for_release) = if hold_open {
+                let (sender, receiver) = mpsc::channel();
+                (Some(sender), Some(receiver))
+            } else {
+                (None, None)
+            };
+            let thread = thread::spawn(move || {
+                let (mut stream, _) = listener.accept()?;
+                let request = read_request(&mut stream)?;
+                for chunk in response_chunks {
+                    if !delay.is_zero() {
+                        thread::sleep(delay);
+                    }
+                    if stream.write_all(&chunk).is_err() {
+                        return Ok(request);
+                    }
+                }
+                if let Some(receiver) = wait_for_release {
+                    let _ = receiver.recv_timeout(Duration::from_secs(2));
+                }
+                Ok(request)
+            });
+            Ok(Self {
+                _directory: directory,
+                socket,
+                release,
+                thread,
+            })
+        }
+
+        fn path(&self) -> &Path {
+            &self.socket
+        }
+
+        fn finish(mut self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            self.thread
+                .join()
+                .map_err(|_| io::Error::other("fake VMM server panicked"))?
+                .map_err(Into::into)
+        }
+    }
+
+    fn read_request(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
+        let mut request = Vec::new();
+        let body_start = loop {
+            if let Some(offset) = find_header_terminator(&request) {
+                break offset + 4;
+            }
+            let mut chunk = [0_u8; 4096];
+            let read = stream.read(&mut chunk)?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "request ended before headers",
+                ));
+            }
+            request.extend_from_slice(&chunk[..read]);
+        };
+        let headers = std::str::from_utf8(&request[..body_start])
+            .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))?;
+        let content_length = headers
+            .split("\r\n")
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .map(str::parse::<usize>)
+            .transpose()
+            .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))?
+            .unwrap_or(0);
+        while request.len() - body_start < content_length {
+            let mut chunk = [0_u8; 4096];
+            let remaining = content_length - (request.len() - body_start);
+            let chunk_length = remaining.min(chunk.len());
+            let read = stream.read(&mut chunk[..chunk_length])?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "request body was truncated",
+                ));
+            }
+            request.extend_from_slice(&chunk[..read]);
+        }
+        Ok(request)
+    }
+
+    fn response(status: &str, body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\nServer: Cloud Hypervisor API\r\nConnection: keep-alive\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    fn no_content_response() -> Vec<u8> {
+        b"HTTP/1.1 204 No Content\r\nServer: Cloud Hypervisor API\r\nConnection: keep-alive\r\nContent-Type: application/json\r\n\r\n"
+            .to_vec()
+    }
+
+    fn ping_body() -> &'static [u8] {
+        br#"{"build_version":"v53.0","version":"53.0.0","pid":42,"features":["kvm"]}"#
+    }
+    fn require_error<T, E>(result: Result<T, E>, message: &'static str) -> Result<E, io::Error> {
+        match result {
+            Ok(_) => Err(io::Error::other(message)),
+            Err(error) => Ok(error),
+        }
+    }
+    fn assert_protocol_error(response: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+        let server = FakeServer::spawn(vec![response], false)?;
+        let error = require_error(
+            VmmApi::new(server.path(), TEST_TIMEOUT).vmm_ping(),
+            "malformed response must fail",
+        )?;
+        let _ = server.finish()?;
+        assert_eq!(error.kind(), ErrorKind::Generic);
+        assert!(
+            error
+                .message()
+                .contains("invalid VMM API GET /api/v1/vmm.ping response")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn methods_expected_statuses_emit_exact_requests() -> Result<(), Box<dyn std::error::Error>> {
+        let ping_server = FakeServer::spawn(vec![response("200 OK", ping_body())], false)?;
+        let ping = VmmApi::new(ping_server.path(), TEST_TIMEOUT).vmm_ping()?;
+        assert_eq!(
+            ping,
+            VmmPingResponse {
+                build_version: "v53.0".to_string(),
+                version: "53.0.0".to_string(),
+                pid: 42,
+                features: vec!["kvm".to_string()],
+            }
+        );
+        assert_eq!(
+            ping_server.finish()?,
+            b"GET /api/v1/vmm.ping HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n\r\n"
+        );
+
+        let create_body = br#"{"answer":42}"#;
+        let create_server = FakeServer::spawn(vec![no_content_response()], false)?;
+        VmmApi::new(create_server.path(), TEST_TIMEOUT).vm_create(&json!({"answer": 42}))?;
+        let mut create_request = format!(
+            "PUT /api/v1/vm.create HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            create_body.len()
+        )
+        .into_bytes();
+        create_request.extend_from_slice(create_body);
+        assert_eq!(create_server.finish()?, create_request);
+
+        let boot_server = FakeServer::spawn(vec![no_content_response()], false)?;
+        VmmApi::new(boot_server.path(), TEST_TIMEOUT).vm_boot()?;
+        assert_eq!(
+            boot_server.finish()?,
+            b"PUT /api/v1/vm.boot HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n\r\n"
+        );
+
+        let info_body = br#"{"config":{"payload":{"kernel":"fw"}},"state":"Running","memory_actual_size":2147483648,"device_tree":null}"#;
+        let info_server = FakeServer::spawn(vec![response("200 OK", info_body)], false)?;
+        let info = VmmApi::new(info_server.path(), TEST_TIMEOUT).vm_info()?;
+        assert_eq!(info.state, VmState::Running);
+        assert_eq!(info.memory_actual_size, 2_147_483_648);
+        assert_eq!(
+            info_server.finish()?,
+            b"GET /api/v1/vm.info HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n\r\n"
+        );
+
+        let power_server = FakeServer::spawn(vec![no_content_response()], false)?;
+        VmmApi::new(power_server.path(), TEST_TIMEOUT).vm_power_button()?;
+        assert_eq!(
+            power_server.finish()?,
+            b"PUT /api/v1/vm.power-button HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n\r\n"
+        );
+
+        let vm_shutdown_server = FakeServer::spawn(vec![no_content_response()], false)?;
+        VmmApi::new(vm_shutdown_server.path(), TEST_TIMEOUT).vm_shutdown()?;
+        assert_eq!(
+            vm_shutdown_server.finish()?,
+            b"PUT /api/v1/vm.shutdown HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n\r\n"
+        );
+
+        let vmm_shutdown_server = FakeServer::spawn(
+            vec![
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n".to_vec(),
+            ],
+            false,
+        )?;
+        VmmApi::new(vmm_shutdown_server.path(), TEST_TIMEOUT).vmm_shutdown()?;
+        assert_eq!(
+            vmm_shutdown_server.finish()?,
+            b"PUT /api/v1/vmm.shutdown HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n\r\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn response_fragmented_and_keep_alive_completes_at_content_length()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let full = response("200 OK", ping_body());
+        let chunks = full.chunks(3).map(<[u8]>::to_vec).collect();
+        let server = FakeServer::spawn_with_delay(chunks, true, Duration::from_millis(1))?;
+        let ping = VmmApi::new(server.path(), TEST_TIMEOUT).vmm_ping()?;
+        assert_eq!(ping.version, "53.0.0");
+        let _ = server.finish()?;
+        Ok(())
+    }
+
+    #[derive(Serialize)]
+    struct LargeConfig<'a> {
+        data: &'a str,
+    }
+
+    #[test]
+    fn vm_create_body_limit_accepts_51200_and_rejects_51201_before_connect()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let accepted_data = "a".repeat(MAX_CREATE_BODY_BYTES - br#"{"data":""}"#.len());
+        let accepted_server = FakeServer::spawn(vec![no_content_response()], false)?;
+        VmmApi::new(accepted_server.path(), TEST_TIMEOUT).vm_create(&LargeConfig {
+            data: &accepted_data,
+        })?;
+        let accepted_request = accepted_server.finish()?;
+        let body_start = find_header_terminator(&accepted_request)
+            .ok_or_else(|| io::Error::other("request header terminator missing"))?
+            + 4;
+        assert_eq!(accepted_request.len() - body_start, MAX_CREATE_BODY_BYTES);
+        assert!(
+            accepted_request[..body_start]
+                .windows(b"Content-Length: 51200\r\n".len())
+                .any(|window| window == b"Content-Length: 51200\r\n")
+        );
+
+        let directory = TempDir::new()?;
+        let socket = directory.path().join("api.sock");
+        let listener = UnixListener::bind(&socket)?;
+        listener.set_nonblocking(true)?;
+        let rejected_data = "a".repeat(MAX_CREATE_BODY_BYTES + 1 - br#"{"data":""}"#.len());
+        let error = require_error(
+            VmmApi::new(&socket, TEST_TIMEOUT).vm_create(&LargeConfig {
+                data: &rejected_data,
+            }),
+            "oversized create body must fail locally",
+        )?;
+        assert_eq!(error.kind(), ErrorKind::InvalidSpec);
+        assert!(error.message().contains("51200-byte"));
+        let accept_error = require_error(listener.accept(), "client must not connect")?;
+        assert_eq!(accept_error.kind(), io::ErrorKind::WouldBlock);
+        Ok(())
+    }
+
+    #[test]
+    fn response_body_limits_reject_oversized_success_and_error_bodies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ping_server = FakeServer::spawn(
+            vec![
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    MAX_PING_BODY_BYTES + 1
+                )
+                .into_bytes(),
+            ],
+            false,
+        )?;
+        let ping_error = require_error(
+            VmmApi::new(ping_server.path(), TEST_TIMEOUT).vmm_ping(),
+            "oversized ping response must fail",
+        )?;
+        let _ = ping_server.finish()?;
+        assert!(ping_error.message().contains("65536-byte limit"));
+
+        let info_server = FakeServer::spawn(
+            vec![
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    MAX_INFO_BODY_BYTES + 1
+                )
+                .into_bytes(),
+            ],
+            false,
+        )?;
+        let info_error = require_error(
+            VmmApi::new(info_server.path(), TEST_TIMEOUT).vm_info(),
+            "oversized info response must fail",
+        )?;
+        let _ = info_server.finish()?;
+        assert!(info_error.message().contains("1048576-byte limit"));
+
+        let error_server = FakeServer::spawn(
+            vec![
+                format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\n\r\n",
+                    MAX_ERROR_BODY_BYTES + 1
+                )
+                .into_bytes(),
+            ],
+            false,
+        )?;
+        let server_error = require_error(
+            VmmApi::new(error_server.path(), TEST_TIMEOUT).vmm_ping(),
+            "oversized error response must fail",
+        )?;
+        let _ = error_server.finish()?;
+        assert!(server_error.message().contains("65536-byte limit"));
+        Ok(())
+    }
+
+    #[test]
+    fn unexpected_status_preserves_bounded_utf8_diagnostic()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let diagnostic = br#"["VM is not created"]"#;
+        let server = FakeServer::spawn(
+            vec![response("500 Internal Server Error", diagnostic)],
+            true,
+        )?;
+        let error = require_error(
+            VmmApi::new(server.path(), TEST_TIMEOUT).vm_boot(),
+            "unexpected status must fail",
+        )?;
+        let _ = server.finish()?;
+        assert_eq!(error.kind(), ErrorKind::Generic);
+        assert!(error.message().contains("PUT /api/v1/vm.boot"));
+        assert!(error.message().contains("HTTP status 500"));
+        assert!(error.message().contains("VM is not created"));
+        Ok(())
+    }
+
+    #[test]
+    fn response_framing_malformed_variants_are_rejected() -> Result<(), Box<dyn std::error::Error>>
+    {
+        for malformed in [
+            b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            b"HTTP/1.1 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nMalformed\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\n{}".to_vec(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}x".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\n".to_vec(),
+        ] {
+            assert_protocol_error(malformed)?;
+        }
+
+        assert_protocol_error(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n{}".to_vec())?;
+        assert_protocol_error(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n".to_vec())?;
+        Ok(())
+    }
+
+    #[test]
+    fn response_header_limit_and_unexpected_empty_body_are_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let oversized = format!(
+            "HTTP/1.1 200 OK\r\nX-Fill: {}\r\nContent-Length: 0\r\n\r\n",
+            "a".repeat(16 * 1024)
+        )
+        .into_bytes();
+        assert_protocol_error(oversized)?;
+
+        let server = FakeServer::spawn(
+            vec![b"HTTP/1.1 204 No Content\r\nContent-Length: 1\r\n\r\nx".to_vec()],
+            false,
+        )?;
+        let error = require_error(
+            VmmApi::new(server.path(), TEST_TIMEOUT).vm_boot(),
+            "204 body must fail",
+        )?;
+        let _ = server.finish()?;
+        assert!(error.message().contains("must not include Content-Length"));
+        Ok(())
+    }
+
+    #[test]
+    fn error_diagnostic_non_utf8_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let server =
+            FakeServer::spawn(vec![response("500 Internal Server Error", &[0xff])], false)?;
+        let error = require_error(
+            VmmApi::new(server.path(), TEST_TIMEOUT).vmm_ping(),
+            "non-UTF8 diagnostic must fail",
+        )?;
+        let _ = server.finish()?;
+        assert!(
+            error
+                .message()
+                .contains("diagnostic body is not valid UTF-8")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn response_partial_body_uses_one_absolute_deadline() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let server = FakeServer::spawn_with_delay(
+            vec![b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{".to_vec()],
+            true,
+            Duration::ZERO,
+        )?;
+        let started = Instant::now();
+        let error = require_error(
+            VmmApi::new(server.path(), Duration::from_millis(60)).vmm_ping(),
+            "partial response must time out",
+        )?;
+        let elapsed = started.elapsed();
+        let _ = server.finish()?;
+        assert_eq!(error.kind(), ErrorKind::Timeout);
+        assert!(error.message().contains("reading response body"));
+        assert!(elapsed < Duration::from_millis(300));
+        Ok(())
+    }
+
+    #[test]
+    fn socket_missing_reports_not_running_and_liveness_false()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TempDir::new()?;
+        let socket = directory.path().join("missing.sock");
+        let error = require_error(
+            VmmApi::new(&socket, TEST_TIMEOUT).vmm_ping(),
+            "missing socket must fail",
+        )?;
+        assert_eq!(error.kind(), ErrorKind::NotRunning);
+        assert!(error.message().contains("GET /api/v1/vmm.ping"));
+        assert!(error.message().contains("missing.sock"));
+
+        let probe = VmmApiLivenessProbe::new(TEST_TIMEOUT);
+        assert!(!probe.ping(&socket)?);
+        Ok(())
+    }
+
+    #[test]
+    fn liveness_unexpected_status_and_malformed_response_return_false()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for response in [
+            response("204 No Content", b""),
+            b"not HTTP\r\n\r\n".to_vec(),
+        ] {
+            let server = FakeServer::spawn(vec![response], false)?;
+            let probe = VmmApiLivenessProbe::new(TEST_TIMEOUT);
+            assert!(!probe.ping(server.path())?);
+            let _ = server.finish()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn liveness_http_200_schema_drift_uses_status_without_identity_decode()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let drifted_body = br#"{"build_version":"v54.0","version":"54.0.0","pid":42,"features":[],"new_field":true}"#;
+        let liveness_server = FakeServer::spawn(vec![response("200 OK", drifted_body)], false)?;
+        let probe = VmmApiLivenessProbe::new(TEST_TIMEOUT);
+        assert!(probe.ping(liveness_server.path())?);
+        let _ = liveness_server.finish()?;
+
+        let identity_server = FakeServer::spawn(vec![response("200 OK", drifted_body)], false)?;
+        let error = require_error(
+            VmmApi::new(identity_server.path(), TEST_TIMEOUT).vmm_ping(),
+            "typed ping identity must reject schema drift",
+        )?;
+        let _ = identity_server.finish()?;
+        assert!(
+            error
+                .message()
+                .contains("cannot decode vmm.ping JSON response")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vm_info_unknown_state_is_protocol_drift() -> Result<(), Box<dyn std::error::Error>> {
+        let body = br#"{"config":{},"state":"Stopped","memory_actual_size":0}"#;
+        let server = FakeServer::spawn(vec![response("200 OK", body)], false)?;
+        let error = require_error(
+            VmmApi::new(server.path(), TEST_TIMEOUT).vm_info(),
+            "unknown v53 VM state must fail",
+        )?;
+        let _ = server.finish()?;
+        assert!(
+            error
+                .message()
+                .contains("cannot decode vm.info JSON response")
+        );
+        Ok(())
+    }
+}

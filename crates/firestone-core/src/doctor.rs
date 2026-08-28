@@ -3,22 +3,11 @@ use std::{
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    os::fd::{AsFd, AsRawFd},
     os::unix::fs::{MetadataExt, PermissionsExt},
-    os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use nix::{
-    errno::Errno,
-    fcntl::{FcntlArg, FdFlag, OFlag, fcntl},
-    poll::{PollFd, PollFlags, PollTimeout, poll},
-    sys::socket::{
-        AddressFamily, SockFlag, SockProtocol, SockType, UnixAddr, connect, getsockopt, socket,
-        sockopt::SocketError,
-    },
-};
 use reqwest::{Url, blocking::Client, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -26,7 +15,8 @@ use tempfile::Builder as TempBuilder;
 
 use crate::{
     Cmd, DependencyArtifact, DependencyManifest, ErrorKind, FirestoneError, MachineLock, Paths,
-    ReconcileRewrite, StateStore, VmmPingProbe, observe_liveness, reconcile, reconciled_state,
+    ReconcileRewrite, StateStore, VmmApiLivenessProbe, VmmPingProbe, observe_liveness, reconcile,
+    reconciled_state,
 };
 
 const MINIMUM_FREE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
@@ -206,7 +196,7 @@ impl DoctorContext {
 /// SPEC 17.3. Every successful fix is checked again before the report is built.
 pub fn run_doctor(context: &DoctorContext, fix: bool) -> Result<DoctorReport, FirestoneError> {
     if !fix {
-        let stale_state = reconcile_machine_states(context, &HttpVmmPing);
+        let stale_state = reconcile_machine_states(context, &VMM_PING_PROBE);
         return Ok(inspect(context, &BTreeMap::new(), &stale_state));
     }
 
@@ -232,7 +222,7 @@ fn run_doctor_with(
     } else {
         BTreeMap::new()
     };
-    let stale_state = reconcile_machine_states(context, &HttpVmmPing);
+    let stale_state = reconcile_machine_states(context, &VMM_PING_PROBE);
     inspect(context, &failures, &stale_state)
 }
 
@@ -242,240 +232,7 @@ struct StaleStateReport {
     failures: Vec<StaleStateFailure>,
 }
 
-struct HttpVmmPing;
-
-impl HttpVmmPing {
-    fn ping_with_timeout(
-        &self,
-        api_socket: &Path,
-        timeout: Duration,
-    ) -> Result<bool, FirestoneError> {
-        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
-            FirestoneError::new(ErrorKind::Generic, "VMM ping deadline is out of range")
-                .with_hint("use a finite VMM ping timeout")
-        })?;
-        let Some(mut stream) = connect_vmm_socket(api_socket, deadline)? else {
-            return Ok(false);
-        };
-        if !write_vmm_ping_request(&mut stream, api_socket, deadline)? {
-            return Ok(false);
-        }
-
-        let mut response = [0_u8; 1024];
-        let mut used = 0;
-        while used < response.len() && !response[..used].contains(&b'\n') {
-            if Instant::now() >= deadline {
-                return Ok(false);
-            }
-            match stream.read(&mut response[used..]) {
-                Ok(0) => break,
-                Ok(read) => used += read,
-                Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
-                    if !wait_for_vmm_socket(
-                        &stream,
-                        PollFlags::POLLIN,
-                        deadline,
-                        api_socket,
-                        "wait to read from",
-                    )? {
-                        return Ok(false);
-                    }
-                }
-                Err(source) if vmm_is_unresponsive(source.kind()) => return Ok(false),
-                Err(source) => return Err(vmm_ping_error(api_socket, "read from", source)),
-            }
-        }
-        let Some(line_end) = response[..used].iter().position(|byte| *byte == b'\n') else {
-            return Ok(false);
-        };
-        let Some(line) = std::str::from_utf8(&response[..line_end]).ok() else {
-            return Ok(false);
-        };
-        let mut fields = line.split_ascii_whitespace();
-        let protocol = fields.next();
-        let status = fields.next();
-        Ok(matches!(protocol, Some("HTTP/1.0" | "HTTP/1.1")) && status == Some("200"))
-    }
-}
-
-impl VmmPingProbe for HttpVmmPing {
-    fn ping(&self, api_socket: &Path) -> Result<bool, FirestoneError> {
-        self.ping_with_timeout(api_socket, DOCTOR_PROBE_TIMEOUT)
-    }
-}
-
-fn connect_vmm_socket(
-    api_socket: &Path,
-    deadline: Instant,
-) -> Result<Option<UnixStream>, FirestoneError> {
-    let address = UnixAddr::new(api_socket)
-        .map_err(|source| vmm_ping_error(api_socket, "address", std::io::Error::from(source)))?;
-
-    loop {
-        if Instant::now() >= deadline {
-            return Ok(None);
-        }
-        let descriptor = socket(
-            AddressFamily::Unix,
-            SockType::Stream,
-            SockFlag::empty(),
-            None::<SockProtocol>,
-        )
-        .map_err(|source| {
-            vmm_ping_error(
-                api_socket,
-                "create socket for",
-                std::io::Error::from(source),
-            )
-        })?;
-        fcntl(&descriptor, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).map_err(|source| {
-            vmm_ping_error(
-                api_socket,
-                "set nonblocking mode on",
-                std::io::Error::from(source),
-            )
-        })?;
-        fcntl(&descriptor, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(|source| {
-            vmm_ping_error(
-                api_socket,
-                "set close-on-exec on",
-                std::io::Error::from(source),
-            )
-        })?;
-
-        match connect(descriptor.as_raw_fd(), &address) {
-            Ok(()) => return Ok(Some(UnixStream::from(descriptor))),
-            Err(Errno::EINPROGRESS | Errno::EALREADY) => {
-                let stream = UnixStream::from(descriptor);
-                if !wait_for_vmm_socket(
-                    &stream,
-                    PollFlags::POLLOUT,
-                    deadline,
-                    api_socket,
-                    "wait to connect to",
-                )? {
-                    return Ok(None);
-                }
-                let pending = getsockopt(&stream, SocketError).map_err(|source| {
-                    vmm_ping_error(
-                        api_socket,
-                        "inspect connection to",
-                        std::io::Error::from(source),
-                    )
-                })?;
-                if pending == 0 {
-                    return Ok(Some(stream));
-                }
-                let source = std::io::Error::from_raw_os_error(pending);
-                if vmm_is_unresponsive(source.kind()) {
-                    return Ok(None);
-                }
-                return Err(vmm_ping_error(api_socket, "connect to", source));
-            }
-            Err(Errno::EAGAIN) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Ok(None);
-                }
-                std::thread::sleep(remaining.min(Duration::from_millis(10)));
-            }
-            Err(source) => {
-                let source = std::io::Error::from(source);
-                if vmm_is_unresponsive(source.kind()) {
-                    return Ok(None);
-                }
-                return Err(vmm_ping_error(api_socket, "connect to", source));
-            }
-        }
-    }
-}
-
-fn write_vmm_ping_request(
-    stream: &mut UnixStream,
-    api_socket: &Path,
-    deadline: Instant,
-) -> Result<bool, FirestoneError> {
-    const REQUEST: &[u8] =
-        b"GET /api/v1/vmm.ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-    let mut written = 0;
-    while written < REQUEST.len() {
-        if Instant::now() >= deadline {
-            return Ok(false);
-        }
-        match stream.write(&REQUEST[written..]) {
-            Ok(0) => return Ok(false),
-            Ok(count) => written += count,
-            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
-                if !wait_for_vmm_socket(
-                    stream,
-                    PollFlags::POLLOUT,
-                    deadline,
-                    api_socket,
-                    "wait to write to",
-                )? {
-                    return Ok(false);
-                }
-            }
-            Err(source) if vmm_is_unresponsive(source.kind()) => return Ok(false),
-            Err(source) => return Err(vmm_ping_error(api_socket, "write to", source)),
-        }
-    }
-    Ok(true)
-}
-
-fn wait_for_vmm_socket(
-    stream: &UnixStream,
-    events: PollFlags,
-    deadline: Instant,
-    api_socket: &Path,
-    operation: &str,
-) -> Result<bool, FirestoneError> {
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(false);
-        }
-        let timeout = PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX);
-        let mut descriptors = [PollFd::new(stream.as_fd(), events)];
-        match poll(&mut descriptors, timeout) {
-            Ok(0) => return Ok(false),
-            Ok(_) => return Ok(true),
-            Err(Errno::EINTR) => {}
-            Err(source) => {
-                return Err(vmm_ping_error(
-                    api_socket,
-                    operation,
-                    std::io::Error::from(source),
-                ));
-            }
-        }
-    }
-}
-
-fn vmm_is_unresponsive(kind: std::io::ErrorKind) -> bool {
-    matches!(
-        kind,
-        std::io::ErrorKind::NotFound
-            | std::io::ErrorKind::ConnectionRefused
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::BrokenPipe
-            | std::io::ErrorKind::TimedOut
-            | std::io::ErrorKind::WouldBlock
-            | std::io::ErrorKind::UnexpectedEof
-    )
-}
-
-fn vmm_ping_error(api_socket: &Path, operation: &str, source: std::io::Error) -> FirestoneError {
-    FirestoneError::new(
-        ErrorKind::Generic,
-        format!("cannot {operation} VMM API socket {}", api_socket.display()),
-    )
-    .with_hint("check the machine runtime directory and VMM process")
-    .with_source(source)
-}
+const VMM_PING_PROBE: VmmApiLivenessProbe = VmmApiLivenessProbe::new(DOCTOR_PROBE_TIMEOUT);
 #[derive(Debug, Clone)]
 struct FixFailure {
     reason: String,
@@ -1467,7 +1224,7 @@ pub fn read_reconciled_machine_state_live(
         name,
         Path::new("/proc"),
         reconciled_at,
-        &HttpVmmPing,
+        &VMM_PING_PROBE,
         None,
     )?;
     Ok(live)
@@ -1485,7 +1242,7 @@ pub fn read_reconciled_machine_state_live_locked(
         name,
         Path::new("/proc"),
         reconciled_at,
-        &HttpVmmPing,
+        &VMM_PING_PROBE,
         Some(lock),
     )?;
     Ok(live)
@@ -2278,16 +2035,16 @@ mod tests {
 
     use super::{
         ArtifactFetcher, CHECK_IDS, DoctorCheck, DoctorCheckId, DoctorContext, DoctorReport,
-        DoctorStatus, HttpVmmPing, MAX_DEPENDENCY_ARTIFACT_BYTES, MINIMUM_PASST_DATE, Package,
-        artifact_state, check_kvm, check_passt, check_user_namespaces,
-        content_length_exceeds_limit, copy_bounded, create_firestone_dir, distro_family,
-        firestone_error_reason, generate_ssh_key, install_artifact, install_command,
-        parse_passt_version, read_reconciled_machine_state_with, reconcile_machine_state,
-        redirect_rejection, require_https, run_doctor_with,
+        DoctorStatus, MAX_DEPENDENCY_ARTIFACT_BYTES, MINIMUM_PASST_DATE, Package, artifact_state,
+        check_kvm, check_passt, check_user_namespaces, content_length_exceeds_limit, copy_bounded,
+        create_firestone_dir, distro_family, firestone_error_reason, generate_ssh_key,
+        install_artifact, install_command, parse_passt_version, read_reconciled_machine_state_with,
+        reconcile_machine_state, redirect_rejection, require_https, run_doctor_with,
     };
     use crate::{
         DependencyArtifact, DependencyManifest, ErrorKind, ExitReason, FirestoneError, LastExit,
-        MachineLock, MachineState, MachineStatus, PathInputs, Paths, StateStore, VmmPingProbe,
+        MachineLock, MachineState, MachineStatus, PathInputs, Paths, StateStore,
+        VmmApiLivenessProbe, VmmPingProbe,
     };
 
     struct FakeFetcher {
@@ -2748,7 +2505,15 @@ mod tests {
         let directory = TempDir::new()?;
         let socket = directory.path().join("api.sock");
         let listener = UnixListener::bind(&socket)?;
-        let response = format!("HTTP/1.1 {status} Fixture\r\nContent-Length: 0\r\n\r\n");
+        let response = if status == "200" {
+            let body = br#"{"build_version":"v53.0","version":"53.0.0","pid":42,"features":[]}"#;
+            let mut response =
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+            response.extend_from_slice(body);
+            response
+        } else {
+            format!("HTTP/1.1 {status} No Content\r\n\r\n").into_bytes()
+        };
         let server = thread::spawn(move || -> Result<(), std::io::Error> {
             let (mut stream, _) = listener.accept()?;
             let mut request = [0_u8; 256];
@@ -2765,11 +2530,11 @@ mod tests {
                 used += read;
             }
             assert!(request[..used].starts_with(b"GET /api/v1/vmm.ping HTTP/1.1\r\n"));
-            stream.write_all(response.as_bytes())?;
+            stream.write_all(&response)?;
             Ok(())
         });
 
-        let pinged = HttpVmmPing.ping(&socket)?;
+        let pinged = VmmApiLivenessProbe::new(Duration::from_secs(5)).ping(&socket)?;
         server
             .join()
             .map_err(|_| std::io::Error::other("VMM ping fixture panicked"))??;
@@ -2813,7 +2578,7 @@ mod tests {
         });
 
         let started = Instant::now();
-        let pinged = HttpVmmPing.ping_with_timeout(&socket, Duration::from_millis(80))?;
+        let pinged = VmmApiLivenessProbe::new(Duration::from_millis(80)).ping(&socket)?;
         let elapsed = started.elapsed();
         server
             .join()

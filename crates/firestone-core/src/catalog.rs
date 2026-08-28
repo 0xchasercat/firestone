@@ -153,14 +153,6 @@ impl Catalog {
     pub fn contains_reference(&self, reference: &str) -> bool {
         self.find(reference).is_some()
     }
-    pub(crate) fn is_canonical_reference(reference: &str) -> bool {
-        let Some((distro, version)) = reference.split_once(':') else {
-            return false;
-        };
-        version.find(':').is_none()
-            && is_reference_component(distro)
-            && is_reference_component(version)
-    }
     /// Iterates over canonical entries in lexical `distro:version` order.
     pub fn entries(&self) -> impl ExactSizeIterator<Item = &CatalogEntry> {
         self.entries.values()
