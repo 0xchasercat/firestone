@@ -496,7 +496,7 @@ mod tests {
             let paths = Paths::from_inputs(&PathInputs {
                 current_dir: root.clone(),
                 home_dir: Some(root.clone()),
-                firestone_home: Some(root),
+                firestone_home: Some(root.clone()),
                 firestone_config_dir: None,
                 firestone_data_dir: None,
                 firestone_runtime_dir: None,
@@ -505,8 +505,19 @@ mod tests {
                 xdg_runtime_dir: None,
                 uid: nix::unistd::getuid().as_raw(),
             })?;
-            fs::create_dir_all(paths.machine_dir("demo")?)?;
-            fs::create_dir_all(paths.ssh_dir())?;
+            let machine_dir = paths.machine_dir("demo")?;
+            let ssh_dir = paths.ssh_dir();
+            fs::create_dir_all(&machine_dir)?;
+            fs::create_dir_all(&ssh_dir)?;
+            for directory in [
+                root,
+                paths.data_dir().to_path_buf(),
+                paths.machines_dir(),
+                machine_dir,
+                ssh_dir,
+            ] {
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+            }
             if with_key {
                 fs::write(paths.ssh_public_key(), FIRESTONE_KEY)?;
             }

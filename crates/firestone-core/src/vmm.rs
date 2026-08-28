@@ -729,8 +729,19 @@ mod tests {
             let temp = tempfile::tempdir()?;
             let root = fs::canonicalize(temp.path())?;
             let paths = paths_for_root(root.clone())?;
-            fs::create_dir_all(paths.machine_dir("demo")?)?;
-            fs::create_dir_all(paths.bin_dir())?;
+            let machine_dir = paths.machine_dir("demo")?;
+            let bin_dir = paths.bin_dir();
+            fs::create_dir_all(&machine_dir)?;
+            fs::create_dir_all(&bin_dir)?;
+            for directory in [
+                root,
+                paths.data_dir().to_path_buf(),
+                paths.machines_dir(),
+                machine_dir,
+                bin_dir,
+            ] {
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+            }
             Ok(Self {
                 _temp: temp,
                 paths,
