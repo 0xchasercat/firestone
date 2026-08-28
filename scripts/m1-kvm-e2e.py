@@ -13,6 +13,7 @@ import re
 import shlex
 import shutil
 import signal
+import select
 import socket
 import stat
 import subprocess
@@ -435,29 +436,42 @@ def prepare_fio_disk(harness: Harness) -> tuple[Path, str, str]:
 class ConsoleSession:
     def __init__(self, path: Path, timeout: int = BOOT_TIMEOUT_SECONDS) -> None:
         self.path = path
-        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.socket.settimeout(0.2)
         deadline = time.monotonic() + timeout
         while True:
             try:
-                self.socket.connect(os.fspath(path))
+                self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
                 break
-            except (FileNotFoundError, ConnectionRefusedError):
+            except FileNotFoundError:
                 if time.monotonic() >= deadline:
-                    self.socket.close()
-                    raise AcceptanceError(f"console socket did not accept a connection: {path}")
+                    raise AcceptanceError(f"console PTY did not appear: {path}")
                 time.sleep(0.1)
         self.buffer = bytearray()
 
     def close(self) -> None:
-        self.socket.close()
+        os.close(self.fd)
+
+    def _sendall(self, data: bytes) -> None:
+        remaining = memoryview(data)
+        while remaining:
+            try:
+                written = os.write(self.fd, remaining)
+            except BlockingIOError:
+                _, writable, _ = select.select([], [self.fd], [], 0.2)
+                require(writable, "console PTY remained blocked while writing")
+                continue
+            require(written > 0, "console PTY accepted no bytes")
+            remaining = remaining[written:]
 
     def _receive(self) -> bool:
-        try:
-            block = self.socket.recv(65_536)
-        except socket.timeout:
+        readable, _, _ = select.select([self.fd], [], [], 0.2)
+        if not readable:
             return False
-        require(block != b"", "console socket closed")
+        try:
+            block = os.read(self.fd, 65_536)
+        except BlockingIOError:
+            return False
+        if not block:
+            return False
         self.buffer.extend(block)
         require(len(self.buffer) <= MAX_CONSOLE_BYTES, "console session exceeded 8 MiB")
         return True
@@ -485,12 +499,12 @@ class ConsoleSession:
             if now >= deadline:
                 raise AcceptanceError("guest console did not reach the root autologin shell")
             if now >= next_probe:
-                self.socket.sendall(command)
+                self._sendall(command)
                 next_probe = now + 2.0
             self._receive()
         _, _, after = bytes(self.buffer).partition(marker)
         self.buffer = bytearray(after)
-        self.socket.sendall(b"\nstty -echo\n")
+        self._sendall(b"\nstty -echo\n")
 
     def run(self, command: str, timeout: int) -> tuple[int, str]:
         identifier = uuid.uuid4().hex
@@ -506,7 +520,7 @@ class ConsoleSession:
             + end_prefix
             + b"%s__\\n' \"$rc\"\n"
         )
-        self.socket.sendall(wrapper)
+        self._sendall(wrapper)
         self._wait_for(begin + b"\r\n", 10)
         deadline = time.monotonic() + timeout
         end_pattern = re.compile(re.escape(end_prefix) + rb"([0-9]+)__\r?\n")
@@ -609,6 +623,19 @@ def image_evidence(harness: Harness, name: str) -> dict[str, Any]:
     }
 
 
+def pty_console_path(info: dict[str, Any]) -> Path:
+    config = info.get("config")
+    require(isinstance(config, dict), "vm.info did not return VmConfig")
+    console = config.get("console")
+    require(isinstance(console, dict), "vm.info did not return console configuration")
+    require(console.get("mode") == "Pty", "vm.info did not report a PTY console")
+    path_value = console.get("file")
+    require(isinstance(path_value, str) and path_value, "vm.info did not return the console PTY path")
+    path = Path(path_value)
+    require(path.is_absolute(), "vm.info returned a relative console PTY path")
+    return path
+
+
 def require_default_vmconfig(harness: Harness, name: str) -> dict[str, Any]:
     config = harness.vmconfig(name)
     payload = config.get("payload")
@@ -620,11 +647,13 @@ def require_default_vmconfig(harness: Harness, name: str) -> dict[str, Any]:
     require(disks[0].get("backing_files") is True, "root disk did not enable backing files")
     require(disks[1].get("image_type") == "Raw", "CIDATA disk is not Raw")
     require(disks[1].get("readonly") is True, "CIDATA disk is not read-only")
+    require(config.get("console") == {"mode": "Pty"}, "VmConfig did not select the supported PTY console")
     require("net" not in config, "network.mode=none produced a net device")
     return {
         "payload": payload,
         "root_disk": disks[0],
         "seed_disk": disks[1],
+        "console": config["console"],
         "net_present": "net" in config,
     }
 
@@ -692,7 +721,7 @@ def run_acceptance(harness: Harness) -> None:
     info = json.loads(info_body)
     require(info.get("state") == "Running", f"vm.info did not report Running: {info!r}")
 
-    console = ConsoleSession(harness.home / "run" / graceful / "console.sock")
+    console = ConsoleSession(pty_console_path(info))
     try:
         console.wait_for_shell()
         cloud_rc, cloud_status = console.run(
@@ -790,7 +819,10 @@ cat /tmp/fio-raw.json
 printf '\nFIO_RAW_END\n'
 umount /mnt/firestone-fio
 """.strip()
-    fio_console = ConsoleSession(harness.home / "run" / converted / "console.sock")
+    converted_info_status, converted_info_body = harness.unix_http(converted, "GET", "/api/v1/vm.info")
+    require(converted_info_status == 200, f"converted vm.info returned HTTP {converted_info_status}")
+    converted_info = json.loads(converted_info_body)
+    fio_console = ConsoleSession(pty_console_path(converted_info))
     try:
         fio_console.wait_for_shell()
         fio_rc, fio_output = fio_console.run(fio_command, timeout=180)
