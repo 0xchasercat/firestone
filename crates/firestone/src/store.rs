@@ -1039,6 +1039,7 @@ mod tests {
     {
         let directory = tempfile::tempdir()?;
         let root = fs::canonicalize(directory.path())?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
         let paths = Paths::from_inputs(&PathInputs {
             current_dir: root.clone(),
             home_dir: Some(root.clone()),

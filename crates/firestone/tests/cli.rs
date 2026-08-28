@@ -53,6 +53,7 @@ fn doctor_failed_checks_emit_report_and_dependency_exit() -> TestResult {
 fn create_edit_editor_writes_stdout_emits_one_result_and_publishes_atomically() -> TestResult {
     let directory = tempfile::tempdir()?;
     let root = fs::canonicalize(directory.path())?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
     let home = root.join("home");
     let editor = root.join("editor.sh");
     fs::write(
