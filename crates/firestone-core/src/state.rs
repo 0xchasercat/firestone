@@ -242,10 +242,18 @@ pub struct LivenessObservation {
 }
 
 /// Whether a pinged VMM still has its expected shim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Supervision {
     Supervised,
     Unsupervised,
+}
+
+/// Effective machine state and the live VMM's current supervision status.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LiveMachineState {
+    pub state: MachineState,
+    pub supervision: Option<Supervision>,
 }
 
 /// A state-file change required by reconciliation.

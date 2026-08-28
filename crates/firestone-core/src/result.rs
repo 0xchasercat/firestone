@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{MachineSpec, MachineState, SpecWarning};
+use crate::{MachineSpec, MachineState, SpecWarning, Supervision};
 
 /// One machine row shared by CLI list output and the REST collection route.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +19,7 @@ pub struct MachineSummary {
 pub struct MachineView {
     pub spec: MachineSpec,
     pub state: MachineState,
+    pub supervision: Option<Supervision>,
 }
 
 /// Newly-created machine returned by every action surface.

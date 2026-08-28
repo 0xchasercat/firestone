@@ -52,8 +52,9 @@ fn doctor_failed_checks_emit_report_and_dependency_exit() -> TestResult {
 #[test]
 fn create_edit_editor_writes_stdout_emits_one_result_and_publishes_atomically() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let home = directory.path().join("home");
-    let editor = directory.path().join("editor.sh");
+    let root = fs::canonicalize(directory.path())?;
+    let home = root.join("home");
+    let editor = root.join("editor.sh");
     fs::write(
         &editor,
         b"#!/bin/sh\n[ \"$1\" = \"--wait\" ] || exit 9\nprintf 'editor-noise\\n'\n",

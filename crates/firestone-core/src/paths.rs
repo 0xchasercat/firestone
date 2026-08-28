@@ -416,12 +416,29 @@ impl Paths {
 
     /// Validates the runtime base, ancestry, and final directory without mutation.
     ///
-    /// Unlike [`Self::ensure_runtime_dir`], this method returns a dependency
+    /// Unlike [Self::ensure_runtime_dir], this method returns a dependency
     /// error when the final directory is missing. It never creates a directory
     /// or changes permissions.
     pub fn validate_runtime_dir(&self) -> Result<(), FirestoneError> {
         self.validate_runtime_prerequisites()?;
         self.inspect_runtime_dir()
+    }
+
+    /// Validates a Firestone-owned data directory without mutating it.
+    ///
+    /// Existing ancestors must be real directories owned by the captured uid or
+    /// root and protected from rename by other users. A root-owned sticky shared
+    /// directory such as /tmp is accepted. When the final directory exists, it
+    /// must be owned by the captured uid and must not be group- or
+    /// world-writable. With allow_missing, missing components are accepted
+    /// without canonicalizing or lexically normalizing the supplied path.
+    pub fn validate_owned_data_directory(
+        &self,
+        path: &Path,
+        label: &str,
+        allow_missing: bool,
+    ) -> Result<(), FirestoneError> {
+        self.validate_directory_path(path, label, allow_missing, true)
     }
 
     fn validate_runtime_prerequisites(&self) -> Result<(), FirestoneError> {
@@ -464,7 +481,7 @@ impl Paths {
 
         let metadata = fs::symlink_metadata(&self.runtime_dir)
             .map_err(|source| runtime_io_error("inspect", &self.runtime_dir, source))?;
-        validate_directory_type(&self.runtime_dir, &metadata)?;
+        validate_directory_type(&self.runtime_dir, "runtime directory", &metadata)?;
 
         fs::set_permissions(&self.runtime_dir, Permissions::from_mode(0o700))
             .map_err(|source| runtime_io_error("set mode 0700 on", &self.runtime_dir, source))?;
@@ -475,7 +492,7 @@ impl Paths {
     fn validate_xdg_runtime_base(&self, base: &Path) -> Result<(), FirestoneError> {
         let metadata = fs::symlink_metadata(base)
             .map_err(|source| runtime_io_error("inspect XDG_RUNTIME_DIR", base, source))?;
-        validate_directory_type(base, &metadata)?;
+        validate_directory_type(base, "XDG_RUNTIME_DIR", &metadata)?;
 
         let actual_uid = metadata.uid();
         let actual_mode = metadata.mode() & 0o7777;
@@ -495,41 +512,99 @@ impl Paths {
     }
 
     fn validate_runtime_ancestry(&self, parent: &Path) -> Result<(), FirestoneError> {
-        if !parent.is_absolute() {
-            return Err(insecure_runtime_ancestry_error(
-                parent,
-                "runtime directory ancestry is not absolute",
-            ));
+        self.validate_directory_path(parent, "runtime directory ancestor", false, false)
+    }
+
+    fn validate_directory_path(
+        &self,
+        path: &Path,
+        label: &str,
+        allow_missing: bool,
+        owned_final: bool,
+    ) -> Result<(), FirestoneError> {
+        if !path.is_absolute() {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!("{label} '{}' is not absolute", path.display()),
+            )
+            .with_hint("use an absolute Firestone data directory"));
         }
 
         let mut current = PathBuf::new();
-        for component in parent.components() {
+        let mut components = path.components().peekable();
+        while let Some(component) = components.next() {
             current.push(component.as_os_str());
-            let metadata = fs::symlink_metadata(&current)
-                .map_err(|source| runtime_io_error("inspect ancestor of", &current, source))?;
-            validate_directory_type(&current, &metadata)?;
+            let is_final = components.peek().is_none();
+            let metadata = match fs::symlink_metadata(&current) {
+                Ok(metadata) => metadata,
+                Err(source) if allow_missing && source.kind() == io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(source) => {
+                    return Err(directory_io_error("inspect", label, &current, source));
+                }
+            };
 
-            let actual_uid = metadata.uid();
-            let actual_mode = metadata.mode() & 0o7777;
-            let trusted_owner = actual_uid == self.runtime_uid || actual_uid == 0;
-            let writable_by_other_users = actual_mode & 0o022 != 0;
-            let sticky = actual_mode & 0o1000 != 0;
-            if !trusted_owner || writable_by_other_users && !sticky {
-                return Err(FirestoneError::new(
-                    ErrorKind::Dependency,
-                    format!(
-                        "runtime directory ancestor '{}' is insecure: expected uid {} or root with protected rename permissions, found uid {actual_uid} and mode {actual_mode:04o}",
-                        current.display(),
-                        self.runtime_uid
-                    ),
-                )
-                .with_hint(
-                    "move the runtime directory below private user-owned ancestry or a root-owned protected directory",
-                ));
+            validate_directory_type(&current, label, &metadata)?;
+            if owned_final && is_final {
+                self.validate_owned_directory_metadata(&current, label, &metadata)?;
+            } else {
+                self.validate_trusted_ancestor_metadata(&current, label, &metadata)?;
             }
         }
 
         Ok(())
+    }
+
+    fn validate_trusted_ancestor_metadata(
+        &self,
+        path: &Path,
+        label: &str,
+        metadata: &Metadata,
+    ) -> Result<(), FirestoneError> {
+        let actual_uid = metadata.uid();
+        let actual_mode = metadata.mode() & 0o7777;
+        let trusted_owner = actual_uid == self.runtime_uid || actual_uid == 0;
+        let writable_by_other_users = actual_mode & 0o022 != 0;
+        let safe_sticky_root = actual_uid == 0 && actual_mode & 0o1000 != 0;
+        if trusted_owner && (!writable_by_other_users || safe_sticky_root) {
+            return Ok(());
+        }
+
+        Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!(
+                "{label} '{}' has insecure ancestry: expected uid {} or root with protected rename permissions, found uid {actual_uid} and mode {actual_mode:04o}",
+                path.display(),
+                self.runtime_uid
+            ),
+        )
+        .with_hint(
+            "move the directory below private user-owned ancestry or a root-owned protected directory",
+        ))
+    }
+
+    fn validate_owned_directory_metadata(
+        &self,
+        path: &Path,
+        label: &str,
+        metadata: &Metadata,
+    ) -> Result<(), FirestoneError> {
+        let actual_uid = metadata.uid();
+        let actual_mode = metadata.mode() & 0o7777;
+        if actual_uid == self.runtime_uid && actual_mode & 0o022 == 0 {
+            return Ok(());
+        }
+
+        Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!(
+                "{label} '{}' is insecure: expected uid {} without group/world write access, found uid {actual_uid} and mode {actual_mode:04o}",
+                path.display(),
+                self.runtime_uid
+            ),
+        )
+        .with_hint("move the existing directory aside or restrict it to its owning user"))
     }
 
     fn inspect_runtime_dir(&self) -> Result<(), FirestoneError> {
@@ -539,7 +614,7 @@ impl Paths {
     }
 
     fn validate_runtime_metadata(&self, metadata: &Metadata) -> Result<(), FirestoneError> {
-        validate_directory_type(&self.runtime_dir, metadata)?;
+        validate_directory_type(&self.runtime_dir, "runtime directory", metadata)?;
 
         let expected_uid = self.runtime_uid;
         let actual_uid = metadata.uid();
@@ -661,13 +736,17 @@ fn insecure_runtime_ancestry_error(path: &Path, message: &str) -> FirestoneError
     )
 }
 
-fn validate_directory_type(path: &Path, metadata: &Metadata) -> Result<(), FirestoneError> {
+fn validate_directory_type(
+    path: &Path,
+    label: &str,
+    metadata: &Metadata,
+) -> Result<(), FirestoneError> {
     if metadata.file_type().is_symlink() {
         return Err(FirestoneError::new(
             ErrorKind::Dependency,
-            format!("runtime directory '{}' is a symbolic link", path.display()),
+            format!("{label} '{}' is a symbolic link", path.display()),
         )
-        .with_hint("replace it with a directory owned by the Firestone user with mode 0700"));
+        .with_hint("replace it with a directory owned by the Firestone user"));
     }
 
     if metadata.is_dir() {
@@ -676,18 +755,24 @@ fn validate_directory_type(path: &Path, metadata: &Metadata) -> Result<(), Fires
 
     Err(FirestoneError::new(
         ErrorKind::Dependency,
-        format!("runtime path '{}' is not a directory", path.display()),
+        format!("{label} '{}' is not a directory", path.display()),
     )
     .with_hint("move the existing path and run 'firestone doctor --fix'"))
 }
 
 fn runtime_io_error(operation: &str, path: &Path, source: io::Error) -> FirestoneError {
+    directory_io_error(operation, "runtime directory", path, source)
+}
+
+fn directory_io_error(
+    operation: &str,
+    label: &str,
+    path: &Path,
+    source: io::Error,
+) -> FirestoneError {
     FirestoneError::new(
         ErrorKind::Dependency,
-        format!(
-            "cannot {operation} runtime directory '{}': {source}",
-            path.display()
-        ),
+        format!("cannot {operation} {label} '{}': {source}", path.display()),
     )
     .with_hint("check the parent directory permissions and run 'firestone doctor --fix'")
     .with_source(source)
@@ -1770,7 +1855,94 @@ mod tests {
         );
         Ok(())
     }
+    #[test]
+    fn owned_data_directory_permissive_final_returns_dependency_without_chmod()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))?;
+        let root = fs::canonicalize(temporary.path())?;
+        let data_dir = root.join("data");
+        fs::create_dir(&data_dir)?;
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o777))?;
+        let paths = explicit_paths(root.join("run"), fs::metadata(&root)?.uid());
 
+        let error = paths
+            .validate_owned_data_directory(&data_dir, "data directory", false)
+            .err();
+
+        assert_eq!(
+            error.as_ref().map(crate::FirestoneError::kind),
+            Some(ErrorKind::Dependency)
+        );
+        assert_eq!(fs::symlink_metadata(data_dir)?.mode() & 0o7777, 0o777);
+        Ok(())
+    }
+
+    #[test]
+    fn owned_data_directory_symlink_ancestor_returns_dependency()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))?;
+        let root = fs::canonicalize(temporary.path())?;
+        let target = root.join("target");
+        let link = root.join("link");
+        fs::create_dir(&target)?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700))?;
+        symlink(&target, &link)?;
+        let paths = explicit_paths(root.join("run"), fs::metadata(&root)?.uid());
+
+        let error = paths
+            .validate_owned_data_directory(&link.join("data"), "data directory", true)
+            .err();
+
+        assert_eq!(
+            error.as_ref().map(crate::FirestoneError::kind),
+            Some(ErrorKind::Dependency)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn owned_data_directory_user_owned_sticky_ancestor_returns_dependency()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))?;
+        let root = fs::canonicalize(temporary.path())?;
+        let shared = root.join("shared");
+        fs::create_dir(&shared)?;
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777))?;
+        let paths = explicit_paths(root.join("run"), fs::metadata(&root)?.uid());
+
+        let error = paths
+            .validate_owned_data_directory(&shared.join("data"), "data directory", true)
+            .err();
+
+        assert_eq!(
+            error.as_ref().map(crate::FirestoneError::kind),
+            Some(ErrorKind::Dependency)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn owned_data_directory_missing_prefix_before_parent_remains_missing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempdir()?;
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))?;
+        let root = fs::canonicalize(temporary.path())?;
+        let target = root.join("target");
+        let link = root.join("link");
+        fs::create_dir(&target)?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700))?;
+        symlink(&target, &link)?;
+        let paths = explicit_paths(root.join("run"), fs::metadata(&root)?.uid());
+        let unresolved = root.join("missing").join("..").join("link");
+
+        paths.validate_owned_data_directory(&unresolved, "data directory", true)?;
+
+        assert!(!root.join("missing").exists());
+        Ok(())
+    }
     fn explicit_paths(runtime_dir: PathBuf, uid: u32) -> Paths {
         test_paths(runtime_dir, uid, RuntimeProvenance::FirestoneRuntimeDir)
     }

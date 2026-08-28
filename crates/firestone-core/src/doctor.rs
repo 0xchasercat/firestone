@@ -842,7 +842,21 @@ fn check_runtime_dir(context: &DoctorContext) -> DoctorCheck {
     }
 }
 
+fn unsafe_owned_directory_check(id: DoctorCheckId, error: &FirestoneError) -> DoctorCheck {
+    let mut check = DoctorCheck::new(id, DoctorStatus::Fail, firestone_error_reason(error));
+    if let Some(hint) = error.hint() {
+        check = check.with_hint(hint);
+    }
+    check
+}
 fn check_vendored(context: &DoctorContext) -> DoctorCheck {
+    if let Err(error) = context.paths.validate_owned_data_directory(
+        &context.paths.bin_dir(),
+        "binary directory",
+        true,
+    ) {
+        return unsafe_owned_directory_check(DoctorCheckId::VendoredBinaries, &error);
+    }
     let mut failures = Vec::new();
     let mut installed = Vec::new();
     let mut hint = None;
@@ -882,6 +896,13 @@ fn check_vendored(context: &DoctorContext) -> DoctorCheck {
 }
 
 fn check_virtiofsd(context: &DoctorContext) -> DoctorCheck {
+    if let Err(error) = context.paths.validate_owned_data_directory(
+        &context.paths.bin_dir(),
+        "binary directory",
+        true,
+    ) {
+        return unsafe_owned_directory_check(DoctorCheckId::Virtiofsd, &error);
+    }
     match context
         .manifest
         .artifact("virtiofsd", &context.architecture)
@@ -1162,6 +1183,13 @@ fn check_user_namespaces(context: &DoctorContext) -> DoctorCheck {
 }
 
 fn check_ssh_key(context: &DoctorContext) -> DoctorCheck {
+    if let Err(error) =
+        context
+            .paths
+            .validate_owned_data_directory(&context.paths.ssh_dir(), "SSH directory", true)
+    {
+        return unsafe_owned_directory_check(DoctorCheckId::SshKey, &error);
+    }
     let private_path = context.paths.ssh_private_key();
     let public_path = context.paths.ssh_public_key();
     let private = fs::symlink_metadata(&private_path);
@@ -1223,6 +1251,21 @@ fn check_ssh_key(context: &DoctorContext) -> DoctorCheck {
 
 fn check_data_space(context: &DoctorContext) -> DoctorCheck {
     let data_dir = context.paths.data_dir();
+    if let Err(error) =
+        context
+            .paths
+            .validate_owned_data_directory(data_dir, "data directory", true)
+    {
+        let check = DoctorCheck::new(
+            DoctorCheckId::DataSpace,
+            DoctorStatus::Fail,
+            error.message().to_owned(),
+        );
+        return match error.hint() {
+            Some(hint) => check.with_hint(hint.to_owned()),
+            None => check,
+        };
+    }
     let Some(path) = nearest_existing_ancestor(data_dir) else {
         return DoctorCheck::new(
             DoctorCheckId::DataSpace,
@@ -1305,7 +1348,23 @@ fn check_stale_state(stale_state: &StaleStateReport) -> DoctorCheck {
 
 fn reconcile_machine_states(context: &DoctorContext, vmm: &dyn VmmPingProbe) -> StaleStateReport {
     let mut report = StaleStateReport::default();
-    let entries = match fs::read_dir(context.paths.machines_dir()) {
+    let machines_dir = context.paths.machines_dir();
+    let storage_validation = context
+        .paths
+        .validate_owned_data_directory(context.paths.data_dir(), "data directory", true)
+        .and_then(|()| {
+            context
+                .paths
+                .validate_owned_data_directory(&machines_dir, "machines directory", true)
+        });
+    if let Err(error) = storage_validation {
+        report.failures.push(StaleStateFailure {
+            machine: "<machines>".to_owned(),
+            reason: error.message().to_owned(),
+        });
+        return report;
+    }
+    let entries = match fs::read_dir(machines_dir) {
         Ok(entries) => entries,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return report,
         Err(source) => {
@@ -1351,6 +1410,27 @@ fn reconcile_machine_states(context: &DoctorContext, vmm: &dyn VmmPingProbe) -> 
             });
             continue;
         };
+        let machine_dir = match context.paths.machine_dir(name) {
+            Ok(machine_dir) => machine_dir,
+            Err(error) => {
+                report.failures.push(StaleStateFailure {
+                    machine: name.to_owned(),
+                    reason: firestone_error_reason(&error),
+                });
+                continue;
+            }
+        };
+        if let Err(error) =
+            context
+                .paths
+                .validate_owned_data_directory(&machine_dir, "machine directory", false)
+        {
+            report.failures.push(StaleStateFailure {
+                machine: name.to_owned(),
+                reason: firestone_error_reason(&error),
+            });
+            continue;
+        }
         match reconcile_machine_state(context, name, vmm) {
             Ok(Some(observation)) => report.observations.push(observation),
             Ok(None) => {}
@@ -1381,15 +1461,34 @@ pub fn read_reconciled_machine_state_live(
     paths: &Paths,
     name: &str,
     reconciled_at: &str,
-) -> Result<crate::MachineState, FirestoneError> {
-    let (state, _) = read_reconciled_machine_state_with(
+) -> Result<crate::LiveMachineState, FirestoneError> {
+    let (live, _) = read_reconciled_machine_state_with(
         paths,
         name,
         Path::new("/proc"),
         reconciled_at,
         &HttpVmmPing,
+        None,
     )?;
-    Ok(state)
+    Ok(live)
+}
+
+/// Reads and, when needed, reconciles one machine while its lock is already held.
+pub fn read_reconciled_machine_state_live_locked(
+    paths: &Paths,
+    name: &str,
+    reconciled_at: &str,
+    lock: &MachineLock,
+) -> Result<crate::LiveMachineState, FirestoneError> {
+    let (live, _) = read_reconciled_machine_state_with(
+        paths,
+        name,
+        Path::new("/proc"),
+        reconciled_at,
+        &HttpVmmPing,
+        Some(lock),
+    )?;
+    Ok(live)
 }
 
 fn reconcile_machine_state(
@@ -1403,6 +1502,7 @@ fn reconcile_machine_state(
         &context.proc_root,
         &context.reconciled_at,
         vmm,
+        None,
     )?;
     Ok(reason.map(|reason| StaleStateObservation {
         machine: name.to_owned(),
@@ -1416,7 +1516,8 @@ fn read_reconciled_machine_state_with(
     proc_root: &Path,
     reconciled_at: &str,
     vmm: &dyn VmmPingProbe,
-) -> Result<(crate::MachineState, Option<String>), FirestoneError> {
+    held_lock: Option<&MachineLock>,
+) -> Result<(crate::LiveMachineState, Option<String>), FirestoneError> {
     let state_store = StateStore::new(paths.machine_state(name)?);
     let runtime_dir = paths.machine_runtime_dir(name)?;
     let api_socket = paths.machine_api_socket(name)?;
@@ -1426,12 +1527,25 @@ fn read_reconciled_machine_state_with(
 
     if reconciliation.rewrite.is_none() {
         state.status = reconciliation.status;
-        return Ok((state, None));
+        return Ok((
+            crate::LiveMachineState {
+                state,
+                supervision: reconciliation.supervision,
+            },
+            None,
+        ));
     }
 
-    let lock_path = paths.machine_lock(name)?;
-    let mut events = |_event: crate::Event| Ok(());
-    let lock = MachineLock::acquire(name, &lock_path, &mut events)?;
+    let acquired_lock;
+    let lock = match held_lock {
+        Some(lock) => lock,
+        None => {
+            let lock_path = paths.machine_lock(name)?;
+            let mut events = |_event: crate::Event| Ok(());
+            acquired_lock = MachineLock::acquire(name, &lock_path, &mut events)?;
+            &acquired_lock
+        }
+    };
     // The shim may have completed its final atomic write while this reader was
     // waiting. Re-read and re-observe under the lock before deciding to write.
     state = state_store.read()?;
@@ -1443,12 +1557,24 @@ fn read_reconciled_machine_state_with(
         .as_ref()
         .map(|ReconcileRewrite::Stopped { reason }| reason.as_str().to_owned());
     if let Some(effective) = reconciled_state(&state, &reconciliation, reconciled_at) {
-        state_store.write_reconciliation(&state, &reconciliation, reconciled_at, &lock)?;
-        return Ok((effective, reason));
+        state_store.write_reconciliation(&state, &reconciliation, reconciled_at, lock)?;
+        return Ok((
+            crate::LiveMachineState {
+                state: effective,
+                supervision: reconciliation.supervision,
+            },
+            reason,
+        ));
     }
 
     state.status = reconciliation.status;
-    Ok((state, None))
+    Ok((
+        crate::LiveMachineState {
+            state,
+            supervision: reconciliation.supervision,
+        },
+        None,
+    ))
 }
 
 fn perform_fixes(
@@ -1458,13 +1584,21 @@ fn perform_fixes(
     let mut failures = BTreeMap::new();
 
     let data_ready = record_directory_fix(
+        &context.paths,
         &mut failures,
         context.paths.data_dir(),
+        "data directory",
         DoctorCheckId::DataSpace,
     );
     let bin_dir = context.paths.bin_dir();
     let bin_ready = data_ready
-        && record_directory_fix(&mut failures, &bin_dir, DoctorCheckId::VendoredBinaries);
+        && record_directory_fix(
+            &context.paths,
+            &mut failures,
+            &bin_dir,
+            "binary directory",
+            DoctorCheckId::VendoredBinaries,
+        );
     if let Err(error) = context.paths.ensure_runtime_dir() {
         record_fix_failure(&mut failures, DoctorCheckId::RuntimeDir, error);
     }
@@ -1472,7 +1606,13 @@ fn perform_fixes(
     let ssh_public_key = context.paths.ssh_public_key();
     let key_ready = if data_ready {
         ssh_private_key.parent().is_some_and(|key_dir| {
-            record_directory_fix(&mut failures, key_dir, DoctorCheckId::SshKey)
+            record_directory_fix(
+                &context.paths,
+                &mut failures,
+                key_dir,
+                "SSH key directory",
+                DoctorCheckId::SshKey,
+            )
         })
     } else {
         false
@@ -1507,11 +1647,13 @@ fn perform_fixes(
 }
 
 fn record_directory_fix(
+    paths: &Paths,
     failures: &mut BTreeMap<DoctorCheckId, FixFailure>,
     path: &Path,
+    label: &str,
     check_id: DoctorCheckId,
 ) -> bool {
-    match create_firestone_dir(path, 0o700) {
+    match create_firestone_dir(paths, path, label) {
         Ok(()) => true,
         Err(error) => {
             record_fix_failure(failures, check_id, error);
@@ -1826,67 +1968,61 @@ fn remove_generated_key(path: &Path) -> Result<(), std::io::Error> {
     }
 }
 
-fn create_firestone_dir(path: &Path, mode: u32) -> Result<(), FirestoneError> {
+fn create_firestone_dir(paths: &Paths, path: &Path, label: &str) -> Result<(), FirestoneError> {
+    paths.validate_owned_data_directory(path, label, true)?;
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() => return Ok(()),
-        Ok(_) => {
-            return Err(FirestoneError::new(
-                ErrorKind::Dependency,
-                format!(
-                    "refusing to replace non-directory Firestone path {}",
-                    path.display()
-                ),
-            )
-            .with_hint("move the existing path aside and rerun `firestone doctor --fix`"));
-        }
+        Ok(_) => return paths.validate_owned_data_directory(path, label, false),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
         Err(source) => {
             return Err(FirestoneError::new(
                 ErrorKind::Dependency,
-                format!("cannot inspect Firestone directory {}", path.display()),
+                format!("cannot inspect {label} {}", path.display()),
             )
             .with_source(source));
         }
     }
 
     let mut builder = DirBuilder::new();
-    builder.recursive(true).mode(mode);
+    builder.recursive(true).mode(0o700);
     if let Err(source) = builder.create(path) {
-        if source.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(FirestoneError::new(
-                ErrorKind::Dependency,
-                format!("cannot create Firestone directory {}", path.display()),
-            )
-            .with_source(source));
+        if source.kind() == std::io::ErrorKind::AlreadyExists {
+            return paths.validate_owned_data_directory(path, label, false);
         }
+        return Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!("cannot create {label} {}", path.display()),
+        )
+        .with_source(source));
     }
 
-    let metadata = fs::symlink_metadata(path).map_err(|source| {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
         FirestoneError::new(
             ErrorKind::Dependency,
-            format!("cannot read back Firestone directory {}", path.display()),
+            format!("cannot set mode 0700 on {label} {}", path.display()),
         )
         .with_source(source)
     })?;
-    if !metadata.is_dir() {
+    paths.validate_owned_data_directory(path, label, false)?;
+    let actual_mode = fs::symlink_metadata(path)
+        .map_err(|source| {
+            FirestoneError::new(
+                ErrorKind::Dependency,
+                format!("cannot read back {label} {}", path.display()),
+            )
+            .with_source(source)
+        })?
+        .permissions()
+        .mode()
+        & 0o7777;
+    if actual_mode != 0o700 {
         return Err(FirestoneError::new(
             ErrorKind::Dependency,
             format!(
-                "Firestone directory {} changed to a non-directory during creation",
-                path.display()
-            ),
-        ));
-    }
-    let actual_mode = metadata.permissions().mode() & 0o777;
-    if actual_mode != mode {
-        return Err(FirestoneError::new(
-            ErrorKind::Dependency,
-            format!(
-                "created Firestone directory {} has mode {actual_mode:04o}; expected {mode:04o}",
+                "created {label} {} has mode {actual_mode:04o}; expected 0700",
                 path.display()
             ),
         )
-        .with_hint(format!("run `chmod {mode:04o} {}`", path.display())));
+        .with_hint(format!("run `chmod 0700 {}`", path.display())));
     }
     Ok(())
 }
@@ -3079,23 +3215,118 @@ mod tests {
     #[test]
     fn directory_fix_rejects_symlink_without_changing_target_mode()
     -> Result<(), Box<dyn std::error::Error>> {
-        let dir = TempDir::new()?;
-        let target = dir.path().join("target");
-        let link = dir.path().join("link");
+        let fixture = Fixture::healthy()?;
+        let target = fixture.context.paths.data_dir().join("directory-target");
+        let link = fixture.context.paths.data_dir().join("directory-link");
         fs::create_dir(&target)?;
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755))?;
         std::os::unix::fs::symlink(&target, &link)?;
 
-        let error = match create_firestone_dir(&link, 0o700) {
+        let error = match create_firestone_dir(&fixture.context.paths, &link, "test directory") {
             Err(error) => error,
             Ok(()) => return Err(std::io::Error::other("directory symlink should fail").into()),
         };
 
-        assert!(error.message().contains("non-directory"));
+        assert!(error.message().contains("symbolic link"));
         assert_eq!(fs::metadata(target)?.permissions().mode() & 0o777, 0o755);
         Ok(())
     }
+    #[test]
+    fn doctor_unsafe_data_directory_reports_thirteen_checks_without_escape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::healthy()?;
+        fs::set_permissions(
+            fixture.context.paths.data_dir(),
+            fs::Permissions::from_mode(0o777),
+        )?;
 
+        let report = super::run_doctor(&fixture.context, false)?;
+
+        assert_eq!(report.checks.len(), 13);
+        assert_eq!(
+            check(&report, DoctorCheckId::DataSpace).status,
+            DoctorStatus::Fail
+        );
+        assert!(
+            check(&report, DoctorCheckId::DataSpace)
+                .reason
+                .contains("group/world write access")
+        );
+        Ok(())
+    }
+    #[test]
+    fn doctor_symlinked_binary_directory_reports_unsafe_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::healthy()?;
+        let bin_dir = fixture.context.paths.bin_dir();
+        let outside = fixture.context.paths.data_dir().join("outside-bin");
+        fs::rename(&bin_dir, &outside)?;
+        std::os::unix::fs::symlink(&outside, &bin_dir)?;
+
+        let report = run_doctor_with(
+            &fixture.context,
+            false,
+            &FakeFetcher::new(fixture.payloads.clone()),
+        );
+
+        for id in [DoctorCheckId::VendoredBinaries, DoctorCheckId::Virtiofsd] {
+            let dependency = check(&report, id);
+            assert_eq!(dependency.status, DoctorStatus::Fail);
+            assert!(dependency.reason.contains("symbolic link"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_symlinked_ssh_directory_reports_unsafe_path() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let fixture = Fixture::healthy()?;
+        let ssh_dir = fixture.context.paths.ssh_dir();
+        let outside = fixture.context.paths.data_dir().join("outside-ssh");
+        fs::rename(&ssh_dir, &outside)?;
+        std::os::unix::fs::symlink(&outside, &ssh_dir)?;
+
+        let report = run_doctor_with(
+            &fixture.context,
+            false,
+            &FakeFetcher::new(fixture.payloads.clone()),
+        );
+
+        let ssh = check(&report, DoctorCheckId::SshKey);
+        assert_eq!(ssh.status, DoctorStatus::Fail);
+        assert!(ssh.reason.contains("symbolic link"));
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_permissive_machine_directory_reports_stale_state_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::healthy()?;
+        let name = "unsafe-machine";
+        write_running_state(&fixture.context.paths, name)?;
+        fs::set_permissions(
+            fixture.context.paths.machine_dir(name)?,
+            fs::Permissions::from_mode(0o777),
+        )?;
+
+        let report = run_doctor_with(
+            &fixture.context,
+            false,
+            &FakeFetcher::new(fixture.payloads.clone()),
+        );
+
+        let stale = check(&report, DoctorCheckId::StaleState);
+        assert_eq!(stale.status, DoctorStatus::Fail);
+        assert!(stale.reason.contains(name));
+        assert!(stale.reason.contains("group/world write access"));
+        assert_eq!(
+            StateStore::new(fixture.context.paths.machine_state(name)?)
+                .read()?
+                .status,
+            MachineStatus::Running
+        );
+        Ok(())
+    }
     #[test]
     fn ssh_key_complete_symlink_pair_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::healthy()?;
@@ -3157,7 +3388,7 @@ mod tests {
     }
 
     #[test]
-    fn live_read_reports_ping_status_without_taking_lock_or_rewriting()
+    fn live_read_ping_without_shim_reports_unsupervised_without_rewrite()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::healthy()?;
         let name = "live";
@@ -3180,15 +3411,48 @@ mod tests {
             &fixture.context.proc_root,
             &fixture.context.reconciled_at,
             &FixedPing(true),
+            Some(&lock),
         )?;
 
-        assert_eq!(effective.status, MachineStatus::Running);
+        assert_eq!(effective.state.status, MachineStatus::Running);
+        assert_eq!(
+            effective.supervision,
+            Some(crate::Supervision::Unsupervised)
+        );
         assert_eq!(reason, None);
         assert_eq!(store.read()?.status, MachineStatus::Starting);
         drop(lock);
         Ok(())
     }
 
+    #[test]
+    fn live_read_stale_state_with_held_lock_rewrites_without_contention()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::healthy()?;
+        let name = "locked-stale";
+        write_running_state(&fixture.context.paths, name)?;
+        let store = StateStore::new(fixture.context.paths.machine_state(name)?);
+        let mut events = Vec::new();
+        let lock = MachineLock::acquire(
+            name,
+            &fixture.context.paths.machine_lock(name)?,
+            &mut events,
+        )?;
+
+        let (effective, reason) = read_reconciled_machine_state_with(
+            &fixture.context.paths,
+            name,
+            &fixture.context.proc_root,
+            &fixture.context.reconciled_at,
+            &FixedPing(false),
+            Some(&lock),
+        )?;
+
+        assert_eq!(effective.state.status, MachineStatus::Stopped);
+        assert_eq!(reason.as_deref(), Some("host reboot"));
+        assert_eq!(store.read()?.status, MachineStatus::Stopped);
+        Ok(())
+    }
     #[test]
     fn reconciliation_rereads_after_shim_final_state_write()
     -> Result<(), Box<dyn std::error::Error>> {

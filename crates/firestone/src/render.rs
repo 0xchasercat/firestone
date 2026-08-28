@@ -45,6 +45,12 @@ impl RenderOptions {
     }
 
     #[must_use]
+    pub const fn with_quiet(mut self, quiet: bool) -> Self {
+        self.quiet = quiet;
+        self
+    }
+
+    #[must_use]
     pub const fn json() -> Self {
         Self {
             mode: OutputMode::Json,
@@ -132,6 +138,9 @@ where
     }
 
     fn render_json_event(&mut self, event: &Event) -> Result<(), FirestoneError> {
+        if self.options.quiet && !matches!(event, Event::Result { .. }) {
+            return Ok(());
+        }
         serde_json::to_writer(&mut self.stdout, event).map_err(json_output_failure)?;
         finish_record(&mut self.stdout)
     }
@@ -428,21 +437,25 @@ pub const fn error_exit_code(error: &FirestoneError) -> u8 {
 
 fn write_doctor_report<W: Write>(writer: &mut W, report: &DoctorReport) -> io::Result<()> {
     for check in &report.checks {
-        writeln!(
-            writer,
-            "{} {}: {}",
-            doctor_status_label(check.status),
-            doctor_check_id_label(check.id),
-            check.reason
-        )?;
+        write_safe_text(writer, doctor_status_label(check.status))?;
+        writer.write_all(b" ")?;
+        write_safe_text(writer, doctor_check_id_label(check.id))?;
+        writer.write_all(b": ")?;
+        write_safe_text(writer, &check.reason)?;
+        writer.write_all(b"\n")?;
+
         if let Some(fix) = &check.fix {
-            writeln!(writer, "  fix: {fix}")?;
+            writer.write_all(b"  fix: ")?;
+            write_safe_text(writer, fix)?;
+            writer.write_all(b"\n")?;
         }
         if let Some(hint) = &check.hint {
-            writeln!(writer, "  hint: {hint}")?;
+            writer.write_all(b"  hint: ")?;
+            write_safe_text(writer, hint)?;
+            writer.write_all(b"\n")?;
         }
     }
-    Ok(())
+    writer.flush()
 }
 
 const fn doctor_status_label(status: DoctorStatus) -> &'static str {
@@ -665,12 +678,39 @@ impl fmt::Display for Elapsed {
     }
 }
 
+struct SafeTextFormatter<'writer, W> {
+    writer: &'writer mut W,
+    error: Option<io::Error>,
+}
+
+impl<W: Write> fmt::Write for SafeTextFormatter<'_, W> {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        write_safe_text(self.writer, value).map_err(|error| {
+            self.error = Some(error);
+            fmt::Error
+        })
+    }
+}
+
+fn write_safe_arguments<W: Write>(writer: &mut W, arguments: fmt::Arguments<'_>) -> io::Result<()> {
+    let mut formatter = SafeTextFormatter {
+        writer,
+        error: None,
+    };
+    if fmt::write(&mut formatter, arguments).is_ok() {
+        return Ok(());
+    }
+    match formatter.error {
+        Some(error) => Err(error),
+        None => Err(io::Error::other("failed to format command output")),
+    }
+}
+
 fn write_line<W: Write>(
     writer: &mut W,
     arguments: fmt::Arguments<'_>,
 ) -> Result<(), FirestoneError> {
-    writer
-        .write_fmt(arguments)
+    write_safe_arguments(writer, arguments)
         .and_then(|()| writer.write_all(b"\n"))
         .and_then(|()| writer.flush())
         .map_err(write_output_failure)
@@ -711,7 +751,7 @@ mod tests {
 
     use super::{
         ErrorInfo, ErrorKind, Event, FirestoneError, Level, MachineSummary, MachineView,
-        RenderOptions, Renderer, error_exit_code, exit_code,
+        RenderOptions, Renderer, Unit, error_exit_code, exit_code,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -735,6 +775,73 @@ mod tests {
             stdout,
             b"{\"type\":\"StepDone\",\"id\":\"image\",\"detail\":\"cached\",\"elapsed_ms\":25}\n{\"type\":\"Log\",\"level\":\"info\",\"message\":\"ready\"}\n"
         );
+        assert!(stderr.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn json_quiet_with_non_result_events_emits_only_result_and_terminal_error() -> TestResult {
+        let options = RenderOptions::json().with_quiet(true);
+        let mut renderer = Renderer::new(Vec::new(), Vec::new(), options);
+        let events = vec![
+            Event::StepStart {
+                id: StepId::from("start"),
+                label: "starting".to_owned(),
+            },
+            Event::StepUpdate {
+                id: StepId::from("update"),
+                detail: "updating".to_owned(),
+            },
+            Event::Progress {
+                id: StepId::from("progress"),
+                done: 1,
+                total: Some(2),
+                unit: Unit::Bytes,
+            },
+            Event::StepDone {
+                id: StepId::from("done"),
+                detail: None,
+                elapsed_ms: 1,
+            },
+            Event::StepSkip {
+                id: StepId::from("skip"),
+                reason: "not needed".to_owned(),
+            },
+            Event::StepFail {
+                id: StepId::from("fail"),
+                error: ErrorInfo {
+                    kind: ErrorKind::Generic,
+                    message: "failed".to_owned(),
+                    hint: Some("retry".to_owned()),
+                },
+            },
+            Event::Log {
+                level: Level::Error,
+                message: "event error".to_owned(),
+            },
+        ];
+        for event in events {
+            renderer.emit(event)?;
+        }
+        renderer.emit(Event::Result {
+            action: "version".to_owned(),
+            payload: json!({"version": "0.1.0"}),
+        })?;
+        renderer.render_error(&FirestoneError::new(
+            ErrorKind::Dependency,
+            "terminal error",
+        ))?;
+
+        let (stdout, stderr) = renderer.into_writers();
+        let records = stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(serde_json::from_slice)
+            .collect::<Result<Vec<serde_json::Value>, _>>()?;
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["type"], "Result");
+        assert_eq!(records[0]["action"], "version");
+        assert_eq!(records[1]["error"]["message"], "terminal error");
         assert!(stderr.is_empty());
         Ok(())
     }
@@ -791,6 +898,34 @@ mod tests {
     }
 
     #[test]
+    fn human_doctor_report_with_control_bearing_text_emits_sanitized_lines() -> TestResult {
+        let mut renderer =
+            Renderer::new(Vec::new(), Vec::new(), RenderOptions::human(false, false));
+        let report = DoctorReport {
+            checks: vec![DoctorCheck {
+                id: DoctorCheckId::Kvm,
+                status: DoctorStatus::Fail,
+                reason: "cannot open /dev/kvm\u{1b}[31m\n拒绝".to_owned(),
+                fix: Some("run \u{7}doctor --fix".to_owned()),
+                hint: Some("réessayer\u{1b}[0m".to_owned()),
+            }],
+        };
+
+        renderer.emit(Event::Result {
+            action: "doctor".to_owned(),
+            payload: serde_json::to_value(report)?,
+        })?;
+
+        let (stdout, stderr) = renderer.into_writers();
+        assert_eq!(
+            String::from_utf8(stdout)?,
+            "fail kvm: cannot open /dev/kvm�[31m�拒绝\n  fix: run �doctor --fix\n  hint: réessayer�[0m\n"
+        );
+        assert!(stderr.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn human_mode_separates_feedback_results_and_errors() -> TestResult {
         let mut renderer =
             Renderer::new(Vec::new(), Vec::new(), RenderOptions::human(false, false));
@@ -824,6 +959,26 @@ mod tests {
         );
         assert!(!stderr.contains(&b'\r'));
         assert!(!stderr.contains(&0x1b));
+        Ok(())
+    }
+
+    #[test]
+    fn human_error_with_control_bearing_path_and_hint_emits_sanitized_lines() -> TestResult {
+        let mut renderer =
+            Renderer::new(Vec::new(), Vec::new(), RenderOptions::human(false, false));
+        let error =
+            FirestoneError::new(ErrorKind::InvalidSpec, "cannot read /tmp/雪\u{1b}[31m\nvm")
+                .with_source(io::Error::other("permission\u{7} denied"))
+                .with_hint("inspect /tmp/雪\u{1b}[0m");
+
+        renderer.render_error(&error)?;
+
+        let (stdout, stderr) = renderer.into_writers();
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr)?,
+            "error: cannot read /tmp/雪�[31m�vm\ncause: permission� denied\nhint:  inspect /tmp/雪�[0m\n"
+        );
         Ok(())
     }
 
@@ -975,6 +1130,7 @@ mod tests {
                 degraded: Vec::new(),
                 last_exit: None,
             },
+            supervision: None,
         };
         let mut expected = serde_json::to_vec_pretty(&view)?;
         expected.push(b'\n');
@@ -990,6 +1146,7 @@ mod tests {
         assert_eq!(stdout, expected);
         assert!(stdout.starts_with(b"{\n  \"spec\": {\n"));
         assert!(stderr.is_empty());
+        assert!(String::from_utf8_lossy(&stdout).contains("\"supervision\": null"));
         Ok(())
     }
 

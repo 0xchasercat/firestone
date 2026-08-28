@@ -1,11 +1,19 @@
-use std::{collections::BTreeMap, env, ffi::OsString, fs, os::unix::fs::DirBuilderExt, path::Path};
+use std::{
+    collections::BTreeMap,
+    env,
+    ffi::{OsStr, OsString},
+    fs,
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
+    path::{Path, PathBuf},
+};
 
 use firestone_core::{
     Action, Arch, Catalog, Cmd, DependencyManifest, DispatchFuture, Dispatcher, DoctorContext,
-    ErrorKind, Event, EventSink, FirestoneError, GlobalConfig, Level, MachineLock, MachineRecord,
-    MachineSpec, MachineSpecPatch, MachineState, MachineStatus, MachineSummary, MachineView, Paths,
-    RealValidationHost, SpecResult, SpecWarningPayload, StateImage, StateStore, StateVersion,
-    ValidationContext, atomic, read_reconciled_machine_state_live, run_doctor,
+    ErrorKind, Event, EventSink, FirestoneError, GlobalConfig, Level, LiveMachineState,
+    MachineLock, MachineRecord, MachineSpec, MachineSpecPatch, MachineState, MachineStatus,
+    MachineSummary, MachineView, Paths, RealValidationHost, SpecResult, SpecWarningPayload,
+    StateImage, StateStore, StateVersion, Supervision, ValidationContext, atomic,
+    read_reconciled_machine_state_live, read_reconciled_machine_state_live_locked, run_doctor,
 };
 
 const SPEC_TEMPLATE: &str = include_str!("../../../templates/firestone.toml");
@@ -26,19 +34,24 @@ impl LocalDispatcher {
     }
 
     fn validate_machine_storage(&self) -> Result<(), FirestoneError> {
-        validate_owned_directory(self.paths.data_dir(), "data directory", true)?;
-        validate_owned_directory(&self.paths.machines_dir(), "machines directory", true)
+        self.paths
+            .validate_owned_data_directory(self.paths.data_dir(), "data directory", true)?;
+        self.paths.validate_owned_data_directory(
+            &self.paths.machines_dir(),
+            "machines directory",
+            true,
+        )
     }
 
     pub fn edit(&self, name: &str, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
         self.validate_machine_storage()?;
         let machine_dir = self.paths.machine_dir(name)?;
         let spec_path = self.paths.machine_spec(name)?;
-        ensure_machine_exists(name, &machine_dir)?;
-        let observed_state = self.read_live_state(name)?;
+        ensure_machine_exists(&self.paths, name, &machine_dir)?;
         let lock_path = self.paths.machine_lock(name)?;
-        let _lock = MachineLock::acquire(name, &lock_path, events)?;
-        ensure_machine_exists(name, &machine_dir)?;
+        let lock = MachineLock::acquire(name, &lock_path, events)?;
+        ensure_machine_exists(&self.paths, name, &machine_dir)?;
+        let observed_state = self.read_live_state_locked(name, &lock)?;
         let original = read_file(&spec_path, "machine spec", ErrorKind::NotFound)?;
         let candidate = spec_path.with_extension("toml.edit");
         atomic::write(&candidate, &original)?;
@@ -47,7 +60,7 @@ impl LocalDispatcher {
         let cleanup = remove_candidate(&candidate);
         match (result, cleanup) {
             (Ok(result), Ok(())) => {
-                emit_running_spec_warning(&observed_state, events)?;
+                emit_running_spec_warning(&observed_state.state, events)?;
                 emit_spec_warnings(&result.warnings, events)?;
                 emit_result(events, "edit", &result)
             }
@@ -147,100 +160,116 @@ impl LocalDispatcher {
     ) -> Result<(), FirestoneError> {
         let machine_dir = self.paths.machine_dir(name)?;
         let machines_dir = self.paths.machines_dir();
-        ensure_owned_directory(self.paths.data_dir(), "data directory", true)?;
-        ensure_owned_directory(&machines_dir, "machines directory", false)?;
+        ensure_owned_directory(&self.paths, self.paths.data_dir(), "data directory", true)?;
+        ensure_owned_directory(&self.paths, &machines_dir, "machines directory", false)?;
 
-        match fs::create_dir(&machine_dir) {
-            Ok(()) => {}
-            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(FirestoneError::new(
-                    ErrorKind::AlreadyExists,
-                    format!("machine `{name}` already exists"),
-                )
-                .with_hint(format!(
-                    "use `firestone show {name}` or choose another name"
-                )));
-            }
-            Err(source) => {
-                return Err(filesystem_error(
-                    ErrorKind::Generic,
-                    format!("cannot create machine directory {}", machine_dir.display()),
-                    "check the Firestone data directory permissions",
-                    source,
-                ));
-            }
-        }
-
-        let creating_marker = machine_dir.join(".creating");
-        if let Err(source) = fs::write(&creating_marker, b"creating\n") {
-            let _ = fs::remove_dir_all(&machine_dir);
-            return Err(filesystem_error(
-                ErrorKind::Generic,
-                format!("cannot mark machine `{name}` as being created"),
-                "check the machine directory permissions",
-                source,
-            ));
-        }
-        let lock_path = self.paths.machine_lock(name)?;
-        let lock = match MachineLock::acquire(name, &lock_path, events) {
-            Ok(lock) => lock,
-            Err(error) => {
-                let _ = fs::remove_dir_all(&machine_dir);
-                return Err(error);
-            }
-        };
-        let mut record = match self.initialize_machine(name, spec, &lock) {
-            Ok(record) => record,
-            Err(error) => {
-                let _ = fs::remove_dir_all(&machine_dir);
-                return Err(error);
-            }
-        };
+        let (lock, creating_marker) = self.prepare_machine_creation(name, &machine_dir, events)?;
+        let mut record = self.initialize_machine(name, spec, &lock)?;
 
         if edit {
             let spec_path = self.paths.machine_spec(name)?;
             let candidate = spec_path.with_extension("toml.edit");
             let original = read_file(&spec_path, "machine spec", ErrorKind::Generic)?;
-            if let Err(error) = atomic::write(&candidate, &original) {
-                let _ = fs::remove_dir_all(&machine_dir);
-                return Err(error);
-            }
+            atomic::write(&candidate, &original)?;
             let edited = self.edit_candidate(name, &machine_dir, &candidate, &spec_path, events);
             let cleanup = remove_candidate(&candidate);
             let edited = match (edited, cleanup) {
                 (Ok(edited), Ok(())) => edited,
-                (Ok(_), Err(error)) | (Err(error), _) => {
-                    let _ = fs::remove_dir_all(&machine_dir);
-                    return Err(error);
-                }
+                (Ok(_), Err(error)) | (Err(error), _) => return Err(error),
             };
-            if let Err(error) = emit_spec_warnings(&edited.warnings, events) {
-                let _ = fs::remove_dir_all(&machine_dir);
-                return Err(error);
-            }
+            emit_spec_warnings(&edited.warnings, events)?;
             let state = self.created_state(name, &edited.spec)?;
-            if let Err(error) = StateStore::new(self.paths.machine_state(name)?)
-                .write_from_locked_action(&state, &lock)
-            {
-                let _ = fs::remove_dir_all(&machine_dir);
-                return Err(error);
-            }
+            StateStore::new(self.paths.machine_state(name)?)
+                .write_from_locked_action(&state, &lock)?;
             record.spec = edited.spec;
             record.state = state;
         }
 
-        if let Err(source) = fs::remove_file(&creating_marker) {
-            let _ = fs::remove_dir_all(&machine_dir);
-            return Err(filesystem_error(
+        fs::remove_file(&creating_marker).map_err(|source| {
+            filesystem_error(
                 ErrorKind::Generic,
                 format!("cannot publish machine `{name}`"),
                 "check the machine directory permissions",
                 source,
-            ));
-        }
+            )
+        })?;
         emit_result(events, "create", &record)
     }
 
+    fn prepare_machine_creation(
+        &self,
+        name: &str,
+        machine_dir: &Path,
+        events: &mut dyn EventSink,
+    ) -> Result<(MachineLock, PathBuf), FirestoneError> {
+        ensure_owned_directory(&self.paths, machine_dir, "machine directory", false)?;
+        let creating_marker = machine_dir.join(".creating");
+        let lock_path = self.paths.machine_lock(name)?;
+        validate_creation_lock_file(&lock_path, name, true)?;
+        let lock = MachineLock::acquire(name, &lock_path, events)?;
+        self.paths
+            .validate_owned_data_directory(machine_dir, "machine directory", false)?;
+        validate_creation_lock_file(&lock_path, name, false)?;
+
+        let marker_exists = creation_marker_exists(&creating_marker, name)?;
+        if self.machine_publication_complete(name, machine_dir)? {
+            if marker_exists {
+                fs::remove_file(&creating_marker).map_err(|source| {
+                    filesystem_error(
+                        ErrorKind::Generic,
+                        format!("cannot finalize machine `{name}` after interrupted creation"),
+                        "check the machine directory permissions",
+                        source,
+                    )
+                })?;
+            }
+            return Err(machine_already_exists_error(name));
+        }
+
+        if marker_exists {
+            clear_incomplete_machine(machine_dir, name)?;
+        } else if machine_has_non_lock_entries(machine_dir, name)? {
+            return Err(machine_already_exists_error(name));
+        }
+
+        if !marker_exists {
+            fs::write(&creating_marker, b"creating\n").map_err(|source| {
+                filesystem_error(
+                    ErrorKind::Generic,
+                    format!("cannot mark machine `{name}` as being created"),
+                    "check the machine directory permissions",
+                    source,
+                )
+            })?;
+        }
+
+        Ok((lock, creating_marker))
+    }
+
+    fn machine_publication_complete(
+        &self,
+        name: &str,
+        machine_dir: &Path,
+    ) -> Result<bool, FirestoneError> {
+        let spec_path = self.paths.machine_spec(name)?;
+        let state_path = self.paths.machine_state(name)?;
+        if !owned_file_ready(&spec_path)? || !owned_file_ready(&state_path)? {
+            return Ok(false);
+        }
+
+        let source = read_file(&spec_path, "machine spec", ErrorKind::InvalidSpec)?;
+        let text = std::str::from_utf8(&source).map_err(|source| {
+            FirestoneError::new(
+                ErrorKind::InvalidSpec,
+                format!("machine spec for `{name}` is not UTF-8"),
+            )
+            .with_hint("save firestone.toml as UTF-8 TOML")
+            .with_source(source)
+        })?;
+        self.load_spec_text(text, machine_dir, machine_dir)?;
+        StateStore::new(state_path).read()?;
+        Ok(true)
+    }
     fn initialize_machine(
         &self,
         name: &str,
@@ -306,16 +335,18 @@ impl LocalDispatcher {
 
     fn list(&self, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
         let names = self.machine_names()?;
+        let now = jiff::Timestamp::now();
         let mut machines = Vec::with_capacity(names.len());
         for name in names {
-            let (spec, state) = self.load_machine(&name)?;
+            let (spec, live) = self.load_machine(&name)?;
+            let state = &live.state;
             machines.push(MachineSummary {
                 name,
-                status: display_status(&state),
+                status: display_status(state.status, !state.degraded.is_empty(), live.supervision),
                 image: state.image.r#ref.clone(),
                 cpus: spec.cpus,
                 memory: spec.memory.to_string(),
-                uptime: None,
+                uptime: display_uptime(state, &now),
                 forwards: state
                     .forwards
                     .iter()
@@ -327,8 +358,16 @@ impl LocalDispatcher {
     }
 
     fn show(&self, name: &str, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
-        let (spec, state) = self.load_machine(name)?;
-        emit_result(events, "show", &MachineView { spec, state })
+        let (spec, live) = self.load_machine(name)?;
+        emit_result(
+            events,
+            "show",
+            &MachineView {
+                spec,
+                state: live.state,
+                supervision: live.supervision,
+            },
+        )
     }
 
     fn set_spec(
@@ -339,14 +378,14 @@ impl LocalDispatcher {
     ) -> Result<(), FirestoneError> {
         self.validate_machine_storage()?;
         let machine_dir = self.paths.machine_dir(name)?;
-        ensure_machine_exists(name, &machine_dir)?;
-        let observed_state = self.read_live_state(name)?;
+        ensure_machine_exists(&self.paths, name, &machine_dir)?;
         let lock_path = self.paths.machine_lock(name)?;
-        let _lock = MachineLock::acquire(name, &lock_path, events)?;
-        ensure_machine_exists(name, &machine_dir)?;
+        let lock = MachineLock::acquire(name, &lock_path, events)?;
+        ensure_machine_exists(&self.paths, name, &machine_dir)?;
+        let observed_state = self.read_live_state_locked(name, &lock)?;
         let document = render_spec(&spec)?;
         atomic::write(&self.paths.machine_spec(name)?, document.as_bytes())?;
-        emit_running_spec_warning(&observed_state, events)?;
+        emit_running_spec_warning(&observed_state.state, events)?;
         emit_result(
             events,
             "edit",
@@ -357,17 +396,27 @@ impl LocalDispatcher {
         )
     }
 
-    fn read_live_state(&self, name: &str) -> Result<MachineState, FirestoneError> {
+    fn read_live_state(&self, name: &str) -> Result<LiveMachineState, FirestoneError> {
         let state_path = self.paths.machine_state(name)?;
         ensure_owned_regular_file(&state_path, "machine state", ErrorKind::Generic)?;
         let reconciled_at = jiff::Timestamp::now().to_string();
         read_reconciled_machine_state_live(&self.paths, name, &reconciled_at)
     }
+    fn read_live_state_locked(
+        &self,
+        name: &str,
+        lock: &MachineLock,
+    ) -> Result<LiveMachineState, FirestoneError> {
+        let state_path = self.paths.machine_state(name)?;
+        ensure_owned_regular_file(&state_path, "machine state", ErrorKind::Generic)?;
+        let reconciled_at = jiff::Timestamp::now().to_string();
+        read_reconciled_machine_state_live_locked(&self.paths, name, &reconciled_at, lock)
+    }
 
-    fn load_machine(&self, name: &str) -> Result<(MachineSpec, MachineState), FirestoneError> {
+    fn load_machine(&self, name: &str) -> Result<(MachineSpec, LiveMachineState), FirestoneError> {
         self.validate_machine_storage()?;
         let machine_dir = self.paths.machine_dir(name)?;
-        ensure_machine_exists(name, &machine_dir)?;
+        ensure_machine_exists(&self.paths, name, &machine_dir)?;
         let source = read_file(
             &self.paths.machine_spec(name)?,
             "machine spec",
@@ -409,7 +458,6 @@ impl LocalDispatcher {
     }
 
     fn doctor(&self, fix: bool, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
-        self.validate_machine_storage()?;
         let hostname = env::var("HOSTNAME")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -475,7 +523,10 @@ impl LocalDispatcher {
     }
 
     fn machine_files_ready(&self, name: &str) -> Result<bool, FirestoneError> {
-        let marker = self.paths.machine_dir(name)?.join(".creating");
+        let machine_dir = self.paths.machine_dir(name)?;
+        self.paths
+            .validate_owned_data_directory(&machine_dir, "machine directory", false)?;
+        let marker = machine_dir.join(".creating");
         match fs::symlink_metadata(&marker) {
             Ok(_) => return Ok(false),
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
@@ -540,17 +591,55 @@ fn render_spec(spec: &MachineSpec) -> Result<String, FirestoneError> {
     Ok(format!("{SPEC_TEMPLATE}\n{effective}"))
 }
 
-fn display_status(state: &MachineState) -> String {
-    match state.status {
+fn display_status(
+    status: MachineStatus,
+    degraded: bool,
+    supervision: Option<Supervision>,
+) -> String {
+    if status == MachineStatus::Running {
+        let base = if degraded { "running!" } else { "running" };
+        return if supervision == Some(Supervision::Unsupervised) {
+            format!("{base} (unsupervised)")
+        } else {
+            base.to_owned()
+        };
+    }
+
+    match status {
         MachineStatus::Created => "created",
         MachineStatus::Starting => "starting",
-        MachineStatus::Running if state.degraded.is_empty() => "running",
-        MachineStatus::Running => "running!",
         MachineStatus::Stopping => "stopping",
         MachineStatus::Stopped => "stopped",
         MachineStatus::Failed => "failed",
+        MachineStatus::Running => unreachable!("running status returned above"),
     }
     .to_owned()
+}
+
+fn display_uptime(state: &MachineState, now: &jiff::Timestamp) -> Option<String> {
+    if !state.status.is_active() {
+        return None;
+    }
+    let started_at = state
+        .started_at
+        .as_deref()?
+        .parse::<jiff::Timestamp>()
+        .ok()?;
+    let seconds = now.as_second().checked_sub(started_at.as_second())?;
+    let seconds = u64::try_from(seconds).ok()?;
+    Some(format_uptime_seconds(seconds))
+}
+
+fn format_uptime_seconds(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 60 * 60 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 24 * 60 * 60 {
+        format!("{}h", seconds / (60 * 60))
+    } else {
+        format!("{}d", seconds / (24 * 60 * 60))
+    }
 }
 
 fn display_forward(forward: &str) -> String {
@@ -560,12 +649,37 @@ fn display_forward(forward: &str) -> String {
     }
 }
 
-fn ensure_owned_directory(path: &Path, label: &str, recursive: bool) -> Result<(), FirestoneError> {
+fn ensure_owned_directory(
+    paths: &Paths,
+    path: &Path,
+    label: &str,
+    recursive: bool,
+) -> Result<bool, FirestoneError> {
+    paths.validate_owned_data_directory(path, label, true)?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            paths.validate_owned_data_directory(path, label, false)?;
+            return Ok(false);
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(filesystem_error(
+                ErrorKind::Generic,
+                format!("cannot inspect {label} {}", path.display()),
+                "check the Firestone data directory permissions",
+                source,
+            ));
+        }
+    }
+
     let mut builder = fs::DirBuilder::new();
     builder.recursive(recursive).mode(0o700);
     match builder.create(path) {
         Ok(()) => {}
-        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            paths.validate_owned_data_directory(path, label, false)?;
+            return Ok(false);
+        }
         Err(source) => {
             return Err(filesystem_error(
                 ErrorKind::Generic,
@@ -575,49 +689,173 @@ fn ensure_owned_directory(path: &Path, label: &str, recursive: bool) -> Result<(
             ));
         }
     }
-    validate_owned_directory(path, label, false)
-}
 
-fn validate_owned_directory(
-    path: &Path,
-    label: &str,
-    allow_missing: bool,
-) -> Result<(), FirestoneError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(source) if allow_missing && source.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(());
-        }
-        Err(source) => {
-            return Err(filesystem_error(
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
+        filesystem_error(
+            ErrorKind::Generic,
+            format!("cannot set mode 0700 on {label} {}", path.display()),
+            "check the Firestone data directory permissions",
+            source,
+        )
+    })?;
+    paths.validate_owned_data_directory(path, label, false)?;
+    let actual_mode = fs::symlink_metadata(path)
+        .map_err(|source| {
+            filesystem_error(
                 ErrorKind::Generic,
-                format!("cannot inspect {label} {}", path.display()),
+                format!("cannot inspect created {label} {}", path.display()),
                 "check the Firestone data directory permissions",
                 source,
-            ));
-        }
-    };
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
-        return Ok(());
+            )
+        })?
+        .permissions()
+        .mode()
+        & 0o7777;
+    if actual_mode != 0o700 {
+        return Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!(
+                "created {label} {} has mode {actual_mode:04o}; expected 0700",
+                path.display()
+            ),
+        )
+        .with_hint("restrict the directory to the Firestone user and retry"));
     }
-    Err(FirestoneError::new(
-        ErrorKind::Generic,
-        format!(
-            "{label} {} is not a regular owned directory",
-            path.display()
-        ),
-    )
-    .with_hint("replace the symlink or special file with a regular Firestone-owned directory"))
+    Ok(true)
 }
 
-fn ensure_machine_exists(name: &str, machine_dir: &Path) -> Result<(), FirestoneError> {
-    match fs::symlink_metadata(machine_dir) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(FirestoneError::new(
-            ErrorKind::NotFound,
-            format!("machine path for `{name}` is a symbolic link"),
+fn creation_marker_exists(path: &Path, name: &str) -> Result<bool, FirestoneError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(true),
+        Ok(_) => Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!("creation marker for machine `{name}` is not a regular file"),
         )
-        .with_hint("remove the symbolic link and recreate the machine")),
-        Ok(metadata) if metadata.is_dir() => {
+        .with_hint("move the invalid machine directory aside and retry")),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(filesystem_error(
+            ErrorKind::Generic,
+            format!("cannot inspect creation marker for machine `{name}`"),
+            "check the machine directory permissions",
+            source,
+        )),
+    }
+}
+
+fn validate_creation_lock_file(
+    path: &Path,
+    name: &str,
+    allow_missing: bool,
+) -> Result<(), FirestoneError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!("machine lock for `{name}` is not a regular file"),
+        )
+        .with_hint("move the invalid machine directory aside and retry")),
+        Err(source) if allow_missing && source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(filesystem_error(
+            ErrorKind::Generic,
+            format!("cannot inspect machine lock for `{name}`"),
+            "check the machine directory permissions",
+            source,
+        )),
+    }
+}
+
+fn clear_incomplete_machine(machine_dir: &Path, name: &str) -> Result<(), FirestoneError> {
+    let entries = fs::read_dir(machine_dir).map_err(|source| {
+        filesystem_error(
+            ErrorKind::Generic,
+            format!("cannot inspect incomplete machine `{name}`"),
+            "check the machine directory permissions",
+            source,
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| {
+            filesystem_error(
+                ErrorKind::Generic,
+                format!("cannot inspect incomplete machine `{name}`"),
+                "check the machine directory permissions",
+                source,
+            )
+        })?;
+        let file_name = entry.file_name();
+        if file_name.as_os_str() == OsStr::new("lock")
+            || file_name.as_os_str() == OsStr::new(".creating")
+        {
+            continue;
+        }
+
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|source| {
+            filesystem_error(
+                ErrorKind::Generic,
+                format!("cannot inspect stale machine path {}", path.display()),
+                "check the machine directory permissions",
+                source,
+            )
+        })?;
+        let removal = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        removal.map_err(|source| {
+            filesystem_error(
+                ErrorKind::Generic,
+                format!("cannot remove stale machine path {}", path.display()),
+                "check the machine directory permissions",
+                source,
+            )
+        })?;
+    }
+    Ok(())
+}
+fn machine_has_non_lock_entries(machine_dir: &Path, name: &str) -> Result<bool, FirestoneError> {
+    let entries = fs::read_dir(machine_dir).map_err(|source| {
+        filesystem_error(
+            ErrorKind::Generic,
+            format!("cannot inspect incomplete machine `{name}`"),
+            "check the machine directory permissions",
+            source,
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| {
+            filesystem_error(
+                ErrorKind::Generic,
+                format!("cannot inspect incomplete machine `{name}`"),
+                "check the machine directory permissions",
+                source,
+            )
+        })?;
+        if entry.file_name().as_os_str() != OsStr::new("lock") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn machine_already_exists_error(name: &str) -> FirestoneError {
+    FirestoneError::new(
+        ErrorKind::AlreadyExists,
+        format!("machine `{name}` already exists"),
+    )
+    .with_hint(format!(
+        "use `firestone show {name}` or choose another name"
+    ))
+}
+fn ensure_machine_exists(
+    paths: &Paths,
+    name: &str,
+    machine_dir: &Path,
+) -> Result<(), FirestoneError> {
+    match fs::symlink_metadata(machine_dir) {
+        Ok(_) => {
+            paths.validate_owned_data_directory(machine_dir, "machine directory", false)?;
             match fs::symlink_metadata(machine_dir.join(".creating")) {
                 Ok(_) => Err(FirestoneError::new(
                     ErrorKind::Busy,
@@ -633,11 +871,6 @@ fn ensure_machine_exists(name: &str, machine_dir: &Path) -> Result<(), Firestone
                 )),
             }
         }
-        Ok(_) => Err(FirestoneError::new(
-            ErrorKind::NotFound,
-            format!("machine path for `{name}` is not a directory"),
-        )
-        .with_hint("remove the invalid machine path and recreate the machine")),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Err(FirestoneError::new(
             ErrorKind::NotFound,
             format!("no machine named `{name}`"),
@@ -771,15 +1004,37 @@ fn filesystem_error(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::symlink};
+    use std::{
+        fs,
+        os::unix::fs::{MetadataExt, PermissionsExt, symlink},
+        sync::mpsc,
+        thread,
+        time::Duration,
+    };
 
     use firestone_core::{
         Action, Catalog, Dispatcher, ErrorKind, Event, EventSink, FirestoneError, GlobalConfig,
-        PathInputs, Paths,
+        MachineLock, MachineStatus, PathInputs, Paths, Supervision,
     };
 
-    use super::{LocalDispatcher, display_forward, parse_editor_command};
+    use super::{
+        LocalDispatcher, display_forward, display_status, format_uptime_seconds,
+        parse_editor_command,
+    };
+    struct WaitingSink(mpsc::Sender<()>);
 
+    impl EventSink for WaitingSink {
+        fn emit(&mut self, event: Event) -> Result<(), FirestoneError> {
+            if matches!(
+                event,
+                Event::Log { ref message, .. }
+                    if message.starts_with("waiting for another firestone operation")
+            ) {
+                let _ = self.0.send(());
+            }
+            Ok(())
+        }
+    }
     fn fixture() -> Result<(tempfile::TempDir, LocalDispatcher, Paths), Box<dyn std::error::Error>>
     {
         let directory = tempfile::tempdir()?;
@@ -794,7 +1049,7 @@ mod tests {
             xdg_config_home: None,
             xdg_data_home: None,
             xdg_runtime_dir: None,
-            uid: 1000,
+            uid: fs::metadata(&root)?.uid(),
         })?;
         let dispatcher =
             LocalDispatcher::new(paths.clone(), GlobalConfig::default(), Catalog::built_in()?);
@@ -853,7 +1108,263 @@ mod tests {
         );
         Ok(())
     }
+    #[tokio::test]
+    async fn create_missing_storage_creates_mode_0700() -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        let mut events = Vec::new();
 
+        dispatcher
+            .run(
+                Action::Create {
+                    name: "secure".to_owned(),
+                    spec: firestone_core::MachineSpec::default(),
+                },
+                &mut events,
+            )
+            .await?;
+
+        for path in [
+            paths.data_dir().to_path_buf(),
+            paths.machines_dir(),
+            paths.machine_dir("secure")?,
+        ] {
+            assert_eq!(
+                fs::symlink_metadata(path)?.permissions().mode() & 0o7777,
+                0o700
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_permissive_data_directory_returns_dependency_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        fs::create_dir_all(paths.data_dir())?;
+        fs::set_permissions(paths.data_dir(), fs::Permissions::from_mode(0o777))?;
+        let mut events = Vec::new();
+
+        let error = dispatcher
+            .run(
+                Action::Create {
+                    name: "blocked".to_owned(),
+                    spec: firestone_core::MachineSpec::default(),
+                },
+                &mut events,
+            )
+            .await
+            .err();
+
+        assert_eq!(
+            error.as_ref().map(FirestoneError::kind),
+            Some(ErrorKind::Dependency)
+        );
+        assert!(!paths.machines_dir().exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_permissive_machines_directory_returns_dependency_without_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        fs::create_dir_all(paths.machines_dir())?;
+        fs::set_permissions(paths.data_dir(), fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(paths.machines_dir(), fs::Permissions::from_mode(0o777))?;
+        let mut events = Vec::new();
+
+        let error = dispatcher
+            .run(
+                Action::Create {
+                    name: "blocked".to_owned(),
+                    spec: firestone_core::MachineSpec::default(),
+                },
+                &mut events,
+            )
+            .await
+            .err();
+
+        assert_eq!(
+            error.as_ref().map(FirestoneError::kind),
+            Some(ErrorKind::Dependency)
+        );
+        assert!(!paths.machine_dir("blocked")?.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_stale_incomplete_publication_recovers_and_retries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        fs::create_dir_all(paths.machines_dir())?;
+        fs::set_permissions(paths.data_dir(), fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(paths.machines_dir(), fs::Permissions::from_mode(0o700))?;
+        let machine_dir = paths.machine_dir("stale-create")?;
+        fs::create_dir(&machine_dir)?;
+        fs::set_permissions(&machine_dir, fs::Permissions::from_mode(0o700))?;
+        fs::write(machine_dir.join(".creating"), b"creating\n")?;
+        fs::write(machine_dir.join("partial"), b"stale")?;
+        let mut events = Vec::new();
+
+        dispatcher
+            .run(
+                Action::Create {
+                    name: "stale-create".to_owned(),
+                    spec: firestone_core::MachineSpec::default(),
+                },
+                &mut events,
+            )
+            .await?;
+
+        assert!(!machine_dir.join(".creating").exists());
+        assert!(!machine_dir.join("partial").exists());
+        assert!(paths.machine_spec("stale-create")?.exists());
+        assert!(paths.machine_state("stale-create")?.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_complete_publication_with_stale_marker_preserves_machine()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        let mut events = Vec::new();
+        dispatcher
+            .run(
+                Action::Create {
+                    name: "complete".to_owned(),
+                    spec: firestone_core::MachineSpec::default(),
+                },
+                &mut events,
+            )
+            .await?;
+        let marker = paths.machine_dir("complete")?.join(".creating");
+        fs::write(&marker, b"creating\n")?;
+        let replacement = firestone_core::MachineSpec {
+            cpus: 8,
+            ..firestone_core::MachineSpec::default()
+        };
+
+        let error = dispatcher
+            .run(
+                Action::Create {
+                    name: "complete".to_owned(),
+                    spec: replacement,
+                },
+                &mut events,
+            )
+            .await
+            .err();
+
+        assert_eq!(
+            error.as_ref().map(FirestoneError::kind),
+            Some(ErrorKind::AlreadyExists)
+        );
+        assert!(!marker.exists());
+        let (spec, _) = dispatcher.load_machine("complete")?;
+        assert_eq!(spec.cpus, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_empty_markerless_directory_recovers_and_publishes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        fs::create_dir_all(paths.machines_dir())?;
+        fs::set_permissions(paths.data_dir(), fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(paths.machines_dir(), fs::Permissions::from_mode(0o700))?;
+        let machine_dir = paths.machine_dir("pre-marker")?;
+        fs::create_dir(&machine_dir)?;
+        fs::set_permissions(&machine_dir, fs::Permissions::from_mode(0o700))?;
+        let mut events = Vec::new();
+
+        dispatcher
+            .run(
+                Action::Create {
+                    name: "pre-marker".to_owned(),
+                    spec: firestone_core::MachineSpec::default(),
+                },
+                &mut events,
+            )
+            .await?;
+
+        assert!(paths.machine_spec("pre-marker")?.is_file());
+        assert!(paths.machine_state("pre-marker")?.is_file());
+        assert!(!machine_dir.join(".creating").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_permissive_machine_directory_returns_dependency()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        let mut events = Vec::new();
+        dispatcher
+            .run(
+                Action::Create {
+                    name: "unsafe-machine".to_owned(),
+                    spec: firestone_core::MachineSpec::default(),
+                },
+                &mut events,
+            )
+            .await?;
+        fs::set_permissions(
+            paths.machine_dir("unsafe-machine")?,
+            fs::Permissions::from_mode(0o777),
+        )?;
+        events.clear();
+
+        let error = dispatcher.run(Action::List, &mut events).await.err();
+
+        assert_eq!(
+            error.as_ref().map(FirestoneError::kind),
+            Some(ErrorKind::Dependency)
+        );
+        Ok(())
+    }
+    #[test]
+    fn create_active_publication_becomes_already_exists_without_deletion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        fs::create_dir_all(paths.machines_dir())?;
+        fs::set_permissions(paths.data_dir(), fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(paths.machines_dir(), fs::Permissions::from_mode(0o700))?;
+        let machine_dir = paths.machine_dir("active-create")?;
+        fs::create_dir(&machine_dir)?;
+        fs::set_permissions(&machine_dir, fs::Permissions::from_mode(0o700))?;
+        let marker = machine_dir.join(".creating");
+        fs::write(&marker, b"creating\n")?;
+        let mut lock_events = Vec::new();
+        let active_lock = MachineLock::acquire(
+            "active-create",
+            &paths.machine_lock("active-create")?,
+            &mut lock_events,
+        )?;
+        let (sender, receiver) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let mut events = WaitingSink(sender);
+            dispatcher
+                .create_internal(
+                    "active-create",
+                    firestone_core::MachineSpec::default(),
+                    false,
+                    &mut events,
+                )
+                .err()
+                .map(|error| error.kind())
+        });
+        receiver.recv_timeout(Duration::from_secs(3))?;
+        let sentinel = machine_dir.join("published");
+        fs::write(&sentinel, b"complete")?;
+        fs::remove_file(&marker)?;
+        drop(active_lock);
+
+        let error_kind = handle
+            .join()
+            .map_err(|_| std::io::Error::other("create thread panicked"))?;
+        assert_eq!(error_kind, Some(ErrorKind::AlreadyExists));
+        assert_eq!(fs::read(sentinel)?, b"complete");
+        Ok(())
+    }
     #[tokio::test]
     async fn list_reconciles_stale_running_state_before_rendering()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -990,7 +1501,7 @@ mod tests {
 
         assert_eq!(
             error.as_ref().map(firestone_core::FirestoneError::kind),
-            Some(ErrorKind::Generic)
+            Some(ErrorKind::Dependency)
         );
         for action in [
             Action::List,
@@ -1001,12 +1512,11 @@ mod tests {
                 name: "redirected".to_owned(),
                 spec: firestone_core::MachineSpec::default(),
             },
-            Action::Doctor { fix: false },
         ] {
             let error = dispatcher.run(action, &mut events).await.err();
             assert_eq!(
                 error.as_ref().map(firestone_core::FirestoneError::kind),
-                Some(ErrorKind::Generic)
+                Some(ErrorKind::Dependency)
             );
         }
         let edit_error = dispatcher.edit("redirected", &mut events).err();
@@ -1014,7 +1524,17 @@ mod tests {
             edit_error
                 .as_ref()
                 .map(firestone_core::FirestoneError::kind),
-            Some(ErrorKind::Generic)
+            Some(ErrorKind::Dependency)
+        );
+
+        events.clear();
+        dispatcher
+            .run(Action::Doctor { fix: false }, &mut events)
+            .await?;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Result { action, .. } if action == "doctor"))
         );
 
         assert!(!outside.join("redirected").exists());
@@ -1042,7 +1562,7 @@ mod tests {
 
         assert_eq!(
             error.as_ref().map(FirestoneError::kind),
-            Some(ErrorKind::NotFound)
+            Some(ErrorKind::Dependency)
         );
         assert!(outside.exists());
         Ok(())
@@ -1175,5 +1695,32 @@ mod tests {
             Some(ErrorKind::Generic)
         );
         Ok(())
+    }
+    #[test]
+    fn display_status_running_without_shim_reports_unsupervised() {
+        assert_eq!(
+            display_status(
+                MachineStatus::Running,
+                false,
+                Some(Supervision::Unsupervised),
+            ),
+            "running (unsupervised)"
+        );
+        assert_eq!(
+            display_status(
+                MachineStatus::Running,
+                true,
+                Some(Supervision::Unsupervised),
+            ),
+            "running! (unsupervised)"
+        );
+    }
+
+    #[test]
+    fn format_uptime_seconds_boundaries_use_short_units() {
+        assert_eq!(format_uptime_seconds(41), "41s");
+        assert_eq!(format_uptime_seconds(60), "1m");
+        assert_eq!(format_uptime_seconds(3_600), "1h");
+        assert_eq!(format_uptime_seconds(172_800), "2d");
     }
 }

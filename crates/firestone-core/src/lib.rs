@@ -25,7 +25,7 @@ pub use deps::{DependencyArtifact, DependencyManifest};
 pub use dispatcher::{DispatchFuture, Dispatcher, EventSink};
 pub use doctor::{
     DoctorCheck, DoctorCheckId, DoctorContext, DoctorReport, DoctorStatus,
-    read_reconciled_machine_state_live, run_doctor,
+    read_reconciled_machine_state_live, read_reconciled_machine_state_live_locked, run_doctor,
 };
 pub use error::{ErrorInfo, ErrorKind, FirestoneError};
 pub use event::{Event, Level, StepId, Unit};
@@ -42,7 +42,7 @@ pub use spec::{
     UiConfig, ValidationContext, ValidationHost, VmmSpec, VmmSpecPatch, validate_machine_spec,
 };
 pub use state::{
-    ExitReason, LastExit, LivenessObservation, MachineState, MachineStatus, ReconcileReport,
-    ReconcileRewrite, StateImage, StateStore, StateVersion, Supervision, VmmPingProbe,
-    observe_liveness, reconcile, reconciled_state, verify_shim_identity,
+    ExitReason, LastExit, LiveMachineState, LivenessObservation, MachineState, MachineStatus,
+    ReconcileReport, ReconcileRewrite, StateImage, StateStore, StateVersion, Supervision,
+    VmmPingProbe, observe_liveness, reconcile, reconciled_state, verify_shim_identity,
 };
