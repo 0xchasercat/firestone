@@ -402,7 +402,8 @@ fn lifecycle_cli_smoke_without_kvm() -> TestResult {
         .output()?;
     assert!(
         stopped.status.success(),
-        "{}",
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&stopped.stdout),
         String::from_utf8_lossy(&stopped.stderr)
     );
     assert_eq!(
