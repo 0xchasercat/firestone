@@ -26,7 +26,7 @@ use tempfile::Builder as TempBuilder;
 
 use crate::{
     Cmd, DependencyArtifact, DependencyManifest, ErrorKind, FirestoneError, MachineLock, Paths,
-    ReconcileRewrite, StateStore, VmmPingProbe, observe_liveness, reconcile,
+    ReconcileRewrite, StateStore, VmmPingProbe, observe_liveness, reconcile, reconciled_state,
 };
 
 const MINIMUM_FREE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
@@ -1373,55 +1373,82 @@ fn reconcile_machine_states(context: &DoctorContext, vmm: &dyn VmmPingProbe) -> 
     report
 }
 
+/// Reads one machine through live process and VMM observations.
+///
+/// The common read-only path does not take the machine lock. A stale active
+/// state is re-read and persisted only after acquiring the lock.
+pub fn read_reconciled_machine_state_live(
+    paths: &Paths,
+    name: &str,
+    reconciled_at: &str,
+) -> Result<crate::MachineState, FirestoneError> {
+    let (state, _) = read_reconciled_machine_state_with(
+        paths,
+        name,
+        Path::new("/proc"),
+        reconciled_at,
+        &HttpVmmPing,
+    )?;
+    Ok(state)
+}
+
 fn reconcile_machine_state(
     context: &DoctorContext,
     name: &str,
     vmm: &dyn VmmPingProbe,
 ) -> Result<Option<StaleStateObservation>, FirestoneError> {
-    let state_store = StateStore::new(context.paths.machine_state(name)?);
-    let lock_path = context.paths.machine_lock(name)?;
-    let runtime_dir = context.paths.machine_runtime_dir(name)?;
-    let api_socket = context.paths.machine_api_socket(name)?;
+    let (_, reason) = read_reconciled_machine_state_with(
+        &context.paths,
+        name,
+        &context.proc_root,
+        &context.reconciled_at,
+        vmm,
+    )?;
+    Ok(reason.map(|reason| StaleStateObservation {
+        machine: name.to_owned(),
+        reason,
+    }))
+}
+
+fn read_reconciled_machine_state_with(
+    paths: &Paths,
+    name: &str,
+    proc_root: &Path,
+    reconciled_at: &str,
+    vmm: &dyn VmmPingProbe,
+) -> Result<(crate::MachineState, Option<String>), FirestoneError> {
+    let state_store = StateStore::new(paths.machine_state(name)?);
+    let runtime_dir = paths.machine_runtime_dir(name)?;
+    let api_socket = paths.machine_api_socket(name)?;
+    let mut state = state_store.read()?;
+    let observation = observe_liveness(name, &state, &runtime_dir, &api_socket, proc_root, vmm)?;
+    let mut reconciliation = reconcile(state.status, observation);
+
+    if reconciliation.rewrite.is_none() {
+        state.status = reconciliation.status;
+        return Ok((state, None));
+    }
+
+    let lock_path = paths.machine_lock(name)?;
     let mut events = |_event: crate::Event| Ok(());
     let lock = MachineLock::acquire(name, &lock_path, &mut events)?;
-    let mut state = state_store.read()?;
-    let mut reconciliation = {
-        let observation = observe_liveness(
-            name,
-            &state,
-            &runtime_dir,
-            &api_socket,
-            &context.proc_root,
-            vmm,
-        )?;
-        reconcile(state.status, observation)
-    };
-
-    if reconciliation.rewrite.is_some() {
-        // Once the observed shim is gone, its final atomic state write is complete.
-        // Re-read that state before applying a reconciliation so an older snapshot
-        // cannot overwrite the shim's exit details.
-        state = state_store.read()?;
-        let observation = observe_liveness(
-            name,
-            &state,
-            &runtime_dir,
-            &api_socket,
-            &context.proc_root,
-            vmm,
-        )?;
-        reconciliation = reconcile(state.status, observation);
-    }
+    // The shim may have completed its final atomic write while this reader was
+    // waiting. Re-read and re-observe under the lock before deciding to write.
+    state = state_store.read()?;
+    let observation = observe_liveness(name, &state, &runtime_dir, &api_socket, proc_root, vmm)?;
+    reconciliation = reconcile(state.status, observation);
 
     let reason = reconciliation
         .rewrite
         .as_ref()
         .map(|ReconcileRewrite::Stopped { reason }| reason.as_str().to_owned());
-    state_store.write_reconciliation(&state, &reconciliation, &context.reconciled_at, &lock)?;
-    Ok(reason.map(|reason| StaleStateObservation {
-        machine: name.to_owned(),
-        reason,
-    }))
+    if let Some(effective) = reconciled_state(&state, &reconciliation, reconciled_at) {
+        state_store.write_reconciliation(&state, &reconciliation, reconciled_at, &lock)?;
+        return Ok((effective, reason));
+    }
+
+    state.status = reconciliation.status;
+    Ok((state, None))
 }
 
 fn perform_fixes(
@@ -2172,12 +2199,12 @@ mod tests {
         artifact_state, check_kvm, check_passt, check_user_namespaces,
         content_length_exceeds_limit, copy_bounded, create_firestone_dir, distro_family,
         firestone_error_reason, generate_ssh_key, install_artifact, install_command,
-        parse_passt_version, reconcile_machine_state, redirect_rejection, require_https,
-        run_doctor_with,
+        parse_passt_version, read_reconciled_machine_state_with, reconcile_machine_state,
+        redirect_rejection, require_https, run_doctor_with,
     };
     use crate::{
         DependencyArtifact, DependencyManifest, ErrorKind, ExitReason, FirestoneError, LastExit,
-        MachineState, MachineStatus, PathInputs, Paths, StateStore, VmmPingProbe,
+        MachineLock, MachineState, MachineStatus, PathInputs, Paths, StateStore, VmmPingProbe,
     };
 
     struct FakeFetcher {
@@ -2239,6 +2266,14 @@ mod tests {
                 self.store.write_from_shim(&self.state)?;
             }
             Ok(false)
+        }
+    }
+
+    struct FixedPing(bool);
+
+    impl VmmPingProbe for FixedPing {
+        fn ping(&self, _api_socket: &Path) -> Result<bool, FirestoneError> {
+            Ok(self.0)
         }
     }
 
@@ -3118,6 +3153,39 @@ mod tests {
             assert_eq!(state["status"], "stopped");
             assert_eq!(state["last_exit"]["reason"], "host reboot");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn live_read_reports_ping_status_without_taking_lock_or_rewriting()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::healthy()?;
+        let name = "live";
+        write_running_state(&fixture.context.paths, name)?;
+        fs::create_dir(fixture.context.paths.machine_runtime_dir(name)?)?;
+        let store = StateStore::new(fixture.context.paths.machine_state(name)?);
+        let mut stored = store.read()?;
+        stored.status = MachineStatus::Starting;
+        store.write_from_shim(&stored)?;
+        let mut events = Vec::new();
+        let lock = MachineLock::acquire(
+            name,
+            &fixture.context.paths.machine_lock(name)?,
+            &mut events,
+        )?;
+
+        let (effective, reason) = read_reconciled_machine_state_with(
+            &fixture.context.paths,
+            name,
+            &fixture.context.proc_root,
+            &fixture.context.reconciled_at,
+            &FixedPing(true),
+        )?;
+
+        assert_eq!(effective.status, MachineStatus::Running);
+        assert_eq!(reason, None);
+        assert_eq!(store.read()?.status, MachineStatus::Starting);
+        drop(lock);
         Ok(())
     }
 

@@ -11,6 +11,7 @@ pub mod error;
 pub mod event;
 pub mod lock;
 pub mod paths;
+pub mod result;
 pub mod spec;
 pub mod state;
 
@@ -23,12 +24,14 @@ pub use cmd::{Cmd, CmdOutput};
 pub use deps::{DependencyArtifact, DependencyManifest};
 pub use dispatcher::{DispatchFuture, Dispatcher, EventSink};
 pub use doctor::{
-    DoctorCheck, DoctorCheckId, DoctorContext, DoctorReport, DoctorStatus, run_doctor,
+    DoctorCheck, DoctorCheckId, DoctorContext, DoctorReport, DoctorStatus,
+    read_reconciled_machine_state_live, run_doctor,
 };
 pub use error::{ErrorInfo, ErrorKind, FirestoneError};
 pub use event::{Event, Level, StepId, Unit};
 pub use lock::MachineLock;
 pub use paths::{PathInputs, Paths};
+pub use result::{MachineRecord, MachineSummary, MachineView, SpecResult, SpecWarningPayload};
 pub use spec::{
     Arch, ByteSize, CloudInitSpec, CloudInitSpecPatch, ColorMode, Firmware, GlobalConfig,
     HumanDuration, ImageRef, ImagesConfig, LoadedMachineSpec, MacAddr, MachineSpec,

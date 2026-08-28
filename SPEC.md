@@ -366,6 +366,8 @@ machines/<name>/
 }
 ```
 
+For a newly-created machine that has not pulled its image, `image.ref` is the canonical catalog reference (or validated URL/path) and `image.id`/`image.sha256` are null. They become non-null together after a checksum-verified pull and before any overlay references the image.
+
 `status ∈ {created, starting, running, stopping, stopped, failed}`. Transitions:
 
 ```
@@ -556,7 +558,7 @@ The host architecture selects the `[image.arch.<arch>]` table; a missing table i
 
 ### 8.4 Overlays
 
-- `create` records the resolved image id in `state.json`. The overlay is created lazily at first `start`:
+- `create` records the canonical image reference in `state.json`; `image.id` and `image.sha256` are null until the first pull resolves immutable content identity. Pull fills both fields atomically before the overlay is created at first `start`. The overlay is created lazily:
   `qemu-img create -f qcow2 -F qcow2 -b <abs base path> <machine>/disk.qcow2 <disk>`
 - cloud‑hypervisor reads qcow2 with backing files natively **[verify 5]**. Fallback if that proves unreliable for the pinned version: `qemu-img convert` to a raw per‑machine copy (slow, large) or `cp --reflink=auto` on reflink‑capable filesystems.
 - Base images are never opened read‑write. `images rm` refuses (without `--force`) while any `state.json` references the id; `images prune` removes unreferenced ones and reports bytes freed.
@@ -1129,8 +1131,10 @@ Rust, edition 2024, stable toolchain, single static binary (`x86_64-unknown-linu
 | HTTP server | `axum`, `hyper`, `hyperlocal` (unix sockets) |
 | HTTP client | `reqwest` (downloads, streaming), `hyper` + `hyperlocal` (VMM API) |
 | hashing | `sha2` |
-| terminal UI | `indicatif`, `console`, `owo-colors`, `crossterm` (raw mode for `console`) |
+| terminal UI | `indicatif`, `console`, `owo-colors`, `crossterm` (raw mode for `console`), `unicode-width` (table layout) |
 | processes / OS | `nix` (flock, setsid, signals, pidfd), `libc` |
+| command argv parsing | `shlex` (`VISUAL`/`EDITOR` only; commands still execute without a shell) |
+| timestamps | `jiff` |
 | seed image | `fatfs` |
 | templates | `minijinja` |
 | paths | `directories` |
@@ -1263,6 +1267,7 @@ Do these in the first milestone, against the pinned versions, and record results
 | CID | fixed 3 | allocation table | CH's vsock is userspace; the CID is not host‑global. |
 | REST transport | unix socket only in v0.1 | TCP with token | Auth by file permissions is simple and correct; TCP later with a token. |
 | Language | Rust | Go | Same ecosystem as the VMM; one static binary. Go would also work. |
+| Pre-pull image identity | `created` state stores the canonical image reference with null `id` and `sha256`; the first successful pull fills both before overlay creation | empty-string sentinels; download during `create`; omit `state.json` until start | `create` is specified as a local spec write and M0 must work on an empty home before M1 image pulling exists. Nulls represent unavailable identity without inventing one; image removal ignores machines until a real id is recorded. |
 | Dependency pins | cloud-hypervisor v53.0; Rust Hypervisor Firmware 0.5.0; cloud-hypervisor edk2 ch-1e1b96f126; virtiofsd v1.14.0 source only | moving `latest` URLs; edk2 newer than the VMM-tested tag; mutable virtiofsd main-branch artifact; distro virtiofsd | Exact release URLs and downloaded SHA-256 values make refreshes reproducible. Cloud Hypervisor v53.0 pins edk2 ch-1e1b96f126 in its integration assets. The pinned virtiofsd source builds for both required musl targets, but the release has no versioned binaries and its CI artifact is x86_64-only and mutable. Binary distribution remains blocked until Firestone owns a reproducible two-target build. |
 | Doctor passt minimum | passt 2024_12_11.09478d5 or newer, with the exact `--vhost-user` help token present | presence alone; capability token alone; semantic-version parsing | Upstream added `--vhost-user` in commit `28997fcb29b560fc0dcfd91bad5eece3ded5eb72`; tag 2024_11_27.c0fbc7e does not contain it and 2024_12_11.09478d5 is the first release tag that does. Passt uses date-and-commit release names rather than semantic versions. Checking both the release date and the pinned capability token rejects old builds and unversioned distro builds without claiming verify 14 runtime interoperability. |
 | [verify 1] firmware mapping at cloud-hypervisor v53.0 | RHF 0.5.0 uses `payload.kernel`; edk2 ch-1e1b96f126 uses `payload.firmware` | pass RHF through `payload.firmware`; pass edk2 through `payload.kernel` | The v53.0 CLI exposes distinct `--kernel` and `--firmware` inputs, `PayloadConfig` exposes the matching JSON fields, and the v53.0 README documents RHF's Xen PVH entry as valid through the kernel input and edk2 through firmware. Source and CLI checks resolve the mapping. Boot behavior remains an M1 runtime check. |

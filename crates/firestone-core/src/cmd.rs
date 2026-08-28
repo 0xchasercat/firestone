@@ -128,6 +128,7 @@ pub struct Cmd {
     error_kind: ErrorKind,
     timeout: Option<Duration>,
     capture_limit: usize,
+    interactive_stdout_to_stderr: bool,
 }
 
 impl Cmd {
@@ -144,6 +145,7 @@ impl Cmd {
             error_kind: ErrorKind::Generic,
             timeout: None,
             capture_limit: DEFAULT_CAPTURE_LIMIT,
+            interactive_stdout_to_stderr: false,
         }
     }
 
@@ -206,6 +208,13 @@ impl Cmd {
     #[must_use]
     pub fn stdin_inherit(mut self) -> Self {
         self.stdin = CmdStdin::Inherit;
+        self
+    }
+
+    /// Routes an interactive child's stdout to the caller's stderr.
+    #[must_use]
+    pub const fn interactive_stdout_to_stderr(mut self) -> Self {
+        self.interactive_stdout_to_stderr = true;
         self
     }
 
@@ -504,7 +513,23 @@ impl Cmd {
 
         let mut command = Command::new(&self.program);
         command.args(self.args.iter().map(|arg| &arg.value));
-        command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        command.stderr(Stdio::inherit());
+        if self.interactive_stdout_to_stderr {
+            let stderr = OpenOptions::new()
+                .write(true)
+                .open("/dev/stderr")
+                .map_err(|source| {
+                    FirestoneError::new(
+                        self.error_kind,
+                        "cannot route interactive command stdout to stderr",
+                    )
+                    .with_hint("check that the process has an open stderr stream")
+                    .with_source(source)
+                })?;
+            command.stdout(Stdio::from(stderr));
+        } else {
+            command.stdout(Stdio::inherit());
+        }
         match self.stdin {
             CmdStdin::Null => {
                 command.stdin(Stdio::null());
