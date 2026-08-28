@@ -884,7 +884,7 @@ mod tests {
     #[test]
     fn output_timeout_kills_and_reaps_process() -> Result<(), Box<dyn std::error::Error>> {
         let dir = TempDir::new()?;
-        let script = executable(&dir, "hang", "while :; do :; done")?;
+        let script = executable(&dir, "hang", "exec sleep 10")?;
         let started = Instant::now();
 
         let error = match Cmd::new(script).timeout(Duration::from_millis(100)).run() {
