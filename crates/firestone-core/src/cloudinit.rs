@@ -182,6 +182,25 @@ fn reject_deferred_inputs(spec: &MachineSpec) -> Result<(), FirestoneError> {
 
 fn read_firestone_public_key(paths: &Paths) -> Result<String, FirestoneError> {
     let path = paths.ssh_public_key();
+    paths.validate_ssh_data_directory()?;
+    let metadata = fs::symlink_metadata(&path).map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::Dependency,
+            format!("cannot read Firestone SSH public key at {}", path.display()),
+        )
+        .with_hint("run `firestone doctor --fix` to generate the Firestone SSH key")
+        .with_source(source)
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!(
+                "Firestone SSH public key {} is not a regular non-symlink file",
+                path.display()
+            ),
+        )
+        .with_hint("run `firestone doctor --fix` to regenerate the Firestone SSH key"));
+    }
     let keys = read_public_key_file(&path, "Firestone SSH public key", ErrorKind::Dependency)?;
     if keys.len() != 1 {
         return Err(FirestoneError::new(
@@ -697,6 +716,62 @@ mod tests {
                 "remove cloud_init.network_config; its instance-id formula and publication are enabled in M3"
             )
         );
+        Ok(())
+    }
+
+    #[test]
+    fn publish_seed_world_writable_ssh_directory_refuses_key_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(true)?;
+        fs::set_permissions(fixture.paths.ssh_dir(), fs::Permissions::from_mode(0o777))?;
+
+        let error = publish_seed(&fixture.paths, "demo", &MachineSpec::default())
+            .err()
+            .ok_or("world-writable SSH directory should fail")?;
+
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert!(!fixture.paths.machine_seed_image("demo")?.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn publish_seed_symlinked_ssh_directory_preserves_external_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(true)?;
+        let outside = tempfile::tempdir()?;
+        let external_key = outside.path().join("id_ed25519.pub");
+        fs::write(&external_key, FIRESTONE_KEY)?;
+        fs::remove_file(fixture.paths.ssh_public_key())?;
+        fs::remove_dir(fixture.paths.ssh_dir())?;
+        symlink(outside.path(), fixture.paths.ssh_dir())?;
+
+        let error = publish_seed(&fixture.paths, "demo", &MachineSpec::default())
+            .err()
+            .ok_or("symlinked SSH directory should fail")?;
+
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert_eq!(fs::read(&external_key)?, FIRESTONE_KEY.as_bytes());
+        assert!(!fixture.paths.machine_seed_image("demo")?.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn publish_seed_symlinked_public_key_preserves_external_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(true)?;
+        let outside = tempfile::tempdir()?;
+        let external_key = outside.path().join("outside.pub");
+        fs::write(&external_key, FIRESTONE_KEY)?;
+        fs::remove_file(fixture.paths.ssh_public_key())?;
+        symlink(&external_key, fixture.paths.ssh_public_key())?;
+
+        let error = publish_seed(&fixture.paths, "demo", &MachineSpec::default())
+            .err()
+            .ok_or("symlinked Firestone public key should fail")?;
+
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert_eq!(fs::read(&external_key)?, FIRESTONE_KEY.as_bytes());
+        assert!(!fixture.paths.machine_seed_image("demo")?.exists());
         Ok(())
     }
 

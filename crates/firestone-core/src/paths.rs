@@ -458,6 +458,25 @@ impl Paths {
         Ok(machine_dir)
     }
 
+    /// Revalidates the owned data and SSH directories before key access.
+    pub fn validate_ssh_data_directory(&self) -> Result<(), FirestoneError> {
+        self.validate_owned_data_subdirectory(&self.ssh_dir(), "SSH directory")
+    }
+
+    /// Revalidates the owned data and binary directories before artifact access.
+    pub fn validate_bin_data_directory(&self) -> Result<(), FirestoneError> {
+        self.validate_owned_data_subdirectory(&self.bin_dir(), "binary directory")
+    }
+
+    fn validate_owned_data_subdirectory(
+        &self,
+        path: &Path,
+        label: &str,
+    ) -> Result<(), FirestoneError> {
+        self.validate_owned_data_directory(self.data_dir(), "data directory", false)?;
+        self.validate_owned_data_directory(path, label, false)
+    }
+
     fn validate_runtime_prerequisites(&self) -> Result<(), FirestoneError> {
         match &self.runtime_provenance {
             RuntimeProvenance::XdgRuntimeDir { base } => {

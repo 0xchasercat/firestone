@@ -455,6 +455,7 @@ fn installed_firmware(
     dependency: &str,
     architecture: Arch,
 ) -> Result<PathBuf, FirestoneError> {
+    paths.validate_bin_data_directory()?;
     let artifact = manifest.artifact(dependency, architecture.as_str())?;
     let path = paths.binary_file(&artifact.install_name)?;
     require_regular_firmware(&path, true)?;
@@ -1246,6 +1247,83 @@ mod tests {
 
         assert_eq!(error.kind(), ErrorKind::Dependency);
         assert!(!fixture.paths.machine_vmconfig("demo")?.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn installed_firmware_world_writable_bin_directory_refuses_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        fixture.install("rust-hypervisor-firmware", Arch::X86_64)?;
+        fs::set_permissions(fixture.paths.bin_dir(), fs::Permissions::from_mode(0o777))?;
+        let spec = MachineSpec::default();
+        let state = state(&fixture.paths)?;
+
+        let error = canonical_vm_config(
+            &fixture.paths,
+            &fixture.manifest,
+            input(&spec, &state, Arch::X86_64, None),
+        )
+        .err()
+        .ok_or("world-writable binary directory should fail")?;
+
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        Ok(())
+    }
+
+    #[test]
+    fn installed_firmware_symlinked_bin_directory_preserves_external_artifact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let installed = fixture.install("rust-hypervisor-firmware", Arch::X86_64)?;
+        let file_name = installed
+            .file_name()
+            .ok_or("installed firmware path should have a file name")?;
+        let outside = tempfile::tempdir()?;
+        let external = outside.path().join(file_name);
+        fs::write(&external, b"external firmware")?;
+        fs::remove_file(&installed)?;
+        fs::remove_dir(fixture.paths.bin_dir())?;
+        symlink(outside.path(), fixture.paths.bin_dir())?;
+        let spec = MachineSpec::default();
+        let state = state(&fixture.paths)?;
+
+        let error = canonical_vm_config(
+            &fixture.paths,
+            &fixture.manifest,
+            input(&spec, &state, Arch::X86_64, None),
+        )
+        .err()
+        .ok_or("symlinked binary directory should fail")?;
+
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert_eq!(fs::read(&external)?, b"external firmware");
+        Ok(())
+    }
+
+    #[test]
+    fn installed_firmware_symlinked_artifact_preserves_external_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let installed = fixture.install("rust-hypervisor-firmware", Arch::X86_64)?;
+        let outside = tempfile::tempdir()?;
+        let external = outside.path().join("firmware");
+        fs::write(&external, b"external firmware")?;
+        fs::remove_file(&installed)?;
+        symlink(&external, &installed)?;
+        let spec = MachineSpec::default();
+        let state = state(&fixture.paths)?;
+
+        let error = canonical_vm_config(
+            &fixture.paths,
+            &fixture.manifest,
+            input(&spec, &state, Arch::X86_64, None),
+        )
+        .err()
+        .ok_or("symlinked firmware artifact should fail")?;
+
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert_eq!(fs::read(&external)?, b"external firmware");
         Ok(())
     }
 
