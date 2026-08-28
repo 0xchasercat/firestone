@@ -217,6 +217,10 @@ fn lifecycle_cli_smoke_without_kvm() -> TestResult {
     let directory = tempfile::tempdir()?;
     let root = fs::canonicalize(directory.path())?;
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(
+        env!("CARGO_BIN_EXE_firestone"),
+        fs::Permissions::from_mode(0o755),
+    )?;
     let home = root.join("home");
     let fake_vmm = compile_fake_vmm(&root)?;
     let bin = root.join("bin");
