@@ -37,6 +37,17 @@ pub fn write(path: &Path, bytes: &[u8]) -> Result<(), FirestoneError> {
     write_with(path, bytes, |file, contents| file.write_all(contents))
 }
 
+/// Streams bytes through a sibling temporary file and durably replaces `path`.
+///
+/// The callback writes directly to the temporary file, so fixed-size artifacts
+/// do not need a second in-memory copy before publication.
+pub fn write_stream<F>(path: &Path, write_bytes: F) -> Result<(), FirestoneError>
+where
+    F: FnOnce(&mut File) -> io::Result<()>,
+{
+    write_with(path, &[], |file, _contents| write_bytes(file))
+}
+
 fn write_with<F>(path: &Path, bytes: &[u8], write_bytes: F) -> Result<(), FirestoneError>
 where
     F: FnOnce(&mut File, &[u8]) -> io::Result<()>,
@@ -49,6 +60,7 @@ where
     remove_known_temp(&temp_path)?;
 
     let mut temp = OpenOptions::new()
+        .read(true)
         .write(true)
         .create_new(true)
         .open(&temp_path)

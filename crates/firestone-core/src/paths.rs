@@ -315,6 +315,10 @@ impl Paths {
         Ok(self.machine_dir(name)?.join("seed.img"))
     }
 
+    pub fn machine_vmconfig(&self, name: &str) -> Result<PathBuf, FirestoneError> {
+        Ok(self.machine_dir(name)?.join("vmconfig.json"))
+    }
+
     pub fn machine_seed_dir(&self, name: &str) -> Result<PathBuf, FirestoneError> {
         Ok(self.machine_dir(name)?.join("seed"))
     }
@@ -1224,6 +1228,10 @@ mod tests {
         assert_eq!(
             paths.machine_seed_image("demo")?,
             PathBuf::from("/firestone/data/machines/demo/seed.img")
+        );
+        assert_eq!(
+            paths.machine_vmconfig("demo")?,
+            PathBuf::from("/firestone/data/machines/demo/vmconfig.json")
         );
         assert_eq!(
             paths.machine_seed_file("demo", "meta-data")?,

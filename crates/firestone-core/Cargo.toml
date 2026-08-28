@@ -6,6 +6,8 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+fatfs.workspace = true
+minijinja.workspace = true
 fs2.workspace = true
 nix.workspace = true
 reqwest.workspace = true
