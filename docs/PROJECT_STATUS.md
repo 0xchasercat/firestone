@@ -4,12 +4,12 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 
 ## Current position
 
-- Milestone: M1, boots; M0 is complete
-- Baseline: M0 core contracts, state, catalog, CLI, host diagnostics, dependency evidence, and public reproducible virtiofsd binaries
+- Milestone: M2, shell; M0 and M1 are complete
+- Baseline: Linux x86_64 boots Ubuntu 24.04 through pinned Cloud Hypervisor v53 + edk2; lifecycle, images, seed, shim recovery, CLI, and M1 KVM acceptance are complete
 - Linux validation host: `firestone@172.203.242.136`, Ubuntu 24.04 x86_64, `/dev/kvm` present
 - Required local gate: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`
 - Required integration gate: the same commands on the Linux host
-- M0 acceptance: 340 tests pass on macOS and Linux; all section 19.1 cases except the M1 cloud-init/VmConfig work are green; `firestone create ubuntu --cpus 4 && firestone ls` works without KVM
+- M1 acceptance: local and Linux gates pass; E2E 1, 5, 6, 7, serial login, and verify 1, 2, 4, 5, 6, 9, 12 are green
 
 ## Work queue
 
@@ -30,7 +30,11 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 | M1-03 | Bounded Cloud Hypervisor Unix-socket API client | `agent/m1-vmm-api` | [#11](https://github.com/0xchasercat/firestone/pull/11) | complete | M0 | Exact v53 methods, status codes, framing limits, and error bodies are covered against a fake server |
 | M1-04 | Shim process supervision, launch, status, stop, and cleanup | `agent/m1-shim` | [#14](https://github.com/0xchasercat/firestone/pull/14) | complete | M1-01, M1-02, M1-03 | Linux x86_64 acceptance uses pinned Cloud Hypervisor v53 + edk2; ordered launch/stop, ownership cleanup, deadlines, lock lifetime, client detachment, child reaping, and verified crash recovery pass. aarch64 runtime, non-Linux authority, and hostile wrapper containment are deferred |
 | M1-05 | Lifecycle and image CLI integration | `agent/m1-lifecycle` | [#15](https://github.com/0xchasercat/firestone/pull/15) | complete | M1-01 through M1-04 | Linux x86_64 fake-VMM lifecycle covers shared start/stop/restart/rm/images/logs/show-vmconfig actions, deterministic rendering, bounded secure logs, safe deletion, and supervised/unsupervised stop; real KVM evidence remains M1-06 |
-| M1-06 | M1 KVM integration and verify evidence | `agent/m1-integration` | [#16](https://github.com/0xchasercat/firestone/pull/16) | in review | M1-01 through M1-05 | Linux x86_64 E2E 1, 5, 6, and 7 pass under pinned Cloud Hypervisor v53 + edk2; serial login and verify 1, 2, 4, 5, 6, 9, and 12 are resolved |
+| M1-06 | M1 KVM integration and verify evidence | `agent/m1-integration` | [#16](https://github.com/0xchasercat/firestone/pull/16) | complete | M1-01 through M1-05 | Linux x86_64 E2E 1, 5, 6, and 7 pass under pinned Cloud Hypervisor v53 + edk2; serial login and verify 1, 2, 4, 5, 6, 9, and 12 are resolved |
+| M2-01 | SSH identity, host-key trust, and vsock proxy transport | `agent/m2-transport` | pending | ready | M1 | Exact SSH/vsock transport contracts, key permissions, trust rotation, cancellation, and verify 13 and 17 pass without KVM |
+| M2-02 | Guest SSH units and cloud-init integration | `agent/m2-guest` | pending | ready | M1 | Deterministic guest units coexist with Ubuntu systemd, activate SSH over vsock, and verify 11 passes |
+| M2-03 | Readiness, shell, ssh-config, console, and run CLI | `agent/m2-cli` | pending | blocked | M2-01, M2-02 | Shared actions, deterministic output, interactive exec, no-wait behavior, and readiness transitions pass |
+| M2-04 | M2 Linux KVM integration | `agent/m2-integration` | pending | blocked | M2-01 through M2-03 | E2E 2 and 10 pass; empty-home run reaches a root prompt; verify 11, 13, and 17 close |
 
 ## Merge order
 
