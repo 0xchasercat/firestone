@@ -27,8 +27,8 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 | M0-06 | M0 integration, docs, Linux verification | `main` | [#8](https://github.com/0xchasercat/firestone/pull/8) + [#9](https://github.com/0xchasercat/firestone/pull/9) + [#10](https://github.com/0xchasercat/firestone/pull/10) | complete | M0-01 through M0-05c | M0 acceptance is green locally, in CI, and on Linux |
 | M1-01 | Image store, pull/verify, raw conversion, overlay, remove, prune | `agent/m1-images` | [#13](https://github.com/0xchasercat/firestone/pull/13) | complete | M0 | Immutable source identity, owned qcow2 storage, overlay and image lifecycle tests pass |
 | M1-02 | Deterministic cloud-init seed and canonical typed VmConfig | `agent/m1-seed-vmconfig` | [#12](https://github.com/0xchasercat/firestone/pull/12) | complete | M0 | CIDATA golden and every VmConfig mapping/overlay contract pass without KVM |
-| M1-03 | Bounded Cloud Hypervisor Unix-socket API client | `agent/m1-vmm-api` | [#11](https://github.com/0xchasercat/firestone/pull/11) | in review | M0 | Exact v53 methods, status codes, framing limits, and error bodies are covered against a fake server |
-| M1-04 | Shim process supervision, launch, status, stop, and cleanup | `agent/m1-shim` | pending | blocked | M1-01, M1-02, M1-03 | Ordered launch/stop, state writes, process identity, logs, and crash paths pass on Linux |
+| M1-03 | Bounded Cloud Hypervisor Unix-socket API client | `agent/m1-vmm-api` | [#11](https://github.com/0xchasercat/firestone/pull/11) | complete | M0 | Exact v53 methods, status codes, framing limits, and error bodies are covered against a fake server |
+| M1-04 | Shim process supervision, launch, status, stop, and cleanup | `agent/m1-shim` | pending | ready | M1-01, M1-02, M1-03 | Ordered launch/stop, state writes, process identity, logs, and crash paths pass on Linux |
 | M1-05 | Lifecycle and image CLI integration | `agent/m1-lifecycle` | pending | blocked | M1-01 through M1-04 | start/stop/restart/rm/images/logs/show-vmconfig project shared actions and preserve renderer contracts |
 | M1-06 | M1 KVM integration and verify evidence | `agent/m1-integration` | pending | blocked | M1-01 through M1-05 | E2E 1, 5, 6, 7, console login prompt, and verify 1, 2, 4, 5, 6, 9, 12 close |
 
@@ -69,6 +69,9 @@ The orchestrator reviews each pull request for spec alignment, public contract d
 - The M0 CLI merged in PR [#9](https://github.com/0xchasercat/firestone/pull/9). It projects create, list, show, edit, and doctor through shared contracts; emits deterministic human and NDJSON output; preserves crash-safe publications; validates owned data paths; and retains live supervision state.
 - M0 integration completed on main at merge `de97ad5`. The 340-test gate, public dependency verification, create/list smoke, interrupted-publication recovery, and unsafe-path refusal passed on macOS, GitHub CI, and the Azure Linux host.
 
+- M1 image storage merged in PR [#13](https://github.com/0xchasercat/firestone/pull/13). It added bounded immutable qcow2 storage, strict sidecars, cache generations, crash recovery, descriptor-relative path creation, architecture-specific firmware, and overlay validation.
+- M1 seed and VmConfig mapping merged in PR [#12](https://github.com/0xchasercat/firestone/pull/12). It added deterministic CIDATA publication, Firestone cloud-init, typed canonical Cloud Hypervisor v53 JSON, and invariant-preserving merge patches.
+- M1 VMM transport merged in PR [#11](https://github.com/0xchasercat/firestone/pull/11). It added the bounded Unix-socket HTTP client, exact endpoint/status contracts, and status-only liveness probing. The integrated foundation has 431 passing tests on macOS and GitHub Linux CI.
 ## Known risks
 
 - Runtime portions of the SPEC section 20 checks remain open unless the decision log explicitly records exact-version evidence.
