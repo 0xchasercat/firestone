@@ -25,6 +25,12 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 | M0-05b | Host checks, doctor report, unprivileged fixes, deterministic tests | `agent/m0-doctor` | [#8](https://github.com/0xchasercat/firestone/pull/8) | complete | M0-01, M0-02, M0-05a | Section 17.3 checks and safe fixes pass without KVM |
 | M0-05c | Reproducible virtiofsd builds and Firestone-owned release assets | `agent/m0-virtiofsd-pins` | [#7](https://github.com/0xchasercat/firestone/pull/7) + [#10](https://github.com/0xchasercat/firestone/pull/10) | complete | M0-05a | Both musl targets build from pinned inputs; published assets have verified immutable URLs and checksums in `deps.toml` |
 | M0-06 | M0 integration, docs, Linux verification | `main` | [#8](https://github.com/0xchasercat/firestone/pull/8) + [#9](https://github.com/0xchasercat/firestone/pull/9) + [#10](https://github.com/0xchasercat/firestone/pull/10) | complete | M0-01 through M0-05c | M0 acceptance is green locally, in CI, and on Linux |
+| M1-01 | Image store, pull/verify, raw conversion, overlay, remove, prune | `agent/m1-images` | pending | ready | M0 | Immutable source identity, owned qcow2 storage, overlay and image lifecycle tests pass |
+| M1-02 | Deterministic cloud-init seed and canonical typed VmConfig | `agent/m1-seed-vmconfig` | pending | ready | M0 | CIDATA golden and every VmConfig mapping/overlay contract pass without KVM |
+| M1-03 | Bounded Cloud Hypervisor Unix-socket API client | `agent/m1-vmm-api` | pending | ready | M0 | Exact v53 methods, status codes, framing limits, and error bodies are covered against a fake server |
+| M1-04 | Shim process supervision, launch, status, stop, and cleanup | `agent/m1-shim` | pending | blocked | M1-01, M1-02, M1-03 | Ordered launch/stop, state writes, process identity, logs, and crash paths pass on Linux |
+| M1-05 | Lifecycle and image CLI integration | `agent/m1-lifecycle` | pending | blocked | M1-01 through M1-04 | start/stop/restart/rm/images/logs/show-vmconfig project shared actions and preserve renderer contracts |
+| M1-06 | M1 KVM integration and verify evidence | `agent/m1-integration` | pending | blocked | M1-01 through M1-05 | E2E 1, 5, 6, 7, console login prompt, and verify 1, 2, 4, 5, 6, 9, 12 close |
 
 ## Merge order
 
@@ -33,6 +39,10 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 3. M0-01, M0-02, M0-03b, M0-05b, and M0-05c
 4. M0-04
 5. M0-06 integration
+6. M1-01, M1-02, and M1-03 in parallel
+7. M1-04 shim integration
+8. M1-05 lifecycle projection
+9. M1-06 KVM integration
 
 The orchestrator reviews each pull request for spec alignment, public contract drift, unsafe filesystem or process behavior, test quality, and dependency direction. A passing branch gate is necessary but does not replace review.
 
@@ -42,7 +52,7 @@ The orchestrator reviews each pull request for spec alignment, public contract d
 |---|---|---|
 | GitHub remote | `git@github.com:0xchasercat/firestone.git`; `main` baseline pushed | All implementation enters through reviewed pull requests |
 | Local macOS toolchain | Rust 1.97.1, Cargo 1.97.0 | Use for fast unit feedback; Linux behavior requires remote validation |
-| Azure Linux host | Reachable; fresh SSH sessions have KVM read/write access; Rust 1.98.0 and M0 build/runtime tools installed | Run every integration candidate here before merge |
+| Azure Linux host | Reachable; fresh SSH sessions have KVM read/write access; Rust 1.98.0 and M1 build/runtime tools installed | Run every integration candidate and M1 KVM acceptance here before merge |
 | Bare-metal host `w` | Available | Use only for behavior that nested Azure KVM cannot validate |
 
 ## Completed work
