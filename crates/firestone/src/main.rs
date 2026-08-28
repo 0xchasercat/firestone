@@ -87,7 +87,7 @@ where
     Stderr: io::Write,
 {
     match result {
-        Ok(()) => renderer.exit_override().map_or(0, |exit| exit),
+        Ok(()) => renderer.exit_override().unwrap_or(0),
         Err(error) if has_broken_pipe_source(&error) => 0,
         Err(error) => render_terminal_error(renderer, &error),
     }
