@@ -2,6 +2,7 @@
 
 pub mod action;
 pub mod atomic;
+mod bounded;
 pub mod catalog;
 pub mod cloudinit;
 pub mod cmd;
@@ -10,6 +11,7 @@ pub mod dispatcher;
 pub mod doctor;
 pub mod error;
 pub mod event;
+pub mod image;
 pub mod lock;
 pub mod paths;
 pub mod result;
@@ -32,6 +34,11 @@ pub use doctor::{
 };
 pub use error::{ErrorInfo, ErrorKind, FirestoneError};
 pub use event::{Event, Level, StepId, Unit};
+pub use image::{
+    ImageInspection, ImageMetadata, ImageMetadataVersion, ImagePruneResult, ImagePullRequest,
+    ImageRemoveResult, ImageSourceLocation, ImageStore, ImageVerification, OverlayInfo,
+    PreparedMachineImage, PulledImage, ResolvedImageSource, StoredImage,
+};
 pub use lock::MachineLock;
 pub use paths::{PathInputs, Paths};
 pub use result::{MachineRecord, MachineSummary, MachineView, SpecResult, SpecWarningPayload};
@@ -45,8 +52,9 @@ pub use spec::{
     UiConfig, ValidationContext, ValidationHost, VmmSpec, VmmSpecPatch, validate_machine_spec,
 };
 pub use state::{
-    ExitReason, LastExit, LiveMachineState, LivenessObservation, MachineState, MachineStatus,
-    ReconcileReport, ReconcileRewrite, StateImage, StateStore, StateVersion, Supervision,
-    VmmPingProbe, observe_liveness, reconcile, reconciled_state, verify_shim_identity,
+    ExitReason, LastExit, LiveMachineState, LivenessObservation, MAX_MACHINE_STATE_BYTES,
+    MachineState, MachineStatus, ReconcileReport, ReconcileRewrite, StateImage, StateStore,
+    StateVersion, Supervision, VmmPingProbe, observe_liveness, reconcile, reconciled_state,
+    verify_shim_identity,
 };
 pub use vmm::{CanonicalVmConfig, VmConfigInput, canonical_vm_config, publish_vm_config};

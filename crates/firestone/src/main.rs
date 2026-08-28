@@ -276,13 +276,7 @@ fn load_create_spec(
         global,
         &patch,
         current_dir,
-        &ValidationContext {
-            host: &host,
-            paths,
-            machine_dir: &machine_dir,
-            catalog,
-            base_image_virtual_size: None,
-        },
+        &ValidationContext::new(&host, paths, &machine_dir, catalog),
     )?;
     Ok((name, loaded))
 }

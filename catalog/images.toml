@@ -1,6 +1,6 @@
-# None of these entries has passed SPEC.md [verify 3]. Do not release the
-# built-in catalog until every architecture boots to SSH with its declared
-# firmware under the pinned Firestone runtime.
+# Ubuntu 24.04 x86_64 reached systemd and ssh.socket under pinned edk2 after
+# raw-to-qcow2 conversion and overlay creation. RHF 0.5.0 panicked while
+# resolving its LABEL root. All aarch64 and remaining verify 3 gates stay open.
 
 [[image]]
 distro = "ubuntu"
@@ -11,6 +11,7 @@ firmware = "rhf"
 format = "qcow2"
 
 [image.arch.x86_64]
+firmware = "edk2"
 url = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
 checksum_url = "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS"
 checksum_alg = "sha256"

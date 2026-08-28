@@ -9,6 +9,7 @@ publish = false
 fatfs.workspace = true
 minijinja.workspace = true
 fs2.workspace = true
+jiff.workspace = true
 nix.workspace = true
 reqwest.workspace = true
 schemars.workspace = true

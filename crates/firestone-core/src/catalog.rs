@@ -50,6 +50,7 @@ pub struct CatalogArchSource {
     pub url: String,
     pub checksum: CatalogChecksum,
     pub checksum_algorithm: ChecksumAlgorithm,
+    pub firmware: Option<CatalogFirmware>,
 }
 
 /// One canonical distro release in a catalog.
@@ -134,11 +135,13 @@ impl Catalog {
             .with_hint("use a host with one of the available architectures")
         })?;
 
+        let firmware = source.firmware.unwrap_or(entry.firmware);
+
         Ok(ResolvedCatalogEntry {
             canonical_reference,
             checksum_algorithm: source.checksum_algorithm,
             source,
-            firmware: entry.firmware,
+            firmware,
             format: entry.format,
             architecture: host_architecture.to_owned(),
         })
@@ -150,7 +153,14 @@ impl Catalog {
     pub fn contains_reference(&self, reference: &str) -> bool {
         self.find(reference).is_some()
     }
-
+    pub(crate) fn is_canonical_reference(reference: &str) -> bool {
+        let Some((distro, version)) = reference.split_once(':') else {
+            return false;
+        };
+        version.find(':').is_none()
+            && is_reference_component(distro)
+            && is_reference_component(version)
+    }
     /// Iterates over canonical entries in lexical `distro:version` order.
     pub fn entries(&self) -> impl ExactSizeIterator<Item = &CatalogEntry> {
         self.entries.values()
@@ -257,6 +267,7 @@ struct RawArchSource {
     url: String,
     checksum_url: Option<String>,
     sha256: Option<String>,
+    firmware: Option<CatalogFirmware>,
     #[serde(default)]
     checksum_alg: ChecksumAlgorithm,
 }
@@ -448,6 +459,7 @@ fn convert_arch_source(
         url: raw.url,
         checksum,
         checksum_algorithm: raw.checksum_alg,
+        firmware: raw.firmware,
     })
 }
 
@@ -457,11 +469,7 @@ fn validate_reference_component(
     source: &str,
     user_editable: bool,
 ) -> Result<(), FirestoneError> {
-    if value.is_empty()
-        || value.trim() != value
-        || value.contains(':')
-        || value.chars().any(char::is_whitespace)
-    {
+    if !is_reference_component(value) {
         return Err(invalid_catalog(
             source,
             format!("{field} '{value}' is not a valid catalog reference component"),
@@ -469,6 +477,16 @@ fn validate_reference_component(
         ));
     }
     Ok(())
+}
+
+fn is_reference_component(value: &str) -> bool {
+    let mut characters = value.chars();
+    characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphanumeric())
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '+' | '-')
+        })
 }
 
 fn validate_architecture_name(
@@ -591,25 +609,31 @@ fn optional_catalog_file_is_absent(path: &Path, read_error: &std::io::Error) -> 
 }
 
 fn is_https_url(value: &str) -> bool {
+    parse_https_url(value).is_some()
+}
+
+pub(crate) fn parse_https_url(value: &str) -> Option<Url> {
     if value.chars().any(char::is_whitespace) {
-        return false;
+        return None;
     }
 
     let syntax_violation = std::cell::Cell::new(false);
     let record_violation = |_| syntax_violation.set(true);
-    let Ok(parsed) = Url::options()
+    let parsed = Url::options()
         .syntax_violation_callback(Some(&record_violation))
         .parse(value)
-    else {
-        return false;
-    };
-    !syntax_violation.get()
-        && parsed.scheme() == "https"
-        && parsed.has_host()
-        && parsed.username().is_empty()
-        && parsed.password().is_none()
-        && !parsed.authority().contains('@')
-        && parsed.fragment().is_none()
+        .ok()?;
+    if syntax_violation.get()
+        || parsed.scheme() != "https"
+        || !parsed.has_host()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.authority().contains('@')
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    Some(parsed)
 }
 
 fn levenshtein(left: &str, right: &str) -> usize {
@@ -736,10 +760,13 @@ checksum_alg = "sha512"
         let catalog = Catalog::built_in()?;
 
         let default = catalog.resolve("ubuntu", "x86_64")?;
+        let ubuntu_aarch64 = catalog.resolve("ubuntu", "aarch64")?;
         let alias = catalog.resolve("debian:bookworm", "aarch64")?;
 
         assert_eq!(default.canonical_reference, "ubuntu:24.04");
         assert_eq!(default.architecture, "x86_64");
+        assert_eq!(default.firmware, CatalogFirmware::Edk2);
+        assert_eq!(ubuntu_aarch64.firmware, CatalogFirmware::Rhf);
         assert_eq!(alias.canonical_reference, "debian:12");
         assert_eq!(alias.architecture, "aarch64");
         Ok(())
@@ -1024,6 +1051,40 @@ arch = {}
 
         assert_eq!(error.kind(), ErrorKind::InvalidSpec);
         assert!(error.message().contains("has no architecture sources"));
+    }
+
+    #[test]
+    fn catalog_reference_components_reject_path_url_and_control_grammar()
+    -> Result<(), Box<dyn Error>> {
+        for invalid in [
+            "",
+            ".",
+            "..",
+            "/absolute",
+            "path/segment",
+            "path\\segment",
+            "query?value",
+            "fragment#value",
+            "scheme:value",
+            "https://example.invalid/image",
+            "control\u{1f}value",
+        ] {
+            let input = TEST_SOURCE.replace("distro = \"test\"", &format!("distro = {invalid:?}"));
+            let error = error_from(catalog_from_toml(&input));
+            assert_eq!(error.kind(), ErrorKind::InvalidSpec, "{invalid:?}");
+        }
+
+        let valid = TEST_SOURCE
+            .replace("distro = \"test\"", "distro = \"test.name_value+extra-1\"")
+            .replace("version = \"1\"", "version = \"24.04_lts+1-2\"");
+        let catalog = catalog_from_toml(&valid)?;
+        assert_eq!(
+            catalog
+                .resolve("test.name_value+extra-1:24.04_lts+1-2", "x86_64")?
+                .canonical_reference,
+            "test.name_value+extra-1:24.04_lts+1-2",
+        );
+        Ok(())
     }
 
     #[test]
