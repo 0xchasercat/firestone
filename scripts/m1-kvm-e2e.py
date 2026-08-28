@@ -195,7 +195,7 @@ class Harness:
             name,
             "--no-wait",
             "--timeout",
-            "10m",
+            "600s",
             timeout=START_TIMEOUT_SECONDS,
         )
         payload = self.result_payload(records, "start")
