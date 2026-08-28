@@ -1,10 +1,10 @@
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
-    fs::{self, DirBuilder, File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     os::fd::{AsFd, AsRawFd},
-    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, PermissionsExt},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -1969,62 +1969,9 @@ fn remove_generated_key(path: &Path) -> Result<(), std::io::Error> {
 }
 
 fn create_firestone_dir(paths: &Paths, path: &Path, label: &str) -> Result<(), FirestoneError> {
-    paths.validate_owned_data_directory(path, label, true)?;
-    match fs::symlink_metadata(path) {
-        Ok(_) => return paths.validate_owned_data_directory(path, label, false),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(FirestoneError::new(
-                ErrorKind::Dependency,
-                format!("cannot inspect {label} {}", path.display()),
-            )
-            .with_source(source));
-        }
-    }
-
-    let mut builder = DirBuilder::new();
-    builder.recursive(true).mode(0o700);
-    if let Err(source) = builder.create(path) {
-        if source.kind() == std::io::ErrorKind::AlreadyExists {
-            return paths.validate_owned_data_directory(path, label, false);
-        }
-        return Err(FirestoneError::new(
-            ErrorKind::Dependency,
-            format!("cannot create {label} {}", path.display()),
-        )
-        .with_source(source));
-    }
-
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
-        FirestoneError::new(
-            ErrorKind::Dependency,
-            format!("cannot set mode 0700 on {label} {}", path.display()),
-        )
-        .with_source(source)
-    })?;
-    paths.validate_owned_data_directory(path, label, false)?;
-    let actual_mode = fs::symlink_metadata(path)
-        .map_err(|source| {
-            FirestoneError::new(
-                ErrorKind::Dependency,
-                format!("cannot read back {label} {}", path.display()),
-            )
-            .with_source(source)
-        })?
-        .permissions()
-        .mode()
-        & 0o7777;
-    if actual_mode != 0o700 {
-        return Err(FirestoneError::new(
-            ErrorKind::Dependency,
-            format!(
-                "created {label} {} has mode {actual_mode:04o}; expected 0700",
-                path.display()
-            ),
-        )
-        .with_hint(format!("run `chmod 0700 {}`", path.display())));
-    }
-    Ok(())
+    paths
+        .ensure_owned_data_directory(path, label, true)
+        .map(|_| ())
 }
 
 fn artifact_state(bin_dir: &Path, artifact: &DependencyArtifact) -> Result<(), String> {

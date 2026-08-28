@@ -591,25 +591,31 @@ fn optional_catalog_file_is_absent(path: &Path, read_error: &std::io::Error) -> 
 }
 
 fn is_https_url(value: &str) -> bool {
+    parse_https_url(value).is_some()
+}
+
+pub(crate) fn parse_https_url(value: &str) -> Option<Url> {
     if value.chars().any(char::is_whitespace) {
-        return false;
+        return None;
     }
 
     let syntax_violation = std::cell::Cell::new(false);
     let record_violation = |_| syntax_violation.set(true);
-    let Ok(parsed) = Url::options()
+    let parsed = Url::options()
         .syntax_violation_callback(Some(&record_violation))
         .parse(value)
-    else {
-        return false;
-    };
-    !syntax_violation.get()
-        && parsed.scheme() == "https"
-        && parsed.has_host()
-        && parsed.username().is_empty()
-        && parsed.password().is_none()
-        && !parsed.authority().contains('@')
-        && parsed.fragment().is_none()
+        .ok()?;
+    if syntax_violation.get()
+        || parsed.scheme() != "https"
+        || !parsed.has_host()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.authority().contains('@')
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    Some(parsed)
 }
 
 fn levenshtein(left: &str, right: &str) -> usize {
@@ -740,6 +746,7 @@ checksum_alg = "sha512"
 
         assert_eq!(default.canonical_reference, "ubuntu:24.04");
         assert_eq!(default.architecture, "x86_64");
+        assert_eq!(default.firmware, CatalogFirmware::Edk2);
         assert_eq!(alias.canonical_reference, "debian:12");
         assert_eq!(alias.architecture, "aarch64");
         Ok(())

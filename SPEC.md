@@ -251,7 +251,7 @@ pub enum Action {
     Show { name: String },
     SetSpec { name: String, spec: MachineSpec },        // PUT
     PatchSpec { name: String, patch: MachineSpecPatch }, // PATCH
-    ImageList, ImagePull { r#ref: ImageRef }, ImageRemove { id: String, force: bool }, ImagePrune,
+    ImageList, ImagePull { r#ref: ImageRef, sha256: Option<String> }, ImageRemove { id: String, force: bool }, ImagePrune,
     Doctor { fix: bool },
     Version,
 }
@@ -305,7 +305,7 @@ Resolved once at startup into a `Paths` struct; no other code computes paths.
 
 Relative user paths keep their `.` and `..` components until the kernel resolves the complete path. Validation may canonicalize an existing complete path after the kernel resolves it; Firestone does not lexically erase missing prefixes or symlink semantics. Owned machine, image, binary and seed file names are single path components without control characters. Arbitrary user-supplied absolute paths are not restricted by the owned-name rule.
 
-Firestone-owned data directories use the same ancestry trust model as runtime paths. Existing ancestors must be real directories owned by the current uid or root and must not be renameable by another uid; root-owned sticky shared directories are allowed. The final data, `machines`, machine, `bin`, and `ssh` directories must be owned by the current uid and must not be group- or world-writable. Firestone creates owned directories with mode 0700 and refuses unsafe existing paths before reading, writing, fixing, or publishing machine data.
+Firestone-owned data directories use the same ancestry trust model as runtime paths. Existing ancestors must be real directories owned by the current uid or root and must not be renameable by another uid; root-owned sticky shared directories are allowed. The final data, `machines`, machine, `images`, `bin`, and `ssh` directories must be owned by the current uid and must not be group- or world-writable. Firestone creates owned directories with mode 0700 and refuses unsafe existing paths before reading, writing, fixing, or publishing machine or image data.
 
 ```
 ~/.config/firestone/
@@ -316,8 +316,8 @@ Firestone-owned data directories use the same ancestry trust model as runtime pa
   bin/                         vendored binaries: cloud-hypervisor-<ver>, hypervisor-fw-<ver>, CLOUDHV-<ver>.fd, virtiofsd-<ver>
   ssh/id_ed25519, id_ed25519.pub   firestone's own key (0600), generated on first use
   images/
-    ubuntu-24.04-x86_64-<sha8>.qcow2
-    ubuntu-24.04-x86_64-<sha8>.json   {ref, url, sha256, size, pulled_at, format}
+    image-<identity-sha256>.qcow2
+    image-<identity-sha256>.json   strict sidecar v1 (§8.3)
   machines/<name>/             see §6.2
 
 $XDG_RUNTIME_DIR/firestone/
@@ -553,19 +553,23 @@ The host architecture selects the `[image.arch.<arch>]` table; a missing table i
 
 ### 8.3 Pull and verify
 
-- Download streams to `images/<id>.partial` while hashing; on completion the hash is compared with the catalog `sha256` or the entry for the file name in the fetched `checksum_url` (SHA256SUMS/SHA512SUMS format). Mismatch → delete partial, error kind `checksum`.
-- Success → rename to `images/<distro>-<version>-<arch>-<sha8>.<format>` and write the sidecar `.json`.
-- `raw` images are converted to qcow2 at pull time (`qemu-img convert -O qcow2`) so every base is qcow2 **[verify 4]**.
-- Resume of interrupted downloads: not in v0.1 (delete partial, restart).
-- Events: `StepStart image` → `Progress` (bytes, total from `Content-Length`) → `StepDone image "ubuntu:24.04 · x86_64 · 613 MB"`, or `StepSkip image "cached"`.
-- "Current" URLs (Ubuntu `current/`, Debian `latest/`) change over time. Firestone treats the checksum as identity: re-pulling when a newer file exists is explicit (`images pull ubuntu:24.04`), never automatic. A machine fixes its base when the first successful `start` resolves and records immutable `image.id` and `image.sha256` before creating the overlay; later pulls do not change that base.
+- HTTPS bodies stream to `images/.pull-<source-key>.source.partial` through a fixed-size buffer while source SHA-256 and any SHA-256/SHA-512 verifier are updated. Checksum manifests are limited to 2 MiB, must be UTF-8, and must contain one unambiguous digest for the image URL's exact filename. A missing or conflicting entry, a digest mismatch, or a partial `Content-Length` response deletes every operation partial and returns kind `checksum` for verification failures.
+- HTTPS requests use identity encoding, a 30 s connect timeout, a 30 min request timeout, and at most five redirects; every redirect must remain a strict HTTPS URL without credentials or a fragment.
+- Local files are opened without following symlinks, streamed into the owned store, and never used directly as a backing file. A qcow2 source is published unchanged; a raw source is converted with `qemu-img convert -f raw -O qcow2 SOURCE TARGET` **[verify 4]**. Every published base is an owned, read-only qcow2 file.
+- Source SHA-256 is always computed before conversion. `state.image.sha256` is this source SHA-256, while the sidecar separately records the stored qcow2 SHA-256. Cache comparison uses complete digests and all identity fields; an eight-character display prefix is never a cache identity. `images ls` may remain metadata-only, but every cache hit or pinned base returned for execution re-hashes the stored qcow2 and rejects a mismatch before invoking `qemu-img`.
+- Stable image ids are `image-<identity-sha256>`, where the complete 64-hex identity digest hashes length-framed sidecar version, source ref, optional source URL, host architecture, and complete source SHA-256. The base is `images/<id>.qcow2`; the strict atomic sidecar `images/<id>.json` is:
+  `{version: 1, id, source_ref, source_url, source_sha256, stored_sha256, architecture, source_format, stored_format: "qcow2", verification_algorithm, verification_digest, size, pulled_at}`. Verification fields are both null only for a local source or an HTTPS URL pulled without `--sha256`; `size` is the stored qcow2 byte length.
+- One `images/.lock` serializes pull publication, machine image pinning, remove, and prune. Owned ancestry, directory/file type, uid, and modes are checked before access; failures remove operation-owned partials and newly published halves. Resume is not in v0.1: a later locked mutation removes recognized stale pull partials and completes deterministic `.removing` tombstones left at any deletion boundary.
+- Events: `StepStart image` → `Progress` (bytes, total from `Content-Length`) → `StepDone image "ubuntu:24.04 · x86_64 · 613 MB"`, or `StepSkip image "cached"`. An unchecked HTTPS URL emits one warning naming `--sha256`.
+- "Current" URLs (Ubuntu `current/`, Debian `latest/`) change over time. Firestone treats the checksum as identity: an explicit `images pull` refreshes the manifest and may publish a new id; machine start canonicalizes bare/alias/URL/local references before a cache-first lookup and does not fetch a manifest on a cache hit. The first successful `start` atomically records canonical `image.ref`, immutable `image.id`, and source `image.sha256` before overlay creation. Every later start requires the sidecar architecture and canonical source ref to match the host and state; later pulls do not change the pin.
 
 ### 8.4 Overlays
 
-- `create` records the canonical image reference in `state.json`; `image.id` and `image.sha256` are null until the first pull resolves immutable content identity. Pull fills both fields atomically before the overlay is created at first `start`. The overlay is created lazily:
-  `qemu-img create -f qcow2 -F qcow2 -b <abs base path> <machine>/disk.qcow2 <disk>`
-- cloud‑hypervisor reads qcow2 with backing files natively **[verify 5]**. Fallback if that proves unreliable for the pinned version: `qemu-img convert` to a raw per‑machine copy (slow, large) or `cp --reflink=auto` on reflink‑capable filesystems.
-- Base images are never opened read‑write. `images rm` refuses (without `--force`) while any `state.json` references the id; `images prune` removes unreferenced ones and reports bytes freed.
+- `create` records the canonical image reference in `state.json`; `image.id` and source `image.sha256` are null until first start resolves immutable content. Start writes both under the machine and image-store locks before lazily invoking:
+  `qemu-img create -f qcow2 -F qcow2 -b <absolute base path> <overlay partial> <disk bytes>`
+  The partial is inspected with `qemu-img info --output=json -f qcow2 PATH`; its format, virtual size, and exact absolute backing filename must match before atomic publication as `<machine>/disk.qcow2`.
+- cloud-hypervisor v53 functionally accepted this qcow2 overlay with a qcow2 backing file on the observed x86_64/edk2 Ubuntu boot **[verify 5]**. The performance comparison and aarch64 behavior remain open; Firestone does not claim those gates.
+- Base images are mode 0400 and never attached read-write. `images rm` refuses (without `--force`) while any complete `state.json` references the full id; `images prune` removes only valid unreferenced pairs and reports stored bytes freed.
 
 ---
 
@@ -573,7 +577,7 @@ The host architecture selects the `[image.arch.<arch>]` table; a missing table i
 
 ### 9.1 Firmware
 
-cloud‑hypervisor boots stock cloud images through a firmware; it supports Rust Hypervisor Firmware (RHF, a small PVH payload) and an edk2 UEFI build (`CLOUDHV.fd` on x86_64, `CLOUDHV_EFI.fd` on aarch64). Which works best depends on the guest OS, and RHF's EFI support is minimal: enough for the shim + GRUB2 path used by Ubuntu and similar, not universal.
+cloud‑hypervisor boots stock cloud images through a firmware; it supports Rust Hypervisor Firmware (RHF, a small PVH payload) and an edk2 UEFI build (`CLOUDHV.fd` on x86_64, `CLOUDHV_EFI.fd` on aarch64). Firmware remains image-specific. On the observed Ubuntu 24.04 x86_64 source, RHF 0.5.0 panicked while resolving the `LABEL=root` device and edk2 reached systemd and `ssh.socket`, so that catalog release is gated to edk2. This observation does not close its aarch64 firmware gate.
 
 Policy:
 
@@ -949,7 +953,7 @@ Global flags on every command: `--json` (NDJSON events on stdout, human output o
 | `ssh-config NAME` | print an OpenSSH Host block |
 | `console NAME` | attach to hvc0 |
 | `logs NAME [-f] [--source S] [-n N]` | view logs |
-| `images ls` / `images pull REF` / `images rm ID [--force]` / `images prune` | image management |
+| `images ls` / `images pull REF [--sha256 HEX]` / `images rm ID [--force]` / `images prune` | image management; `--sha256` is valid only for an HTTPS URL |
 | `doctor [--fix]` | diagnose host; `--fix` downloads vendorable binaries and prints the rest |
 | `serve [--listen unix:PATH]` | REST listener |
 | `completions SHELL` | shell completions |
@@ -1058,7 +1062,7 @@ The server holds no state and takes the same machine locks as the CLI. `curl --u
 | GET | `/v1/machines/{name}/logs?source=&follow=&lines=` | | `text/plain`, chunked |
 | GET | `/v1/machines/{name}/vmconfig` | | generated VmConfig JSON |
 | GET | `/v1/images` | | `[Image]` |
-| POST | `/v1/images/pull` | `{ref}` | event stream → `Result` |
+| POST | `/v1/images/pull` | `{ref, sha256?}` | event stream → `Result` |
 | DELETE | `/v1/images/{id}?force=` | | 204 |
 | POST | `/v1/images/prune` | | `{removed, bytes_freed}` |
 
@@ -1261,7 +1265,7 @@ Do these in the first milestone, against the pinned versions, and record results
 | VM‑to‑VM networking | not in v0.1; tap mode for users who need it | managed bridge | Owning an L2 story is a big surface; defer until demanded. |
 | Shell transport | ssh over vsock | ssh over forwarded TCP port; serial login | Works with no network, full ssh feature set, no port allocation, keeps `shell` working when users break networking. |
 | SSH keys | firestone generates its own; user keys are an appended list; multipart cloud‑init | `--ssh-key` as the only path; "pass the user's key" | The user's key needs `authorized_keys`, not custom networking; multipart keeps user‑data untouched. |
-| Boot | firmware boot of stock cloud images (RHF default, edk2 fallback) | direct kernel boot | Direct boot needs per‑distro kernels and rootfs extraction; firmware boot is ~100–200 ms and maintenance‑free. |
+| Boot | firmware boot of stock cloud images; catalog entries select a tested firmware, while local/URL defaults remain RHF on x86_64 and edk2 on aarch64 | direct kernel boot; one firmware default for every image | Direct boot needs per-distro kernels and rootfs extraction. Firmware is image-specific: the Ubuntu 24.04 x86_64 observation requires edk2, without generalizing that result to untested releases or architectures. |
 | Seed disk | vfat via `fatfs` | ISO via genisoimage | One fewer host dependency. |
 | VMM configuration | JSON `VmConfig` via `vm.create` | argv flags | Data, not shell strings; enables `config_overlay`. |
 | `create` behavior | silent, never boots, `--edit` opens editor | prompt "boot with defaults?" | Prompts break scripting; `run` is the verb that boots. |
@@ -1289,6 +1293,14 @@ Do these in the first milestone, against the pinned versions, and record results
 | User path resolution | retain `.` and `..` until complete kernel resolution; any canonicalization happens only for an existing complete path | lexical normalization before filesystem access | Lexical collapse changes meaning when a prefix is missing or a symlink participates in resolution. |
 | Relative spec paths | resolve relative paths from `firestone.toml` against the machine directory and relative action patches against their supplied base directory inside `MachineSpec::load` | process working directory at validation time; adapter-side pre-resolution | Machine behavior remains stable across CLI and REST invocations, and callers cannot accidentally skip path provenance handling. |
 | Image removal action payload | `ImageRemove` carries `force` | leave force in CLI/REST adapters | Sections 15.1, 15.4, and 16.2 expose forced image removal. The shared action must carry that choice so every interface dispatches the same operation. |
+| Image pull checksum action payload | `ImagePull` carries optional `sha256`; absent values remain omitted on serialization | keep `--sha256` only in the CLI adapter; create a second URL-pull action | URL verification is shared behavior in §§8.2, 15.1, and 16.2. One optional field lets CLI and REST invoke the same core operation without changing checksum-free catalog/local pulls. |
+| Image sidecar v1 and identity | strict atomic v1 records full source/stored identities, architecture, formats, verifier, stored size and timestamp; stable id is `image-` plus a full SHA-256 over length-framed source identity | the six-field §6.1 sketch; use `<sha8>` as identity; hash only the converted qcow2 | Raw conversion makes source and stored bytes different, while `MachineState.image.sha256` must keep source identity. Full digests prevent prefix collisions and let remove/prune/pinned start validate the same immutable pair. |
+| Image store publication and locking | one checked `images/.lock`; source/converted partials; recoverable `.removing` tombstones; base mode 0400, sidecar/lock mode 0600; sidecar atomic write; machine state pin before overlay | per-id locks; direct local backing; overwrite cache entries; two direct unlinks; unlocked prune | A single mutation lock keeps pull, pin, remove and prune ordering boring and race-free. Owned copies survive mutable/deleted local sources. Fsynced tombstone renames let the next mutation finish a removal after process death without adopting or stranding a half-pair. |
+| Machine image cache and execution validation | canonicalize supported refs before cache lookup; persist canonical ref/id/source SHA together; require host architecture and canonical ref on every use; hash stored qcow2 before execution | compare raw alias text; trust id/source SHA or file size alone; hash only in `images inspect` | Moving catalog URLs must not bypass a warm canonical cache, and copied/stale state must not select a wrong-architecture or wrong-source base. The stored digest is meaningful only if execution paths verify the bytes it names. |
+| Image HTTPS transport bounds | identity encoding; strict HTTPS at every redirect; five redirects; 30 s connect and 30 min request timeouts; manifests capped at 2 MiB | reqwest defaults; permit HTTPS→HTTP redirects; buffer manifests without a limit | A bounded transport fails malformed or stalled sources predictably, keeps credentials out of URLs, and prevents a checksum document from becoming an unbounded allocation. Image bodies remain streaming and have no arbitrary product-size cap. |
+| [verify 4] qemu-img 8.2.2 raw conversion | `convert -f raw -O qcow2 SOURCE TARGET`; the Ubuntu x86_64 source was converted qcow2→raw→qcow2 and the result booted under cloud-hypervisor v53 with edk2 to systemd and `ssh.socket` | retain raw bases; infer conversion flags; claim both architectures from one boot | The pinned argv and observed boot close the functional x86_64/edk2 conversion assumption. No aarch64 result or performance claim is inferred. |
+| [verify 5] cloud-hypervisor v53 qcow2 backing, functional portion | `create -f qcow2 -F qcow2 -b ABS_BASE OVERLAY SIZE`; `info --output=json -f qcow2 PATH`; the exact overlay was accepted with backing files enabled and reached systemd and `ssh.socket` under x86_64 edk2 | raw per-machine copy; reflink; treat creation success as boot proof | The runtime boot proves functional backing-file support for the observed configuration. The `fio` performance comparison and aarch64 closure remain open. |
+| Ubuntu 24.04 firmware release gate | catalog `auto` selects edk2; RHF 0.5.0 is not selected for this release | keep RHF from the unverified catalog default; generalize the result to every Ubuntu/aarch64 source | On the observed x86_64 source RHF panicked during `LABEL=root` resolution while the same converted base and overlay booted through edk2. Only the affected catalog release is corrected; verify 3 remains open for aarch64 and other releases. |
 
 ---
 

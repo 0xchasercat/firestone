@@ -291,6 +291,34 @@ impl Paths {
         checked_join(&self.images_dir(), "image file name", file_name)
     }
 
+    pub fn image_store_lock(&self) -> Result<PathBuf, FirestoneError> {
+        self.image_file(".lock")
+    }
+
+    pub fn image_base(&self, id: &str) -> Result<PathBuf, FirestoneError> {
+        self.image_file(&format!("{id}.qcow2"))
+    }
+
+    pub fn image_metadata(&self, id: &str) -> Result<PathBuf, FirestoneError> {
+        self.image_file(&format!("{id}.json"))
+    }
+
+    pub fn image_base_removal(&self, id: &str) -> Result<PathBuf, FirestoneError> {
+        self.image_file(&format!("{id}.qcow2.removing"))
+    }
+
+    pub fn image_metadata_removal(&self, id: &str) -> Result<PathBuf, FirestoneError> {
+        self.image_file(&format!("{id}.json.removing"))
+    }
+
+    pub fn image_source_partial(&self, operation: &str) -> Result<PathBuf, FirestoneError> {
+        self.image_file(&format!(".pull-{operation}.source.partial"))
+    }
+
+    pub fn image_stored_partial(&self, operation: &str) -> Result<PathBuf, FirestoneError> {
+        self.image_file(&format!(".pull-{operation}.stored.partial"))
+    }
+
     pub fn machine_dir(&self, name: &str) -> Result<PathBuf, FirestoneError> {
         checked_join(&self.machines_dir(), "machine name", name)
     }
@@ -309,6 +337,10 @@ impl Paths {
 
     pub fn machine_disk(&self, name: &str) -> Result<PathBuf, FirestoneError> {
         Ok(self.machine_dir(name)?.join("disk.qcow2"))
+    }
+
+    pub fn machine_disk_partial(&self, name: &str) -> Result<PathBuf, FirestoneError> {
+        Ok(self.machine_dir(name)?.join("disk.qcow2.partial"))
     }
 
     pub fn machine_seed_image(&self, name: &str) -> Result<PathBuf, FirestoneError> {
@@ -439,6 +471,105 @@ impl Paths {
         allow_missing: bool,
     ) -> Result<(), FirestoneError> {
         self.validate_directory_path(path, label, allow_missing, true)
+    }
+
+    /// Creates a Firestone-owned data directory with mode 0700 when missing.
+    ///
+    /// Existing paths and ancestry are validated before any mutation. The
+    /// returned value is true only when this call created the directory.
+    pub fn ensure_owned_data_directory(
+        &self,
+        path: &Path,
+        label: &str,
+        recursive: bool,
+    ) -> Result<bool, FirestoneError> {
+        self.validate_owned_data_directory(path, label, true)?;
+        match fs::symlink_metadata(path) {
+            Ok(_) => {
+                self.validate_owned_data_directory(path, label, false)?;
+                return Ok(false);
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(directory_io_error("inspect", label, path, source)),
+        }
+
+        let mut builder = DirBuilder::new();
+        builder.recursive(recursive).mode(0o700);
+        match builder.create(path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                self.validate_owned_data_directory(path, label, false)?;
+                return Ok(false);
+            }
+            Err(source) => return Err(directory_io_error("create", label, path, source)),
+        }
+
+        fs::set_permissions(path, Permissions::from_mode(0o700))
+            .map_err(|source| directory_io_error("set mode 0700 on", label, path, source))?;
+        self.validate_owned_data_directory(path, label, false)?;
+        let actual_mode = fs::symlink_metadata(path)
+            .map_err(|source| directory_io_error("inspect created", label, path, source))?
+            .mode()
+            & 0o7777;
+        if actual_mode != 0o700 {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "created {label} '{}' has mode {actual_mode:04o}; expected 0700",
+                    path.display()
+                ),
+            )
+            .with_hint("restrict the directory to the Firestone user and retry"));
+        }
+        Ok(true)
+    }
+
+    /// Validates one regular Firestone-owned data file and its ancestry.
+    pub fn validate_owned_data_file(
+        &self,
+        path: &Path,
+        label: &str,
+        expected_mode: u32,
+        allow_missing: bool,
+    ) -> Result<(), FirestoneError> {
+        let parent = path.parent().ok_or_else(|| {
+            FirestoneError::new(
+                ErrorKind::Dependency,
+                format!("{label} '{}' has no parent directory", path.display()),
+            )
+            .with_hint("use a file below the Firestone data directory")
+        })?;
+        self.validate_owned_data_directory(parent, &format!("{label} parent"), false)?;
+
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(source) if allow_missing && source.kind() == io::ErrorKind::NotFound => {
+                return Ok(());
+            }
+            Err(source) => return Err(directory_io_error("inspect", label, path, source)),
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!("{label} '{}' is not a regular owned file", path.display()),
+            )
+            .with_hint("replace the symlink or special file with a regular Firestone-owned file"));
+        }
+
+        let actual_uid = metadata.uid();
+        let actual_mode = metadata.mode() & 0o7777;
+        if actual_uid != self.runtime_uid || actual_mode != expected_mode {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "{label} '{}' is insecure: expected uid {} and mode {expected_mode:04o}, found uid {actual_uid} and mode {actual_mode:04o}",
+                    path.display(),
+                    self.runtime_uid
+                ),
+            )
+            .with_hint("replace the file with one owned and protected by the Firestone user"));
+        }
+        Ok(())
     }
 
     fn validate_runtime_prerequisites(&self) -> Result<(), FirestoneError> {

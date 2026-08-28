@@ -3,7 +3,6 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs,
-    os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -160,8 +159,10 @@ impl LocalDispatcher {
     ) -> Result<(), FirestoneError> {
         let machine_dir = self.paths.machine_dir(name)?;
         let machines_dir = self.paths.machines_dir();
-        ensure_owned_directory(&self.paths, self.paths.data_dir(), "data directory", true)?;
-        ensure_owned_directory(&self.paths, &machines_dir, "machines directory", false)?;
+        self.paths
+            .ensure_owned_data_directory(self.paths.data_dir(), "data directory", true)?;
+        self.paths
+            .ensure_owned_data_directory(&machines_dir, "machines directory", false)?;
 
         let (lock, creating_marker) = self.prepare_machine_creation(name, &machine_dir, events)?;
         let mut record = self.initialize_machine(name, spec, &lock)?;
@@ -202,7 +203,8 @@ impl LocalDispatcher {
         machine_dir: &Path,
         events: &mut dyn EventSink,
     ) -> Result<(MachineLock, PathBuf), FirestoneError> {
-        ensure_owned_directory(&self.paths, machine_dir, "machine directory", false)?;
+        self.paths
+            .ensure_owned_data_directory(machine_dir, "machine directory", false)?;
         let creating_marker = machine_dir.join(".creating");
         let lock_path = self.paths.machine_lock(name)?;
         validate_creation_lock_file(&lock_path, name, true)?;
@@ -647,81 +649,6 @@ fn display_forward(forward: &str) -> String {
         Some((host, guest)) => format!("{host}→{guest}"),
         None => forward.to_owned(),
     }
-}
-
-fn ensure_owned_directory(
-    paths: &Paths,
-    path: &Path,
-    label: &str,
-    recursive: bool,
-) -> Result<bool, FirestoneError> {
-    paths.validate_owned_data_directory(path, label, true)?;
-    match fs::symlink_metadata(path) {
-        Ok(_) => {
-            paths.validate_owned_data_directory(path, label, false)?;
-            return Ok(false);
-        }
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(filesystem_error(
-                ErrorKind::Generic,
-                format!("cannot inspect {label} {}", path.display()),
-                "check the Firestone data directory permissions",
-                source,
-            ));
-        }
-    }
-
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(recursive).mode(0o700);
-    match builder.create(path) {
-        Ok(()) => {}
-        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-            paths.validate_owned_data_directory(path, label, false)?;
-            return Ok(false);
-        }
-        Err(source) => {
-            return Err(filesystem_error(
-                ErrorKind::Generic,
-                format!("cannot create {label} {}", path.display()),
-                "check the Firestone data directory permissions",
-                source,
-            ));
-        }
-    }
-
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
-        filesystem_error(
-            ErrorKind::Generic,
-            format!("cannot set mode 0700 on {label} {}", path.display()),
-            "check the Firestone data directory permissions",
-            source,
-        )
-    })?;
-    paths.validate_owned_data_directory(path, label, false)?;
-    let actual_mode = fs::symlink_metadata(path)
-        .map_err(|source| {
-            filesystem_error(
-                ErrorKind::Generic,
-                format!("cannot inspect created {label} {}", path.display()),
-                "check the Firestone data directory permissions",
-                source,
-            )
-        })?
-        .permissions()
-        .mode()
-        & 0o7777;
-    if actual_mode != 0o700 {
-        return Err(FirestoneError::new(
-            ErrorKind::Dependency,
-            format!(
-                "created {label} {} has mode {actual_mode:04o}; expected 0700",
-                path.display()
-            ),
-        )
-        .with_hint("restrict the directory to the Firestone user and retry"));
-    }
-    Ok(true)
 }
 
 fn creation_marker_exists(path: &Path, name: &str) -> Result<bool, FirestoneError> {

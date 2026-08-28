@@ -9,6 +9,7 @@ pub mod dispatcher;
 pub mod doctor;
 pub mod error;
 pub mod event;
+pub mod image;
 pub mod lock;
 pub mod paths;
 pub mod result;
@@ -29,6 +30,11 @@ pub use doctor::{
 };
 pub use error::{ErrorInfo, ErrorKind, FirestoneError};
 pub use event::{Event, Level, StepId, Unit};
+pub use image::{
+    ImageInspection, ImageMetadata, ImageMetadataVersion, ImagePruneResult, ImagePullRequest,
+    ImageRemoveResult, ImageSourceLocation, ImageStore, ImageVerification, OverlayInfo,
+    PreparedMachineImage, PulledImage, ResolvedImageSource, StoredImage,
+};
 pub use lock::MachineLock;
 pub use paths::{PathInputs, Paths};
 pub use result::{MachineRecord, MachineSummary, MachineView, SpecResult, SpecWarningPayload};
