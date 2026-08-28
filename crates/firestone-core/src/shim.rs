@@ -51,7 +51,7 @@ use crate::{
     FirestoneError, ImageStore, LastExit, MachineLock, MachineSpec, MachineState, MachineStatus,
     ManagedProcess, NetMode, Paths, ProcessSignal, StateStore, StepId, VmConfigInput, VmState,
     VmmApi, VmmApiLivenessProbe, VmmPingProbe, atomic, ensure_ssh_identity,
-    invalidate_known_hosts_for_seed, publish_seed, publish_vm_config,
+    invalidate_known_hosts_for_seed, publish_seed_with_sshd_path, publish_vm_config,
 };
 
 const PLAN_VERSION: u32 = 1;
@@ -634,7 +634,8 @@ pub fn prepare_start(
         ensure_ssh_identity(paths)?;
     }
     let previous_instance_id = state.instance_id.clone();
-    let rendered = publish_seed(paths, name, spec)?;
+    let rendered =
+        publish_seed_with_sshd_path(paths, name, spec, &prepared_image.image.metadata.sshd_path)?;
     invalidate_known_hosts_for_seed(
         paths,
         name,

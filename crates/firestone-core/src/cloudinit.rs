@@ -13,7 +13,10 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use ssh_key::PublicKey;
 
-use crate::{ErrorKind, FirestoneError, MachineSpec, Paths, atomic};
+use crate::{
+    ErrorKind, FirestoneError, MachineSpec, Paths, atomic, catalog::SshdPath,
+    spec::validate_guest_user,
+};
 
 const FIRESTONE_TEMPLATE: &str = include_str!("../../../templates/cloud-init.yaml");
 const MIME_BOUNDARY: &str = "===============firestone==";
@@ -68,20 +71,56 @@ struct TemplateMount {
     readonly: bool,
 }
 
-/// Renders M1's Firestone-owned cloud-init content without publishing it.
-///
-/// User data and network configuration enter the product in M3. Rejecting both
-/// here prevents an M1 start from silently booting with incomplete provisioning.
+/// Renders Firestone-owned cloud-init content with the default guest sshd path.
 pub fn render_cloud_init(
     paths: &Paths,
     name: &str,
     spec: &MachineSpec,
 ) -> Result<RenderedCloudInit, FirestoneError> {
+    render_cloud_init_from_paths(paths, name, spec, &SshdPath::default())
+}
+
+/// Renders Firestone-owned cloud-init content from supplied, validated SSH inputs.
+///
+/// This API never generates host identity. Callers that own identity generation
+/// supply its public key without exposing private-key or user-data contents.
+pub fn render_cloud_init_with_guest_ssh(
+    paths: &Paths,
+    name: &str,
+    spec: &MachineSpec,
+    firestone_pubkey: &str,
+    sshd_path: &SshdPath,
+) -> Result<RenderedCloudInit, FirestoneError> {
+    render_cloud_init_inner(paths, name, spec, firestone_pubkey, sshd_path)
+}
+
+fn render_cloud_init_from_paths(
+    paths: &Paths,
+    name: &str,
+    spec: &MachineSpec,
+    sshd_path: &SshdPath,
+) -> Result<RenderedCloudInit, FirestoneError> {
+    let firestone_pubkey = if spec.cloud_init.provisioning {
+        read_firestone_public_key(paths)?
+    } else {
+        String::new()
+    };
+    render_cloud_init_inner(paths, name, spec, &firestone_pubkey, sshd_path)
+}
+
+fn render_cloud_init_inner(
+    paths: &Paths,
+    name: &str,
+    spec: &MachineSpec,
+    firestone_pubkey: &str,
+    sshd_path: &SshdPath,
+) -> Result<RenderedCloudInit, FirestoneError> {
     paths.machine_dir(name)?;
     reject_deferred_inputs(spec)?;
+    validate_guest_user(&spec.user)?;
 
     let user_data = if spec.cloud_init.provisioning {
-        let firestone_pubkey = read_firestone_public_key(paths)?;
+        let firestone_pubkey = validate_supplied_firestone_public_key(firestone_pubkey)?;
         let user_keys = read_user_public_keys(&spec.cloud_init.ssh_keys)?;
         let mounts = spec
             .mounts
@@ -105,8 +144,14 @@ pub fn render_cloud_init(
                 })
             })
             .collect::<Result<Vec<_>, FirestoneError>>()?;
-        let firestone_part =
-            render_firestone_part(name, &spec.user, &firestone_pubkey, &user_keys, &mounts)?;
+        let firestone_part = render_firestone_part(
+            name,
+            &spec.user,
+            firestone_pubkey,
+            &user_keys,
+            &mounts,
+            sshd_path,
+        )?;
         render_multipart(&firestone_part)
     } else {
         Vec::new()
@@ -114,7 +159,9 @@ pub fn render_cloud_init(
 
     let instance_id = instance_id(name, &user_data);
     let meta_data = format!(
-        "instance-id: {}\nlocal-hostname: {}\n",
+        r#"instance-id: {}
+local-hostname: {}
+"#,
         json_string(&instance_id)?,
         json_string(name)?
     )
@@ -134,7 +181,25 @@ pub fn publish_seed(
     name: &str,
     spec: &MachineSpec,
 ) -> Result<RenderedCloudInit, FirestoneError> {
-    let rendered = render_cloud_init(paths, name, spec)?;
+    publish_seed_with_sshd_path(paths, name, spec, &SshdPath::default())
+}
+
+/// Publishes a seed using the sshd path selected by the resolved image catalog.
+pub fn publish_seed_with_sshd_path(
+    paths: &Paths,
+    name: &str,
+    spec: &MachineSpec,
+    sshd_path: &SshdPath,
+) -> Result<RenderedCloudInit, FirestoneError> {
+    let rendered = render_cloud_init_from_paths(paths, name, spec, sshd_path)?;
+    publish_rendered_seed(paths, name, rendered)
+}
+
+fn publish_rendered_seed(
+    paths: &Paths,
+    name: &str,
+    rendered: RenderedCloudInit,
+) -> Result<RenderedCloudInit, FirestoneError> {
     paths.validate_machine_data_directory(name)?;
     let seed_dir = paths.machine_seed_dir(name)?;
     ensure_seed_directory(&seed_dir)?;
@@ -223,6 +288,21 @@ fn read_firestone_public_key(paths: &Paths) -> Result<String, FirestoneError> {
         .with_hint("run `firestone doctor --fix` to regenerate the Firestone SSH key")
     })
 }
+fn validate_supplied_firestone_public_key(value: &str) -> Result<&str, FirestoneError> {
+    let value = value.trim();
+    let valid = !value.is_empty()
+        && value.lines().count() == 1
+        && !value.starts_with('#')
+        && PublicKey::from_openssh(value).is_ok();
+    if !valid {
+        return Err(FirestoneError::new(
+            ErrorKind::InvalidSpec,
+            "supplied Firestone SSH public key must contain exactly one valid OpenSSH key",
+        )
+        .with_hint("supply one OpenSSH public-key line without surrounding content"));
+    }
+    Ok(value)
+}
 
 fn read_user_public_keys(paths: &[std::path::PathBuf]) -> Result<Vec<String>, FirestoneError> {
     let mut keys = Vec::new();
@@ -297,9 +377,11 @@ fn render_firestone_part(
     firestone_pubkey: &str,
     user_keys: &[String],
     mounts: &[TemplateMount],
+    sshd_path: &SshdPath,
 ) -> Result<Vec<u8>, FirestoneError> {
     let name = json_string(name)?;
     let firestone_pubkey = json_string(firestone_pubkey)?;
+    let sshd_path = sshd_path.as_str();
     let user_keys = user_keys
         .iter()
         .map(|key| json_string(key))
@@ -318,6 +400,7 @@ fn render_firestone_part(
             firestone_pubkey,
             user_keys,
             mounts,
+            sshd_path,
         })
         .map_err(template_error)?
         .into_bytes();
@@ -474,15 +557,18 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
 
-    use crate::{ErrorKind, MachineSpec, MountSpec, PathInputs, Paths};
+    use crate::{ErrorKind, MachineSpec, MountSpec, PathInputs, Paths, SshdPath};
 
-    use super::{SEED_IMAGE_SIZE, VOLUME_ID, publish_seed, render_cloud_init};
+    use super::{
+        SEED_IMAGE_SIZE, VOLUME_ID, publish_seed, publish_seed_with_sshd_path, render_cloud_init,
+        render_cloud_init_with_guest_ssh,
+    };
 
     const FIRESTONE_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKg0J8YPh7wARkZSlBzFAoJez6gssTQUuPu4Qy3z8T1P firestone@test\n";
     const USER_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN6eVqR0T6lRuT6aGvdMVhZkcNrD1s8g8J3RYfLZBuo5 user@test\n";
     const GOLDEN_MULTIPART: &[u8] = include_bytes!("../testdata/cloud-init.multipart");
     const GOLDEN_SEED_SHA256: &str =
-        "3f787cde89e47e5fd05c2cf2cd8c62a3901628868c6f4488704dc3f5aa673587";
+        "d4ad73c9803e42e2d9f77c42efc907945ec9d0f1f0be633db74b744e59a22fd4";
 
     struct Fixture {
         _temp: TempDir,
@@ -587,7 +673,7 @@ mod tests {
             rendered.user_data.len(),
             GOLDEN_MULTIPART.len()
         );
-        assert_eq!(rendered.instance_id, "iid-demo-fdd1d6011b92");
+        assert_eq!(rendered.instance_id, "iid-demo-390b75d3a7b4");
         assert_eq!(
             rendered.meta_data,
             format!(
@@ -597,6 +683,117 @@ mod tests {
             .as_bytes()
         );
         assert!(rendered.network_config.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn guest_ssh_users_custom_path_and_identity_are_deterministic()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let spec = MachineSpec {
+            user: "ubuntu".to_owned(),
+            ..MachineSpec::default()
+        };
+        let custom_path = SshdPath::new("/usr/libexec/openssh/sshd")?;
+        let key = FIRESTONE_KEY.trim();
+
+        let first =
+            render_cloud_init_with_guest_ssh(&fixture.paths, "demo", &spec, key, &custom_path)?;
+        let unchanged =
+            render_cloud_init_with_guest_ssh(&fixture.paths, "demo", &spec, key, &custom_path)?;
+        let default_path = render_cloud_init_with_guest_ssh(
+            &fixture.paths,
+            "demo",
+            &spec,
+            key,
+            &SshdPath::default(),
+        )?;
+
+        assert_eq!(first, unchanged);
+        assert_ne!(first.instance_id, default_path.instance_id);
+        let user_data = std::str::from_utf8(&first.user_data)?;
+        let quoted_key = serde_json::to_string(key)?;
+        assert!(user_data.contains("ssh_pwauth: false"));
+        assert!(user_data.contains("disable_root: false"));
+        assert!(user_data.contains("  - default"));
+        assert!(user_data.contains("  - name: root"));
+        assert_eq!(user_data.matches(&quoted_key).count(), 2);
+        assert!(user_data.contains("RuntimeDirectory=sshd"));
+        assert!(user_data.contains("RuntimeDirectoryPreserve=yes"));
+        assert!(user_data.contains("ExecStart=/usr/libexec/openssh/sshd -i"));
+        assert!(!user_data.contains("ExecStart=-/usr/libexec/openssh/sshd -i"));
+        Ok(())
+    }
+
+    #[test]
+    fn native_vsock_presence_deterministically_suppresses_firestone_listener()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let rendered = render_cloud_init_with_guest_ssh(
+            &fixture.paths,
+            "demo",
+            &MachineSpec::default(),
+            FIRESTONE_KEY.trim(),
+            &SshdPath::default(),
+        )?;
+        let user_data = std::str::from_utf8(&rendered.user_data)?;
+        let condition = user_data
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("ConditionPathExists=!"))
+            .ok_or("missing native-vsock condition")?;
+        let firestone_starts = |generated_paths: &[&str]| !generated_paths.contains(&condition);
+
+        assert!(firestone_starts(&[]));
+        assert!(!firestone_starts(&[
+            "/run/systemd/generator/sshd-vsock.socket"
+        ]));
+        assert!(user_data.contains("After=sshd-vsock.socket"));
+        assert!(user_data.contains("ListenStream=vsock::22"));
+        assert!(user_data.contains("Accept=yes"));
+        assert!(user_data.contains(
+            "systemctl is-active --quiet sshd-vsock.socket || systemctl is-active --quiet firestone-sshd.socket"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn guest_render_rejects_invalid_user_and_key_without_echoing_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let spec = MachineSpec {
+            user: "root;service".to_owned(),
+            ..MachineSpec::default()
+        };
+
+        let user_error = render_cloud_init_with_guest_ssh(
+            &fixture.paths,
+            "demo",
+            &spec,
+            FIRESTONE_KEY.trim(),
+            &SshdPath::default(),
+        )
+        .err()
+        .ok_or("invalid user should fail")?;
+        assert_eq!(user_error.kind(), ErrorKind::InvalidSpec);
+
+        let spec = MachineSpec::default();
+        let invalid_key = "private-looking-but-invalid-key-material";
+        let key_error = render_cloud_init_with_guest_ssh(
+            &fixture.paths,
+            "demo",
+            &spec,
+            invalid_key,
+            &SshdPath::default(),
+        )
+        .err()
+        .ok_or("invalid key should fail")?;
+        assert_eq!(key_error.kind(), ErrorKind::InvalidSpec);
+        assert!(!key_error.message().contains(invalid_key));
+        assert!(
+            key_error
+                .hint()
+                .is_none_or(|hint| !hint.contains(invalid_key))
+        );
         Ok(())
     }
 
@@ -625,11 +822,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::new(true)?;
         let spec = MachineSpec::default();
+        let sshd_path = SshdPath::new("/usr/libexec/openssh/sshd")?;
 
-        let first_render = publish_seed(&fixture.paths, "demo", &spec)?;
+        let first_render = publish_seed_with_sshd_path(&fixture.paths, "demo", &spec, &sshd_path)?;
         let first = fs::read(fixture.paths.machine_seed_image("demo")?)?;
         let first_hash = hex_digest(&first);
-        let second_render = publish_seed(&fixture.paths, "demo", &spec)?;
+        let second_render = publish_seed_with_sshd_path(&fixture.paths, "demo", &spec, &sshd_path)?;
         let second = fs::read(fixture.paths.machine_seed_image("demo")?)?;
 
         assert_eq!(first_render, second_render);

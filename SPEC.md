@@ -735,6 +735,8 @@ write_files:
     content: |
       [Unit]
       Description=firestone: sshd over vsock
+      After=sshd-vsock.socket
+      ConditionPathExists=!/run/systemd/generator/sshd-vsock.socket
       [Socket]
       ListenStream=vsock::22
       Accept=yes
@@ -747,7 +749,10 @@ write_files:
       Description=firestone: sshd over vsock (%i)
       After=sshd-keygen.service ssh.service
       [Service]
-      ExecStart=-/usr/sbin/sshd -i
+      RuntimeDirectory=sshd
+      RuntimeDirectoryMode=0755
+      RuntimeDirectoryPreserve=yes
+      ExecStart={{ sshd_path }} -i
       StandardInput=socket
       StandardError=journal
   - path: /etc/systemd/system/serial-getty@hvc0.service.d/firestone-autologin.conf
@@ -765,20 +770,22 @@ mounts:
 runcmd:
   - systemctl daemon-reload
   - systemctl enable --now firestone-sshd.socket
+  - systemctl is-active --quiet sshd-vsock.socket || systemctl is-active --quiet firestone-sshd.socket
   - systemctl enable serial-getty@hvc0.service
   - systemctl restart serial-getty@hvc0.service
 ```
 
 Notes:
 
-- Root login works because `disable_root: false` plus a key; stock sshd allows key‑only root (`PermitRootLogin prohibit-password`). If the user sets `user = "ubuntu"`, the default user already has the keys.
-- On guests with systemd ≥ 256, `systemd-ssh-generator` may already bind sshd to vsock port 22 as `sshd-vsock.socket`. Either unit serving port 22 is fine; if firestone's unit fails to bind because the native one won, the failure is cosmetic **[verify 11]**.
-- The `sshd` path differs between distros only rarely (`/usr/sbin/sshd` on Debian/Ubuntu/Fedora); the catalog entry may override `sshd_path` if a distro needs it.
-- Templates are rendered with `minijinja`; the rendered output is unit‑tested against golden files per template input.
+- Root login works because `disable_root: false` plus a key while `ssh_pwauth: false` keeps it key-only (`PermitRootLogin prohibit-password`/`without-password`, `PasswordAuthentication no`). The image's default user receives the same Firestone and user keys.
+- On guests with systemd ≥ 256, the generated `/run/systemd/generator/sshd-vsock.socket` owns vsock port 22. `firestone-sshd.socket` is ordered after it and has the inverse path condition, so the Firestone socket starts only when the native unit is absent. The final `is-active` command requires one listener; unrelated bind/start failures remain failures **[verify 11]**.
+- The per-connection service owns and preserves `/run/sshd`, which stock OpenSSH requires before `sshd -i`; its `ExecStart` is not failure-prefixed.
+- The `sshd` path differs between distros only rarely (`/usr/sbin/sshd` on Debian/Ubuntu/Fedora); the typed catalog entry may override `sshd_path`, which must be a safe absolute POSIX executable path.
+- Templates are rendered with `minijinja`; multipart bytes and deterministic seed images are golden-tested per typed input.
 
 ### 10.4 Instance id and re-provisioning
 
-`instance-id` is derived from the rendered user‑data. Editing anything under `[cloud_init]`, adding a mount, or changing `user` changes the id, so cloud‑init re‑runs its per‑instance modules on the next boot — that is how config changes reach the guest. Because a new instance id regenerates the guest's SSH host keys (`ssh_deletekeys` default), `start` deletes `machines/<name>/known_hosts` whenever it rewrites the seed.
+`instance-id` is derived from the final rendered user‑data bytes. Editing anything under `[cloud_init]`, adding a mount, changing `user`, or selecting a different catalog `sshd_path` changes the id, so cloud‑init re‑runs its per‑instance modules on the next boot — that is how config changes reach the guest. Because a new instance id regenerates the guest's SSH host keys (`ssh_deletekeys` default), `start` deletes `machines/<name>/known_hosts` whenever it rewrites the seed.
 
 ---
 
@@ -1251,13 +1258,13 @@ Do these in the first milestone, against the pinned versions, and record results
 | 8 | open | CH opens a user-owned tap without CAP_NET_ADMIN when `ip`/`mask` are unset | tap e2e on a dev box |
 | 9 | resolved | cloud-init NoCloud accepts a vfat `CIDATA` volume built by `fatfs`; no ISO is needed | M1-06 first boot and `cloud-init status --long` |
 | 10 | open | `merge_how` grammar and part ordering yield "user scalars win, lists append" | render both parts; run `cloud-init devel schema` or a merge test inside a guest; golden test |
-| 11 | open | `firestone-sshd.socket` coexists with systemd-256's `sshd-vsock.socket` | boot a systemd >= 256 image; `systemctl list-sockets` |
+| 11 | resolved | `firestone-sshd.socket` coexists with systemd-256+'s generated `sshd-vsock.socket` | Debian 13 systemd 257 KVM boot; inspect conditions/socket ownership and connect over native vsock SSH |
 | 12 | resolved | The pinned v53 host protocol is `CONNECT <port>\n` followed by `OK <allocated-host-port>\n` after guest acceptance | exact v53 `docs/vsock.md`, muxer source, and muxer unit test |
 | 13 | open | The shim's PTY broker permits console attach, detach, and reattach | attach, detach, attach again |
 | 14 | open | `passt --vhost-user` and CH `vhost_mode: "Client"` interoperate at the pinned versions | e2e scenario 3 |
 | 15 | open | passt `-t`/`-u` grammar for bind addresses and ranges | `man passt`; unit tests against man-page examples |
 | 16 | open | virtiofsd supports read-only mode and `--sandbox namespace` rootless | `virtiofsd --help`; mount e2e |
-| 17 | open | target-image systemd supports `ListenStream=vsock::22` and `serial-getty@hvc0` | boot; inspect both units |
+| 17 | resolved | target-image systemd supports `ListenStream=vsock::22` and `serial-getty@hvc0` | Ubuntu 24.04.4 KVM boot; inspect loaded units/listeners and exercise SSH plus hvc0 |
 | 18 | open | The CI runner exposes `/dev/kvm` | `ls -l /dev/kvm` in a workflow |
 
 ---
@@ -1355,6 +1362,9 @@ Do these in the first milestone, against the pinned versions, and record results
 | M1-06 Linux KVM acceptance evidence | Run the gated `scripts/m1-kvm-e2e.py` with `FIRESTONE_E2E=1`, a new mode-0700 `FIRESTONE_HOME`, and the exact pinned artifacts; keep `network.mode=none` | fake VMM claims; an ungated shared home; network, SSH readiness, passt, mounts, or aarch64 expansion | The recorded command was `FIRESTONE_E2E=1 FIRESTONE_HOME=/tmp/firestone-m1-577116f FIRESTONE_BIN=/tmp/firestone-25f7119 FIRESTONE_E2E_KEEP=1 FIRESTONE_E2E_EVIDENCE=$HOME/m1-evidence-577116f.json scripts/m1-kvm-e2e.py`. Run `577116f86ef6c61a302a5fabccf775ae267ee6be` on Linux 6.17.0-1022-azure x86_64 with read/write `/dev/kvm` passed E2E 1, 5, 6, and 7. CH SHA-256 was `448af3d4e59b22c2987f7df94c213ad40fb53a10d437e42b5ee6c4fce7c29ecc`; edk2 was `9fb511fc0dd423d90a79615a90a8ace9b9e078b4a115ea2c459e0ac2f4e60218`; Ubuntu source was `d0fe84bb5f80853425fa6be28e2c106f30104c3cfe8611933f2e65c9b63f0e30`. VMM SIGKILL reached `failed` in 140.309 ms and restarted to login. Shim SIGKILL reached `running (unsupervised)` in 7.099 ms and stopped with guest-shutdown reason. The evidence JSON SHA-256 is `a91a27d5921858e827515872e8f2d7ae53fff5056b5e0902b2efcf83ca3fe1d3`. No cloud-init content or secret was captured. |
 | M2 SSH identity publication and machine host trust | Resolve all paths through `Paths`; serialize first use with a current-user mode-0600 `<data>/.ssh-identity.lock`; create `<data>/ssh` as mode 0700; mark an unpublished generation with mode-0600 `.generating`; run exactly `ssh-keygen -t ed25519 -N "" -C firestone@<gethostname> -f <data>/ssh/id_ed25519` through `Cmd`; require a mode-0600 private key and mode-0644 public key; fsync both and the directory before removing the marker. Recover only marked non-directory partial nodes created after an empty-directory preflight; never overwrite an unmarked incomplete pair. Validate per-machine `known_hosts` as a current-user protected regular file, preserve it when `instance-id` is unchanged, and unlink plus fsync before durably recording a changed id; `rm` continues to remove the whole machine directory. | generate at a temporary `-f` path and rename two files; publish with hard links; let concurrent callers race; repair or overwrite arbitrary incomplete keys; delete `known_hosts` on every byte-identical seed build | The exact normative argv names the final private-key path, while the lock and marker prevent any Firestone consumer from observing a partial pair and make interrupted first use recoverable. Standard OpenSSH modes protect private material without making the public half unnecessarily private. Instance-id comparison rotates trust exactly when cloud-init regenerates guest host keys, and retaining the old durable id makes a crash between seed publication and trust deletion self-healing on retry. |
 | M2 bounded v53 vsock proxy | Validate the Paths-resolved mode-0700 machine runtime directory and a current-user, non-symlink Unix `vsock.sock` with no group/world write; use one nonblocking connect/handshake deadline of 5 s and a 64-byte response-line cap; send exact `CONNECT <nonzero-u32>\n`; accept only `OK <nonzero-u32>\n`; escape malformed bytes in deterministic errors. After acknowledgement, relay raw bytes in both directions with blocking worker copies, propagate stdin EOF as a socket write half-close, finish on socket/stdout closure, treat broken pipes as closure, and leave default process signals authoritative. The hidden command emits neither events nor a terminal `Result`. | unbounded `read_line`; buffered reads that can consume payload bytes after the acknowledgement; joined copies that hang forever on stdin; poll and mutate inherited stdio file flags; frame relay bytes as events | Exact one-byte handshake reads cannot steal payload bytes, while one absolute deadline bounds connect, partial frames, and guest acceptance. Independent blocking copies provide kernel backpressure without busy loops; returning when the download direction closes lets the short-lived proxy process cancel a stdin-blocked worker safely and preserves binary stdout byte-for-byte. |
+| M2 guest SSH rendering and activation | Carry a validated catalog `sshd_path` into image metadata and the deterministic seed; give both root and the image default user the Firestone/user keys; make root key-only; preserve `/run/sshd` for per-connection OpenSSH; prefer systemd-256+'s generated socket by an inverse generator-path condition; require one socket active after daemon reload | hard-code `/usr/sbin/sshd`; let both sockets race; mask/disable the native unit; prefix `sshd -i` with `-`; ignore a failed activation | The Ubuntu KVM run exposed a real `/run/sshd` failure that the prior failure-prefixed `ExecStart` reported as success. `RuntimeDirectory=sshd`, `RuntimeDirectoryPreserve=yes`, and an unprefixed `ExecStart` made root/default SSH succeed while preserving failures. Typed path/key/user validation and exact multipart/seed goldens keep dynamic content deterministic and non-secret. |
+| [verify 11] systemd-257 native-vsock coexistence | When `/run/systemd/generator/sshd-vsock.socket` exists, native `sshd-vsock.socket` owns `vsock::22` and `firestone-sshd.socket` is condition-skipped with a successful result | infer from systemd source; accept a bind race; claim Debian's unverified catalog firmware | On Linux 6.17.0-1022-azure x86_64 with pinned Cloud Hypervisor v53 + edk2, exact host commands `FIRESTONE_HOME=/tmp/firestone-m2-guest-20260829 /tmp/firestone-m2-guest-20260829/harness-bin/firestone --json create m2-native-edk2 debian:13 --net none --vmm-firmware edk2` and then `... --json start m2-native-edk2 --no-wait --timeout 600s` returned `running`. In the guest, `systemctl --version` began `systemd 257 (257.13-1~deb13u1)`; `test -e /run/systemd/generator/sshd-vsock.socket` succeeded; `systemctl show -p LoadState -p ActiveState -p SubState -p Result -p ConditionResult sshd-vsock.socket firestone-sshd.socket` returned native `active/listening, Result=success, ConditionResult=yes` and Firestone `inactive/dead, Result=success, ConditionResult=no`; `systemctl list-sockets --all --no-pager` listed `vsock::22 sshd-vsock.socket`; `systemd-analyze verify /run/systemd/generator/sshd-vsock.socket /usr/lib/systemd/system/sshd@.service /etc/systemd/system/firestone-sshd.socket /etc/systemd/system/firestone-sshd@.service /usr/lib/systemd/system/serial-getty@.service` exited 0. OpenSSH over the pinned CH `CONNECT 22` transport ran `id -un` as both `root` and `debian`. This resolves coexistence only; the explicit edk2 override does not resolve catalog verify 3. |
+| [verify 17] Ubuntu 24.04.4 guest SSH and hvc0 units | Use the Firestone socket on the accepted Ubuntu systemd-255 image; keep first-boot hvc0 enable plus restart | infer unit support from package files; count an active socket without completing SSH; require a second boot for hvc0 | Exact host commands `FIRESTONE_HOME=/tmp/firestone-m2-guest-20260829 /tmp/firestone-m2-guest-20260829/harness-bin/firestone --json create m2-guest ubuntu:24.04 --net none` and then `... --json start m2-guest --no-wait --timeout 600s` returned `running`; the hardened seed changed the instance from `iid-m2-guest-4aa5984ea771` to `iid-m2-guest-45e487e61f18` and cloud-init reran. Guest `systemctl --version` began `systemd 255 (255.4-1ubuntu8.17)`; `cloud-init status --long` returned `status: done`, `DataSourceNoCloud [seed=/dev/vdb]`, and empty errors; the native generator path was absent; `systemctl show -p LoadState -p ActiveState -p SubState -p Result firestone-sshd.socket sshd-vsock.socket serial-getty@hvc0.service` returned Firestone `active/listening`, native `not-found`, and hvc0 `active/running`; `systemctl list-sockets --all --no-pager` and `ss -ln --vsock` showed `vsock::22` and `*:22`; `/usr/sbin/sshd -T` returned `permitrootlogin without-password` and `passwordauthentication no`; both authorized-key files existed with one line; SSH `id -un` returned `root` and `ubuntu`; the live hvc0 PTY returned `hvc0_login=root`. `systemd-analyze verify firestone-sshd.socket firestone-sshd@.service serial-getty@hvc0.service` exited 0. |
 
 
 ---

@@ -4,13 +4,72 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use url::Url;
 
 use crate::{ErrorKind, FirestoneError};
 
 const BUILT_IN_CATALOG: &str = include_str!("../../../catalog/images.toml");
 const CATALOG_FILE_HINT: &str = "fix the catalog file and retry";
+pub const DEFAULT_SSHD_PATH: &str = "/usr/sbin/sshd";
+
+/// Validated absolute path to the SSH daemon inside a catalog guest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SshdPath(Option<String>);
+
+impl SshdPath {
+    /// Validates a catalog-selected guest executable path.
+    pub fn new(value: impl Into<String>) -> Result<Self, FirestoneError> {
+        let value = value.into();
+        let valid = value.strip_prefix('/').is_some_and(|relative| {
+            !relative.is_empty()
+                && relative.split('/').all(|component| {
+                    !component.is_empty()
+                        && !matches!(component, "." | "..")
+                        && component.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric()
+                                || matches!(byte, b'.' | b'_' | b'+' | b'-')
+                        })
+                })
+        });
+        if !valid || value.len() > 4096 {
+            return Err(FirestoneError::new(
+                ErrorKind::InvalidSpec,
+                "sshd_path must be an absolute POSIX executable path using only +                 [A-Za-z0-9._+-] components",
+            )
+            .with_hint("set sshd_path to the absolute sshd executable inside the guest"));
+        }
+        Ok(Self((value != DEFAULT_SSHD_PATH).then_some(value)))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_deref().unwrap_or(DEFAULT_SSHD_PATH)
+    }
+
+    pub(crate) fn is_default(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+impl Serialize for SshdPath {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SshdPath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(|error| de::Error::custom(error.message()))
+    }
+}
 
 /// Firmware declared by a catalog entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +121,7 @@ pub struct CatalogEntry {
     pub default: bool,
     pub firmware: CatalogFirmware,
     pub format: ImageFormat,
+    pub sshd_path: SshdPath,
     pub arch: BTreeMap<String, CatalogArchSource>,
 }
 
@@ -80,6 +140,7 @@ pub struct ResolvedCatalogEntry {
     pub checksum_algorithm: ChecksumAlgorithm,
     pub firmware: CatalogFirmware,
     pub format: ImageFormat,
+    pub sshd_path: SshdPath,
     pub architecture: String,
 }
 
@@ -143,6 +204,7 @@ impl Catalog {
             source,
             firmware,
             format: entry.format,
+            sshd_path: entry.sshd_path.clone(),
             architecture: host_architecture.to_owned(),
         })
     }
@@ -250,6 +312,8 @@ struct RawCatalogEntry {
     default: bool,
     firmware: CatalogFirmware,
     format: ImageFormat,
+    #[serde(default)]
+    sshd_path: SshdPath,
     arch: BTreeMap<String, RawArchSource>,
 }
 
@@ -376,6 +440,7 @@ fn convert_entry(
         default: raw.default,
         firmware: raw.firmware,
         format: raw.format,
+        sshd_path: raw.sshd_path,
         arch,
     })
 }
@@ -785,12 +850,46 @@ checksum_alg = "sha512"
         assert_eq!(resolved.canonical_reference, "debian:13");
         assert_eq!(resolved.firmware, CatalogFirmware::Rhf);
         assert_eq!(resolved.format, ImageFormat::Qcow2);
+        assert_eq!(resolved.sshd_path.as_str(), "/usr/sbin/sshd");
         assert_eq!(resolved.checksum_algorithm, ChecksumAlgorithm::Sha512);
         assert!(matches!(
             resolved.source.checksum,
             CatalogChecksum::ManifestUrl(_)
         ));
         Ok(())
+    }
+
+    #[test]
+    fn catalog_selects_validated_custom_sshd_path() -> Result<(), Box<dyn Error>> {
+        let input = TEST_SOURCE.replace(
+            r#"format = "qcow2""#,
+            r#"format = "qcow2"
+sshd_path = "/usr/libexec/openssh/sshd""#,
+        );
+        let catalog = catalog_from_toml(&input)?;
+
+        let resolved = catalog.resolve("test:1", "x86_64")?;
+
+        assert_eq!(resolved.sshd_path.as_str(), "/usr/libexec/openssh/sshd");
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_rejects_unsafe_sshd_paths() {
+        for path in ["usr/sbin/sshd", "/usr/../sshd", "/usr/sbin/sshd%p"] {
+            let input = TEST_SOURCE.replace(
+                r#"format = "qcow2""#,
+                &format!(
+                    r#"format = "qcow2"
+sshd_path = "{path}""#
+                ),
+            );
+
+            let error = error_from(catalog_from_toml(&input));
+
+            assert_eq!(error.kind(), ErrorKind::InvalidSpec);
+            assert!(error.message().contains("sshd_path"));
+        }
     }
 
     #[test]
