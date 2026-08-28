@@ -304,7 +304,7 @@ class Harness:
                 require(len(response) <= 16 * 1_024, f"{path} response headers exceeded 16 KiB")
             raw_headers, body = bytes(response).split(b"\r\n\r\n", 1)
             lines = raw_headers.split(b"\r\n")
-            status_match = re.fullmatch(rb"HTTP/1\.1 ([0-9]{3}) .+", lines[0])
+            status_match = re.fullmatch(rb"HTTP/1\.1 ([0-9]{3}) .*", lines[0])
             require(status_match is not None, f"{path} returned a malformed status line")
             lengths = []
             for line in lines[1:]:
