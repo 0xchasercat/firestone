@@ -1143,7 +1143,7 @@ Rust, edition 2024, stable toolchain, single static binary (`x86_64-unknown-linu
 | serialization | `serde`, `serde_json`, `toml` (with `toml_edit` for comment‑preserving writes), `schemars` |
 | async runtime | `tokio` (multi‑thread for serve/shim; current‑thread is fine for CLI) |
 | HTTP server | `axum`, `hyper`, `hyperlocal` (unix sockets) |
-| HTTP client | `reqwest` (downloads, streaming), `hyper` + `hyperlocal` (VMM API) |
+| HTTP client | `reqwest` (downloads, streaming); `std::os::unix::net::UnixStream` + `nix` (VMM API) |
 | hashing | `sha2` |
 | terminal UI | `indicatif`, `console`, `owo-colors`, `crossterm` (raw mode for `console`), `unicode-width` (table layout) |
 | processes / OS | `nix` (flock, setsid, signals, pidfd), `libc` |

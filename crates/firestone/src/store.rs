@@ -55,7 +55,21 @@ impl LocalDispatcher {
         let candidate = spec_path.with_extension("toml.edit");
         atomic::write(&candidate, &original)?;
 
-        let result = self.edit_candidate(name, &machine_dir, &candidate, &spec_path, events);
+        let pinned_image_ref = if observed_state.state.image.id.is_some()
+            && observed_state.state.image.sha256.is_some()
+        {
+            Some(observed_state.state.image.r#ref.as_str())
+        } else {
+            None
+        };
+        let result = self.edit_candidate(
+            name,
+            &machine_dir,
+            &candidate,
+            &spec_path,
+            pinned_image_ref,
+            events,
+        );
         let cleanup = remove_candidate(&candidate);
         match (result, cleanup) {
             (Ok(result), Ok(())) => {
@@ -74,6 +88,7 @@ impl LocalDispatcher {
         machine_dir: &Path,
         candidate: &Path,
         spec_path: &Path,
+        pinned_image_ref: Option<&str>,
         events: &mut dyn EventSink,
     ) -> Result<SpecResult, FirestoneError> {
         let editor = env::var_os("VISUAL")
@@ -104,7 +119,12 @@ impl LocalDispatcher {
                 .with_hint("save the machine spec as UTF-8 TOML")
                 .with_source(source)
             })?;
-            match self.load_spec_text(candidate_text, machine_dir, machine_dir) {
+            match self.load_spec_text_with_pinned(
+                candidate_text,
+                machine_dir,
+                machine_dir,
+                pinned_image_ref,
+            ) {
                 Ok(loaded) => {
                     atomic::write(spec_path, &candidate_bytes)?;
                     return Ok(SpecResult {
@@ -172,7 +192,8 @@ impl LocalDispatcher {
             let candidate = spec_path.with_extension("toml.edit");
             let original = read_file(&spec_path, "machine spec", ErrorKind::Generic)?;
             atomic::write(&candidate, &original)?;
-            let edited = self.edit_candidate(name, &machine_dir, &candidate, &spec_path, events);
+            let edited =
+                self.edit_candidate(name, &machine_dir, &candidate, &spec_path, None, events);
             let cleanup = remove_candidate(&candidate);
             let edited = match (edited, cleanup) {
                 (Ok(edited), Ok(())) => edited,
@@ -269,17 +290,22 @@ impl LocalDispatcher {
             .with_source(source)
         })?;
         let state = StateStore::new(state_path).read()?;
-        let pinned_image = state.image.id.is_some() && state.image.sha256.is_some();
-        self.load_spec_text_with_pinned(text, machine_dir, machine_dir, pinned_image)?;
+        let pinned_image_ref = if state.image.id.is_some() && state.image.sha256.is_some() {
+            Some(state.image.r#ref.as_str())
+        } else {
+            None
+        };
+        self.load_spec_text_with_pinned(text, machine_dir, machine_dir, pinned_image_ref)?;
         Ok(true)
     }
     fn initialize_machine(
         &self,
         name: &str,
-        spec: MachineSpec,
+        mut spec: MachineSpec,
         lock: &MachineLock,
     ) -> Result<MachineRecord, FirestoneError> {
         let state = self.created_state(name, &spec)?;
+        spec.image = state.image.r#ref.clone().into();
         let spec_document = render_spec(&spec)?;
         atomic::write(&self.paths.machine_spec(name)?, spec_document.as_bytes())?;
         StateStore::new(self.paths.machine_state(name)?).write_from_locked_action(&state, lock)?;
@@ -434,19 +460,15 @@ impl LocalDispatcher {
             .with_hint("save firestone.toml as UTF-8 TOML")
             .with_source(source)
         })?;
-        let pinned_image = state.state.image.id.is_some() && state.state.image.sha256.is_some();
+        let pinned_image_ref =
+            if state.state.image.id.is_some() && state.state.image.sha256.is_some() {
+                Some(state.state.image.r#ref.as_str())
+            } else {
+                None
+            };
         let loaded =
-            self.load_spec_text_with_pinned(text, &machine_dir, &machine_dir, pinned_image)?;
+            self.load_spec_text_with_pinned(text, &machine_dir, &machine_dir, pinned_image_ref)?;
         Ok((loaded.spec, state))
-    }
-
-    fn load_spec_text(
-        &self,
-        text: &str,
-        machine_dir: &Path,
-        patch_base_dir: &Path,
-    ) -> Result<firestone_core::LoadedMachineSpec, FirestoneError> {
-        self.load_spec_text_with_pinned(text, machine_dir, patch_base_dir, false)
     }
 
     fn load_spec_text_with_pinned(
@@ -454,16 +476,20 @@ impl LocalDispatcher {
         text: &str,
         machine_dir: &Path,
         patch_base_dir: &Path,
-        pinned_image: bool,
+        pinned_image_ref: Option<&str>,
     ) -> Result<firestone_core::LoadedMachineSpec, FirestoneError> {
         let host = RealValidationHost::new();
+        let context = ValidationContext::new(&host, &self.paths, machine_dir, &self.catalog);
+        let context = match pinned_image_ref {
+            Some(reference) => context.with_pinned_image_ref(reference),
+            None => context,
+        };
         MachineSpec::load(
             text,
             &self.global,
             &MachineSpecPatch::default(),
             patch_base_dir,
-            &ValidationContext::new(&host, &self.paths, machine_dir, &self.catalog)
-                .with_pinned_image(pinned_image),
+            &context,
         )
     }
     fn doctor(&self, fix: bool, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
@@ -1015,6 +1041,34 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn create_catalog_alias_persists_canonical_image_reference()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        let mut events = Vec::new();
+        let spec = firestone_core::MachineSpec {
+            image: "ubuntu".into(),
+            ..firestone_core::MachineSpec::default()
+        };
+
+        dispatcher
+            .run(
+                Action::Create {
+                    name: "canonical".to_owned(),
+                    spec,
+                },
+                &mut events,
+            )
+            .await?;
+
+        let persisted = fs::read_to_string(paths.machine_spec("canonical")?)?;
+        let patch = firestone_core::MachineSpecPatch::from_toml(&persisted)?;
+        assert_eq!(
+            patch.image.as_ref().map(|image| image.as_str()),
+            Some("ubuntu:24.04")
+        );
+        Ok(())
+    }
     #[tokio::test]
     async fn create_then_list_persists_effective_spec_and_created_state()
     -> Result<(), Box<dyn std::error::Error>> {

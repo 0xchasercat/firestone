@@ -155,7 +155,7 @@ pub struct ValidationContext<'a> {
     pub machine_dir: &'a Path,
     pub catalog: &'a Catalog,
     pub base_image_virtual_size: Option<ByteSize>,
-    pub pinned_image: bool,
+    pub pinned_image_ref: Option<&'a str>,
 }
 
 impl<'a> ValidationContext<'a> {
@@ -172,7 +172,7 @@ impl<'a> ValidationContext<'a> {
             machine_dir,
             catalog,
             base_image_virtual_size: None,
-            pinned_image: false,
+            pinned_image_ref: None,
         }
     }
 
@@ -183,8 +183,8 @@ impl<'a> ValidationContext<'a> {
     }
 
     #[must_use]
-    pub const fn with_pinned_image(mut self, pinned: bool) -> Self {
-        self.pinned_image = pinned;
+    pub const fn with_pinned_image_ref(mut self, reference: &'a str) -> Self {
+        self.pinned_image_ref = Some(reference);
         self
     }
 }
@@ -328,6 +328,9 @@ fn validate_image(
         ));
     }
 
+    if context.pinned_image_ref == Some(reference.as_str()) {
+        return Ok(());
+    }
     let candidate = image_path(&reference, context, image_base_dir)?;
     if host_path_exists(context.host, "image", &candidate)? {
         require_regular_file(
@@ -354,11 +357,6 @@ fn validate_image(
                 )
             })?;
         spec.image = image_ref_from_path(&canonical)?;
-        return Ok(());
-    }
-    if context.pinned_image
-        && (Path::new(&reference).is_absolute() || Catalog::is_canonical_reference(&reference))
-    {
         return Ok(());
     }
 
@@ -1312,13 +1310,38 @@ mod tests {
     #[test]
     fn image_missing_absolute_local_path_is_allowed_only_for_complete_pin_context()
     -> Result<(), crate::FirestoneError> {
-        let host = FakeHost::default();
+        let mut host = FakeHost::default();
         let mut spec = MachineSpec {
             image: "/deleted/base.qcow2".into(),
             ..MachineSpec::default()
         };
-        validate_machine_spec(&mut spec, &host.context().with_pinned_image(true))?;
+        validate_machine_spec(
+            &mut spec,
+            &host.context().with_pinned_image_ref("/deleted/base.qcow2"),
+        )?;
         assert_eq!(spec.image.as_str(), "/deleted/base.qcow2");
+
+        host.files
+            .insert(PathBuf::from("/deleted/base.qcow2"), Vec::new());
+        let mut replaced = MachineSpec {
+            image: "/deleted/base.qcow2".into(),
+            ..MachineSpec::default()
+        };
+        validate_machine_spec(
+            &mut replaced,
+            &host.context().with_pinned_image_ref("/deleted/base.qcow2"),
+        )?;
+
+        let mut changed = MachineSpec {
+            image: "/deleted/other.qcow2".into(),
+            ..MachineSpec::default()
+        };
+        let error = validate_machine_spec(
+            &mut changed,
+            &host.context().with_pinned_image_ref("/deleted/base.qcow2"),
+        )
+        .expect_err("a complete pin must not exempt a different missing image");
+        assert_invalid_key(&error, "image");
         Ok(())
     }
 
@@ -1336,15 +1359,21 @@ mod tests {
             image: "removed:1".into(),
             ..MachineSpec::default()
         };
-        validate_machine_spec(&mut pinned, &host.context().with_pinned_image(true))
-            .expect("complete pin may outlive its catalog entry");
+        validate_machine_spec(
+            &mut pinned,
+            &host.context().with_pinned_image_ref("removed:1"),
+        )
+        .expect("complete pin may outlive its catalog entry");
 
         let mut malformed = MachineSpec {
             image: "https:/broken".into(),
             ..MachineSpec::default()
         };
-        validate_machine_spec(&mut malformed, &host.context().with_pinned_image(true))
-            .expect_err("malformed URL must not masquerade as a former catalog pin");
+        validate_machine_spec(
+            &mut malformed,
+            &host.context().with_pinned_image_ref("removed:1"),
+        )
+        .expect_err("malformed URL must not masquerade as a former catalog pin");
     }
 
     #[test]
