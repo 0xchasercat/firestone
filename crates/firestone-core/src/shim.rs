@@ -4563,7 +4563,10 @@ fn authorize_peer(stream: &UnixStream, expected_uid: u32) -> Result<(), Fireston
     Ok(())
 }
 
-fn read_request(stream: &UnixStream, timeout: Duration) -> Result<ControlRequest, FirestoneError> {
+fn read_request(
+    mut stream: &UnixStream,
+    timeout: Duration,
+) -> Result<ControlRequest, FirestoneError> {
     stream.set_nonblocking(true).map_err(|source| {
         FirestoneError::new(
             ErrorKind::Generic,
@@ -4576,7 +4579,7 @@ fn read_request(stream: &UnixStream, timeout: Duration) -> Result<ControlRequest
         .ok_or_else(|| FirestoneError::new(ErrorKind::Usage, "control deadline is out of range"))?;
     let frame = read_frame(stream, MAX_CONTROL_REQUEST_BYTES, deadline)?;
     let mut trailing = [0_u8; 1];
-    match (&*stream).read(&mut trailing) {
+    match stream.read(&mut trailing) {
         Ok(0) => {}
         Err(source) if source.kind() == io::ErrorKind::WouldBlock => {}
         Err(source) if source.kind() == io::ErrorKind::Interrupted => {}

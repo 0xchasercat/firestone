@@ -429,11 +429,11 @@ fn resolve_payload(
     }
 }
 
-fn effective_firmware<'a>(
-    firmware: &'a Firmware,
+fn effective_firmware(
+    firmware: &Firmware,
     architecture: Arch,
     catalog_firmware: Option<CatalogFirmware>,
-) -> EffectiveFirmware<'a> {
+) -> EffectiveFirmware<'_> {
     if let Some(path) = firmware.as_path() {
         return EffectiveFirmware::Custom(path);
     }

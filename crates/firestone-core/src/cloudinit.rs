@@ -810,7 +810,7 @@ mod tests {
 
     fn hex_digest(bytes: &[u8]) -> String {
         let digest = Sha256::digest(bytes);
-        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+        format!("{digest:x}")
     }
 
     fn verify_seed_filesystem(
