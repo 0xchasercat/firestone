@@ -1,6 +1,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -18,6 +19,23 @@ pub fn write_json<T>(path: &Path, value: &T) -> Result<(), FirestoneError>
 where
     T: Serialize + ?Sized,
 {
+    let bytes = serialize_json(path, value)?;
+    write(path, &bytes)
+}
+
+/// Writes JSON atomically while creating the published file with the supplied mode.
+pub fn write_json_with_mode<T>(path: &Path, value: &T, mode: u32) -> Result<(), FirestoneError>
+where
+    T: Serialize + ?Sized,
+{
+    let bytes = serialize_json(path, value)?;
+    write_with_mode(path, &bytes, mode)
+}
+
+fn serialize_json<T>(path: &Path, value: &T) -> Result<Vec<u8>, FirestoneError>
+where
+    T: Serialize + ?Sized,
+{
     let mut bytes = serde_json::to_vec_pretty(value).map_err(|error| {
         FirestoneError::new(
             ErrorKind::Generic,
@@ -27,20 +45,47 @@ where
         .with_source(error)
     })?;
     bytes.push(b'\n');
-
-    write(path, &bytes)
+    Ok(bytes)
 }
 
-/// Writes all bytes through `<filename>.tmp`, fsyncs, renames, and fsyncs the
+/// Writes all bytes through a sibling temporary file, fsyncs, renames, and fsyncs the
 /// parent directory.
 pub fn write(path: &Path, bytes: &[u8]) -> Result<(), FirestoneError> {
     write_with(path, bytes, |file, contents| file.write_all(contents))
+}
+
+/// Writes bytes atomically while creating the published file with the supplied mode.
+pub fn write_with_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<(), FirestoneError> {
+    write_with_options(path, bytes, Some(mode), |file, contents| {
+        file.write_all(contents)
+    })
 }
 
 fn write_with<F>(path: &Path, bytes: &[u8], write_bytes: F) -> Result<(), FirestoneError>
 where
     F: FnOnce(&mut File, &[u8]) -> io::Result<()>,
 {
+    write_with_options(path, bytes, None, write_bytes)
+}
+
+fn write_with_options<F>(
+    path: &Path,
+    bytes: &[u8],
+    mode: Option<u32>,
+    write_bytes: F,
+) -> Result<(), FirestoneError>
+where
+    F: FnOnce(&mut File, &[u8]) -> io::Result<()>,
+{
+    if matches!(mode, Some(value) if value & !0o7777 != 0) {
+        return Err(FirestoneError::new(
+            ErrorKind::InvalidSpec,
+            format!(
+                "invalid atomic file mode {value:04o}",
+                value = mode.unwrap_or_default()
+            ),
+        ));
+    }
     let parent = parent_directory(path)?;
     let temp_path = temp_path(path)?;
     let parent_file =
@@ -48,11 +93,18 @@ where
 
     remove_known_temp(&temp_path)?;
 
-    let mut temp = OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    if let Some(mode) = mode {
+        options.mode(mode);
+    }
+    let mut temp = options
         .open(&temp_path)
         .map_err(|error| io_failure("create temporary file", &temp_path, error))?;
+    if let Some(mode) = mode {
+        temp.set_permissions(fs::Permissions::from_mode(mode))
+            .map_err(|error| fail_before_rename("set temporary file mode", &temp_path, error))?;
+    }
 
     if let Err(error) = write_bytes(&mut temp, bytes) {
         drop(temp);

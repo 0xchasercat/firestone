@@ -3,7 +3,6 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs,
-    os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -160,8 +159,10 @@ impl LocalDispatcher {
     ) -> Result<(), FirestoneError> {
         let machine_dir = self.paths.machine_dir(name)?;
         let machines_dir = self.paths.machines_dir();
-        ensure_owned_directory(&self.paths, self.paths.data_dir(), "data directory", true)?;
-        ensure_owned_directory(&self.paths, &machines_dir, "machines directory", false)?;
+        self.paths
+            .ensure_owned_data_directory(self.paths.data_dir(), "data directory", true)?;
+        self.paths
+            .ensure_owned_data_directory(&machines_dir, "machines directory", false)?;
 
         let (lock, creating_marker) = self.prepare_machine_creation(name, &machine_dir, events)?;
         let mut record = self.initialize_machine(name, spec, &lock)?;
@@ -202,7 +203,8 @@ impl LocalDispatcher {
         machine_dir: &Path,
         events: &mut dyn EventSink,
     ) -> Result<(MachineLock, PathBuf), FirestoneError> {
-        ensure_owned_directory(&self.paths, machine_dir, "machine directory", false)?;
+        self.paths
+            .ensure_owned_data_directory(machine_dir, "machine directory", false)?;
         let creating_marker = machine_dir.join(".creating");
         let lock_path = self.paths.machine_lock(name)?;
         validate_creation_lock_file(&lock_path, name, true)?;
@@ -266,8 +268,9 @@ impl LocalDispatcher {
             .with_hint("save firestone.toml as UTF-8 TOML")
             .with_source(source)
         })?;
-        self.load_spec_text(text, machine_dir, machine_dir)?;
-        StateStore::new(state_path).read()?;
+        let state = StateStore::new(state_path).read()?;
+        let pinned_image = state.image.id.is_some() && state.image.sha256.is_some();
+        self.load_spec_text_with_pinned(text, machine_dir, machine_dir, pinned_image)?;
         Ok(true)
     }
     fn initialize_machine(
@@ -417,6 +420,7 @@ impl LocalDispatcher {
         self.validate_machine_storage()?;
         let machine_dir = self.paths.machine_dir(name)?;
         ensure_machine_exists(&self.paths, name, &machine_dir)?;
+        let state = self.read_live_state(name)?;
         let source = read_file(
             &self.paths.machine_spec(name)?,
             "machine spec",
@@ -430,8 +434,9 @@ impl LocalDispatcher {
             .with_hint("save firestone.toml as UTF-8 TOML")
             .with_source(source)
         })?;
-        let loaded = self.load_spec_text(text, &machine_dir, &machine_dir)?;
-        let state = self.read_live_state(name)?;
+        let pinned_image = state.state.image.id.is_some() && state.state.image.sha256.is_some();
+        let loaded =
+            self.load_spec_text_with_pinned(text, &machine_dir, &machine_dir, pinned_image)?;
         Ok((loaded.spec, state))
     }
 
@@ -441,22 +446,26 @@ impl LocalDispatcher {
         machine_dir: &Path,
         patch_base_dir: &Path,
     ) -> Result<firestone_core::LoadedMachineSpec, FirestoneError> {
+        self.load_spec_text_with_pinned(text, machine_dir, patch_base_dir, false)
+    }
+
+    fn load_spec_text_with_pinned(
+        &self,
+        text: &str,
+        machine_dir: &Path,
+        patch_base_dir: &Path,
+        pinned_image: bool,
+    ) -> Result<firestone_core::LoadedMachineSpec, FirestoneError> {
         let host = RealValidationHost::new();
         MachineSpec::load(
             text,
             &self.global,
             &MachineSpecPatch::default(),
             patch_base_dir,
-            &ValidationContext {
-                host: &host,
-                paths: &self.paths,
-                machine_dir,
-                catalog: &self.catalog,
-                base_image_virtual_size: None,
-            },
+            &ValidationContext::new(&host, &self.paths, machine_dir, &self.catalog)
+                .with_pinned_image(pinned_image),
         )
     }
-
     fn doctor(&self, fix: bool, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
         let hostname = env::var("HOSTNAME")
             .ok()
@@ -647,81 +656,6 @@ fn display_forward(forward: &str) -> String {
         Some((host, guest)) => format!("{host}→{guest}"),
         None => forward.to_owned(),
     }
-}
-
-fn ensure_owned_directory(
-    paths: &Paths,
-    path: &Path,
-    label: &str,
-    recursive: bool,
-) -> Result<bool, FirestoneError> {
-    paths.validate_owned_data_directory(path, label, true)?;
-    match fs::symlink_metadata(path) {
-        Ok(_) => {
-            paths.validate_owned_data_directory(path, label, false)?;
-            return Ok(false);
-        }
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(filesystem_error(
-                ErrorKind::Generic,
-                format!("cannot inspect {label} {}", path.display()),
-                "check the Firestone data directory permissions",
-                source,
-            ));
-        }
-    }
-
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(recursive).mode(0o700);
-    match builder.create(path) {
-        Ok(()) => {}
-        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-            paths.validate_owned_data_directory(path, label, false)?;
-            return Ok(false);
-        }
-        Err(source) => {
-            return Err(filesystem_error(
-                ErrorKind::Generic,
-                format!("cannot create {label} {}", path.display()),
-                "check the Firestone data directory permissions",
-                source,
-            ));
-        }
-    }
-
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
-        filesystem_error(
-            ErrorKind::Generic,
-            format!("cannot set mode 0700 on {label} {}", path.display()),
-            "check the Firestone data directory permissions",
-            source,
-        )
-    })?;
-    paths.validate_owned_data_directory(path, label, false)?;
-    let actual_mode = fs::symlink_metadata(path)
-        .map_err(|source| {
-            filesystem_error(
-                ErrorKind::Generic,
-                format!("cannot inspect created {label} {}", path.display()),
-                "check the Firestone data directory permissions",
-                source,
-            )
-        })?
-        .permissions()
-        .mode()
-        & 0o7777;
-    if actual_mode != 0o700 {
-        return Err(FirestoneError::new(
-            ErrorKind::Dependency,
-            format!(
-                "created {label} {} has mode {actual_mode:04o}; expected 0700",
-                path.display()
-            ),
-        )
-        .with_hint("restrict the directory to the Firestone user and retry"));
-    }
-    Ok(true)
 }
 
 fn creation_marker_exists(path: &Path, name: &str) -> Result<bool, FirestoneError> {
@@ -1014,7 +948,8 @@ mod tests {
 
     use firestone_core::{
         Action, Catalog, Dispatcher, ErrorKind, Event, EventSink, FirestoneError, GlobalConfig,
-        MachineLock, MachineStatus, PathInputs, Paths, Supervision,
+        MachineLock, MachineSpec, MachineSpecPatch, MachineStatus, PathInputs, Paths,
+        RealValidationHost, StateStore, Supervision, ValidationContext,
     };
 
     use super::{
@@ -1112,6 +1047,117 @@ mod tests {
         );
         Ok(())
     }
+    #[tokio::test]
+    async fn pinned_relative_local_image_remains_listable_and_showable_after_source_deletion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (directory, dispatcher, paths) = fixture()?;
+        let root = fs::canonicalize(directory.path())?;
+        let source = root.join("relative.qcow2");
+        fs::write(&source, b"QFI\xFBLOCAL")?;
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600))?;
+        let catalog = Catalog::built_in()?;
+        let host = RealValidationHost::new();
+        let machine_dir = paths.machine_dir("local-pin")?;
+        let patch = MachineSpecPatch {
+            image: Some("relative.qcow2".into()),
+            ..MachineSpecPatch::default()
+        };
+        let loaded = MachineSpec::load(
+            "",
+            &GlobalConfig::default(),
+            &patch,
+            &root,
+            &ValidationContext::new(&host, &paths, &machine_dir, &catalog),
+        )?;
+        assert_eq!(loaded.spec.image.as_str(), source.to_string_lossy());
+
+        let mut events = Vec::new();
+        dispatcher
+            .run(
+                Action::Create {
+                    name: "local-pin".to_owned(),
+                    spec: loaded.spec,
+                },
+                &mut events,
+            )
+            .await?;
+        let state_path = paths.machine_state("local-pin")?;
+        let mut state = StateStore::new(state_path.clone()).read()?;
+        assert_eq!(state.image.r#ref, source.to_string_lossy());
+        state.image.id = Some(format!("image-{}", "a".repeat(64)));
+        state.image.sha256 = Some("b".repeat(64));
+        StateStore::new(state_path).write_from_shim(&state)?;
+        fs::remove_file(&source)?;
+
+        dispatcher.run(Action::List, &mut events).await?;
+        dispatcher
+            .run(
+                Action::Show {
+                    name: "local-pin".to_owned(),
+                },
+                &mut events,
+            )
+            .await?;
+        let duplicate = dispatcher
+            .run(
+                Action::Create {
+                    name: "local-pin".to_owned(),
+                    spec: MachineSpec::default(),
+                },
+                &mut events,
+            )
+            .await
+            .err()
+            .ok_or("expected duplicate machine rejection")?;
+        assert_eq!(duplicate.kind(), ErrorKind::AlreadyExists);
+        assert!(!source.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn removed_catalog_machine_requires_complete_pin_before_spec_reload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        let mut events = Vec::new();
+        let spec = MachineSpec {
+            image: "retired:1".into(),
+            ..MachineSpec::default()
+        };
+        dispatcher
+            .run(
+                Action::Create {
+                    name: "retired".to_owned(),
+                    spec,
+                },
+                &mut events,
+            )
+            .await?;
+
+        let unpinned = dispatcher
+            .run(Action::List, &mut events)
+            .await
+            .err()
+            .ok_or("expected unresolved unpinned catalog rejection")?;
+        assert_eq!(unpinned.kind(), ErrorKind::InvalidSpec);
+
+        let state_path = paths.machine_state("retired")?;
+        let mut state = StateStore::new(state_path.clone()).read()?;
+        state.image.id = Some(format!("image-{}", "c".repeat(64)));
+        state.image.sha256 = Some("d".repeat(64));
+        StateStore::new(state_path).write_from_shim(&state)?;
+
+        dispatcher.run(Action::List, &mut events).await?;
+        dispatcher
+            .run(
+                Action::Show {
+                    name: "retired".to_owned(),
+                },
+                &mut events,
+            )
+            .await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn create_missing_storage_creates_mode_0700() -> Result<(), Box<dyn std::error::Error>> {
         let (_directory, dispatcher, paths) = fixture()?;

@@ -411,6 +411,7 @@ name = "firestone-core"
 version = "0.1.0"
 dependencies = [
  "fs2",
+ "jiff",
  "nix",
  "reqwest",
  "schemars",
