@@ -149,7 +149,7 @@ impl<'a> VmmApi<'a> {
     }
 
     fn vmm_ping_for_liveness(&self) -> Result<bool, FirestoneError> {
-        match self.vmm_ping_inner() {
+        match self.request_inner(Endpoint::VmmPing, None) {
             Ok(_) => Ok(true),
             Err(failure) if failure.is_liveness_negative() => Ok(false),
             Err(failure) => Err(self.firestone_error(Endpoint::VmmPing, failure)),
@@ -1357,6 +1357,29 @@ mod tests {
             assert!(!probe.ping(server.path())?);
             let _ = server.finish()?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn liveness_http_200_schema_drift_uses_status_without_identity_decode()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let drifted_body = br#"{"build_version":"v54.0","version":"54.0.0","pid":42,"features":[],"new_field":true}"#;
+        let liveness_server = FakeServer::spawn(vec![response("200 OK", drifted_body)], false)?;
+        let probe = VmmApiLivenessProbe::new(TEST_TIMEOUT);
+        assert!(probe.ping(liveness_server.path())?);
+        let _ = liveness_server.finish()?;
+
+        let identity_server = FakeServer::spawn(vec![response("200 OK", drifted_body)], false)?;
+        let error = require_error(
+            VmmApi::new(identity_server.path(), TEST_TIMEOUT).vmm_ping(),
+            "typed ping identity must reject schema drift",
+        )?;
+        let _ = identity_server.finish()?;
+        assert!(
+            error
+                .message()
+                .contains("cannot decode vmm.ping JSON response")
+        );
         Ok(())
     }
 
