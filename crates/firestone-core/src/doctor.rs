@@ -2254,6 +2254,7 @@ mod tests {
             let temp = TempDir::new()?;
             let canonical_root = fs::canonicalize(temp.path())?;
             let root = canonical_root.as_path();
+            fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
             let data_dir = root.join("data");
             let bin_dir = data_dir.join("bin");
             let runtime_dir = root.join("run");
@@ -2491,7 +2492,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             CHECK_IDS
         );
-        assert!(!report.has_failures());
+        assert!(!report.has_failures(), "{report:#?}");
         assert!(
             report
                 .checks
