@@ -143,6 +143,7 @@ fn compile_fake_vmm(root: &Path) -> Result<PathBuf, Box<dyn Error>> {
         )
         .into());
     }
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))?;
     Ok(binary)
 }
 
