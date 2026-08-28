@@ -1040,10 +1040,13 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let root = fs::canonicalize(directory.path())?;
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        let firestone_home = root.join("home");
+        fs::create_dir(&firestone_home)?;
+        fs::set_permissions(&firestone_home, fs::Permissions::from_mode(0o700))?;
         let paths = Paths::from_inputs(&PathInputs {
             current_dir: root.clone(),
             home_dir: Some(root.clone()),
-            firestone_home: Some(root.join("home")),
+            firestone_home: Some(firestone_home),
             firestone_config_dir: None,
             firestone_data_dir: None,
             firestone_runtime_dir: None,
@@ -1621,6 +1624,10 @@ mod tests {
                 .await?;
         }
         fs::create_dir(paths.machine_dir("pending")?)?;
+        fs::set_permissions(
+            paths.machine_dir("pending")?,
+            fs::Permissions::from_mode(0o700),
+        )?;
         fs::copy(paths.machine_spec("alpha")?, paths.machine_spec("pending")?)?;
         fs::copy(
             paths.machine_state("alpha")?,
@@ -1642,6 +1649,7 @@ mod tests {
         let (_directory, dispatcher, paths) = fixture()?;
         let machine_dir = paths.machine_dir("pending")?;
         fs::create_dir_all(&machine_dir)?;
+        fs::set_permissions(&machine_dir, fs::Permissions::from_mode(0o700))?;
         fs::write(machine_dir.join(".creating"), b"creating\n")?;
 
         let error = dispatcher.load_machine("pending").err();
