@@ -246,18 +246,20 @@ pub enum Action {
     Start { name: String, wait: bool, timeout: Duration },
     Stop { name: String, timeout: Duration, force: bool },
     Restart { name: String, timeout: Duration },
-    Remove { name: String, force: bool },
+    Remove { names: Vec<String>, force: bool },
     List,
-    Show { name: String },
+    Show { name: String, vmconfig: bool },
     SetSpec { name: String, spec: MachineSpec },        // PUT
     PatchSpec { name: String, patch: MachineSpecPatch }, // PATCH
-    ImageList, ImagePull { r#ref: ImageRef, sha256: Option<String> }, ImageRemove { id: String, force: bool }, ImagePrune,
+    Logs { name: String, source: LogSource, lines: u32, follow: bool },
+    ImageList, ImagePull { r#ref: ImageRef, sha256: Option<String> }, ImageInspect { id: String },
+    ImageRemove { id: String, force: bool }, ImagePrune,
     Doctor { fix: bool },
     Version,
 }
 ```
 
-CLI subcommands and REST routes are thin adapters that construct an `Action` and hand it to `Dispatcher::run(action, &mut EventSink)`. Actions that require a terminal (`shell`, `console`, `logs -f`, `edit`) are CLI‑only by nature and are implemented in the CLI crate on top of core primitives; they are documented as such in §16 (REST exposes `logs` as a stream, and nothing else from that set).
+CLI subcommands and REST routes are thin adapters that construct an `Action` and hand it to `Dispatcher::run(action, &mut EventSink)`. Terminal attachment commands (`shell`, `console`, and `edit`) remain CLI-only. Bounded log reads, including follow, use the shared `Logs` action and `Output`/`Result` events; the CLI owns only terminal signal projection while REST maps the same operation to its documented stream.
 
 ### 5.3 `Event` — one stream, three renderers
 
@@ -270,6 +272,7 @@ pub enum Event {
     StepSkip   { id: StepId, reason: String },              // "cached", "already running"
     StepFail   { id: StepId, error: ErrorInfo },
     Log        { level: Level, message: String },           // secondary; dim in TTY, -v shows debug
+    Output     { data: String },                            // primary stdout data, including logs
     Result     { action: String, payload: serde_json::Value }, // exactly one, last, on success
 }
 ```
@@ -278,7 +281,7 @@ pub enum Event {
 - `serve` streams them as NDJSON (§16.3).
 - `firestone --json` prints them as NDJSON to stdout, unchanged.
 
-Every action emits `Result` exactly once on success, or returns an error (which the CLI/REST layer turns into the terminal failure output). Step ids for `start` are fixed and ordered: `image`, `disk`, `seed`, `shim`, `net`, `fs`, `vmm`, `boot`, `ssh`.
+Every action emits Result exactly once on success, or returns an error (which the CLI/REST layer turns into the terminal failure output). Start ids stay ordered. M1 emits image, disk, seed, shim, net, fs, and vmm, then returns only after status is running. M2 appends boot and ssh readiness; M1 never claims those checks.
 
 ### 5.4 The drift test (normative)
 
@@ -835,7 +838,7 @@ Because ssh runs over vsock, `ssh -L`/`-R` work with `network.mode = "none"`. No
 
 ### 11.7 `logs`
 
-`firestone logs <name> [-f] [--source console|vmm|shim|passt|virtiofsd-N] [-n LINES]` prints the chosen file (default `console.log`, last 200 lines) and follows with `-f` (inotify/poll). Over REST: `GET /v1/machines/{name}/logs?source=&follow=`.
+`firestone logs <name> [-f] [--source console|vmm|shim|passt|virtiofsd-N] [-n LINES]` opens only the selected current-user-owned mode-0600 regular file with no-follow and nonblocking flags. It prints the last 200 lines by default; `LINES` is 0 through 100,000. The reverse tail scan is capped at 8 MiB and refuses an individual or requested tail beyond that bound instead of truncating it. Follow reopens a safely rotated path, reads at most 256 KiB per pass, and sleeps 100 ms between passes. `SIGINT` cancels within one polling interval and returns the shared interrupted error without a terminal `Result`. Over REST: `GET /v1/machines/{name}/logs?source=&follow=`.
 
 ---
 
@@ -959,7 +962,7 @@ Global flags on every command: `--json` (NDJSON events on stdout, human output o
 | `ssh-config NAME` | print an OpenSSH Host block |
 | `console NAME` | attach to hvc0 |
 | `logs NAME [-f] [--source S] [-n N]` | view logs |
-| `images ls` / `images pull REF [--sha256 HEX]` / `images rm ID [--force]` / `images prune` | image management; `--sha256` is valid only for an HTTPS URL |
+| `images ls` / `images pull REF [--sha256 HEX]` / `images inspect ID` / `images rm ID [--force]` / `images prune` | image management; `--sha256` is valid only for an HTTPS URL |
 | `doctor [--fix]` | diagnose host; `--fix` downloads vendorable binaries and prints the rest |
 | `serve [--listen unix:PATH]` | REST listener |
 | `completions SHELL` | shell completions |
@@ -1344,6 +1347,8 @@ Do these in the first milestone, against the pinned versions, and record results
 | M1 lifecycle deadlines, liveness, and control detachment | Launch and stop use shared client/server absolute deadlines with per-phase caps and reserved cleanup/response budgets; timeout zero remains bounded. Only socket absence/refusal proves negative VMM liveness; timeout, malformed protocol, reset, and unexpected status are ambiguous and preserve state. Every control response write failure is connection-local and logged once without request data; the lifetime machine lock remains held through the final response and shim return. Peer authentication is enabled only for audited Linux/Android `SO_PEERCRED` and BSD/macOS `getpeereid` targets; every other Unix target fails closed. | reset a timeout per phase; treat ping timeout as stale; let terminal disconnect abort supervision; release the lock before replying; trust socket mode on unknown Unix targets. | A hung or slow VMM is not absent, cumulative phases must not exceed the caller contract, and a client terminal cannot own VM lifetime. Keeping the lock through the response prevents a second lifecycle action from observing a partially finalized machine. |
 | M1 executable and log descriptor hardening | Hash actual bytes with limit-plus-one and before/after descriptor identity checks. Command logs and VMM failure diagnostics open with no-follow, nonblocking, and close-on-exec behavior, then require a current-uid regular mode-0600 descriptor before clearing nonblocking; diagnostic failure falls back to the primary lifecycle error and never aborts cleanup. | trust pre-open length; follow final symlinks; pathname stat then blocking open; let log-tail errors replace the launch/exit result. | The final node can change after a pathname check and a FIFO can block forever. Diagnostics are secondary and cannot decide whether durable state/runtime cleanup runs. |
 | M1 release acceptance platform | Linux x86_64 with the pinned Cloud Hypervisor v53.0 binary and Ubuntu 24.04 x86_64 edk2 boot path. Custom wrappers are supported when they `exec` the VMM and remain within the normal supervisor contract. | require aarch64 runtime parity, non-Linux shim authentication/recovery, or containment of adversarial wrapper forks/`setsid` helpers before M1 merge | The current release gate is the specified Linux boot/stop product path. aarch64 runtime validation, non-Linux authority backends, and hostile-wrapper containment are separate follow-on work and are not inferred from portable compilation or unit coverage. |
+| M1 lifecycle and image action projection | `Remove` carries the complete ordered name list, `Show` carries `vmconfig`, `Logs` carries its typed source/line/follow request, and `ImageInspect` joins the shared action enum. Log bytes travel as `Output`; every successful invocation still ends in one `Result`. The standalone CLI polls the shared future with a safe thread-waker executor so blocking image transport is not nested inside a Tokio runtime. | loop over single-name actions and emit several results; implement logs or VmConfig directly in the adapter; retain a Tokio CLI runtime around `reqwest::blocking` | Multi-name `rm`, exact VmConfig output, logs, image inspection, CLI, and future REST adapters now invoke one dispatcher behavior. The standard-library executor avoids the blocking-client nested-runtime panic without a second action implementation. |
+| M1 bounded log reads and follow | Accept 0 through 100,000 lines; reverse-scan at most 8 MiB; refuse a requested tail that crosses the bound; follow in no more than 256 KiB passes with a 100 ms sleep, safe rotation reopen, and `SIGINT` cancellation reported as `interrupted` | read the whole append log; silently truncate a long line; busy-poll; add platform-specific inotify behavior for M1 | The bounds cap memory and cancellation latency, keep output deterministic across supported Unix hosts, and preserve explicit failure instead of losing log bytes silently. |
 
 
 

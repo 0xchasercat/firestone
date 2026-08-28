@@ -332,6 +332,10 @@ impl Paths {
     pub fn machine_dir(&self, name: &str) -> Result<PathBuf, FirestoneError> {
         checked_join(&self.machines_dir(), "machine name", name)
     }
+    pub fn machine_removal_dir(&self, name: &str) -> Result<PathBuf, FirestoneError> {
+        let removal = format!(".removing-{name}");
+        checked_join(&self.machines_dir(), "machine removal name", &removal)
+    }
 
     pub fn machine_spec(&self, name: &str) -> Result<PathBuf, FirestoneError> {
         Ok(self.machine_dir(name)?.join("firestone.toml"))

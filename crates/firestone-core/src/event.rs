@@ -89,6 +89,9 @@ pub enum Event {
         level: Level,
         message: String,
     },
+    Output {
+        data: String,
+    },
     Result {
         action: String,
         payload: serde_json::Value,
@@ -118,6 +121,19 @@ mod tests {
                 "elapsed_ms": 12
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn output_event_round_trip_preserves_data() -> Result<(), serde_json::Error> {
+        let event = Event::Output {
+            data: "first\nsecond\n".to_owned(),
+        };
+        let encoded = serde_json::to_string(&event)?;
+        let decoded = serde_json::from_str(&encoded)?;
+
+        assert_eq!(event, decoded);
+        assert_eq!(encoded, r#"{"type":"Output","data":"first\nsecond\n"}"#);
         Ok(())
     }
 

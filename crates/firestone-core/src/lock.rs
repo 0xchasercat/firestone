@@ -1,6 +1,7 @@
 use std::{
     fs::{File, OpenOptions},
     io,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
@@ -62,6 +63,7 @@ impl MachineLock {
             .read(true)
             .write(true)
             .create(true)
+            .mode(0o600)
             .truncate(false)
             .open(path)
             .map_err(|error| lock_io_failure("open", path, error))?;

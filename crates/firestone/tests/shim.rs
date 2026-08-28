@@ -1025,6 +1025,10 @@ fn starting_recovery_timeout_terminates_the_pinned_vmm() -> TestResult<()> {
         Some(ExitReason::Failure(reason)) if reason.contains("did not become ready")
     ));
     assert!(linux_process_inactive(vmm_pid)?);
+    wait_for_path_absent(
+        &fixture.paths.machine_runtime_dir(NAME)?,
+        Duration::from_secs(3),
+    )?;
     assert!(!fixture.paths.machine_runtime_dir(NAME)?.exists());
     Ok(())
 }
@@ -1195,6 +1199,18 @@ fn wait_for_path(path: &Path, timeout: Duration) -> TestResult<()> {
         thread::sleep(Duration::from_millis(10));
     }
     Err(format!("{} did not appear", path.display()).into())
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_path_absent(path: &Path, timeout: Duration) -> TestResult<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !path.exists() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Err(format!("{} did not disappear", path.display()).into())
 }
 
 fn send_and_shutdown(socket: &Path, bytes: &[u8]) -> TestResult<()> {

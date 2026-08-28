@@ -2,11 +2,11 @@ use std::path::{Path, PathBuf};
 
 use clap::{ArgAction, Args, Parser, Subcommand, error::ErrorKind};
 use firestone_core::{
-    Arch, ByteSize, CloudInitSpecPatch, Firmware, ImageRef, MacAddr, MachineSpecPatch, MountSpec,
-    NetMode, NetworkSpecPatch, PortForward, SpecClear, VmmSpecPatch,
+    Arch, ByteSize, CloudInitSpecPatch, Firmware, HumanDuration, ImageRef, LogSource, MacAddr,
+    MachineSpecPatch, MountSpec, NetMode, NetworkSpecPatch, PortForward, SpecClear, VmmSpecPatch,
 };
 
-/// Firestone's command-line interface for the M0 command set.
+/// Firestone's command-line interface.
 #[derive(Debug, Parser)]
 #[command(name = "firestone")]
 pub struct Cli {
@@ -43,11 +43,24 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// Commands implemented by the M0 CLI.
+/// Commands implemented by the Linux M1 CLI.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Create a machine definition without booting it.
     Create(Box<CreateArgs>),
+
+    /// Start a machine and wait for the M1 running contract.
+    Start(StartArgs),
+
+    /// Stop a machine.
+    Stop(StopArgs),
+
+    /// Stop and start a machine.
+    Restart(RestartArgs),
+
+    /// Stop and remove one or more machines.
+    #[command(name = "rm")]
+    Remove(RemoveArgs),
 
     /// List machines.
     #[command(name = "ls", visible_alias = "list")]
@@ -58,10 +71,141 @@ pub enum Command {
 
     /// Edit and validate a machine's firestone.toml.
     Edit(EditArgs),
+
+    /// Print a bounded machine log.
+    Logs(LogsArgs),
+
+    /// Manage the owned image store.
+    Images(ImagesArgs),
+
     /// Check host requirements and optional safe repairs.
     Doctor(DoctorArgs),
 }
-/// Arguments accepted by `firestone show`.
+
+/// Arguments accepted by firestone start.
+#[derive(Debug, Args)]
+pub struct StartArgs {
+    pub name: String,
+
+    /// Return after the M1 running contract without later readiness checks.
+    #[arg(long)]
+    pub no_wait: bool,
+
+    /// Override the configured start deadline.
+    #[arg(long, value_name = "DURATION")]
+    pub timeout: Option<HumanDuration>,
+}
+
+/// Arguments accepted by firestone stop.
+#[derive(Debug, Args)]
+pub struct StopArgs {
+    pub name: String,
+
+    /// Override the configured graceful-stop deadline.
+    #[arg(long, value_name = "DURATION")]
+    pub timeout: Option<HumanDuration>,
+
+    /// Skip the guest power button and kill the VMM.
+    #[arg(long)]
+    pub force: bool,
+}
+
+/// Arguments accepted by firestone restart.
+#[derive(Debug, Args)]
+pub struct RestartArgs {
+    pub name: String,
+}
+
+/// Arguments accepted by firestone rm.
+#[derive(Debug, Args)]
+pub struct RemoveArgs {
+    #[arg(value_name = "NAME", num_args = 1.., required = true)]
+    pub names: Vec<String>,
+
+    /// Approve removal of running machines.
+    #[arg(long)]
+    pub force: bool,
+}
+
+/// Arguments accepted by firestone logs.
+#[derive(Debug, Args)]
+pub struct LogsArgs {
+    pub name: String,
+
+    /// Continue printing appended log data until interrupted.
+    #[arg(short = 'f', long)]
+    pub follow: bool,
+
+    /// Select an owned machine log.
+    #[arg(long, default_value = "console", value_name = "SOURCE")]
+    pub source: LogSource,
+
+    /// Print the last LINES lines before following.
+    #[arg(
+        short = 'n',
+        default_value_t = 200,
+        value_parser = clap::value_parser!(u32).range(0..=100_000),
+        value_name = "LINES"
+    )]
+    pub lines: u32,
+}
+
+/// Arguments accepted by firestone images.
+#[derive(Debug, Args)]
+pub struct ImagesArgs {
+    #[command(subcommand)]
+    pub command: ImageCommand,
+}
+
+/// Image-store commands.
+#[derive(Debug, Subcommand)]
+pub enum ImageCommand {
+    /// List stored images.
+    #[command(name = "ls")]
+    List,
+
+    /// Pull and verify one image.
+    Pull(ImagePullArgs),
+
+    /// Verify and inspect one stored image.
+    Inspect(ImageInspectArgs),
+
+    /// Remove one stored image.
+    #[command(name = "rm")]
+    Remove(ImageRemoveArgs),
+
+    /// Remove all unreferenced images.
+    Prune,
+}
+
+/// Arguments accepted by firestone images pull.
+#[derive(Debug, Args)]
+pub struct ImagePullArgs {
+    #[arg(value_name = "REF")]
+    pub reference: String,
+
+    /// Verify a direct HTTPS URL with this SHA-256 digest.
+    #[arg(long, value_name = "HEX")]
+    pub sha256: Option<String>,
+}
+
+/// Arguments accepted by firestone images inspect.
+#[derive(Debug, Args)]
+pub struct ImageInspectArgs {
+    pub id: String,
+}
+
+/// Arguments accepted by firestone images rm.
+#[derive(Debug, Args)]
+pub struct ImageRemoveArgs {
+    pub id: String,
+
+    /// Approve removal while a machine still references the image.
+    #[arg(long)]
+    pub force: bool,
+}
+
+/// Arguments accepted by firestone show.
 #[derive(Debug, Args)]
 pub struct ShowArgs {
     pub name: String,
@@ -71,20 +215,19 @@ pub struct ShowArgs {
     pub vmconfig: bool,
 }
 
-/// Arguments accepted by `firestone edit`.
+/// Arguments accepted by firestone edit.
 #[derive(Debug, Args)]
 pub struct EditArgs {
     pub name: String,
 }
 
-/// Arguments accepted by `firestone doctor`.
+/// Arguments accepted by firestone doctor.
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
     /// Perform only the safe unprivileged repairs.
     #[arg(long)]
     pub fix: bool,
 }
-
 /// Arguments accepted by `firestone create` before positional resolution.
 #[derive(Debug, Args)]
 pub struct CreateArgs {
@@ -439,7 +582,7 @@ mod tests {
     use firestone_core::{Arch, ByteSize, Firmware, NetMode, SPEC_FIELD_METADATA, SpecClear};
     use serde_json::json;
 
-    use super::{Cli, Command, CreateArgs};
+    use super::{Cli, Command, CreateArgs, ImageCommand};
 
     fn create_request(arguments: &[&str]) -> Result<super::CreateRequest, clap::Error> {
         let cli = Cli::try_parse_from(arguments)?;
@@ -512,6 +655,195 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn lifecycle_commands_capture_exact_flags_and_defaults() -> Result<(), clap::Error> {
+        let start =
+            Cli::try_parse_from(["firestone", "start", "dev", "--no-wait", "--timeout", "17s"])?;
+        match start.command {
+            Command::Start(arguments) => {
+                assert_eq!(arguments.name, "dev");
+                assert!(arguments.no_wait);
+                assert_eq!(
+                    arguments.timeout.map(|timeout| timeout.get()),
+                    Some(std::time::Duration::from_secs(17))
+                );
+            }
+            _ => panic!("expected start command"),
+        }
+
+        let stop = Cli::try_parse_from(["firestone", "stop", "dev", "--timeout", "9s", "--force"])?;
+        match stop.command {
+            Command::Stop(arguments) => {
+                assert_eq!(arguments.name, "dev");
+                assert_eq!(
+                    arguments.timeout.map(|timeout| timeout.get()),
+                    Some(std::time::Duration::from_secs(9))
+                );
+                assert!(arguments.force);
+            }
+            _ => panic!("expected stop command"),
+        }
+
+        let restart = Cli::try_parse_from(["firestone", "restart", "dev"])?;
+        assert!(matches!(
+            restart.command,
+            Command::Restart(arguments) if arguments.name == "dev"
+        ));
+
+        let remove = Cli::try_parse_from(["firestone", "rm", "one", "two", "--force"])?;
+        match remove.command {
+            Command::Remove(arguments) => {
+                assert_eq!(arguments.names, ["one", "two"]);
+                assert!(arguments.force);
+            }
+            _ => panic!("expected rm command"),
+        }
+
+        let defaults = Cli::try_parse_from(["firestone", "start", "dev"])?;
+        match defaults.command {
+            Command::Start(arguments) => {
+                assert!(!arguments.no_wait);
+                assert!(arguments.timeout.is_none());
+            }
+            _ => panic!("expected start command"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn logs_accepts_follow_source_and_line_boundaries() -> Result<(), clap::Error> {
+        let defaults = Cli::try_parse_from(["firestone", "logs", "dev"])?;
+        match defaults.command {
+            Command::Logs(arguments) => {
+                assert_eq!(arguments.name, "dev");
+                assert_eq!(arguments.source, firestone_core::LogSource::Console);
+                assert_eq!(arguments.lines, 200);
+                assert!(!arguments.follow);
+            }
+            _ => panic!("expected logs command"),
+        }
+
+        let selected = Cli::try_parse_from([
+            "firestone",
+            "logs",
+            "dev",
+            "-f",
+            "--source",
+            "virtiofsd-3",
+            "-n",
+            "0",
+        ])?;
+        match selected.command {
+            Command::Logs(arguments) => {
+                assert!(arguments.follow);
+                assert_eq!(arguments.source, firestone_core::LogSource::Virtiofsd(3));
+                assert_eq!(arguments.lines, 0);
+            }
+            _ => panic!("expected logs command"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn images_commands_capture_every_operation() -> Result<(), clap::Error> {
+        let list = Cli::try_parse_from(["firestone", "images", "ls"])?;
+        assert!(matches!(
+            list.command,
+            Command::Images(arguments) if matches!(arguments.command, ImageCommand::List)
+        ));
+
+        let pull = Cli::try_parse_from([
+            "firestone",
+            "images",
+            "pull",
+            "https://images.example/base.qcow2",
+            "--sha256",
+            "abcd",
+        ])?;
+        match pull.command {
+            Command::Images(arguments) => match arguments.command {
+                ImageCommand::Pull(arguments) => {
+                    assert_eq!(arguments.reference, "https://images.example/base.qcow2");
+                    assert_eq!(arguments.sha256.as_deref(), Some("abcd"));
+                }
+                _ => panic!("expected images pull command"),
+            },
+            _ => panic!("expected images command"),
+        }
+
+        let inspect = Cli::try_parse_from(["firestone", "images", "inspect", "image-id"])?;
+        assert!(matches!(
+            inspect.command,
+            Command::Images(arguments)
+                if matches!(&arguments.command, ImageCommand::Inspect(arguments) if arguments.id == "image-id")
+        ));
+
+        let remove = Cli::try_parse_from(["firestone", "images", "rm", "image-id", "--force"])?;
+        assert!(matches!(
+            remove.command,
+            Command::Images(arguments)
+                if matches!(&arguments.command, ImageCommand::Remove(arguments) if arguments.id == "image-id" && arguments.force)
+        ));
+
+        let prune = Cli::try_parse_from(["firestone", "images", "prune"])?;
+        assert!(matches!(
+            prune.command,
+            Command::Images(arguments) if matches!(arguments.command, ImageCommand::Prune)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_parser_rejects_missing_invalid_and_out_of_scope_flags() {
+        let missing =
+            Cli::try_parse_from(["firestone", "rm"]).expect_err("rm without a name must fail");
+        assert_eq!(missing.kind(), ErrorKind::MissingRequiredArgument);
+
+        let source = Cli::try_parse_from(["firestone", "logs", "dev", "--source", "../console"])
+            .expect_err("unsafe source must fail");
+        assert_eq!(source.kind(), ErrorKind::ValueValidation);
+
+        let lines = Cli::try_parse_from(["firestone", "logs", "dev", "-n", "100001"])
+            .expect_err("unbounded line count must fail");
+        assert_eq!(lines.kind(), ErrorKind::ValueValidation);
+
+        let restart_timeout =
+            Cli::try_parse_from(["firestone", "restart", "dev", "--timeout", "5s"])
+                .expect_err("restart has no timeout flag");
+        assert_eq!(restart_timeout.kind(), ErrorKind::UnknownArgument);
+
+        let missing_pull = Cli::try_parse_from(["firestone", "images", "pull"])
+            .expect_err("images pull requires a reference");
+        assert_eq!(missing_pull.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn m1_short_and_long_help_contracts_do_not_drift() {
+        let command = Cli::command();
+        let names = command
+            .get_subcommands()
+            .map(clap::Command::get_name)
+            .collect::<BTreeSet<_>>();
+        for name in ["start", "stop", "restart", "rm", "logs", "images", "show"] {
+            assert!(names.contains(name), "missing {name} command");
+        }
+
+        let logs = command
+            .get_subcommands()
+            .find(|command| command.get_name() == "logs")
+            .expect("logs command");
+        assert_eq!(
+            logs.get_arguments()
+                .find(|argument| argument.get_long() == Some("follow"))
+                .and_then(clap::Arg::get_short),
+            Some('f')
+        );
+        let lines = logs
+            .get_arguments()
+            .find(|argument| argument.get_short() == Some('n'))
+            .expect("-n argument");
+        assert_eq!(lines.get_long(), None);
+    }
     #[test]
     fn create_resolves_all_supported_image_forms() -> Result<(), clap::Error> {
         let derived = create_request(&["firestone", "create", "ubuntu:24.04"])?;

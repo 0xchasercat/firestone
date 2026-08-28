@@ -229,7 +229,11 @@ pub fn publish_vm_config(
 ) -> Result<CanonicalVmConfig, FirestoneError> {
     let config = canonical_vm_config(paths, manifest, input)?;
     paths.validate_machine_data_directory(input.name)?;
-    atomic::write(&paths.machine_vmconfig(input.name)?, config.as_bytes())?;
+    atomic::write_with_mode(
+        &paths.machine_vmconfig(input.name)?,
+        config.as_bytes(),
+        0o600,
+    )?;
     Ok(config)
 }
 

@@ -1,6 +1,6 @@
-use std::time::Duration;
+use std::{fmt, str::FromStr, time::Duration};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::{ImageRef, MachineSpec, MachineSpecPatch};
 
@@ -27,12 +27,13 @@ pub enum Action {
         timeout: Duration,
     },
     Remove {
-        name: String,
+        names: Vec<String>,
         force: bool,
     },
     List,
     Show {
         name: String,
+        vmconfig: bool,
     },
     SetSpec {
         name: String,
@@ -41,6 +42,12 @@ pub enum Action {
     PatchSpec {
         name: String,
         patch: MachineSpecPatch,
+    },
+    Logs {
+        name: String,
+        source: LogSource,
+        lines: u32,
+        follow: bool,
     },
     ImageList,
     ImagePull {
@@ -52,6 +59,9 @@ pub enum Action {
         id: String,
         force: bool,
     },
+    ImageInspect {
+        id: String,
+    },
     ImagePrune,
     Doctor {
         fix: bool,
@@ -59,20 +69,90 @@ pub enum Action {
     Version,
 }
 
+/// One bounded, Firestone-owned machine log selected by the CLI or API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LogSource {
+    Console,
+    Vmm,
+    Shim,
+    Passt,
+    Virtiofsd(u16),
+}
+
+impl fmt::Display for LogSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Console => formatter.write_str("console"),
+            Self::Vmm => formatter.write_str("vmm"),
+            Self::Shim => formatter.write_str("shim"),
+            Self::Passt => formatter.write_str("passt"),
+            Self::Virtiofsd(index) => write!(formatter, "virtiofsd-{index}"),
+        }
+    }
+}
+
+impl FromStr for LogSource {
+    type Err = ParseLogSourceError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "console" => Ok(Self::Console),
+            "vmm" => Ok(Self::Vmm),
+            "shim" => Ok(Self::Shim),
+            "passt" => Ok(Self::Passt),
+            _ => value
+                .strip_prefix("virtiofsd-")
+                .filter(|index| !index.is_empty())
+                .and_then(|index| index.parse::<u16>().ok())
+                .map(Self::Virtiofsd)
+                .ok_or(ParseLogSourceError),
+        }
+    }
+}
+
+impl Serialize for LogSource {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for LogSource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(de::Error::custom)
+    }
+}
+
+/// Closed-value parse failure for LogSource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("source must be console, vmm, shim, passt, or virtiofsd-N")]
+pub struct ParseLogSourceError;
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::Action;
+    use super::{Action, LogSource};
     use crate::{ImageRef, MachineSpec, MachineSpecPatch};
 
     #[test]
     fn action_serialization_has_stable_type_tag() -> Result<(), serde_json::Error> {
         let serialized = serde_json::to_value(Action::Show {
             name: "ubuntu".to_owned(),
+            vmconfig: false,
         })?;
 
-        assert_eq!(serialized, json!({"type": "Show", "name": "ubuntu"}));
+        assert_eq!(
+            serialized,
+            json!({"type": "Show", "name": "ubuntu", "vmconfig": false})
+        );
         Ok(())
     }
 
@@ -151,5 +231,55 @@ mod tests {
             })
         );
         Ok(())
+    }
+
+    #[test]
+    fn action_lifecycle_and_log_payloads_round_trip() -> Result<(), serde_json::Error> {
+        let action = Action::Logs {
+            name: "ubuntu".to_owned(),
+            source: LogSource::Virtiofsd(2),
+            lines: 200,
+            follow: true,
+        };
+
+        let encoded = serde_json::to_value(&action)?;
+        assert_eq!(
+            encoded,
+            json!({
+                "type": "Logs",
+                "name": "ubuntu",
+                "source": "virtiofsd-2",
+                "lines": 200,
+                "follow": true
+            })
+        );
+        assert_eq!(serde_json::from_value::<Action>(encoded)?, action);
+
+        let remove = Action::Remove {
+            names: vec!["one".to_owned(), "two".to_owned()],
+            force: true,
+        };
+        assert_eq!(
+            serde_json::from_value::<Action>(serde_json::to_value(&remove)?)?,
+            remove
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn log_source_accepts_only_owned_log_names() {
+        for (value, expected) in [
+            ("console", LogSource::Console),
+            ("vmm", LogSource::Vmm),
+            ("shim", LogSource::Shim),
+            ("passt", LogSource::Passt),
+            ("virtiofsd-12", LogSource::Virtiofsd(12)),
+        ] {
+            assert_eq!(value.parse(), Ok(expected));
+            assert_eq!(expected.to_string(), value);
+        }
+        for value in ["", "console.log", "virtiofsd-", "virtiofsd--1", "../shim"] {
+            assert!(value.parse::<LogSource>().is_err(), "accepted {value}");
+        }
     }
 }
