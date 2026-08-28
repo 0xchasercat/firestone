@@ -260,29 +260,25 @@ fn validate_sha256(dependency: &str, sha256: &str) -> Result<(), FirestoneError>
 #[cfg(test)]
 mod tests {
     use super::DependencyManifest;
-    use crate::ErrorKind;
 
     const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     #[test]
-    fn bundled_manifest_resolves_binary_and_reports_virtiofsd_release_blocker()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn bundled_manifest_binary_dependencies_resolve() -> Result<(), Box<dyn std::error::Error>> {
         let manifest = DependencyManifest::bundled()?;
         let cloud_hypervisor = manifest.artifact("cloud-hypervisor", "x86_64")?;
+        let virtiofsd = manifest.artifact("virtiofsd", "x86_64")?;
 
         assert_eq!(manifest.manifest_version(), 1);
         assert_eq!(cloud_hypervisor.install_name, "cloud-hypervisor-v53.0");
         assert_eq!(cloud_hypervisor.expected_mode(), 0o755);
-
-        let error = match manifest.artifact("virtiofsd", "x86_64") {
-            Err(error) => error,
-            Ok(_) => {
-                return Err(std::io::Error::other("source-only dependency must fail").into());
-            }
-        };
-        assert_eq!(error.kind(), ErrorKind::Dependency);
-        assert!(error.message().contains("no immutable x86_64 binary"));
-        assert!(error.hint().is_some_and(|hint| hint.contains("M0-05c")));
+        assert_eq!(virtiofsd.version, "v1.14.0");
+        assert_eq!(virtiofsd.install_name, "virtiofsd-v1.14.0");
+        assert_eq!(
+            virtiofsd.sha256,
+            "9ad3e33c45dd816b24ad483b60ca469974ba54c3b37ef93be3da2a623986646f"
+        );
+        assert_eq!(virtiofsd.expected_mode(), 0o755);
         Ok(())
     }
 
