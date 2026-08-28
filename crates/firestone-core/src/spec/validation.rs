@@ -356,7 +356,9 @@ fn validate_image(
         spec.image = image_ref_from_path(&canonical)?;
         return Ok(());
     }
-    if context.pinned_image && Path::new(&reference).is_absolute() {
+    if context.pinned_image
+        && (Path::new(&reference).is_absolute() || Catalog::is_canonical_reference(&reference))
+    {
         return Ok(());
     }
 
@@ -1318,6 +1320,31 @@ mod tests {
         validate_machine_spec(&mut spec, &host.context().with_pinned_image(true))?;
         assert_eq!(spec.image.as_str(), "/deleted/base.qcow2");
         Ok(())
+    }
+
+    #[test]
+    fn removed_catalog_reference_is_allowed_only_for_complete_pin_context() {
+        let host = FakeHost::default();
+        let mut unpinned = MachineSpec {
+            image: "removed:1".into(),
+            ..MachineSpec::default()
+        };
+        validate_machine_spec(&mut unpinned, &host.context())
+            .expect_err("unpinned removed catalog must fail");
+
+        let mut pinned = MachineSpec {
+            image: "removed:1".into(),
+            ..MachineSpec::default()
+        };
+        validate_machine_spec(&mut pinned, &host.context().with_pinned_image(true))
+            .expect("complete pin may outlive its catalog entry");
+
+        let mut malformed = MachineSpec {
+            image: "https:/broken".into(),
+            ..MachineSpec::default()
+        };
+        validate_machine_spec(&mut malformed, &host.context().with_pinned_image(true))
+            .expect_err("malformed URL must not masquerade as a former catalog pin");
     }
 
     #[test]

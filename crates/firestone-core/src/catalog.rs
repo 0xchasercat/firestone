@@ -153,7 +153,14 @@ impl Catalog {
     pub fn contains_reference(&self, reference: &str) -> bool {
         self.find(reference).is_some()
     }
-
+    pub(crate) fn is_canonical_reference(reference: &str) -> bool {
+        let Some((distro, version)) = reference.split_once(':') else {
+            return false;
+        };
+        version.find(':').is_none()
+            && is_reference_component(distro)
+            && is_reference_component(version)
+    }
     /// Iterates over canonical entries in lexical `distro:version` order.
     pub fn entries(&self) -> impl ExactSizeIterator<Item = &CatalogEntry> {
         self.entries.values()
@@ -462,14 +469,7 @@ fn validate_reference_component(
     source: &str,
     user_editable: bool,
 ) -> Result<(), FirestoneError> {
-    let mut characters = value.chars();
-    let valid_first = characters
-        .next()
-        .is_some_and(|character| character.is_ascii_alphanumeric());
-    let valid_rest = characters.all(|character| {
-        character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '+' | '-')
-    });
-    if !valid_first || !valid_rest {
+    if !is_reference_component(value) {
         return Err(invalid_catalog(
             source,
             format!("{field} '{value}' is not a valid catalog reference component"),
@@ -477,6 +477,16 @@ fn validate_reference_component(
         ));
     }
     Ok(())
+}
+
+fn is_reference_component(value: &str) -> bool {
+    let mut characters = value.chars();
+    characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphanumeric())
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '+' | '-')
+        })
 }
 
 fn validate_architecture_name(

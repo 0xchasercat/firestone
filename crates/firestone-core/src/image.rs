@@ -2324,13 +2324,9 @@ impl ImageStoreLock {
                     .map_err(|source| image_lock_error("fsync", &path, source))?;
                 file
             }
-            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => OpenOptions::new()
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC)
-                .open(&path)
-                .map_err(|source| image_lock_error("open existing", &path, source))?,
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                Self::open_existing(paths, &path)?
+            }
             Err(source) => return Err(image_lock_error("create", &path, source)),
         };
         paths.validate_owned_data_file_handle(&path, "image store lock", LOCK_FILE_MODE, &file)?;
@@ -2363,13 +2359,65 @@ impl ImageStoreLock {
             thread::sleep(poll_interval.min(timeout.saturating_sub(started.elapsed())));
         }
     }
+
+    fn open_existing(paths: &Paths, path: &Path) -> Result<File, FirestoneError> {
+        paths.validate_owned_data_directory(
+            &paths.images_dir(),
+            "image store lock parent",
+            false,
+        )?;
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|source| image_lock_error("inspect existing", path, source))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "existing image store lock '{}' is not a regular no-follow file",
+                    path.display()
+                ),
+            )
+            .with_hint("replace the symlink or special file with a protected regular lock file"));
+        }
+
+        let expected_uid = nix::unistd::getuid().as_raw();
+        let actual_uid = metadata.uid();
+        let mode = metadata.mode() & 0o7777;
+        if actual_uid != expected_uid || mode & !LOCK_FILE_MODE != 0 {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "existing image store lock '{}' is insecure: expected uid {expected_uid} and owner permissions no broader than 0600, found uid {actual_uid} and mode {mode:04o}",
+                    path.display()
+                ),
+            )
+            .with_hint("replace the lock with a current-user regular file without group/world permissions"));
+        }
+
+        let recovered = mode != LOCK_FILE_MODE;
+        if recovered {
+            fs::set_permissions(path, fs::Permissions::from_mode(LOCK_FILE_MODE))
+                .map_err(|source| image_lock_error("recover mode on", path, source))?;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|source| image_lock_error("open existing", path, source))?;
+        paths.validate_owned_data_file_handle(path, "image store lock", LOCK_FILE_MODE, &file)?;
+        if recovered {
+            file.sync_all()
+                .map_err(|source| image_lock_error("fsync recovered", path, source))?;
+        }
+        Ok(file)
+    }
 }
 
 struct CleanupGuard {
     paths: Vec<PathBuf>,
     armed: bool,
 }
-
 impl CleanupGuard {
     fn new() -> Self {
         Self {
@@ -2650,11 +2698,7 @@ fn metadata_matches_cache_source(metadata: &ImageMetadata, source: &ResolvedImag
         return false;
     }
     match &source.checksum {
-        ExpectedChecksum::None => {
-            metadata.source_url == source.source_url
-                && metadata.verification_algorithm.is_none()
-                && metadata.verification_digest.is_none()
-        }
+        ExpectedChecksum::None => metadata.source_url == source.source_url,
         ExpectedChecksum::Digest(verification) => {
             metadata.source_url == source.source_url
                 && metadata.verification().as_ref() == Some(verification)
@@ -3272,17 +3316,17 @@ fn reject_hidden_qemu_dependencies(
     }
     Ok(())
 }
-fn validate_qcow2_health(label: &str, info: &QemuInfo) -> Result<(), FirestoneError> {
+fn validate_qcow2_structure(label: &str, info: &QemuInfo) -> Result<(), FirestoneError> {
     if info.format != "qcow2" {
         return Err(FirestoneError::new(
             ErrorKind::Dependency,
             format!("{label} has qemu format '{}'", info.format),
         ));
     }
-    if info.dirty_flag != Some(false) || info.corrupt != Some(false) {
+    if info.dirty_flag.is_none() || info.corrupt != Some(false) {
         return Err(FirestoneError::new(
             ErrorKind::Dependency,
-            format!("{label} omitted health fields or is marked dirty/corrupt by qemu-img"),
+            format!("{label} omitted health fields or is marked corrupt by qemu-img"),
         )
         .with_hint("repair or replace the qcow2 image before retrying"));
     }
@@ -3295,9 +3339,15 @@ fn validate_qcow2_health(label: &str, info: &QemuInfo) -> Result<(), FirestoneEr
     }
     Ok(())
 }
-
 fn validate_base_info(id: &str, info: &QemuInfo) -> Result<(), FirestoneError> {
-    validate_qcow2_health(&format!("stored image `{id}`"), info)?;
+    validate_qcow2_structure(&format!("stored image `{id}`"), info)?;
+    if info.dirty_flag != Some(false) {
+        return Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!("stored image `{id}` is marked dirty by qemu-img"),
+        )
+        .with_hint("repair or replace the immutable base image before retrying"));
+    }
     if info.backing_filename.is_some()
         || info.backing_filename_format.is_some()
         || info.full_backing_filename.is_some()
@@ -3317,7 +3367,7 @@ fn validate_overlay_info(
     requested_size: u64,
     info: &QemuInfo,
 ) -> Result<(), FirestoneError> {
-    validate_qcow2_health(&format!("overlay '{}'", overlay.display()), info)?;
+    validate_qcow2_structure(&format!("overlay '{}'", overlay.display()), info)?;
     let expected = base.to_str().ok_or_else(|| {
         FirestoneError::new(
             ErrorKind::Dependency,
@@ -3602,6 +3652,8 @@ elif args[0] == "create":
 elif args[0] == "info":
     data = pathlib.Path(args[4]).read_bytes()
     info = {"format": "qcow2", "virtual-size": 4, "dirty-flag": False, "format-specific": {"type": "qcow2", "data": {"corrupt": False}}}
+    if b"DIRTY" in data:
+        info["dirty-flag"] = True
     if data[4:].startswith(b"OVERLAY\n"):
         lines = data[4:].splitlines()
         info["virtual-size"] = int(lines[2])
@@ -4734,6 +4786,12 @@ else:
         valid_overlay.full_backing_filename = Some(base.to_string_lossy().into_owned());
         valid_overlay.backing_filename_format = Some("qcow2".to_owned());
         validate_overlay_info(overlay, base, 4096, &valid_overlay)?;
+        let mut dirty_overlay = valid_overlay.clone();
+        dirty_overlay.dirty_flag = Some(true);
+        validate_overlay_info(overlay, base, 4096, &dirty_overlay)?;
+        let mut corrupt_overlay = valid_overlay.clone();
+        corrupt_overlay.corrupt = Some(true);
+        assert!(validate_overlay_info(overlay, base, 4096, &corrupt_overlay).is_err());
         let mut wrong_path = valid_overlay.clone();
         wrong_path.full_backing_filename = Some("/other/base.qcow2".to_owned());
         assert!(validate_overlay_info(overlay, base, 4096, &wrong_path).is_err());
@@ -5304,6 +5362,7 @@ else:
             .arg("image::tests::image_store_restrictive_umask_helper")
             .arg("--nocapture")
             .env("FIRESTONE_IMAGE_UMASK_ROOT", &fixture.root)
+            .env("FIRESTONE_IMAGE_UMASK_INTERRUPT", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -5318,11 +5377,27 @@ else:
             OWNED_DIRECTORY_MODE,
         );
         let lock_path = fixture.paths.image_store_lock()?;
+        assert_eq!(fs::symlink_metadata(&lock_path)?.mode() & 0o7777, 0o000);
+        drop(ImageStoreLock::acquire(
+            &fixture.paths,
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+        )?);
         assert_eq!(
             fs::symlink_metadata(&lock_path)?.mode() & 0o7777,
             LOCK_FILE_MODE
         );
 
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o400))?;
+        drop(ImageStoreLock::acquire(
+            &fixture.paths,
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+        )?);
+        assert_eq!(
+            fs::symlink_metadata(&lock_path)?.mode() & 0o7777,
+            LOCK_FILE_MODE
+        );
         fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644))?;
         let error = ImageStoreLock::acquire(
             &fixture.paths,
@@ -5345,6 +5420,19 @@ else:
         let paths = test_paths(&root, root.join("firestone"))?;
         paths.ensure_owned_data_directory(paths.data_dir(), "data directory", true)?;
         paths.ensure_owned_data_directory(&paths.images_dir(), "images directory", false)?;
+        if env::var_os("FIRESTONE_IMAGE_UMASK_INTERRUPT").is_some() {
+            let lock_path = paths.image_store_lock()?;
+            drop(
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .mode(LOCK_FILE_MODE)
+                    .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+                    .open(lock_path)?,
+            );
+            return Ok(());
+        }
         drop(ImageStoreLock::acquire(
             &paths,
             Duration::from_secs(1),
@@ -5466,6 +5554,150 @@ else:
         assert!(second.image.cached);
         assert_eq!(second.image.metadata.id, first.image.metadata.id);
         assert!(!source.exists());
+        Ok(())
+    }
+    #[test]
+    fn verified_direct_url_is_an_offline_warm_cache_and_unchecked_refresh_tracks_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let url = "https://mutable.example.invalid/base.qcow2";
+        let original_bytes = b"QFI\xFBMUTABLE-ONE".to_vec();
+        let original_sha = sha256_bytes(&original_bytes);
+        fixture.http.push(
+            url,
+            original_bytes.clone(),
+            Some(original_bytes.len() as u64),
+            None,
+        )?;
+        let verified = fixture.store.pull(
+            &url_request(url, Some(original_sha), &fixture.root),
+            &mut Vec::new(),
+        )?;
+        assert_eq!(verified.metadata.generation, 1);
+        assert_eq!(
+            verified.metadata.verification_algorithm,
+            Some(ChecksumAlgorithm::Sha256)
+        );
+
+        let first_name = "verified-url-cache";
+        let mut first_state = machine_state(
+            &fixture.paths,
+            first_name,
+            StateImage {
+                r#ref: url.to_owned(),
+                id: None,
+                sha256: None,
+            },
+        )?;
+        let first_lock = create_machine(&fixture.paths, first_name, &first_state, &mut Vec::new())?;
+        let offline = fixture.store.prepare_machine_image(
+            first_name,
+            &mut first_state,
+            &fixture.root,
+            ByteSize::from_mib(1)?,
+            &first_lock,
+            &mut Vec::new(),
+        )?;
+        assert!(offline.image.cached);
+        assert_eq!(offline.image.metadata.id, verified.metadata.id);
+        assert_eq!(
+            offline.image.metadata.verification_algorithm,
+            Some(ChecksumAlgorithm::Sha256)
+        );
+
+        let changed_bytes = b"QFI\xFBMUTABLE-TWO".to_vec();
+        fixture.http.push(
+            url,
+            changed_bytes.clone(),
+            Some(changed_bytes.len() as u64),
+            None,
+        )?;
+        let refreshed = fixture
+            .store
+            .pull(&url_request(url, None, &fixture.root), &mut Vec::new())?;
+        assert!(!refreshed.cached);
+        assert_ne!(refreshed.metadata.id, verified.metadata.id);
+        assert_eq!(refreshed.metadata.generation, 2);
+        assert!(refreshed.metadata.verification().is_none());
+
+        let second_name = "refreshed-url-cache";
+        let mut second_state = machine_state(
+            &fixture.paths,
+            second_name,
+            StateImage {
+                r#ref: url.to_owned(),
+                id: None,
+                sha256: None,
+            },
+        )?;
+        let second_lock =
+            create_machine(&fixture.paths, second_name, &second_state, &mut Vec::new())?;
+        let latest = fixture.store.prepare_machine_image(
+            second_name,
+            &mut second_state,
+            &fixture.root,
+            ByteSize::from_mib(1)?,
+            &second_lock,
+            &mut Vec::new(),
+        )?;
+        assert!(latest.image.cached);
+        assert_eq!(latest.image.metadata.id, refreshed.metadata.id);
+        assert_eq!(
+            first_state.image.id.as_deref(),
+            Some(verified.metadata.id.as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dirty_base_is_rejected_but_cached_dirty_overlay_is_restartable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let dirty_base = fixture.write_source("dirty-base.qcow2", b"QFI\xFBDIRTY-BASE")?;
+        let base_error = fixture
+            .store
+            .pull(&local_request(&dirty_base, &fixture.root), &mut Vec::new())
+            .err()
+            .ok_or("expected dirty immutable base rejection")?;
+        assert_eq!(base_error.kind(), ErrorKind::Dependency);
+        assert_no_image_artifacts(&fixture.paths)?;
+
+        let clean = fixture.write_source("clean-base.qcow2", b"QFI\xFBCLEAN-BASE")?;
+        let name = "dirty-overlay";
+        let mut state = machine_state(
+            &fixture.paths,
+            name,
+            StateImage {
+                r#ref: clean.to_string_lossy().into_owned(),
+                id: None,
+                sha256: None,
+            },
+        )?;
+        let lock = create_machine(&fixture.paths, name, &state, &mut Vec::new())?;
+        let first = fixture.store.prepare_machine_image(
+            name,
+            &mut state,
+            &fixture.root,
+            ByteSize::from_mib(1)?,
+            &lock,
+            &mut Vec::new(),
+        )?;
+        OpenOptions::new()
+            .append(true)
+            .open(&first.overlay.path)?
+            .write_all(b"\nDIRTY\n")?;
+
+        let restarted = fixture.store.prepare_machine_image(
+            name,
+            &mut state,
+            &fixture.root,
+            ByteSize::from_mib(1)?,
+            &lock,
+            &mut Vec::new(),
+        )?;
+        assert!(restarted.image.cached);
+        assert!(restarted.overlay.cached);
+        assert_eq!(restarted.overlay.path, first.overlay.path);
         Ok(())
     }
 }

@@ -1115,6 +1115,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn removed_catalog_machine_requires_complete_pin_before_spec_reload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        let mut events = Vec::new();
+        let spec = MachineSpec {
+            image: "retired:1".into(),
+            ..MachineSpec::default()
+        };
+        dispatcher
+            .run(
+                Action::Create {
+                    name: "retired".to_owned(),
+                    spec,
+                },
+                &mut events,
+            )
+            .await?;
+
+        let unpinned = dispatcher
+            .run(Action::List, &mut events)
+            .await
+            .err()
+            .ok_or("expected unresolved unpinned catalog rejection")?;
+        assert_eq!(unpinned.kind(), ErrorKind::InvalidSpec);
+
+        let state_path = paths.machine_state("retired")?;
+        let mut state = StateStore::new(state_path.clone()).read()?;
+        state.image.id = Some(format!("image-{}", "c".repeat(64)));
+        state.image.sha256 = Some("d".repeat(64));
+        StateStore::new(state_path).write_from_shim(&state)?;
+
+        dispatcher.run(Action::List, &mut events).await?;
+        dispatcher
+            .run(
+                Action::Show {
+                    name: "retired".to_owned(),
+                },
+                &mut events,
+            )
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn create_missing_storage_creates_mode_0700() -> Result<(), Box<dyn std::error::Error>> {
         let (_directory, dispatcher, paths) = fixture()?;
         let mut events = Vec::new();
