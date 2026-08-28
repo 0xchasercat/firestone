@@ -3346,7 +3346,7 @@ mod tests {
     }
 
     #[test]
-    fn source_only_virtiofsd_reports_stable_release_blocker()
+    fn doctor_bundled_virtiofsd_missing_binary_reports_fix()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut fixture = Fixture::healthy()?;
         fixture.context.manifest = DependencyManifest::bundled()?;
@@ -3357,13 +3357,10 @@ mod tests {
         );
         let check = check(&report, DoctorCheckId::Virtiofsd);
         assert_eq!(check.status, DoctorStatus::Fail);
-        assert!(check.reason.contains("no immutable x86_64 binary"));
-        assert!(
-            check
-                .hint
-                .as_deref()
-                .is_some_and(|hint| hint.contains("M0-05c"))
-        );
+        assert!(check.reason.contains("virtiofsd-v1.14.0"));
+        assert!(check.reason.contains("checksum mismatch"));
+        assert_eq!(check.fix.as_deref(), Some("firestone doctor --fix"));
+        assert!(check.hint.is_none());
         Ok(())
     }
 }

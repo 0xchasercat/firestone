@@ -22,8 +22,8 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 | M0-03b | Image reference parsing, catalog merge, architecture selection, resolution | `agent/m0-catalog` | [#5](https://github.com/0xchasercat/firestone/pull/5) | complete | M0-00, M0-03a | Catalog rules from sections 8.1 and 8.2 pass without network |
 | M0-04 | CLI parser, renderers, create/list/show/edit/doctor, dispatcher adapters | `agent/m0-cli` | [#9](https://github.com/0xchasercat/firestone/pull/9) | in review | M0-01, M0-02, M0-03b, M0-05a, M0-05b | M0 no-KVM command acceptance and renderer snapshots pass |
 | M0-05a | Dependency manifest, real pins, download/hash tooling, third-party evidence | `agent/m0-deps` | [#3](https://github.com/0xchasercat/firestone/pull/3) | complete | baseline | Real per-architecture URLs and checksums; verified behavior recorded against exact versions |
-| M0-05b | Host checks, doctor report, unprivileged fixes, deterministic tests | `agent/m0-doctor` | [#8](https://github.com/0xchasercat/firestone/pull/8) | in review | M0-01, M0-02, M0-05a | Section 17.3 checks and safe fixes pass without KVM |
-| M0-05c | Reproducible virtiofsd builds and Firestone-owned release assets | `agent/m0-virtiofsd-pins` | [#7](https://github.com/0xchasercat/firestone/pull/7) + follow-up pending | blocked | M0-05a, public asset hosting | Both musl targets build from pinned inputs; published assets have verified immutable URLs and checksums in `deps.toml` |
+| M0-05b | Host checks, doctor report, unprivileged fixes, deterministic tests | `agent/m0-doctor` | [#8](https://github.com/0xchasercat/firestone/pull/8) | complete | M0-01, M0-02, M0-05a | Section 17.3 checks and safe fixes pass without KVM |
+| M0-05c | Reproducible virtiofsd builds and Firestone-owned release assets | `agent/m0-virtiofsd-pins` | [#7](https://github.com/0xchasercat/firestone/pull/7) + [#10](https://github.com/0xchasercat/firestone/pull/10) | in review | M0-05a | Both musl targets build from pinned inputs; published assets have verified immutable URLs and checksums in `deps.toml` |
 | M0-06 | M0 integration, docs, Linux verification | `agent/m0-integration` | pending | blocked | M0-01 through M0-05c | M0 acceptance is green locally, in CI, and on Linux |
 
 ## Merge order
@@ -58,6 +58,5 @@ The orchestrator reviews each pull request for spec alignment, public contract d
 ## Known risks
 
 - Runtime portions of the SPEC section 20 checks remain open unless the decision log explicitly records exact-version evidence.
-- The Firestone virtiofsd prerelease is attached to a private repository. Authenticated readback succeeds, but unauthenticated asset URLs return 404. M0-05c needs user-approved public asset hosting before `deps.toml` can switch to binary availability and `doctor --fix` can pass M0.
 - The Azure VM has only 29 GB total storage. Image-matrix tests must prune artifacts between runs.
 - aarch64 runtime testing needs a separate native host or CI runner. Cross-compilation alone cannot close M5 acceptance.
