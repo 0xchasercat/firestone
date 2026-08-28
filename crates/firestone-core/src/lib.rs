@@ -14,6 +14,7 @@ pub mod paths;
 pub mod result;
 pub mod spec;
 pub mod state;
+pub mod vmm_api;
 
 pub use action::Action;
 pub use catalog::{
@@ -46,3 +47,4 @@ pub use state::{
     ReconcileReport, ReconcileRewrite, StateImage, StateStore, StateVersion, Supervision,
     VmmPingProbe, observe_liveness, reconcile, reconciled_state, verify_shim_identity,
 };
+pub use vmm_api::{VmInfo, VmState, VmmApi, VmmApiLivenessProbe, VmmPingResponse};
