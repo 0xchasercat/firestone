@@ -3,12 +3,22 @@ use std::{
     ffi::{OsStr, OsString},
     fs::{self, DirBuilder, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
+    os::fd::{AsFd, AsRawFd},
     os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use nix::{
+    errno::Errno,
+    fcntl::{FcntlArg, FdFlag, OFlag, fcntl},
+    poll::{PollFd, PollFlags, PollTimeout, poll},
+    sys::socket::{
+        AddressFamily, SockFlag, SockProtocol, SockType, UnixAddr, connect, getsockopt, socket,
+        sockopt::SocketError,
+    },
+};
 use reqwest::{Url, blocking::Client, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -234,34 +244,44 @@ struct StaleStateReport {
 
 struct HttpVmmPing;
 
-impl VmmPingProbe for HttpVmmPing {
-    fn ping(&self, api_socket: &Path) -> Result<bool, FirestoneError> {
-        let mut stream = match UnixStream::connect(api_socket) {
-            Ok(stream) => stream,
-            Err(source) if vmm_is_unresponsive(source.kind()) => return Ok(false),
-            Err(source) => return Err(vmm_ping_error(api_socket, "connect to", source)),
+impl HttpVmmPing {
+    fn ping_with_timeout(
+        &self,
+        api_socket: &Path,
+        timeout: Duration,
+    ) -> Result<bool, FirestoneError> {
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            FirestoneError::new(ErrorKind::Generic, "VMM ping deadline is out of range")
+                .with_hint("use a finite VMM ping timeout")
+        })?;
+        let Some(mut stream) = connect_vmm_socket(api_socket, deadline)? else {
+            return Ok(false);
         };
-        stream
-            .set_read_timeout(Some(DOCTOR_PROBE_TIMEOUT))
-            .map_err(|source| vmm_ping_error(api_socket, "set read timeout on", source))?;
-        stream
-            .set_write_timeout(Some(DOCTOR_PROBE_TIMEOUT))
-            .map_err(|source| vmm_ping_error(api_socket, "set write timeout on", source))?;
-        if let Err(source) = stream.write_all(
-            b"GET /api/v1/vmm.ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-        ) {
-            if vmm_is_unresponsive(source.kind()) {
-                return Ok(false);
-            }
-            return Err(vmm_ping_error(api_socket, "write to", source));
+        if !write_vmm_ping_request(&mut stream, api_socket, deadline)? {
+            return Ok(false);
         }
 
         let mut response = [0_u8; 1024];
         let mut used = 0;
         while used < response.len() && !response[..used].contains(&b'\n') {
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
             match stream.read(&mut response[used..]) {
                 Ok(0) => break,
                 Ok(read) => used += read,
+                Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+                    if !wait_for_vmm_socket(
+                        &stream,
+                        PollFlags::POLLIN,
+                        deadline,
+                        api_socket,
+                        "wait to read from",
+                    )? {
+                        return Ok(false);
+                    }
+                }
                 Err(source) if vmm_is_unresponsive(source.kind()) => return Ok(false),
                 Err(source) => return Err(vmm_ping_error(api_socket, "read from", source)),
             }
@@ -276,6 +296,161 @@ impl VmmPingProbe for HttpVmmPing {
         let protocol = fields.next();
         let status = fields.next();
         Ok(matches!(protocol, Some("HTTP/1.0" | "HTTP/1.1")) && status == Some("200"))
+    }
+}
+
+impl VmmPingProbe for HttpVmmPing {
+    fn ping(&self, api_socket: &Path) -> Result<bool, FirestoneError> {
+        self.ping_with_timeout(api_socket, DOCTOR_PROBE_TIMEOUT)
+    }
+}
+
+fn connect_vmm_socket(
+    api_socket: &Path,
+    deadline: Instant,
+) -> Result<Option<UnixStream>, FirestoneError> {
+    let address = UnixAddr::new(api_socket)
+        .map_err(|source| vmm_ping_error(api_socket, "address", std::io::Error::from(source)))?;
+
+    loop {
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        let descriptor = socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::empty(),
+            None::<SockProtocol>,
+        )
+        .map_err(|source| {
+            vmm_ping_error(
+                api_socket,
+                "create socket for",
+                std::io::Error::from(source),
+            )
+        })?;
+        fcntl(&descriptor, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).map_err(|source| {
+            vmm_ping_error(
+                api_socket,
+                "set nonblocking mode on",
+                std::io::Error::from(source),
+            )
+        })?;
+        fcntl(&descriptor, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(|source| {
+            vmm_ping_error(
+                api_socket,
+                "set close-on-exec on",
+                std::io::Error::from(source),
+            )
+        })?;
+
+        match connect(descriptor.as_raw_fd(), &address) {
+            Ok(()) => return Ok(Some(UnixStream::from(descriptor))),
+            Err(Errno::EINPROGRESS | Errno::EALREADY) => {
+                let stream = UnixStream::from(descriptor);
+                if !wait_for_vmm_socket(
+                    &stream,
+                    PollFlags::POLLOUT,
+                    deadline,
+                    api_socket,
+                    "wait to connect to",
+                )? {
+                    return Ok(None);
+                }
+                let pending = getsockopt(&stream, SocketError).map_err(|source| {
+                    vmm_ping_error(
+                        api_socket,
+                        "inspect connection to",
+                        std::io::Error::from(source),
+                    )
+                })?;
+                if pending == 0 {
+                    return Ok(Some(stream));
+                }
+                let source = std::io::Error::from_raw_os_error(pending);
+                if vmm_is_unresponsive(source.kind()) {
+                    return Ok(None);
+                }
+                return Err(vmm_ping_error(api_socket, "connect to", source));
+            }
+            Err(Errno::EAGAIN) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Ok(None);
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+            Err(source) => {
+                let source = std::io::Error::from(source);
+                if vmm_is_unresponsive(source.kind()) {
+                    return Ok(None);
+                }
+                return Err(vmm_ping_error(api_socket, "connect to", source));
+            }
+        }
+    }
+}
+
+fn write_vmm_ping_request(
+    stream: &mut UnixStream,
+    api_socket: &Path,
+    deadline: Instant,
+) -> Result<bool, FirestoneError> {
+    const REQUEST: &[u8] =
+        b"GET /api/v1/vmm.ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let mut written = 0;
+    while written < REQUEST.len() {
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        match stream.write(&REQUEST[written..]) {
+            Ok(0) => return Ok(false),
+            Ok(count) => written += count,
+            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+                if !wait_for_vmm_socket(
+                    stream,
+                    PollFlags::POLLOUT,
+                    deadline,
+                    api_socket,
+                    "wait to write to",
+                )? {
+                    return Ok(false);
+                }
+            }
+            Err(source) if vmm_is_unresponsive(source.kind()) => return Ok(false),
+            Err(source) => return Err(vmm_ping_error(api_socket, "write to", source)),
+        }
+    }
+    Ok(true)
+}
+
+fn wait_for_vmm_socket(
+    stream: &UnixStream,
+    events: PollFlags,
+    deadline: Instant,
+    api_socket: &Path,
+    operation: &str,
+) -> Result<bool, FirestoneError> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        let timeout = PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX);
+        let mut descriptors = [PollFd::new(stream.as_fd(), events)];
+        match poll(&mut descriptors, timeout) {
+            Ok(0) => return Ok(false),
+            Ok(_) => return Ok(true),
+            Err(Errno::EINTR) => {}
+            Err(source) => {
+                return Err(vmm_ping_error(
+                    api_socket,
+                    operation,
+                    std::io::Error::from(source),
+                ));
+            }
+        }
     }
 }
 
@@ -1086,18 +1261,27 @@ fn check_data_space(context: &DoctorContext) -> DoctorCheck {
 
 fn check_stale_state(stale_state: &StaleStateReport) -> DoctorCheck {
     if !stale_state.failures.is_empty() {
-        let details = stale_state
+        let failures = stale_state
             .failures
             .iter()
             .map(|failure| format!("{} ({})", failure.machine, failure.reason))
             .collect::<Vec<_>>()
             .join(", ");
-        return DoctorCheck::new(
-            DoctorCheckId::StaleState,
-            DoctorStatus::Fail,
-            format!("could not reconcile machine states: {details}"),
-        )
-        .with_hint("repair the named machine state or lock error and rerun doctor");
+        let observations = stale_state
+            .observations
+            .iter()
+            .map(|observation| format!("{} ({})", observation.machine, observation.reason))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let reason = if observations.is_empty() {
+            format!("could not reconcile machine states: {failures}")
+        } else {
+            format!(
+                "could not reconcile machine states: {failures}; reconciled stale machine states: {observations}"
+            )
+        };
+        return DoctorCheck::new(DoctorCheckId::StaleState, DoctorStatus::Fail, reason)
+            .with_hint("repair the named machine state or lock error and rerun doctor");
     }
     if stale_state.observations.is_empty() {
         return DoctorCheck::new(
@@ -1200,16 +1384,35 @@ fn reconcile_machine_state(
     let api_socket = context.paths.machine_api_socket(name)?;
     let mut events = |_event: crate::Event| Ok(());
     let lock = MachineLock::acquire(name, &lock_path, &mut events)?;
-    let state = state_store.read()?;
-    let observation = observe_liveness(
-        name,
-        &state,
-        &runtime_dir,
-        &api_socket,
-        &context.proc_root,
-        vmm,
-    )?;
-    let reconciliation = reconcile(state.status, observation);
+    let mut state = state_store.read()?;
+    let mut reconciliation = {
+        let observation = observe_liveness(
+            name,
+            &state,
+            &runtime_dir,
+            &api_socket,
+            &context.proc_root,
+            vmm,
+        )?;
+        reconcile(state.status, observation)
+    };
+
+    if reconciliation.rewrite.is_some() {
+        // Once the observed shim is gone, its final atomic state write is complete.
+        // Re-read that state before applying a reconciliation so an older snapshot
+        // cannot overwrite the shim's exit details.
+        state = state_store.read()?;
+        let observation = observe_liveness(
+            name,
+            &state,
+            &runtime_dir,
+            &api_socket,
+            &context.proc_root,
+            vmm,
+        )?;
+        reconciliation = reconcile(state.status, observation);
+    }
+
     let reason = reconciliation
         .rewrite
         .as_ref()
@@ -1453,6 +1656,34 @@ fn generate_ssh_key(context: &DoctorContext) -> Result<(), FirestoneError> {
         .with_hint("install the OpenSSH client package")
     })?;
     let private_key = context.paths.ssh_private_key();
+    let public_key = context.paths.ssh_public_key();
+    let key_dir = private_key.parent().ok_or_else(|| {
+        FirestoneError::new(
+            ErrorKind::Dependency,
+            format!(
+                "Firestone SSH key path {} has no parent",
+                private_key.display()
+            ),
+        )
+        .with_hint("choose a Firestone data directory with a key parent directory")
+    })?;
+    let temporary = TempBuilder::new()
+        .prefix(".ssh-key.")
+        .tempdir_in(key_dir)
+        .map_err(|source| {
+            FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "cannot create temporary SSH key directory in {}",
+                    key_dir.display()
+                ),
+            )
+            .with_hint("check directory permissions and retry 'firestone doctor --fix'")
+            .with_source(source)
+        })?;
+    let temporary_private = temporary.path().join("id_ed25519");
+    let temporary_public = temporary.path().join("id_ed25519.pub");
+
     Cmd::new(keygen)
         .args([OsStr::new("-t"), OsStr::new("ed25519"), OsStr::new("-N")])
         .secret_arg(OsString::new())
@@ -1460,31 +1691,111 @@ fn generate_ssh_key(context: &DoctorContext) -> Result<(), FirestoneError> {
             OsStr::new("-C"),
             OsStr::new(&format!("firestone@{}", context.hostname)),
             OsStr::new("-f"),
-            private_key.as_os_str(),
+            temporary_private.as_os_str(),
         ])
         .stdin_null()
         .timeout(Duration::from_secs(30))
         .error_kind(ErrorKind::Dependency)
         .run()?;
-    fs::set_permissions(&private_key, fs::Permissions::from_mode(0o600)).map_err(|source| {
+
+    for (kind, path) in [
+        ("private", temporary_private.as_path()),
+        ("public", temporary_public.as_path()),
+    ] {
+        let metadata = fs::symlink_metadata(path).map_err(|source| {
+            FirestoneError::new(
+                ErrorKind::Dependency,
+                format!("generated SSH {kind} key {} is unavailable", path.display()),
+            )
+            .with_source(source)
+        })?;
+        if !metadata.is_file() {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "generated SSH {kind} key {} is not a regular file",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    fs::set_permissions(&temporary_private, fs::Permissions::from_mode(0o600)).map_err(
+        |source| {
+            FirestoneError::new(
+                ErrorKind::Dependency,
+                format!("cannot set mode 0600 on {}", temporary_private.display()),
+            )
+            .with_source(source)
+        },
+    )?;
+
+    fs::hard_link(&temporary_private, &private_key).map_err(|source| {
         FirestoneError::new(
             ErrorKind::Dependency,
-            format!("cannot set mode 0600 on {}", private_key.display()),
+            format!(
+                "cannot install Firestone SSH private key at {}",
+                private_key.display()
+            ),
         )
+        .with_hint("move any existing key pair aside and retry 'firestone doctor --fix'")
         .with_source(source)
     })?;
+    if let Err(source) = fs::hard_link(&temporary_public, &public_key) {
+        let cleanup = remove_generated_key(&private_key).err();
+        let mut error = FirestoneError::new(
+            ErrorKind::Dependency,
+            format!(
+                "cannot install Firestone SSH public key at {}",
+                public_key.display()
+            ),
+        )
+        .with_source(source);
+        if let Some(cleanup) = cleanup {
+            error = error.with_hint(format!(
+                "remove partial private key {}; cleanup failed: {}",
+                private_key.display(),
+                bounded_detail(&cleanup.to_string())
+            ));
+        }
+        return Err(error);
+    }
 
     let check = check_ssh_key(context);
     if check.status == DoctorStatus::Ok {
-        Ok(())
-    } else {
-        Err(FirestoneError::new(
-            ErrorKind::Dependency,
-            format!(
-                "generated Firestone SSH key failed readback: {}",
-                check.reason
-            ),
-        ))
+        return Ok(());
+    }
+
+    let mut cleanup_failures = Vec::new();
+    for path in [&public_key, &private_key] {
+        if let Err(source) = remove_generated_key(path) {
+            cleanup_failures.push(format!(
+                "{}: {}",
+                path.display(),
+                bounded_detail(&source.to_string())
+            ));
+        }
+    }
+    let mut error = FirestoneError::new(
+        ErrorKind::Dependency,
+        format!(
+            "generated Firestone SSH key failed readback: {}",
+            check.reason
+        ),
+    );
+    if !cleanup_failures.is_empty() {
+        error = error.with_hint(format!(
+            "remove the partial key pair; cleanup failed for {}",
+            cleanup_failures.join(", ")
+        ));
+    }
+    Err(error)
+}
+
+fn remove_generated_key(path: &Path) -> Result<(), std::io::Error> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(source),
     }
 }
 
@@ -1694,9 +2005,13 @@ fn parse_passt_version(output: &str) -> Option<PasstVersion> {
         if components.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
             return None;
         }
+        let date = year
+            .checked_mul(10_000)?
+            .checked_add(month.checked_mul(100)?)?
+            .checked_add(day)?;
         Some(PasstVersion {
             raw: trimmed.to_owned(),
-            date: year * 10_000 + month * 100 + day,
+            date,
         })
     })
 }
@@ -1834,7 +2149,7 @@ fn sync_directory(path: &Path) -> Result<(), FirestoneError> {
 #[cfg(test)]
 mod tests {
     use std::{
-        cell::RefCell,
+        cell::{Cell, RefCell},
         collections::BTreeMap,
         ffi::OsString,
         fs,
@@ -1845,6 +2160,7 @@ mod tests {
         },
         path::{Path, PathBuf},
         thread,
+        time::{Duration, Instant},
     };
 
     use sha2::{Digest, Sha256};
@@ -1855,12 +2171,13 @@ mod tests {
         DoctorStatus, HttpVmmPing, MAX_DEPENDENCY_ARTIFACT_BYTES, MINIMUM_PASST_DATE, Package,
         artifact_state, check_kvm, check_passt, check_user_namespaces,
         content_length_exceeds_limit, copy_bounded, create_firestone_dir, distro_family,
-        firestone_error_reason, install_artifact, install_command, parse_passt_version,
-        redirect_rejection, require_https, run_doctor_with,
+        firestone_error_reason, generate_ssh_key, install_artifact, install_command,
+        parse_passt_version, reconcile_machine_state, redirect_rejection, require_https,
+        run_doctor_with,
     };
     use crate::{
-        DependencyArtifact, DependencyManifest, ErrorKind, FirestoneError, PathInputs, Paths,
-        VmmPingProbe,
+        DependencyArtifact, DependencyManifest, ErrorKind, ExitReason, FirestoneError, LastExit,
+        MachineState, MachineStatus, PathInputs, Paths, StateStore, VmmPingProbe,
     };
 
     struct FakeFetcher {
@@ -1907,6 +2224,21 @@ mod tests {
                 ));
             }
             Ok(())
+        }
+    }
+
+    struct FinalStateDuringPing {
+        store: StateStore,
+        state: MachineState,
+        wrote: Cell<bool>,
+    }
+
+    impl VmmPingProbe for FinalStateDuringPing {
+        fn ping(&self, _api_socket: &Path) -> Result<bool, FirestoneError> {
+            if !self.wrote.replace(true) {
+                self.store.write_from_shim(&self.state)?;
+            }
+            Ok(false)
         }
     }
 
@@ -2328,6 +2660,47 @@ mod tests {
         assert!(!probe_vmm_status("204")?);
         Ok(())
     }
+
+    #[test]
+    fn vmm_ping_probe_uses_one_absolute_deadline() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = TempDir::new()?;
+        let socket = directory.path().join("api.sock");
+        let listener = UnixListener::bind(&socket)?;
+        let server = thread::spawn(move || -> Result<(), std::io::Error> {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = [0_u8; 256];
+            let mut used = 0;
+            while used < request.len()
+                && !request[..used]
+                    .windows(4)
+                    .any(|window| window == b"\r\n\r\n")
+            {
+                let read = stream.read(&mut request[used..])?;
+                if read == 0 {
+                    return Ok(());
+                }
+                used += read;
+            }
+            for byte in b"HTTP/1.1 200 Slow\r\n" {
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            Ok(())
+        });
+
+        let started = Instant::now();
+        let pinged = HttpVmmPing.ping_with_timeout(&socket, Duration::from_millis(80))?;
+        let elapsed = started.elapsed();
+        server
+            .join()
+            .map_err(|_| std::io::Error::other("VMM slow-ping fixture panicked"))??;
+
+        assert!(!pinged);
+        assert!(elapsed < Duration::from_millis(250));
+        Ok(())
+    }
     #[test]
     fn report_serialization_preserves_stable_ids_and_order()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2538,6 +2911,7 @@ mod tests {
             .ok_or_else(|| std::io::Error::other("old version should parse"))?;
         assert_eq!(minimum.date, MINIMUM_PASST_DATE);
         assert!(old.date < MINIMUM_PASST_DATE);
+        assert!(parse_passt_version("passt 4294967295_12_31.abcdef0").is_none());
 
         let fixture = Fixture::healthy()?;
         let passt = PathBuf::from(&fixture.context.search_path).join("passt");
@@ -2747,6 +3121,37 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_rereads_after_shim_final_state_write()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::healthy()?;
+        let name = "race";
+        write_running_state(&fixture.context.paths, name)?;
+        fs::create_dir(fixture.context.paths.machine_runtime_dir(name)?)?;
+        let store = StateStore::new(fixture.context.paths.machine_state(name)?);
+        let mut final_state = store.read()?;
+        final_state.status = MachineStatus::Stopped;
+        final_state.started_at = None;
+        final_state.last_exit = Some(LastExit {
+            at: "2026-08-28T00:00:01Z".to_owned(),
+            code: Some(17),
+            signal: None,
+            reason: ExitReason::Failure("vmm exited".to_owned()),
+        });
+        let expected = final_state.clone();
+        let ping = FinalStateDuringPing {
+            store: store.clone(),
+            state: final_state,
+            wrote: Cell::new(false),
+        };
+
+        let observation = reconcile_machine_state(&fixture.context, name, &ping)?;
+
+        assert!(observation.is_none());
+        assert_eq!(store.read()?, expected);
+        Ok(())
+    }
+
+    #[test]
     fn stale_machine_failure_does_not_abort_later_reconciliation()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::healthy()?;
@@ -2763,6 +3168,7 @@ mod tests {
         let stale = check(&report, DoctorCheckId::StaleState);
         assert_eq!(stale.status, DoctorStatus::Fail);
         assert!(stale.reason.contains("alpha"));
+        assert!(stale.reason.contains("zeta (host reboot)"));
         let zeta: serde_json::Value =
             serde_json::from_slice(&fs::read(fixture.context.paths.machine_state("zeta")?)?)?;
         assert_eq!(zeta["status"], "stopped");
@@ -2805,6 +3211,39 @@ mod tests {
         );
         assert_eq!(fs::read(fixture.context.paths.ssh_private_key())?, original);
         assert!(!fixture.context.paths.ssh_public_key().exists());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_ssh_key_generation_rolls_back_and_can_retry() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let fixture = Fixture::healthy()?;
+        let private_key = fixture.context.paths.ssh_private_key();
+        let public_key = fixture.context.paths.ssh_public_key();
+        fs::remove_file(&private_key)?;
+        fs::remove_file(&public_key)?;
+        let keygen = PathBuf::from(&fixture.context.search_path).join("ssh-keygen");
+        write_executable(
+            &keygen,
+            r#"key=''; while [ "$#" -gt 0 ]; do if [ "$1" = '-f' ]; then shift; key=$1; fi; shift; done; printf private > "$key"; exit 23"#,
+        )?;
+
+        assert!(generate_ssh_key(&fixture.context).is_err());
+        assert!(!private_key.exists());
+        assert!(!public_key.exists());
+
+        write_executable(
+            &keygen,
+            r#"key=''; while [ "$#" -gt 0 ]; do if [ "$1" = '-f' ]; then shift; key=$1; fi; shift; done; [ -n "$key" ] || exit 2; umask 077; printf private > "$key"; printf public > "$key.pub""#,
+        )?;
+        generate_ssh_key(&fixture.context)?;
+
+        assert!(private_key.is_file());
+        assert!(public_key.is_file());
+        assert_eq!(
+            fs::metadata(private_key)?.permissions().mode() & 0o777,
+            0o600
+        );
         Ok(())
     }
 

@@ -3,11 +3,18 @@ use std::{
     ffi::OsString,
     fs::{File, OpenOptions},
     io::{Read, Write},
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
-    time::Duration,
+    thread::JoinHandle,
+    time::{Duration, Instant},
 };
 
+use nix::{
+    errno::Errno,
+    sys::signal::{Signal, killpg},
+    unistd::Pid,
+};
 use wait_timeout::ChildExt;
 
 use crate::{ErrorKind, FirestoneError};
@@ -257,6 +264,8 @@ impl Cmd {
         let mut command = Command::new(&self.program);
         command.args(self.args.iter().map(|arg| &arg.value));
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        command.process_group(0);
+        let deadline = self.timeout.map(|timeout| Instant::now() + timeout);
 
         if let Some(cwd) = &self.cwd {
             command.current_dir(cwd);
@@ -285,9 +294,9 @@ impl Cmd {
             )
             .with_source(source)
         })?;
-
+        let process_group = child.id();
         let Some(stdout) = child.stdout.take() else {
-            let _ = child.kill();
+            let _ = kill_process_group(process_group);
             let _ = child.wait();
             return Err(FirestoneError::new(
                 self.error_kind,
@@ -298,7 +307,7 @@ impl Cmd {
             ));
         };
         let Some(stderr) = child.stderr.take() else {
-            let _ = child.kill();
+            let _ = kill_process_group(process_group);
             let _ = child.wait();
             return Err(FirestoneError::new(
                 self.error_kind,
@@ -313,7 +322,7 @@ impl Cmd {
             Some(path) => match open_log(path, self.error_kind) {
                 Ok(file) => Some(file),
                 Err(error) => {
-                    let _ = child.kill();
+                    let _ = kill_process_group(process_group);
                     let _ = child.wait();
                     return Err(error);
                 }
@@ -328,7 +337,7 @@ impl Cmd {
 
         let stdin_writer = if let CmdStdin::Bytes(bytes) = &self.stdin {
             let Some(mut stdin) = child.stdin.take() else {
-                let _ = child.kill();
+                let _ = kill_process_group(process_group);
                 let _ = child.wait();
                 return Err(FirestoneError::new(
                     self.error_kind,
@@ -344,24 +353,30 @@ impl Cmd {
             None
         };
 
-        let (status_result, timed_out) = match self.timeout {
-            Some(timeout) => match child.wait_timeout(timeout) {
-                Ok(Some(status)) => (Ok(status), false),
-                Ok(None) => {
-                    let kill_result = child.kill();
-                    let wait_result = child.wait();
-                    match (kill_result, wait_result) {
-                        (_, Ok(status)) => (Ok(status), true),
-                        (Err(source), _) | (_, Err(source)) => (Err(source), true),
+        let mut timed_out = false;
+        let status_result = match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match child.wait_timeout(remaining) {
+                    Ok(Some(status)) => Ok(status),
+                    Ok(None) => {
+                        timed_out = true;
+                        let kill_result = kill_process_group(process_group);
+                        let wait_result = child.wait();
+                        match (kill_result, wait_result) {
+                            (_, Ok(status)) => Ok(status),
+                            (Err(source), _) | (_, Err(source)) => Err(source),
+                        }
                     }
+                    Err(source) => Err(source),
                 }
-                Err(source) => (Err(source), false),
-            },
-            None => (child.wait(), false),
+            }
+            None => child.wait(),
         };
         if let Some(writer) = stdin_writer {
-            match writer.join() {
+            match join_before_deadline(writer, deadline, process_group, &mut timed_out) {
                 Ok(Ok(())) => {}
+                Ok(Err(_)) if timed_out => {}
                 Ok(Err(source)) => {
                     return Err(FirestoneError::new(
                         self.error_kind,
@@ -384,8 +399,24 @@ impl Cmd {
             }
         }
 
-        let stdout = join_capture(stdout_reader, &self.program, "stdout", self.error_kind)?;
-        let stderr = join_capture(stderr_reader, &self.program, "stderr", self.error_kind)?;
+        let stdout = join_capture(
+            stdout_reader,
+            &self.program,
+            "stdout",
+            self.error_kind,
+            deadline,
+            process_group,
+            &mut timed_out,
+        )?;
+        let stderr = join_capture(
+            stderr_reader,
+            &self.program,
+            "stderr",
+            self.error_kind,
+            deadline,
+            process_group,
+            &mut timed_out,
+        )?;
         let status = status_result.map_err(|source| {
             FirestoneError::new(
                 self.error_kind,
@@ -410,7 +441,8 @@ impl Cmd {
                     self.program.to_string_lossy(),
                     self.timeout.map_or(0, |timeout| timeout.as_millis())
                 ),
-            ));
+            )
+            .with_hint("retry after increasing the command timeout"));
         }
 
         Ok(CmdOutput {
@@ -430,6 +462,148 @@ impl Cmd {
             Ok(output)
         } else {
             Err(output.failure(self.error_kind))
+        }
+    }
+    /// Runs a terminal-facing process with inherited stdout and stderr.
+    ///
+    /// This is for editors and other interactive tools whose terminal protocol
+    /// cannot be captured. Stdin follows the configured null/inherit setting;
+    /// byte-buffered stdin and stderr log capture are rejected.
+    pub fn run_interactive(&self) -> Result<(), FirestoneError> {
+        if matches!(self.stdin, CmdStdin::Bytes(_)) {
+            return Err(FirestoneError::new(
+                ErrorKind::Generic,
+                "interactive commands cannot use buffered stdin",
+            )
+            .with_hint("use stdin_inherit for an interactive command"));
+        }
+        if self.stderr_log.is_some() {
+            return Err(FirestoneError::new(
+                ErrorKind::Generic,
+                "interactive commands cannot capture a stderr log",
+            )
+            .with_hint("remove stderr_log or use output/run instead"));
+        }
+
+        let logged_argv = std::iter::once(self.program.as_os_str())
+            .chain(self.args.iter().map(|arg| arg.logged.as_os_str()))
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let env_keys = self
+            .env
+            .keys()
+            .map(|key| key.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        tracing::debug!(
+            argv = ?logged_argv,
+            cwd = ?self.cwd,
+            env_clear = self.clear_env,
+            env_keys = ?env_keys,
+            "starting interactive external process"
+        );
+
+        let mut command = Command::new(&self.program);
+        command.args(self.args.iter().map(|arg| &arg.value));
+        command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        match self.stdin {
+            CmdStdin::Null => {
+                command.stdin(Stdio::null());
+            }
+            CmdStdin::Inherit => {
+                command.stdin(Stdio::inherit());
+            }
+            CmdStdin::Bytes(_) => unreachable!("buffered stdin was rejected"),
+        }
+        if let Some(cwd) = &self.cwd {
+            command.current_dir(cwd);
+        }
+        if self.clear_env {
+            command.env_clear();
+        }
+        command.envs(&self.env);
+
+        let mut child = command.spawn().map_err(|source| {
+            FirestoneError::new(
+                self.error_kind,
+                format!("cannot start command `{}`", self.program.to_string_lossy()),
+            )
+            .with_hint("check that the program exists and is executable")
+            .with_source(source)
+        })?;
+        let (status, timed_out) = match self.timeout {
+            Some(timeout) => match child.wait_timeout(timeout) {
+                Ok(Some(status)) => (status, false),
+                Ok(None) => {
+                    child.kill().map_err(|source| {
+                        FirestoneError::new(
+                            self.error_kind,
+                            format!(
+                                "cannot stop timed-out command `{}`",
+                                self.program.to_string_lossy()
+                            ),
+                        )
+                        .with_source(source)
+                    })?;
+                    let status = child.wait().map_err(|source| {
+                        FirestoneError::new(
+                            self.error_kind,
+                            format!(
+                                "cannot wait for timed-out command `{}`",
+                                self.program.to_string_lossy()
+                            ),
+                        )
+                        .with_source(source)
+                    })?;
+                    (status, true)
+                }
+                Err(source) => {
+                    return Err(FirestoneError::new(
+                        self.error_kind,
+                        format!(
+                            "cannot wait for command `{}`",
+                            self.program.to_string_lossy()
+                        ),
+                    )
+                    .with_source(source));
+                }
+            },
+            None => (
+                child.wait().map_err(|source| {
+                    FirestoneError::new(
+                        self.error_kind,
+                        format!(
+                            "cannot wait for command `{}`",
+                            self.program.to_string_lossy()
+                        ),
+                    )
+                    .with_source(source)
+                })?,
+                false,
+            ),
+        };
+        if timed_out {
+            return Err(FirestoneError::new(
+                ErrorKind::Timeout,
+                format!(
+                    "command `{}` timed out after {} ms",
+                    self.program.to_string_lossy(),
+                    self.timeout.map_or(0, |timeout| timeout.as_millis())
+                ),
+            )
+            .with_hint("retry after increasing the command timeout"));
+        }
+        if status.success() {
+            Ok(())
+        } else {
+            Err(CmdOutput {
+                program: self.program.clone(),
+                status,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+            }
+            .failure(self.error_kind))
         }
     }
 }
@@ -498,12 +672,15 @@ fn capture_stream(
 }
 
 fn join_capture(
-    reader: std::thread::JoinHandle<Result<Captured, std::io::Error>>,
+    reader: JoinHandle<Result<Captured, std::io::Error>>,
     program: &std::ffi::OsStr,
     stream: &str,
     kind: ErrorKind,
+    deadline: Option<Instant>,
+    process_group: u32,
+    timed_out: &mut bool,
 ) -> Result<Captured, FirestoneError> {
-    match reader.join() {
+    match join_before_deadline(reader, deadline, process_group, timed_out) {
         Ok(Ok(captured)) => Ok(captured),
         Ok(Err(source)) => Err(FirestoneError::new(
             kind,
@@ -520,6 +697,36 @@ fn join_capture(
                 program.to_string_lossy()
             ),
         )),
+    }
+}
+
+fn join_before_deadline<T>(
+    worker: JoinHandle<T>,
+    deadline: Option<Instant>,
+    process_group: u32,
+    timed_out: &mut bool,
+) -> std::thread::Result<T> {
+    if let Some(deadline) = deadline {
+        while !worker.is_finished() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                *timed_out = true;
+                let _ = kill_process_group(process_group);
+                break;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        }
+    }
+    worker.join()
+}
+
+fn kill_process_group(process_group: u32) -> Result<(), std::io::Error> {
+    let process_group = i32::try_from(process_group)
+        .map(Pid::from_raw)
+        .map_err(|_| std::io::Error::other("process id does not fit pid_t"))?;
+    match killpg(process_group, Signal::SIGKILL) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(error) => Err(std::io::Error::from_raw_os_error(error as i32)),
     }
 }
 
@@ -664,5 +871,71 @@ mod tests {
         assert!(error.message().contains("timed out after 100 ms"));
         assert!(started.elapsed() < Duration::from_secs(2));
         Ok(())
+    }
+
+    #[test]
+    fn output_timeout_kills_pipe_inheriting_descendants() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = TempDir::new()?;
+        let script = executable(&dir, "fork", "(sleep 10) & exit 0")?;
+        let started = Instant::now();
+
+        let error = match Cmd::new(script)
+            .timeout(Duration::from_millis(100))
+            .output()
+        {
+            Err(error) => error,
+            Ok(_) => return Err(std::io::Error::other("capture should time out").into()),
+        };
+
+        assert_eq!(error.kind(), crate::ErrorKind::Timeout);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        Ok(())
+    }
+
+    #[test]
+    fn interactive_run_executes_with_arguments() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let script = executable(&dir, "interactive", r#"printf done > "$1""#)?;
+        let marker = dir.path().join("marker");
+
+        Cmd::new(script)
+            .arg(marker.as_os_str())
+            .stdin_inherit()
+            .run_interactive()?;
+
+        assert_eq!(fs::read_to_string(marker)?, "done");
+        Ok(())
+    }
+
+    #[test]
+    fn interactive_run_nonzero_reports_program_and_status() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = TempDir::new()?;
+        let script = executable(&dir, "interactive-failure", "exit 19")?;
+
+        let error = match Cmd::new(&script).run_interactive() {
+            Err(error) => error,
+            Ok(()) => return Err(std::io::Error::other("command should fail").into()),
+        };
+
+        assert!(error.message().contains(&script.display().to_string()));
+        assert!(error.message().contains("status 19"));
+        Ok(())
+    }
+
+    #[test]
+    fn interactive_run_rejects_buffered_stdin() {
+        let error = Cmd::new("unused")
+            .stdin_bytes(b"secret".to_vec())
+            .run_interactive()
+            .err();
+
+        assert!(error.is_some());
+        assert!(
+            error
+                .and_then(|error| error.hint().map(str::to_owned))
+                .is_some()
+        );
     }
 }

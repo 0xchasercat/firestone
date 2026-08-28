@@ -12,7 +12,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 fs2 = "0.4"
-nix = { version = "0.30", features = ["fs", "user"] }
+nix = { version = "0.30", features = ["fs", "poll", "process", "signal", "socket", "user"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
