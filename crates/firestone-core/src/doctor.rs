@@ -2532,7 +2532,10 @@ mod tests {
 
     fn write_running_state(paths: &Paths, name: &str) -> Result<(), Box<dyn std::error::Error>> {
         fs::create_dir_all(paths.machines_dir())?;
-        fs::create_dir(paths.machine_dir(name)?)?;
+        fs::set_permissions(paths.machines_dir(), fs::Permissions::from_mode(0o700))?;
+        let machine_dir = paths.machine_dir(name)?;
+        fs::create_dir(&machine_dir)?;
+        fs::set_permissions(&machine_dir, fs::Permissions::from_mode(0o700))?;
         let state = serde_json::json!({
             "version": 1,
             "status": "running",
