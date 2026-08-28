@@ -101,11 +101,17 @@ class Harness:
     def _binary_path(self) -> Path:
         configured = os.environ.get("FIRESTONE_BIN")
         if configured:
-            binary = Path(configured).expanduser()
-            if not binary.is_absolute():
-                binary = (Path.cwd() / binary).resolve()
-            require(binary.is_file(), f"FIRESTONE_BIN is not a file: {binary}")
-            require(os.access(binary, os.X_OK), f"FIRESTONE_BIN is not executable: {binary}")
+            source = Path(configured).expanduser()
+            if not source.is_absolute():
+                source = (Path.cwd() / source).resolve()
+            require(source.is_file(), f"FIRESTONE_BIN is not a file: {source}")
+            require(os.access(source, os.X_OK), f"FIRESTONE_BIN is not executable: {source}")
+            directory = self.home / "harness-bin"
+            directory.mkdir(mode=0o700)
+            binary = directory / "firestone"
+            shutil.copy2(source, binary)
+            os.chmod(binary, 0o755)
+            require(sha256(binary) == sha256(source), "staged FIRESTONE_BIN changed bytes")
             return binary
         return REPO_ROOT / "target" / "debug" / "firestone"
 
@@ -476,34 +482,39 @@ class ConsoleSession:
         require(len(self.buffer) <= MAX_CONSOLE_BYTES, "console session exceeded 8 MiB")
         return True
 
-    def _wait_for(self, marker: bytes, timeout: float) -> bytes:
+    def _pop_line_marker(self, marker: bytes) -> bytes | None:
+        match = re.search(re.escape(marker) + rb"\r*\n", self.buffer)
+        if match is None:
+            return None
+        before = bytes(self.buffer[: match.start()])
+        self.buffer = self.buffer[match.end() :]
+        return before
+
+    def _wait_for_line(self, marker: bytes, timeout: float) -> bytes:
         deadline = time.monotonic() + timeout
-        while marker not in self.buffer:
+        while True:
+            before = self._pop_line_marker(marker)
+            if before is not None:
+                return before
             if time.monotonic() >= deadline:
                 raise AcceptanceError(
                     f"console did not return marker {marker.decode('ascii', errors='replace')!r}"
                 )
             self._receive()
-        before, _, after = bytes(self.buffer).partition(marker)
-        self.buffer = bytearray(after)
-        return before
 
     def wait_for_shell(self, timeout: int = BOOT_TIMEOUT_SECONDS) -> None:
         token = f"__FIRESTONE_READY_{uuid.uuid4().hex}__".encode("ascii")
-        marker = b"\r\n" + token + b"\r\n"
-        command = b"\x03\nprintf '" + token + b"\\n'\n"
+        command = b"printf '" + token + b"\\n'\n"
         deadline = time.monotonic() + timeout
         next_probe = 0.0
-        while marker not in self.buffer:
+        while self._pop_line_marker(token) is None:
             now = time.monotonic()
             if now >= deadline:
                 raise AcceptanceError("guest console did not reach the root autologin shell")
-            if now >= next_probe:
+            if b"automatic login" in self.buffer and now >= next_probe:
                 self._sendall(command)
                 next_probe = now + 2.0
             self._receive()
-        _, _, after = bytes(self.buffer).partition(marker)
-        self.buffer = bytearray(after)
         self._sendall(b"\nstty -echo\n")
 
     def run(self, command: str, timeout: int) -> tuple[int, str]:
@@ -521,9 +532,9 @@ class ConsoleSession:
             + b"%s__\\n' \"$rc\"\n"
         )
         self._sendall(wrapper)
-        self._wait_for(begin + b"\r\n", 10)
+        self._wait_for_line(begin, 10)
         deadline = time.monotonic() + timeout
-        end_pattern = re.compile(re.escape(end_prefix) + rb"([0-9]+)__\r?\n")
+        end_pattern = re.compile(re.escape(end_prefix) + rb"([0-9]+)__\r*\n")
         while True:
             match = end_pattern.search(self.buffer)
             if match is not None:
@@ -673,6 +684,7 @@ def run_acceptance(harness: Harness) -> None:
         "architecture": platform.machine(),
         "kvm_read_write": True,
         "qemu_img": harness.run(["qemu-img", "--version"]).stdout.splitlines()[0],
+        "firestone_sha256": sha256(harness.binary),
     }
 
     if "FIRESTONE_BIN" not in os.environ:
