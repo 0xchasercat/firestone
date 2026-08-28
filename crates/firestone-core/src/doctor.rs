@@ -4,6 +4,7 @@ use std::{
     fs::{self, DirBuilder, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+    os::unix::net::UnixStream,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -13,7 +14,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::Builder as TempBuilder;
 
-use crate::{Cmd, DependencyArtifact, DependencyManifest, ErrorKind, FirestoneError};
+use crate::{
+    Cmd, DependencyArtifact, DependencyManifest, ErrorKind, FirestoneError, MachineLock, Paths,
+    ReconcileRewrite, StateStore, VmmPingProbe, observe_liveness, reconcile,
+};
 
 const MINIMUM_FREE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MAX_DEPENDENCY_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
@@ -118,41 +122,26 @@ impl DoctorReport {
     }
 }
 
-/// Explains how the caller selected the runtime directory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeDirKind {
-    Configured,
-    TmpFallback,
-}
-
-/// A stale state that the caller already reconciled before running doctor.
+/// A stale state reconciled while running doctor.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StaleStateObservation {
-    pub machine: String,
-    pub reason: String,
+struct StaleStateObservation {
+    machine: String,
+    reason: String,
 }
 
-/// A machine state that the caller could not reconcile.
+/// A machine state that doctor could not reconcile.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StaleStateFailure {
-    pub machine: String,
-    pub reason: String,
+struct StaleStateFailure {
+    machine: String,
+    reason: String,
 }
 
-/// Paths and host facts supplied by the CLI's resolved `Paths` and state layer.
-///
-/// Doctor never derives a Firestone path. Tests can point every field at an
-/// isolated fixture without changing process-global environment variables.
+/// Resolved Firestone paths and injectable host facts used by doctor.
 #[derive(Debug, Clone)]
 pub struct DoctorContext {
+    pub paths: Paths,
     pub operating_system: String,
     pub architecture: String,
-    pub data_dir: PathBuf,
-    pub bin_dir: PathBuf,
-    pub runtime_dir: PathBuf,
-    pub runtime_dir_kind: RuntimeDirKind,
-    pub ssh_private_key: PathBuf,
-    pub ssh_public_key: PathBuf,
     pub kvm_device: PathBuf,
     pub nested_parameters: Vec<PathBuf>,
     pub user_namespace_sysctl: PathBuf,
@@ -161,12 +150,41 @@ pub struct DoctorContext {
     pub search_path: OsString,
     pub hostname: String,
     pub manifest: DependencyManifest,
-    pub stale_states: Vec<StaleStateObservation>,
-    pub stale_state_failures: Vec<StaleStateFailure>,
+    pub proc_root: PathBuf,
+    pub reconciled_at: String,
     pub minimum_data_free_bytes: u64,
 }
 
 impl DoctorContext {
+    /// Builds production host facts from the process-wide resolved paths.
+    #[must_use]
+    pub fn from_paths(
+        paths: Paths,
+        manifest: DependencyManifest,
+        hostname: impl Into<String>,
+        reconciled_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            paths,
+            operating_system: std::env::consts::OS.to_owned(),
+            architecture: std::env::consts::ARCH.to_owned(),
+            kvm_device: PathBuf::from("/dev/kvm"),
+            nested_parameters: vec![
+                PathBuf::from("/sys/module/kvm_intel/parameters/nested"),
+                PathBuf::from("/sys/module/kvm_amd/parameters/nested"),
+            ],
+            user_namespace_sysctl: PathBuf::from("/proc/sys/user/max_user_namespaces"),
+            os_release: PathBuf::from("/etc/os-release"),
+            group_file: PathBuf::from("/etc/group"),
+            search_path: std::env::var_os("PATH").unwrap_or_default(),
+            hostname: hostname.into(),
+            manifest,
+            proc_root: PathBuf::from("/proc"),
+            reconciled_at: reconciled_at.into(),
+            minimum_data_free_bytes: MINIMUM_FREE_BYTES,
+        }
+    }
+
     /// The product threshold from SPEC 17.3, exposed for explicit contexts.
     #[must_use]
     pub const fn default_minimum_data_free_bytes() -> u64 {
@@ -178,7 +196,8 @@ impl DoctorContext {
 /// SPEC 17.3. Every successful fix is checked again before the report is built.
 pub fn run_doctor(context: &DoctorContext, fix: bool) -> Result<DoctorReport, FirestoneError> {
     if !fix {
-        return Ok(inspect(context, &BTreeMap::new()));
+        let stale_state = reconcile_machine_states(context, &HttpVmmPing);
+        return Ok(inspect(context, &BTreeMap::new(), &stale_state));
     }
 
     match HttpsDownloader::new() {
@@ -203,9 +222,85 @@ fn run_doctor_with(
     } else {
         BTreeMap::new()
     };
-    inspect(context, &failures)
+    let stale_state = reconcile_machine_states(context, &HttpVmmPing);
+    inspect(context, &failures, &stale_state)
 }
 
+#[derive(Debug, Default)]
+struct StaleStateReport {
+    observations: Vec<StaleStateObservation>,
+    failures: Vec<StaleStateFailure>,
+}
+
+struct HttpVmmPing;
+
+impl VmmPingProbe for HttpVmmPing {
+    fn ping(&self, api_socket: &Path) -> Result<bool, FirestoneError> {
+        let mut stream = match UnixStream::connect(api_socket) {
+            Ok(stream) => stream,
+            Err(source) if vmm_is_unresponsive(source.kind()) => return Ok(false),
+            Err(source) => return Err(vmm_ping_error(api_socket, "connect to", source)),
+        };
+        stream
+            .set_read_timeout(Some(DOCTOR_PROBE_TIMEOUT))
+            .map_err(|source| vmm_ping_error(api_socket, "set read timeout on", source))?;
+        stream
+            .set_write_timeout(Some(DOCTOR_PROBE_TIMEOUT))
+            .map_err(|source| vmm_ping_error(api_socket, "set write timeout on", source))?;
+        if let Err(source) = stream.write_all(
+            b"GET /api/v1/vmm.ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        ) {
+            if vmm_is_unresponsive(source.kind()) {
+                return Ok(false);
+            }
+            return Err(vmm_ping_error(api_socket, "write to", source));
+        }
+
+        let mut response = [0_u8; 1024];
+        let mut used = 0;
+        while used < response.len() && !response[..used].contains(&b'\n') {
+            match stream.read(&mut response[used..]) {
+                Ok(0) => break,
+                Ok(read) => used += read,
+                Err(source) if vmm_is_unresponsive(source.kind()) => return Ok(false),
+                Err(source) => return Err(vmm_ping_error(api_socket, "read from", source)),
+            }
+        }
+        let Some(line_end) = response[..used].iter().position(|byte| *byte == b'\n') else {
+            return Ok(false);
+        };
+        let Some(line) = std::str::from_utf8(&response[..line_end]).ok() else {
+            return Ok(false);
+        };
+        let mut fields = line.split_ascii_whitespace();
+        let protocol = fields.next();
+        let status = fields.next();
+        Ok(matches!(protocol, Some("HTTP/1.0" | "HTTP/1.1")) && status == Some("200"))
+    }
+}
+
+fn vmm_is_unresponsive(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+fn vmm_ping_error(api_socket: &Path, operation: &str, source: std::io::Error) -> FirestoneError {
+    FirestoneError::new(
+        ErrorKind::Generic,
+        format!("cannot {operation} VMM API socket {}", api_socket.display()),
+    )
+    .with_hint("check the machine runtime directory and VMM process")
+    .with_source(source)
+}
 #[derive(Debug, Clone)]
 struct FixFailure {
     reason: String,
@@ -342,6 +437,7 @@ fn artifact_too_large(url: &Url) -> FirestoneError {
 fn inspect(
     context: &DoctorContext,
     fix_failures: &BTreeMap<DoctorCheckId, FixFailure>,
+    stale_state: &StaleStateReport,
 ) -> DoctorReport {
     let kvm = check_kvm(context);
     let mut checks = vec![
@@ -363,7 +459,7 @@ fn inspect(
         check_user_namespaces(context),
         check_ssh_key(context),
         check_data_space(context),
-        check_stale_state(context),
+        check_stale_state(stale_state),
     ];
 
     for check in &mut checks {
@@ -540,34 +636,34 @@ fn check_nested_virtualization(
 }
 
 fn check_runtime_dir(context: &DoctorContext) -> DoctorCheck {
-    let writable = directory_writable(&context.runtime_dir);
-    match (context.runtime_dir_kind, writable) {
-        (RuntimeDirKind::Configured, Ok(())) => DoctorCheck::new(
-            DoctorCheckId::RuntimeDir,
-            DoctorStatus::Ok,
-            format!(
-                "runtime directory {} is writable",
-                context.runtime_dir.display()
-            ),
-        ),
-        (RuntimeDirKind::TmpFallback, Ok(())) => DoctorCheck::new(
+    let runtime_dir = context.paths.runtime_dir();
+    match context.paths.validate_runtime_dir() {
+        Ok(()) if context.paths.uses_runtime_fallback() => DoctorCheck::new(
             DoctorCheckId::RuntimeDir,
             DoctorStatus::Warn,
             format!(
-                "XDG_RUNTIME_DIR is unavailable; using writable fallback {}",
-                context.runtime_dir.display()
+                "XDG_RUNTIME_DIR is unavailable; using secure fallback {}",
+                runtime_dir.display()
             ),
         )
         .with_hint("set XDG_RUNTIME_DIR to a user-owned runtime directory"),
-        (_, Err(reason)) => DoctorCheck::new(
+        Ok(()) => DoctorCheck::new(
             DoctorCheckId::RuntimeDir,
-            DoctorStatus::Fail,
-            format!(
-                "runtime directory {} is not writable: {reason}",
-                context.runtime_dir.display()
-            ),
-        )
-        .with_fix("firestone doctor --fix"),
+            DoctorStatus::Ok,
+            format!("runtime directory {} is secure", runtime_dir.display()),
+        ),
+        Err(error) => {
+            let mut check = DoctorCheck::new(
+                DoctorCheckId::RuntimeDir,
+                DoctorStatus::Fail,
+                firestone_error_reason(&error),
+            )
+            .with_fix("firestone doctor --fix");
+            if let Some(hint) = error.hint() {
+                check = check.with_hint(hint);
+            }
+            check
+        }
     }
 }
 
@@ -577,7 +673,7 @@ fn check_vendored(context: &DoctorContext) -> DoctorCheck {
     let mut hint = None;
     for dependency in VENDORED_DEPENDENCIES {
         match context.manifest.artifact(dependency, &context.architecture) {
-            Ok(artifact) => match artifact_state(&context.bin_dir, &artifact) {
+            Ok(artifact) => match artifact_state(&context.paths.bin_dir(), &artifact) {
                 Ok(()) => installed.push(format!("{} {}", artifact.dependency, artifact.version)),
                 Err(reason) => failures.push(reason),
             },
@@ -615,7 +711,7 @@ fn check_virtiofsd(context: &DoctorContext) -> DoctorCheck {
         .manifest
         .artifact("virtiofsd", &context.architecture)
     {
-        Ok(artifact) => match artifact_state(&context.bin_dir, &artifact) {
+        Ok(artifact) => match artifact_state(&context.paths.bin_dir(), &artifact) {
             Ok(()) => DoctorCheck::new(
                 DoctorCheckId::Virtiofsd,
                 DoctorStatus::Ok,
@@ -891,8 +987,10 @@ fn check_user_namespaces(context: &DoctorContext) -> DoctorCheck {
 }
 
 fn check_ssh_key(context: &DoctorContext) -> DoctorCheck {
-    let private = fs::symlink_metadata(&context.ssh_private_key);
-    let public = fs::symlink_metadata(&context.ssh_public_key);
+    let private_path = context.paths.ssh_private_key();
+    let public_path = context.paths.ssh_public_key();
+    let private = fs::symlink_metadata(&private_path);
+    let public = fs::symlink_metadata(&public_path);
     match (private, public) {
         (Ok(private), Ok(public)) if private.is_file() && public.is_file() => {
             let mode = private.permissions().mode() & 0o777;
@@ -902,7 +1000,7 @@ fn check_ssh_key(context: &DoctorContext) -> DoctorCheck {
                     DoctorStatus::Ok,
                     format!(
                         "Firestone SSH key is present at {} with mode 0600",
-                        context.ssh_private_key.display()
+                        private_path.display()
                     ),
                 )
             } else {
@@ -911,10 +1009,10 @@ fn check_ssh_key(context: &DoctorContext) -> DoctorCheck {
                     DoctorStatus::Fail,
                     format!(
                         "Firestone SSH private key {} has mode {mode:04o}",
-                        context.ssh_private_key.display()
+                        private_path.display()
                     ),
                 );
-                match shell_quote(&context.ssh_private_key) {
+                match shell_quote(&private_path) {
                     Some(path) => check.with_fix(format!("chmod 600 -- {path}")),
                     None => check.with_hint(
                         "set mode 0600 with a filesystem tool that preserves non-UTF-8 paths",
@@ -940,8 +1038,7 @@ fn check_ssh_key(context: &DoctorContext) -> DoctorCheck {
         )
         .with_hint(format!(
             "move the incomplete key pair out of {} and run `firestone doctor --fix`",
-            context
-                .ssh_private_key
+            private_path
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
                 .display()
@@ -950,13 +1047,14 @@ fn check_ssh_key(context: &DoctorContext) -> DoctorCheck {
 }
 
 fn check_data_space(context: &DoctorContext) -> DoctorCheck {
-    let Some(path) = nearest_existing_ancestor(&context.data_dir) else {
+    let data_dir = context.paths.data_dir();
+    let Some(path) = nearest_existing_ancestor(data_dir) else {
         return DoctorCheck::new(
             DoctorCheckId::DataSpace,
             DoctorStatus::Warn,
             format!(
                 "cannot find an existing filesystem for {}",
-                context.data_dir.display()
+                data_dir.display()
             ),
         );
     };
@@ -986,15 +1084,10 @@ fn check_data_space(context: &DoctorContext) -> DoctorCheck {
     }
 }
 
-fn check_stale_state(context: &DoctorContext) -> DoctorCheck {
-    let mut failures = context.stale_state_failures.clone();
-    failures.sort_by(|left, right| {
-        left.machine
-            .cmp(&right.machine)
-            .then_with(|| left.reason.cmp(&right.reason))
-    });
-    if !failures.is_empty() {
-        let details = failures
+fn check_stale_state(stale_state: &StaleStateReport) -> DoctorCheck {
+    if !stale_state.failures.is_empty() {
+        let details = stale_state
+            .failures
             .iter()
             .map(|failure| format!("{} ({})", failure.machine, failure.reason))
             .collect::<Vec<_>>()
@@ -1006,20 +1099,15 @@ fn check_stale_state(context: &DoctorContext) -> DoctorCheck {
         )
         .with_hint("repair the named machine state or lock error and rerun doctor");
     }
-    if context.stale_states.is_empty() {
+    if stale_state.observations.is_empty() {
         return DoctorCheck::new(
             DoctorCheckId::StaleState,
             DoctorStatus::Ok,
             "no stale machine states were observed",
         );
     }
-    let mut observations = context.stale_states.clone();
-    observations.sort_by(|left, right| {
-        left.machine
-            .cmp(&right.machine)
-            .then_with(|| left.reason.cmp(&right.reason))
-    });
-    let details = observations
+    let details = stale_state
+        .observations
         .iter()
         .map(|observation| format!("{} ({})", observation.machine, observation.reason))
         .collect::<Vec<_>>()
@@ -1031,27 +1119,129 @@ fn check_stale_state(context: &DoctorContext) -> DoctorCheck {
     )
 }
 
+fn reconcile_machine_states(context: &DoctorContext, vmm: &dyn VmmPingProbe) -> StaleStateReport {
+    let mut report = StaleStateReport::default();
+    let entries = match fs::read_dir(context.paths.machines_dir()) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return report,
+        Err(source) => {
+            report.failures.push(StaleStateFailure {
+                machine: "<machines>".to_owned(),
+                reason: format!("cannot enumerate machine directories: {source}"),
+            });
+            return report;
+        }
+    };
+
+    let mut machine_entries = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => machine_entries.push((entry.file_name(), entry)),
+            Err(source) => report.failures.push(StaleStateFailure {
+                machine: "<machines>".to_owned(),
+                reason: format!("cannot read machine directory entry: {source}"),
+            }),
+        }
+    }
+    machine_entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+    for (name_os, entry) in machine_entries {
+        let display_name = name_os.to_string_lossy().into_owned();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(source) => {
+                report.failures.push(StaleStateFailure {
+                    machine: display_name,
+                    reason: format!("cannot inspect machine directory type: {source}"),
+                });
+                continue;
+            }
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(name) = name_os.to_str() else {
+            report.failures.push(StaleStateFailure {
+                machine: display_name,
+                reason: "machine directory name is not valid UTF-8".to_owned(),
+            });
+            continue;
+        };
+        match reconcile_machine_state(context, name, vmm) {
+            Ok(Some(observation)) => report.observations.push(observation),
+            Ok(None) => {}
+            Err(error) => report.failures.push(StaleStateFailure {
+                machine: name.to_owned(),
+                reason: firestone_error_reason(&error),
+            }),
+        }
+    }
+    report.observations.sort_by(|left, right| {
+        left.machine
+            .cmp(&right.machine)
+            .then_with(|| left.reason.cmp(&right.reason))
+    });
+    report.failures.sort_by(|left, right| {
+        left.machine
+            .cmp(&right.machine)
+            .then_with(|| left.reason.cmp(&right.reason))
+    });
+    report
+}
+
+fn reconcile_machine_state(
+    context: &DoctorContext,
+    name: &str,
+    vmm: &dyn VmmPingProbe,
+) -> Result<Option<StaleStateObservation>, FirestoneError> {
+    let state_store = StateStore::new(context.paths.machine_state(name)?);
+    let lock_path = context.paths.machine_lock(name)?;
+    let runtime_dir = context.paths.machine_runtime_dir(name)?;
+    let api_socket = context.paths.machine_api_socket(name)?;
+    let mut events = |_event: crate::Event| Ok(());
+    let lock = MachineLock::acquire(name, &lock_path, &mut events)?;
+    let state = state_store.read()?;
+    let observation = observe_liveness(
+        name,
+        &state,
+        &runtime_dir,
+        &api_socket,
+        &context.proc_root,
+        vmm,
+    )?;
+    let reconciliation = reconcile(state.status, observation);
+    let reason = reconciliation
+        .rewrite
+        .as_ref()
+        .map(|ReconcileRewrite::Stopped { reason }| reason.as_str().to_owned());
+    state_store.write_reconciliation(&state, &reconciliation, &context.reconciled_at, &lock)?;
+    Ok(reason.map(|reason| StaleStateObservation {
+        machine: name.to_owned(),
+        reason,
+    }))
+}
+
 fn perform_fixes(
     context: &DoctorContext,
     fetcher: &dyn ArtifactFetcher,
 ) -> BTreeMap<DoctorCheckId, FixFailure> {
     let mut failures = BTreeMap::new();
 
-    let data_ready =
-        record_directory_fix(&mut failures, &context.data_dir, DoctorCheckId::DataSpace);
-    let bin_ready = data_ready
-        && record_directory_fix(
-            &mut failures,
-            &context.bin_dir,
-            DoctorCheckId::VendoredBinaries,
-        );
-    record_directory_fix(
+    let data_ready = record_directory_fix(
         &mut failures,
-        &context.runtime_dir,
-        DoctorCheckId::RuntimeDir,
+        context.paths.data_dir(),
+        DoctorCheckId::DataSpace,
     );
+    let bin_dir = context.paths.bin_dir();
+    let bin_ready = data_ready
+        && record_directory_fix(&mut failures, &bin_dir, DoctorCheckId::VendoredBinaries);
+    if let Err(error) = context.paths.ensure_runtime_dir() {
+        record_fix_failure(&mut failures, DoctorCheckId::RuntimeDir, error);
+    }
+    let ssh_private_key = context.paths.ssh_private_key();
+    let ssh_public_key = context.paths.ssh_public_key();
     let key_ready = if data_ready {
-        context.ssh_private_key.parent().is_some_and(|key_dir| {
+        ssh_private_key.parent().is_some_and(|key_dir| {
             record_directory_fix(&mut failures, key_dir, DoctorCheckId::SshKey)
         })
     } else {
@@ -1077,10 +1267,7 @@ fn perform_fixes(
         );
     }
 
-    if key_ready
-        && path_is_missing(&context.ssh_private_key)
-        && path_is_missing(&context.ssh_public_key)
-    {
+    if key_ready && path_is_missing(&ssh_private_key) && path_is_missing(&ssh_public_key) {
         if let Err(error) = generate_ssh_key(context) {
             record_fix_failure(&mut failures, DoctorCheckId::SshKey, error);
         }
@@ -1119,10 +1306,10 @@ fn fix_artifact(
             return;
         }
     };
-    if artifact_state(&context.bin_dir, &artifact).is_ok() {
+    if artifact_state(&context.paths.bin_dir(), &artifact).is_ok() {
         return;
     }
-    if let Err(error) = install_artifact(&context.bin_dir, &artifact, fetcher) {
+    if let Err(error) = install_artifact(&context.paths.bin_dir(), &artifact, fetcher) {
         record_fix_failure(failures, check_id, error);
     }
 }
@@ -1265,6 +1452,7 @@ fn generate_ssh_key(context: &DoctorContext) -> Result<(), FirestoneError> {
         )
         .with_hint("install the OpenSSH client package")
     })?;
+    let private_key = context.paths.ssh_private_key();
     Cmd::new(keygen)
         .args([OsStr::new("-t"), OsStr::new("ed25519"), OsStr::new("-N")])
         .secret_arg(OsString::new())
@@ -1272,24 +1460,19 @@ fn generate_ssh_key(context: &DoctorContext) -> Result<(), FirestoneError> {
             OsStr::new("-C"),
             OsStr::new(&format!("firestone@{}", context.hostname)),
             OsStr::new("-f"),
-            context.ssh_private_key.as_os_str(),
+            private_key.as_os_str(),
         ])
         .stdin_null()
         .timeout(Duration::from_secs(30))
         .error_kind(ErrorKind::Dependency)
         .run()?;
-    fs::set_permissions(&context.ssh_private_key, fs::Permissions::from_mode(0o600)).map_err(
-        |source| {
-            FirestoneError::new(
-                ErrorKind::Dependency,
-                format!(
-                    "cannot set mode 0600 on {}",
-                    context.ssh_private_key.display()
-                ),
-            )
-            .with_source(source)
-        },
-    )?;
+    fs::set_permissions(&private_key, fs::Permissions::from_mode(0o600)).map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::Dependency,
+            format!("cannot set mode 0600 on {}", private_key.display()),
+        )
+        .with_source(source)
+    })?;
 
     let check = check_ssh_key(context);
     if check.status == DoctorStatus::Ok {
@@ -1431,17 +1614,6 @@ fn require_https(url: &Url) -> Result<(), FirestoneError> {
         )
         .with_hint("dependency downloads and every redirect must use HTTPS"))
     }
-}
-
-fn directory_writable(path: &Path) -> Result<(), String> {
-    if !path.is_dir() {
-        return Err("directory does not exist".to_owned());
-    }
-    TempBuilder::new()
-        .prefix(".doctor-write-")
-        .tempfile_in(path)
-        .map(|_| ())
-        .map_err(|source| source.to_string())
 }
 
 fn device_group(group_file: &Path, gid: u32) -> Option<String> {
@@ -1666,9 +1838,13 @@ mod tests {
         collections::BTreeMap,
         ffi::OsString,
         fs,
-        io::{Cursor, Write},
-        os::unix::fs::{MetadataExt, PermissionsExt},
+        io::{Cursor, Read, Write},
+        os::unix::{
+            fs::{MetadataExt, PermissionsExt},
+            net::UnixListener,
+        },
         path::{Path, PathBuf},
+        thread,
     };
 
     use sha2::{Digest, Sha256};
@@ -1676,13 +1852,16 @@ mod tests {
 
     use super::{
         ArtifactFetcher, CHECK_IDS, DoctorCheck, DoctorCheckId, DoctorContext, DoctorReport,
-        DoctorStatus, MAX_DEPENDENCY_ARTIFACT_BYTES, MINIMUM_PASST_DATE, Package, RuntimeDirKind,
-        StaleStateFailure, StaleStateObservation, artifact_state, check_kvm, check_passt,
-        check_user_namespaces, content_length_exceeds_limit, copy_bounded, create_firestone_dir,
-        distro_family, firestone_error_reason, install_artifact, install_command,
-        parse_passt_version, redirect_rejection, require_https, run_doctor_with,
+        DoctorStatus, HttpVmmPing, MAX_DEPENDENCY_ARTIFACT_BYTES, MINIMUM_PASST_DATE, Package,
+        artifact_state, check_kvm, check_passt, check_user_namespaces,
+        content_length_exceeds_limit, copy_bounded, create_firestone_dir, distro_family,
+        firestone_error_reason, install_artifact, install_command, parse_passt_version,
+        redirect_rejection, require_https, run_doctor_with,
     };
-    use crate::{DependencyArtifact, DependencyManifest, ErrorKind, FirestoneError};
+    use crate::{
+        DependencyArtifact, DependencyManifest, ErrorKind, FirestoneError, PathInputs, Paths,
+        VmmPingProbe,
+    };
 
     struct FakeFetcher {
         payloads: BTreeMap<String, Vec<u8>>,
@@ -1741,7 +1920,8 @@ mod tests {
     impl Fixture {
         fn healthy() -> Result<Self, Box<dyn std::error::Error>> {
             let temp = TempDir::new()?;
-            let root = temp.path();
+            let canonical_root = fs::canonicalize(temp.path())?;
+            let root = canonical_root.as_path();
             let data_dir = root.join("data");
             let bin_dir = data_dir.join("bin");
             let runtime_dir = root.join("run");
@@ -1806,15 +1986,24 @@ mod tests {
             )?;
             write_executable(&fake_bin.join("unshare"), "exit 0")?;
 
+            let paths = Paths::from_inputs(&PathInputs {
+                current_dir: root.to_path_buf(),
+                home_dir: None,
+                firestone_home: None,
+                firestone_config_dir: Some(root.join("config")),
+                firestone_data_dir: Some(data_dir),
+                firestone_runtime_dir: Some(runtime_dir),
+                xdg_config_home: None,
+                xdg_data_home: None,
+                xdg_runtime_dir: None,
+                uid: fs::metadata(root)?.uid(),
+            })?;
+            let proc_root = root.join("proc");
+            fs::create_dir(&proc_root)?;
             let context = DoctorContext {
+                paths,
                 operating_system: "linux".to_owned(),
                 architecture: "x86_64".to_owned(),
-                data_dir,
-                bin_dir,
-                runtime_dir,
-                runtime_dir_kind: RuntimeDirKind::Configured,
-                ssh_private_key,
-                ssh_public_key,
                 kvm_device,
                 nested_parameters: vec![nested],
                 user_namespace_sysctl: sysctl,
@@ -1823,8 +2012,8 @@ mod tests {
                 search_path: OsString::from(fake_bin),
                 hostname: "fixture".to_owned(),
                 manifest,
-                stale_states: Vec::new(),
-                stale_state_failures: Vec::new(),
+                proc_root,
+                reconciled_at: "2026-08-28T00:00:00Z".to_owned(),
                 minimum_data_free_bytes: 0,
             };
 
@@ -1835,6 +2024,32 @@ mod tests {
                 privileged_marker,
             })
         }
+    }
+
+    fn write_running_state(paths: &Paths, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        fs::create_dir_all(paths.machines_dir())?;
+        fs::create_dir(paths.machine_dir(name)?)?;
+        let state = serde_json::json!({
+            "version": 1,
+            "status": "running",
+            "image": {"ref": "ubuntu:24.04", "id": "fixture", "sha256": "fixture"},
+            "mac": null,
+            "cid": 3,
+            "instance_id": "iid-fixture",
+            "shim_pid": null,
+            "vmm_pid": null,
+            "sidecar_pids": {},
+            "runtime_dir": paths.machine_runtime_dir(name)?,
+            "started_at": "2026-08-28T00:00:00Z",
+            "forwards": [],
+            "degraded": [],
+            "last_exit": null
+        });
+        fs::write(
+            paths.machine_state(name)?,
+            serde_json::to_vec_pretty(&state)?,
+        )?;
+        Ok(())
     }
 
     fn artifact_payloads() -> BTreeMap<String, Vec<u8>> {
@@ -1962,19 +2177,8 @@ mod tests {
         fixture.context.operating_system = "macos".to_owned();
         fixture.context.architecture = "riscv64".to_owned();
         fs::remove_file(&fixture.context.kvm_device)?;
-        fixture.context.runtime_dir_kind = RuntimeDirKind::TmpFallback;
-        fs::remove_file(&fixture.context.ssh_private_key)?;
+        fs::remove_file(fixture.context.paths.ssh_private_key())?;
         fixture.context.minimum_data_free_bytes = u64::MAX;
-        fixture.context.stale_states = vec![
-            StaleStateObservation {
-                machine: "zeta".to_owned(),
-                reason: "host reboot".to_owned(),
-            },
-            StaleStateObservation {
-                machine: "alpha".to_owned(),
-                reason: "stale".to_owned(),
-            },
-        ];
 
         let report = run_doctor_with(
             &fixture.context,
@@ -2004,7 +2208,7 @@ mod tests {
         );
         assert_eq!(
             check(&report, DoctorCheckId::RuntimeDir).status,
-            DoctorStatus::Warn
+            DoctorStatus::Ok
         );
         assert_eq!(
             check(&report, DoctorCheckId::SshKey).status,
@@ -2014,21 +2218,15 @@ mod tests {
             check(&report, DoctorCheckId::DataSpace).status,
             DoctorStatus::Warn
         );
-        assert!(
-            check(&report, DoctorCheckId::StaleState)
-                .reason
-                .contains("alpha")
-        );
         assert!(report.has_failures());
         Ok(())
     }
 
     #[test]
-    fn runtime_unwritable_fallback_fails_instead_of_warning()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut fixture = Fixture::healthy()?;
-        fs::remove_dir(&fixture.context.runtime_dir)?;
-        fixture.context.runtime_dir_kind = RuntimeDirKind::TmpFallback;
+    fn runtime_missing_fails_without_read_only_creation() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let fixture = Fixture::healthy()?;
+        fs::remove_dir(fixture.context.paths.runtime_dir())?;
 
         let report = run_doctor_with(
             &fixture.context,
@@ -2040,9 +2238,96 @@ mod tests {
             check(&report, DoctorCheckId::RuntimeDir).status,
             DoctorStatus::Fail
         );
+        assert!(!fixture.context.paths.runtime_dir().exists());
         Ok(())
     }
 
+    #[test]
+    fn runtime_missing_fix_creates_secure_directory() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::healthy()?;
+        fs::remove_dir(fixture.context.paths.runtime_dir())?;
+
+        let report = run_doctor_with(
+            &fixture.context,
+            true,
+            &FakeFetcher::new(fixture.payloads.clone()),
+        );
+
+        assert_eq!(
+            check(&report, DoctorCheckId::RuntimeDir).status,
+            DoctorStatus::Ok
+        );
+        let mode = fs::metadata(fixture.context.paths.runtime_dir())?
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_context_from_paths_preserves_resolved_paths() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let fixture = Fixture::healthy()?;
+        let context = DoctorContext::from_paths(
+            fixture.context.paths.clone(),
+            fixture.context.manifest.clone(),
+            "test-host",
+            "2026-08-28T01:02:03Z",
+        );
+
+        assert_eq!(context.paths.data_dir(), fixture.context.paths.data_dir());
+        assert_eq!(
+            context.paths.runtime_dir(),
+            fixture.context.paths.runtime_dir()
+        );
+        assert_eq!(context.hostname, "test-host");
+        assert_eq!(context.reconciled_at, "2026-08-28T01:02:03Z");
+        assert_eq!(
+            context.minimum_data_free_bytes,
+            DoctorContext::default_minimum_data_free_bytes()
+        );
+        Ok(())
+    }
+
+    fn probe_vmm_status(status: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        let directory = TempDir::new()?;
+        let socket = directory.path().join("api.sock");
+        let listener = UnixListener::bind(&socket)?;
+        let response = format!("HTTP/1.1 {status} Fixture\r\nContent-Length: 0\r\n\r\n");
+        let server = thread::spawn(move || -> Result<(), std::io::Error> {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = [0_u8; 256];
+            let mut used = 0;
+            while used < request.len()
+                && !request[..used]
+                    .windows(4)
+                    .any(|window| window == b"\r\n\r\n")
+            {
+                let read = stream.read(&mut request[used..])?;
+                if read == 0 {
+                    break;
+                }
+                used += read;
+            }
+            assert!(request[..used].starts_with(b"GET /api/v1/vmm.ping HTTP/1.1\r\n"));
+            stream.write_all(response.as_bytes())?;
+            Ok(())
+        });
+
+        let pinged = HttpVmmPing.ping(&socket)?;
+        server
+            .join()
+            .map_err(|_| std::io::Error::other("VMM ping fixture panicked"))??;
+        Ok(pinged)
+    }
+
+    #[test]
+    fn vmm_ping_probe_requires_http_200() -> Result<(), Box<dyn std::error::Error>> {
+        assert!(probe_vmm_status("200")?);
+        assert!(!probe_vmm_status("204")?);
+        Ok(())
+    }
     #[test]
     fn report_serialization_preserves_stable_ids_and_order()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2073,10 +2358,10 @@ mod tests {
             "virtiofsd",
         ] {
             let artifact = fixture.context.manifest.artifact(dependency, "x86_64")?;
-            fs::remove_file(fixture.context.bin_dir.join(artifact.install_name))?;
+            fs::remove_file(fixture.context.paths.bin_dir().join(artifact.install_name))?;
         }
-        fs::remove_file(&fixture.context.ssh_private_key)?;
-        fs::remove_file(&fixture.context.ssh_public_key)?;
+        fs::remove_file(fixture.context.paths.ssh_private_key())?;
+        fs::remove_file(fixture.context.paths.ssh_public_key())?;
         let fetcher = FakeFetcher::new(fixture.payloads.clone());
 
         let report = run_doctor_with(&fixture.context, true, &fetcher);
@@ -2102,7 +2387,7 @@ mod tests {
             "virtiofsd",
         ] {
             let artifact = fixture.context.manifest.artifact(dependency, "x86_64")?;
-            artifact_state(&fixture.context.bin_dir, &artifact)?;
+            artifact_state(&fixture.context.paths.bin_dir(), &artifact)?;
         }
 
         let second = run_doctor_with(&fixture.context, true, &fetcher);
@@ -2187,14 +2472,14 @@ mod tests {
             .context
             .manifest
             .artifact("cloud-hypervisor", "x86_64")?;
-        let path = fixture.context.bin_dir.join(&artifact.install_name);
-        let outside = fixture.context.data_dir.join("outside-tool");
+        let path = fixture.context.paths.bin_dir().join(&artifact.install_name);
+        let outside = fixture.context.paths.data_dir().join("outside-tool");
         fs::write(&outside, fs::read(&path)?)?;
         fs::set_permissions(&outside, fs::Permissions::from_mode(0o755))?;
         fs::remove_file(&path)?;
         std::os::unix::fs::symlink(&outside, &path)?;
 
-        let reason = match artifact_state(&fixture.context.bin_dir, &artifact) {
+        let reason = match artifact_state(&fixture.context.paths.bin_dir(), &artifact) {
             Err(reason) => reason,
             Ok(()) => return Err(std::io::Error::other("symlink should not be accepted").into()),
         };
@@ -2371,10 +2656,7 @@ mod tests {
     fn kvm_open_failure_reports_detected_device_group_command()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut fixture = Fixture::healthy()?;
-        fixture
-            .context
-            .kvm_device
-            .clone_from(&fixture.context.runtime_dir);
+        fixture.context.kvm_device = fixture.context.paths.runtime_dir().to_path_buf();
 
         let kvm = check_kvm(&fixture.context);
 
@@ -2407,15 +2689,15 @@ mod tests {
     #[test]
     fn ssh_key_complete_symlink_pair_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::healthy()?;
-        let private_target = fixture.context.data_dir.join("private-target");
-        let public_target = fixture.context.data_dir.join("public-target");
+        let private_target = fixture.context.paths.data_dir().join("private-target");
+        let public_target = fixture.context.paths.data_dir().join("public-target");
         fs::write(&private_target, "private")?;
         fs::write(&public_target, "public")?;
         fs::set_permissions(&private_target, fs::Permissions::from_mode(0o600))?;
-        fs::remove_file(&fixture.context.ssh_private_key)?;
-        fs::remove_file(&fixture.context.ssh_public_key)?;
-        std::os::unix::fs::symlink(&private_target, &fixture.context.ssh_private_key)?;
-        std::os::unix::fs::symlink(&public_target, &fixture.context.ssh_public_key)?;
+        fs::remove_file(fixture.context.paths.ssh_private_key())?;
+        fs::remove_file(fixture.context.paths.ssh_public_key())?;
+        std::os::unix::fs::symlink(&private_target, fixture.context.paths.ssh_private_key())?;
+        std::os::unix::fs::symlink(&public_target, fixture.context.paths.ssh_public_key())?;
 
         let report = run_doctor_with(
             &fixture.context,
@@ -2428,7 +2710,7 @@ mod tests {
             DoctorStatus::Fail
         );
         assert!(
-            fs::symlink_metadata(&fixture.context.ssh_private_key)?
+            fs::symlink_metadata(fixture.context.paths.ssh_private_key())?
                 .file_type()
                 .is_symlink()
         );
@@ -2437,19 +2719,40 @@ mod tests {
     }
 
     #[test]
-    fn stale_state_failure_is_sorted_and_fails_only_that_check()
+    fn stale_machine_states_reconcile_in_sorted_order() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::healthy()?;
+        write_running_state(&fixture.context.paths, "zeta")?;
+        write_running_state(&fixture.context.paths, "alpha")?;
+
+        let report = run_doctor_with(
+            &fixture.context,
+            false,
+            &FakeFetcher::new(fixture.payloads.clone()),
+        );
+
+        let stale = check(&report, DoctorCheckId::StaleState);
+        assert_eq!(stale.status, DoctorStatus::Ok);
+        assert!(
+            stale.reason.find("alpha").is_some_and(|alpha| {
+                stale.reason.find("zeta").is_some_and(|zeta| alpha < zeta)
+            })
+        );
+        for name in ["alpha", "zeta"] {
+            let state: serde_json::Value =
+                serde_json::from_slice(&fs::read(fixture.context.paths.machine_state(name)?)?)?;
+            assert_eq!(state["status"], "stopped");
+            assert_eq!(state["last_exit"]["reason"], "host reboot");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stale_machine_failure_does_not_abort_later_reconciliation()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut fixture = Fixture::healthy()?;
-        fixture.context.stale_state_failures = vec![
-            StaleStateFailure {
-                machine: "zeta".to_owned(),
-                reason: "lock timeout".to_owned(),
-            },
-            StaleStateFailure {
-                machine: "alpha".to_owned(),
-                reason: "invalid state".to_owned(),
-            },
-        ];
+        let fixture = Fixture::healthy()?;
+        write_running_state(&fixture.context.paths, "zeta")?;
+        fs::create_dir(fixture.context.paths.machine_dir("alpha")?)?;
+        fs::write(fixture.context.paths.machine_state("alpha")?, b"{")?;
 
         let report = run_doctor_with(
             &fixture.context,
@@ -2459,11 +2762,10 @@ mod tests {
 
         let stale = check(&report, DoctorCheckId::StaleState);
         assert_eq!(stale.status, DoctorStatus::Fail);
-        assert!(
-            stale.reason.find("alpha").is_some_and(|alpha| {
-                stale.reason.find("zeta").is_some_and(|zeta| alpha < zeta)
-            })
-        );
+        assert!(stale.reason.contains("alpha"));
+        let zeta: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.context.paths.machine_state("zeta")?)?)?;
+        assert_eq!(zeta["status"], "stopped");
         assert!(
             report
                 .checks
@@ -2473,7 +2775,6 @@ mod tests {
         );
         Ok(())
     }
-
     #[test]
     fn report_error_reason_includes_bounded_source_context() {
         let error = FirestoneError::new(ErrorKind::Dependency, "cannot run probe")
@@ -2489,8 +2790,8 @@ mod tests {
     fn fix_incomplete_ssh_key_does_not_overwrite_existing_private_key()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::healthy()?;
-        let original = fs::read(&fixture.context.ssh_private_key)?;
-        fs::remove_file(&fixture.context.ssh_public_key)?;
+        let original = fs::read(fixture.context.paths.ssh_private_key())?;
+        fs::remove_file(fixture.context.paths.ssh_public_key())?;
 
         let report = run_doctor_with(
             &fixture.context,
@@ -2502,8 +2803,8 @@ mod tests {
             check(&report, DoctorCheckId::SshKey).status,
             DoctorStatus::Fail
         );
-        assert_eq!(fs::read(&fixture.context.ssh_private_key)?, original);
-        assert!(!fixture.context.ssh_public_key.exists());
+        assert_eq!(fs::read(fixture.context.paths.ssh_private_key())?, original);
+        assert!(!fixture.context.paths.ssh_public_key().exists());
         Ok(())
     }
 
@@ -2515,7 +2816,7 @@ mod tests {
             .context
             .manifest
             .artifact("cloud-hypervisor", "x86_64")?;
-        fs::remove_file(fixture.context.bin_dir.join(&artifact.install_name))?;
+        fs::remove_file(fixture.context.paths.bin_dir().join(&artifact.install_name))?;
         let fetcher = FakeFetcher::failing(fixture.payloads.clone());
 
         let report = run_doctor_with(&fixture.context, true, &fetcher);
@@ -2529,7 +2830,7 @@ mod tests {
                 .contains("fix failed: injected stream failure")
         );
         assert!(
-            fs::read_dir(&fixture.context.bin_dir)?
+            fs::read_dir(fixture.context.paths.bin_dir())?
                 .filter_map(Result::ok)
                 .all(|entry| !entry.file_name().to_string_lossy().ends_with(".partial"))
         );
