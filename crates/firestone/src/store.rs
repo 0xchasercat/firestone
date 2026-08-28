@@ -268,8 +268,9 @@ impl LocalDispatcher {
             .with_hint("save firestone.toml as UTF-8 TOML")
             .with_source(source)
         })?;
-        self.load_spec_text(text, machine_dir, machine_dir)?;
-        StateStore::new(state_path).read()?;
+        let state = StateStore::new(state_path).read()?;
+        let pinned_image = state.image.id.is_some() && state.image.sha256.is_some();
+        self.load_spec_text_with_pinned(text, machine_dir, machine_dir, pinned_image)?;
         Ok(true)
     }
     fn initialize_machine(
@@ -419,6 +420,7 @@ impl LocalDispatcher {
         self.validate_machine_storage()?;
         let machine_dir = self.paths.machine_dir(name)?;
         ensure_machine_exists(&self.paths, name, &machine_dir)?;
+        let state = self.read_live_state(name)?;
         let source = read_file(
             &self.paths.machine_spec(name)?,
             "machine spec",
@@ -432,8 +434,9 @@ impl LocalDispatcher {
             .with_hint("save firestone.toml as UTF-8 TOML")
             .with_source(source)
         })?;
-        let loaded = self.load_spec_text(text, &machine_dir, &machine_dir)?;
-        let state = self.read_live_state(name)?;
+        let pinned_image = state.state.image.id.is_some() && state.state.image.sha256.is_some();
+        let loaded =
+            self.load_spec_text_with_pinned(text, &machine_dir, &machine_dir, pinned_image)?;
         Ok((loaded.spec, state))
     }
 
@@ -443,22 +446,26 @@ impl LocalDispatcher {
         machine_dir: &Path,
         patch_base_dir: &Path,
     ) -> Result<firestone_core::LoadedMachineSpec, FirestoneError> {
+        self.load_spec_text_with_pinned(text, machine_dir, patch_base_dir, false)
+    }
+
+    fn load_spec_text_with_pinned(
+        &self,
+        text: &str,
+        machine_dir: &Path,
+        patch_base_dir: &Path,
+        pinned_image: bool,
+    ) -> Result<firestone_core::LoadedMachineSpec, FirestoneError> {
         let host = RealValidationHost::new();
         MachineSpec::load(
             text,
             &self.global,
             &MachineSpecPatch::default(),
             patch_base_dir,
-            &ValidationContext {
-                host: &host,
-                paths: &self.paths,
-                machine_dir,
-                catalog: &self.catalog,
-                base_image_virtual_size: None,
-            },
+            &ValidationContext::new(&host, &self.paths, machine_dir, &self.catalog)
+                .with_pinned_image(pinned_image),
         )
     }
-
     fn doctor(&self, fix: bool, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
         let hostname = env::var("HOSTNAME")
             .ok()
@@ -941,7 +948,8 @@ mod tests {
 
     use firestone_core::{
         Action, Catalog, Dispatcher, ErrorKind, Event, EventSink, FirestoneError, GlobalConfig,
-        MachineLock, MachineStatus, PathInputs, Paths, Supervision,
+        MachineLock, MachineSpec, MachineSpecPatch, MachineStatus, PathInputs, Paths,
+        RealValidationHost, StateStore, Supervision, ValidationContext,
     };
 
     use super::{
@@ -1039,6 +1047,73 @@ mod tests {
         );
         Ok(())
     }
+    #[tokio::test]
+    async fn pinned_relative_local_image_remains_listable_and_showable_after_source_deletion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (directory, dispatcher, paths) = fixture()?;
+        let root = fs::canonicalize(directory.path())?;
+        let source = root.join("relative.qcow2");
+        fs::write(&source, b"QFI\xFBLOCAL")?;
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600))?;
+        let catalog = Catalog::built_in()?;
+        let host = RealValidationHost::new();
+        let machine_dir = paths.machine_dir("local-pin")?;
+        let patch = MachineSpecPatch {
+            image: Some("relative.qcow2".into()),
+            ..MachineSpecPatch::default()
+        };
+        let loaded = MachineSpec::load(
+            "",
+            &GlobalConfig::default(),
+            &patch,
+            &root,
+            &ValidationContext::new(&host, &paths, &machine_dir, &catalog),
+        )?;
+        assert_eq!(loaded.spec.image.as_str(), source.to_string_lossy());
+
+        let mut events = Vec::new();
+        dispatcher
+            .run(
+                Action::Create {
+                    name: "local-pin".to_owned(),
+                    spec: loaded.spec,
+                },
+                &mut events,
+            )
+            .await?;
+        let state_path = paths.machine_state("local-pin")?;
+        let mut state = StateStore::new(state_path.clone()).read()?;
+        assert_eq!(state.image.r#ref, source.to_string_lossy());
+        state.image.id = Some(format!("image-{}", "a".repeat(64)));
+        state.image.sha256 = Some("b".repeat(64));
+        StateStore::new(state_path).write_from_shim(&state)?;
+        fs::remove_file(&source)?;
+
+        dispatcher.run(Action::List, &mut events).await?;
+        dispatcher
+            .run(
+                Action::Show {
+                    name: "local-pin".to_owned(),
+                },
+                &mut events,
+            )
+            .await?;
+        let duplicate = dispatcher
+            .run(
+                Action::Create {
+                    name: "local-pin".to_owned(),
+                    spec: MachineSpec::default(),
+                },
+                &mut events,
+            )
+            .await
+            .err()
+            .ok_or("expected duplicate machine rejection")?;
+        assert_eq!(duplicate.kind(), ErrorKind::AlreadyExists);
+        assert!(!source.exists());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn create_missing_storage_creates_mode_0700() -> Result<(), Box<dyn std::error::Error>> {
         let (_directory, dispatcher, paths) = fixture()?;

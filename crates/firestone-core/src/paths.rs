@@ -1,12 +1,17 @@
 use std::env;
 use std::ffi::OsStr;
-use std::fs::{self, DirBuilder, Metadata, Permissions};
+use std::fs::{self, DirBuilder, File, Metadata, Permissions};
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
-use nix::unistd::getuid;
+use nix::{
+    errno::Errno,
+    fcntl::{OFlag, openat},
+    sys::stat::{FchmodatFlags, Mode, fchmod, fchmodat, mkdirat},
+    unistd::getuid,
+};
 
 use crate::{ErrorKind, FirestoneError};
 
@@ -483,47 +488,160 @@ impl Paths {
         label: &str,
         recursive: bool,
     ) -> Result<bool, FirestoneError> {
-        self.validate_owned_data_directory(path, label, true)?;
-        match fs::symlink_metadata(path) {
-            Ok(_) => {
-                self.validate_owned_data_directory(path, label, false)?;
-                return Ok(false);
-            }
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => return Err(directory_io_error("inspect", label, path, source)),
-        }
-
-        let mut builder = DirBuilder::new();
-        builder.recursive(recursive).mode(0o700);
-        match builder.create(path) {
-            Ok(()) => {}
-            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
-                self.validate_owned_data_directory(path, label, false)?;
-                return Ok(false);
-            }
-            Err(source) => return Err(directory_io_error("create", label, path, source)),
-        }
-
-        fs::set_permissions(path, Permissions::from_mode(0o700))
-            .map_err(|source| directory_io_error("set mode 0700 on", label, path, source))?;
-        self.validate_owned_data_directory(path, label, false)?;
-        let actual_mode = fs::symlink_metadata(path)
-            .map_err(|source| directory_io_error("inspect created", label, path, source))?
-            .mode()
-            & 0o7777;
-        if actual_mode != 0o700 {
+        if !path.is_absolute() {
             return Err(FirestoneError::new(
                 ErrorKind::Dependency,
-                format!(
-                    "created {label} '{}' has mode {actual_mode:04o}; expected 0700",
-                    path.display()
-                ),
+                format!("{label} '{}' is not absolute", path.display()),
             )
-            .with_hint("restrict the directory to the Firestone user and retry"));
+            .with_hint("use an absolute Firestone data directory"));
         }
-        Ok(true)
-    }
 
+        let components = path
+            .components()
+            .filter_map(|component| match component {
+                Component::RootDir => None,
+                Component::Normal(value) => Some(Ok(value)),
+                Component::CurDir | Component::ParentDir | Component::Prefix(_) => Some(Err(
+                    FirestoneError::new(
+                        ErrorKind::Dependency,
+                        format!(
+                            "{label} '{}' contains an unsafe path component",
+                            path.display()
+                        ),
+                    )
+                    .with_hint("use an absolute path without dot or parent components"),
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if components.is_empty() {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!("{label} cannot be the filesystem root"),
+            ));
+        }
+
+        let mut directory = File::open("/")
+            .map_err(|source| directory_io_error("open root for", label, path, source))?;
+        let root_metadata = directory
+            .metadata()
+            .map_err(|source| directory_io_error("inspect root for", label, path, source))?;
+        self.validate_trusted_ancestor_metadata(Path::new("/"), label, &root_metadata)?;
+
+        let mut current_path = PathBuf::from("/");
+        let mut final_created = false;
+        for (index, component) in components.iter().enumerate() {
+            let is_final = index + 1 == components.len();
+            current_path.push(component);
+            let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+            let (descriptor, created) =
+                match openat(&directory, Path::new(component), flags, Mode::empty()) {
+                    Ok(descriptor) => (descriptor, false),
+                    Err(Errno::ENOENT) if recursive || is_final => {
+                        let created = match mkdirat(
+                            &directory,
+                            Path::new(component),
+                            Mode::from_bits_truncate(0o700),
+                        ) {
+                            Ok(()) => true,
+                            Err(Errno::EEXIST) => false,
+                            Err(source) => {
+                                return Err(directory_io_error(
+                                    "create",
+                                    label,
+                                    &current_path,
+                                    io::Error::from_raw_os_error(source as i32),
+                                ));
+                            }
+                        };
+                        if created {
+                            fchmodat(
+                                &directory,
+                                Path::new(component),
+                                Mode::from_bits_truncate(0o700),
+                                FchmodatFlags::NoFollowSymlink,
+                            )
+                            .map_err(|source| {
+                                directory_io_error(
+                                    "set initial mode 0700 on created",
+                                    label,
+                                    &current_path,
+                                    io::Error::from_raw_os_error(source as i32),
+                                )
+                            })?;
+                        }
+                        let descriptor =
+                            openat(&directory, Path::new(component), flags, Mode::empty())
+                                .map_err(|source| {
+                                    descriptor_directory_open_error(
+                                        "open created",
+                                        label,
+                                        &current_path,
+                                        source,
+                                    )
+                                })?;
+                        if created {
+                            fchmod(&descriptor, Mode::from_bits_truncate(0o700)).map_err(
+                                |source| {
+                                    directory_io_error(
+                                        "set mode 0700 on created",
+                                        label,
+                                        &current_path,
+                                        io::Error::from_raw_os_error(source as i32),
+                                    )
+                                },
+                            )?;
+                            directory.sync_all().map_err(|source| {
+                                directory_io_error("fsync parent of", label, &current_path, source)
+                            })?;
+                        }
+                        (descriptor, created)
+                    }
+                    Err(source) => {
+                        return Err(descriptor_directory_open_error(
+                            "open",
+                            label,
+                            &current_path,
+                            source,
+                        ));
+                    }
+                };
+
+            let opened = File::from(descriptor);
+            let metadata = opened.metadata().map_err(|source| {
+                directory_io_error("inspect open", label, &current_path, source)
+            })?;
+            validate_directory_type(&current_path, label, &metadata)?;
+            if is_final {
+                self.validate_owned_directory_metadata(&current_path, label, &metadata)?;
+                if created && metadata.mode() & 0o7777 != 0o700 {
+                    return Err(FirestoneError::new(
+                        ErrorKind::Dependency,
+                        format!(
+                            "created {label} '{}' has mode {:04o}; expected 0700",
+                            current_path.display(),
+                            metadata.mode() & 0o7777
+                        ),
+                    ));
+                }
+                final_created = created;
+            } else {
+                self.validate_trusted_ancestor_metadata(&current_path, label, &metadata)?;
+                if created
+                    && (metadata.uid() != self.runtime_uid || metadata.mode() & 0o7777 != 0o700)
+                {
+                    return Err(FirestoneError::new(
+                        ErrorKind::Dependency,
+                        format!(
+                            "created {label} ancestor '{}' is insecure",
+                            current_path.display()
+                        ),
+                    ));
+                }
+            }
+            directory = opened;
+        }
+        Ok(final_created)
+    }
     /// Validates one regular Firestone-owned data file and its ancestry.
     pub fn validate_owned_data_file(
         &self,
@@ -556,6 +674,47 @@ impl Paths {
             .with_hint("replace the symlink or special file with a regular Firestone-owned file"));
         }
 
+        let actual_uid = metadata.uid();
+        let actual_mode = metadata.mode() & 0o7777;
+        if actual_uid != self.runtime_uid || actual_mode != expected_mode {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "{label} '{}' is insecure: expected uid {} and mode {expected_mode:04o}, found uid {actual_uid} and mode {actual_mode:04o}",
+                    path.display(),
+                    self.runtime_uid
+                ),
+            )
+            .with_hint("replace the file with one owned and protected by the Firestone user"));
+        }
+        Ok(())
+    }
+
+    pub fn validate_owned_data_file_handle(
+        &self,
+        path: &Path,
+        label: &str,
+        expected_mode: u32,
+        file: &File,
+    ) -> Result<(), FirestoneError> {
+        let parent = path.parent().ok_or_else(|| {
+            FirestoneError::new(
+                ErrorKind::Dependency,
+                format!("{label} '{}' has no parent directory", path.display()),
+            )
+            .with_hint("use a file below the Firestone data directory")
+        })?;
+        self.validate_owned_data_directory(parent, &format!("{label} parent"), false)?;
+        let metadata = file
+            .metadata()
+            .map_err(|source| directory_io_error("inspect open", label, path, source))?;
+        if !metadata.is_file() {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!("{label} '{}' is not a regular owned file", path.display()),
+            )
+            .with_hint("replace the special file with a regular Firestone-owned file"));
+        }
         let actual_uid = metadata.uid();
         let actual_mode = metadata.mode() & 0o7777;
         if actual_uid != self.runtime_uid || actual_mode != expected_mode {
@@ -893,6 +1052,30 @@ fn validate_directory_type(
 
 fn runtime_io_error(operation: &str, path: &Path, source: io::Error) -> FirestoneError {
     directory_io_error(operation, "runtime directory", path, source)
+}
+
+fn descriptor_directory_open_error(
+    operation: &str,
+    label: &str,
+    path: &Path,
+    source: Errno,
+) -> FirestoneError {
+    if matches!(source, Errno::ELOOP | Errno::ENOTDIR) {
+        return FirestoneError::new(
+            ErrorKind::Dependency,
+            format!(
+                "{label} '{}' is not a directory or contains a symbolic link",
+                path.display()
+            ),
+        )
+        .with_hint("replace the symbolic link or non-directory path and retry");
+    }
+    directory_io_error(
+        operation,
+        label,
+        path,
+        io::Error::from_raw_os_error(source as i32),
+    )
 }
 
 fn directory_io_error(

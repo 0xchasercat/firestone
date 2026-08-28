@@ -2,6 +2,7 @@
 
 pub mod action;
 pub mod atomic;
+mod bounded;
 pub mod catalog;
 pub mod cmd;
 pub mod deps;
@@ -48,7 +49,8 @@ pub use spec::{
     UiConfig, ValidationContext, ValidationHost, VmmSpec, VmmSpecPatch, validate_machine_spec,
 };
 pub use state::{
-    ExitReason, LastExit, LiveMachineState, LivenessObservation, MachineState, MachineStatus,
-    ReconcileReport, ReconcileRewrite, StateImage, StateStore, StateVersion, Supervision,
-    VmmPingProbe, observe_liveness, reconcile, reconciled_state, verify_shim_identity,
+    ExitReason, LastExit, LiveMachineState, LivenessObservation, MAX_MACHINE_STATE_BYTES,
+    MachineState, MachineStatus, ReconcileReport, ReconcileRewrite, StateImage, StateStore,
+    StateVersion, Supervision, VmmPingProbe, observe_liveness, reconcile, reconciled_state,
+    verify_shim_identity,
 };

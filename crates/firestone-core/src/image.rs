@@ -12,7 +12,8 @@ use std::{
 
 use nix::{
     errno::Errno,
-    fcntl::{Flock, FlockArg},
+    fcntl::{Flock, FlockArg, OFlag, openat},
+    sys::stat::Mode,
 };
 use reqwest::{
     blocking::Client,
@@ -26,9 +27,10 @@ use url::Url;
 use crate::{
     Arch, ByteSize, Catalog, CatalogChecksum, CatalogFirmware, ChecksumAlgorithm, Cmd, ErrorKind,
     Event, EventSink, FirestoneError, ImageFormat, ImageRef, Level, MachineLock, MachineState,
-    Paths, StateImage, StateStore, StepId, Unit, atomic, catalog::parse_https_url,
+    Paths, StateImage, StateStore, StepId, Unit, atomic,
+    bounded::{self, BoundedReadError},
+    catalog::parse_https_url,
 };
-
 const IMAGE_METADATA_VERSION: u32 = 1;
 const IMAGE_ID_PREFIX: &str = "image-";
 const IMAGE_ID_HEX_LENGTH: usize = 64;
@@ -39,6 +41,9 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const QEMU_INFO_TIMEOUT: Duration = Duration::from_secs(30);
+const QEMU_CREATE_TIMEOUT: Duration = Duration::from_secs(60);
+const QEMU_CONVERT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_HTTPS_REDIRECTS: usize = 5;
 const OWNED_DIRECTORY_MODE: u32 = 0o700;
 const LOCK_FILE_MODE: u32 = 0o600;
@@ -46,6 +51,10 @@ const SIDECAR_FILE_MODE: u32 = 0o600;
 const BASE_FILE_MODE: u32 = 0o400;
 const OVERLAY_FILE_MODE: u32 = 0o600;
 const QCOW2_MAGIC: [u8; 4] = *b"QFI\xfb";
+
+fn redirect_limit_exceeded(previous_redirects: usize) -> bool {
+    previous_redirects > MAX_HTTPS_REDIRECTS
+}
 
 /// The only image sidecar version accepted by this release.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -77,16 +86,17 @@ impl<'de> Deserialize<'de> for ImageMetadataVersion {
 }
 
 /// Strict version-one contents of an image sidecar.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ImageMetadata {
     pub version: ImageMetadataVersion,
     pub id: String,
+    pub generation: u64,
     pub source_ref: String,
     pub source_url: Option<String>,
     pub source_sha256: String,
     pub stored_sha256: String,
     pub architecture: Arch,
+    pub firmware: Option<CatalogFirmware>,
     pub source_format: ImageFormat,
     pub stored_format: ImageFormat,
     pub verification_algorithm: Option<ChecksumAlgorithm>,
@@ -95,9 +105,64 @@ pub struct ImageMetadata {
     pub pulled_at: String,
 }
 
+#[derive(Deserialize)]
+struct RequiredNullable<T>(Option<T>);
+
+impl<'de> Deserialize<'de> for ImageMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            version: ImageMetadataVersion,
+            id: String,
+            generation: u64,
+            source_ref: String,
+            source_url: RequiredNullable<String>,
+            source_sha256: String,
+            stored_sha256: String,
+            architecture: Arch,
+            firmware: RequiredNullable<CatalogFirmware>,
+            source_format: ImageFormat,
+            stored_format: ImageFormat,
+            verification_algorithm: RequiredNullable<ChecksumAlgorithm>,
+            verification_digest: RequiredNullable<String>,
+            size: u64,
+            pulled_at: String,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            version: wire.version,
+            id: wire.id,
+            generation: wire.generation,
+            source_ref: wire.source_ref,
+            source_url: wire.source_url.0,
+            source_sha256: wire.source_sha256,
+            stored_sha256: wire.stored_sha256,
+            architecture: wire.architecture,
+            firmware: wire.firmware.0,
+            source_format: wire.source_format,
+            stored_format: wire.stored_format,
+            verification_algorithm: wire.verification_algorithm.0,
+            verification_digest: wire.verification_digest.0,
+            size: wire.size,
+            pulled_at: wire.pulled_at,
+        })
+    }
+}
+
 impl ImageMetadata {
     fn validate(&self) -> Result<(), FirestoneError> {
         validate_image_id(&self.id)?;
+        if self.generation == 0 {
+            return Err(invalid_sidecar(
+                &self.id,
+                "generation must be greater than zero",
+            ));
+        }
         if self.source_ref.is_empty() || self.source_ref.trim() != self.source_ref {
             return Err(invalid_sidecar(
                 &self.id,
@@ -147,11 +212,32 @@ impl ImageMetadata {
                     "source_url must use its canonical URL representation",
                 ));
             }
-        } else if !Path::new(&self.source_ref).is_absolute() {
-            return Err(invalid_sidecar(
-                &self.id,
-                "a source without source_url must use an absolute local source_ref",
-            ));
+            if self.source_ref == *source_url {
+                if self.firmware.is_some() {
+                    return Err(invalid_sidecar(
+                        &self.id,
+                        "direct URL image firmware must be null",
+                    ));
+                }
+            } else if self.firmware.is_none() {
+                return Err(invalid_sidecar(
+                    &self.id,
+                    "catalog image firmware must be present",
+                ));
+            }
+        } else {
+            if !Path::new(&self.source_ref).is_absolute() {
+                return Err(invalid_sidecar(
+                    &self.id,
+                    "a source without source_url must use an absolute local source_ref",
+                ));
+            }
+            if self.firmware.is_some() {
+                return Err(invalid_sidecar(
+                    &self.id,
+                    "local image firmware must be null",
+                ));
+            }
         }
         match (
             self.verification_algorithm,
@@ -224,8 +310,26 @@ pub enum ImageSourceLocation {
     Local(PathBuf),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalSourceSnapshot {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[derive(Debug, Clone)]
+struct OpenedLocalSource {
+    path: PathBuf,
+    file: Arc<File>,
+    snapshot: LocalSourceSnapshot,
+}
+
 /// A catalog, HTTPS, or local image resolved for one host architecture.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ResolvedImageSource {
     pub source_ref: String,
     pub source_url: Option<String>,
@@ -235,6 +339,7 @@ pub struct ResolvedImageSource {
     pub verification: Option<ImageVerification>,
     pub location: ImageSourceLocation,
     checksum: ExpectedChecksum,
+    local_source: Option<OpenedLocalSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -349,7 +454,7 @@ struct ReqwestHttpSource {
 impl ReqwestHttpSource {
     fn new() -> Result<Self, FirestoneError> {
         let redirect = Policy::custom(|attempt| {
-            if attempt.previous().len() >= MAX_HTTPS_REDIRECTS {
+            if redirect_limit_exceeded(attempt.previous().len()) {
                 attempt.error("HTTPS download exceeded five redirects")
             } else if parse_https_url(attempt.url().as_str()).is_none() {
                 attempt.error("HTTPS download redirected to an invalid or non-HTTPS URL")
@@ -456,42 +561,32 @@ impl ImageStore {
         let local = self
             .paths
             .resolve_input_path(Path::new(value), source_base, "image")?;
-        match fs::symlink_metadata(&local) {
-            Ok(_) => {
-                if supplied_sha256.is_some() {
-                    return Err(FirestoneError::new(
-                        ErrorKind::Usage,
-                        "--sha256 is accepted only for HTTPS image URLs",
-                    )
-                    .with_hint("remove --sha256 when pulling a local file"));
-                }
-                let source_ref = local.to_str().ok_or_else(|| {
-                    FirestoneError::new(
-                        ErrorKind::InvalidSpec,
-                        format!("local image path '{}' is not UTF-8", local.display()),
-                    )
-                    .with_hint("rename the path using UTF-8 characters and retry")
-                })?;
-                return Ok(ResolvedImageSource {
-                    source_ref: source_ref.to_owned(),
-                    source_url: None,
-                    architecture: self.architecture,
-                    source_format: None,
-                    firmware: None,
-                    verification: None,
-                    location: ImageSourceLocation::Local(local),
-                    checksum: ExpectedChecksum::None,
-                });
-            }
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => {
+        if let Some(opened) = try_open_local_source(&local)? {
+            if supplied_sha256.is_some() {
                 return Err(FirestoneError::new(
-                    ErrorKind::Generic,
-                    format!("cannot inspect local image candidate '{}'", local.display()),
+                    ErrorKind::Usage,
+                    "--sha256 is accepted only for HTTPS image URLs",
                 )
-                .with_hint("check the image path permissions")
-                .with_source(source));
+                .with_hint("remove --sha256 when pulling a local file"));
             }
+            let source_ref = opened.path.to_str().ok_or_else(|| {
+                FirestoneError::new(
+                    ErrorKind::InvalidSpec,
+                    format!("local image path '{}' is not UTF-8", opened.path.display()),
+                )
+                .with_hint("rename the path using UTF-8 characters and retry")
+            })?;
+            return Ok(ResolvedImageSource {
+                source_ref: source_ref.to_owned(),
+                source_url: None,
+                architecture: self.architecture,
+                source_format: None,
+                firmware: None,
+                verification: None,
+                location: ImageSourceLocation::Local(opened.path.clone()),
+                checksum: ExpectedChecksum::None,
+                local_source: Some(opened),
+            });
         }
 
         if let Some(url) = parse_https_url(value) {
@@ -512,6 +607,7 @@ impl ImageStore {
                 verification: verification.clone(),
                 location: ImageSourceLocation::Https(source_url),
                 checksum: verification.map_or(ExpectedChecksum::None, ExpectedChecksum::Digest),
+                local_source: None,
             });
         }
 
@@ -561,6 +657,7 @@ impl ImageStore {
                     verification,
                     location: ImageSourceLocation::Https(source_url),
                     checksum,
+                    local_source: None,
                 })
             }
             Err(catalog_error)
@@ -575,6 +672,82 @@ impl ImageStore {
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn resolve_persisted(&self, reference: &str) -> Result<ResolvedImageSource, FirestoneError> {
+        if let Some(url) = parse_https_url(reference) {
+            let source_url = url.to_string();
+            return Ok(ResolvedImageSource {
+                source_ref: source_url.clone(),
+                source_url: Some(source_url.clone()),
+                architecture: self.architecture,
+                source_format: None,
+                firmware: None,
+                verification: None,
+                location: ImageSourceLocation::Https(source_url),
+                checksum: ExpectedChecksum::None,
+                local_source: None,
+            });
+        }
+        if Path::new(reference).is_absolute() {
+            let Some(opened) = try_open_local_source(Path::new(reference))? else {
+                return Err(FirestoneError::new(
+                    ErrorKind::NotFound,
+                    format!("persisted local image path '{reference}' does not exist"),
+                )
+                .with_hint("restore the source or use the already-pinned owned image"));
+            };
+            return Ok(ResolvedImageSource {
+                source_ref: opened.path.to_string_lossy().into_owned(),
+                source_url: None,
+                architecture: self.architecture,
+                source_format: None,
+                firmware: None,
+                verification: None,
+                location: ImageSourceLocation::Local(opened.path.clone()),
+                checksum: ExpectedChecksum::None,
+                local_source: Some(opened),
+            });
+        }
+        let resolved = self
+            .catalog
+            .resolve(reference, self.architecture.as_str())?;
+        let source_url = parse_https_url(&resolved.source.url)
+            .map(|url| url.to_string())
+            .ok_or_else(|| {
+                FirestoneError::new(
+                    ErrorKind::InvalidSpec,
+                    format!(
+                        "catalog image '{}' has an invalid HTTPS URL",
+                        resolved.canonical_reference
+                    ),
+                )
+            })?;
+        let checksum = match resolved.source.checksum {
+            CatalogChecksum::Sha256(digest) => ExpectedChecksum::Digest(ImageVerification {
+                algorithm: ChecksumAlgorithm::Sha256,
+                digest,
+            }),
+            CatalogChecksum::ManifestUrl(url) => ExpectedChecksum::Manifest {
+                url,
+                algorithm: resolved.checksum_algorithm,
+            },
+        };
+        let verification = match &checksum {
+            ExpectedChecksum::Digest(verification) => Some(verification.clone()),
+            _ => None,
+        };
+        Ok(ResolvedImageSource {
+            source_ref: resolved.canonical_reference,
+            source_url: Some(source_url.clone()),
+            architecture: self.architecture,
+            source_format: Some(resolved.format),
+            firmware: Some(resolved.firmware),
+            verification,
+            location: ImageSourceLocation::Https(source_url),
+            checksum,
+            local_source: None,
+        })
     }
 
     /// Pulls and verifies an image, always publishing an owned qcow2 base.
@@ -600,6 +773,7 @@ impl ImageStore {
             return Ok(Vec::new());
         }
         let _lock = self.acquire_lock()?;
+        self.cleanup_stale_partials()?;
         self.list_locked()
     }
 
@@ -609,6 +783,7 @@ impl ImageStore {
             return Err(image_not_found(id));
         }
         let _lock = self.acquire_lock()?;
+        self.cleanup_stale_partials()?;
         let image = self.load_verified_pair(id)?;
         let info = self.qemu_info(&image.path)?;
         validate_base_info(id, &info)?;
@@ -712,10 +887,9 @@ impl ImageStore {
             }
             (None, None) => {
                 let requested_ref = state.image.r#ref.clone();
-                let resolved =
-                    self.resolve(&ImageRef::new(requested_ref.clone()), None, source_base);
+                let resolved = self.resolve_persisted(&requested_ref);
                 let image = match resolved {
-                    Ok(source) => match self.find_latest_by_reference(&source.source_ref)? {
+                    Ok(source) => match self.find_latest_for_source(&source)? {
                         Some(stored) => {
                             self.emit_image_start(&source.source_ref, events)?;
                             events.emit(Event::StepSkip {
@@ -723,28 +897,26 @@ impl ImageStore {
                                 reason: "cached".to_owned(),
                             })?;
                             PulledImage {
+                                firmware: stored.metadata.firmware,
                                 metadata: stored.metadata,
                                 path: stored.path,
-                                firmware: source.firmware,
                                 cached: true,
                             }
                         }
                         None => self.pull_locked(source, events)?,
                     },
                     Err(resolve_error) => {
-                        let local_ref =
-                            self.absolute_local_reference(&requested_ref, source_base)?;
-                        match self.find_latest_by_reference(&local_ref)? {
+                        match self.find_latest_by_canonical_ref(&requested_ref)? {
                             Some(stored) => {
-                                self.emit_image_start(&local_ref, events)?;
+                                self.emit_image_start(&requested_ref, events)?;
                                 events.emit(Event::StepSkip {
                                     id: StepId::from("image"),
                                     reason: "cached".to_owned(),
                                 })?;
                                 PulledImage {
+                                    firmware: stored.metadata.firmware,
                                     metadata: stored.metadata,
                                     path: stored.path,
-                                    firmware: None,
                                     cached: true,
                                 }
                             }
@@ -826,9 +998,9 @@ impl ImageStore {
                     reason: "cached".to_owned(),
                 })?;
                 return Ok(PulledImage {
+                    firmware: cached.metadata.firmware,
                     metadata: cached.metadata,
                     path: cached.path,
-                    firmware: source.firmware,
                     cached: true,
                 });
             }
@@ -871,9 +1043,9 @@ impl ImageStore {
                 reason: "cached".to_owned(),
             })?;
             return Ok(PulledImage {
+                firmware: cached.metadata.firmware,
                 metadata: cached.metadata,
                 path: cached.path,
-                firmware: source.firmware,
                 cached: true,
             });
         }
@@ -903,14 +1075,17 @@ impl ImageStore {
         cleanup.track(sidecar_path.clone());
         publish_no_replace(candidate, &base_path)?;
 
+        let generation = self.next_generation(&source.source_ref, source.architecture)?;
         let metadata = ImageMetadata {
             version: ImageMetadataVersion,
             id: id.clone(),
+            generation,
             source_ref: source.source_ref.clone(),
             source_url: source.source_url.clone(),
             source_sha256: staged.source_sha256,
             stored_sha256,
             architecture: source.architecture,
+            firmware: source.firmware,
             source_format,
             stored_format: ImageFormat::Qcow2,
             verification_algorithm: source.verification.as_ref().map(|value| value.algorithm),
@@ -943,9 +1118,9 @@ impl ImageStore {
             elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         })?;
         Ok(PulledImage {
+            firmware: metadata.firmware,
             metadata,
             path: base_path,
-            firmware: source.firmware,
             cached: false,
         })
     }
@@ -958,16 +1133,42 @@ impl ImageStore {
     ) -> Result<StagedSource, FirestoneError> {
         match &source.location {
             ImageSourceLocation::Local(path) => {
-                let mut input = open_local_source(path)?;
-                let total = input.metadata().ok().map(|metadata| metadata.len());
-                stream_source(
+                let opened = source.local_source.as_ref().ok_or_else(|| {
+                    FirestoneError::new(
+                        ErrorKind::Conflict,
+                        format!(
+                            "local image '{}' was not opened for this pull",
+                            path.display()
+                        ),
+                    )
+                })?;
+                let mut input = opened.file.as_ref();
+                let staged = stream_source(
                     &mut input,
                     partial,
-                    total,
+                    Some(opened.snapshot.size),
                     ErrorKind::Generic,
                     source.verification.as_ref().map(|value| value.algorithm),
                     events,
-                )
+                )?;
+                let after = opened.file.metadata().map_err(|source| {
+                    FirestoneError::new(
+                        ErrorKind::Generic,
+                        format!("cannot re-inspect local image '{}'", path.display()),
+                    )
+                    .with_source(source)
+                })?;
+                if local_source_snapshot(&after) != opened.snapshot {
+                    return Err(FirestoneError::new(
+                        ErrorKind::Checksum,
+                        format!(
+                            "local image '{}' changed while it was copied",
+                            path.display()
+                        ),
+                    )
+                    .with_hint("stop modifying the source image and retry"));
+                }
+                Ok(staged)
             }
             ImageSourceLocation::Https(url) => {
                 let parsed = parse_https_url(url).ok_or_else(|| {
@@ -1145,7 +1346,40 @@ impl ImageStore {
             .transpose()
     }
 
-    fn find_latest_by_reference(
+    fn find_latest_for_source(
+        &self,
+        source: &ResolvedImageSource,
+    ) -> Result<Option<StoredImage>, FirestoneError> {
+        let mut matches = self
+            .list_locked()?
+            .into_iter()
+            .filter(|stored| metadata_matches_cache_source(&stored.metadata, source))
+            .collect::<Vec<_>>();
+        let Some(maximum) = matches
+            .iter()
+            .map(|stored| stored.metadata.generation)
+            .max()
+        else {
+            return Ok(None);
+        };
+        matches.retain(|stored| stored.metadata.generation == maximum);
+        if matches.len() != 1 {
+            return Err(FirestoneError::new(
+                ErrorKind::Conflict,
+                format!(
+                    "image source '{}' has ambiguous generation {maximum}",
+                    source.source_ref
+                ),
+            )
+            .with_hint("move duplicate image sidecars aside and retry"));
+        }
+        matches
+            .pop()
+            .map(|stored| self.verify_stored_pair(stored))
+            .transpose()
+    }
+
+    fn find_latest_by_canonical_ref(
         &self,
         source_ref: &str,
     ) -> Result<Option<StoredImage>, FirestoneError> {
@@ -1157,16 +1391,59 @@ impl ImageStore {
                     && stored.metadata.architecture == self.architecture
             })
             .collect::<Vec<_>>();
-        matches.sort_by(|left, right| {
-            left.metadata
-                .pulled_at
-                .cmp(&right.metadata.pulled_at)
-                .then_with(|| left.metadata.id.cmp(&right.metadata.id))
-        });
+        let Some(maximum) = matches
+            .iter()
+            .map(|stored| stored.metadata.generation)
+            .max()
+        else {
+            return Ok(None);
+        };
+        matches.retain(|stored| stored.metadata.generation == maximum);
+        if matches.len() != 1 {
+            return Err(FirestoneError::new(
+                ErrorKind::Conflict,
+                format!("image source '{source_ref}' has ambiguous generation {maximum}"),
+            )
+            .with_hint("move duplicate image sidecars aside and retry"));
+        }
         matches
             .pop()
             .map(|stored| self.verify_stored_pair(stored))
             .transpose()
+    }
+
+    fn next_generation(&self, source_ref: &str, architecture: Arch) -> Result<u64, FirestoneError> {
+        let generations = self
+            .list_locked()?
+            .into_iter()
+            .filter(|stored| {
+                stored.metadata.source_ref == source_ref
+                    && stored.metadata.architecture == architecture
+            })
+            .map(|stored| stored.metadata.generation)
+            .collect::<Vec<_>>();
+        let Some(maximum) = generations.iter().copied().max() else {
+            return Ok(1);
+        };
+        if generations
+            .iter()
+            .filter(|generation| **generation == maximum)
+            .count()
+            != 1
+        {
+            return Err(FirestoneError::new(
+                ErrorKind::Conflict,
+                format!("image source '{source_ref}' has ambiguous generation {maximum}"),
+            )
+            .with_hint("move duplicate image sidecars aside and retry"));
+        }
+        maximum.checked_add(1).ok_or_else(|| {
+            FirestoneError::new(
+                ErrorKind::Conflict,
+                format!("image source '{source_ref}' generation overflow"),
+            )
+            .with_hint("move obsolete image generations aside and retry")
+        })
     }
 
     fn existing_identity(
@@ -1184,30 +1461,51 @@ impl ImageStore {
             (false, false) => Ok(None),
             (true, true) => {
                 let stored = self.load_verified_pair(id)?;
-                let exact = stored.metadata.source_ref == source.source_ref
+                let immutable_match = stored.metadata.source_ref == source.source_ref
                     && stored.metadata.source_url == source.source_url
                     && stored.metadata.source_sha256 == source_sha256
                     && stored.metadata.architecture == source.architecture
-                    && stored.metadata.source_format == source_format
-                    && stored.metadata.verification() == source.verification;
-                if exact {
-                    Ok(Some(stored))
-                } else {
-                    Err(FirestoneError::new(
+                    && stored.metadata.source_format == source_format;
+                if !immutable_match {
+                    return Err(FirestoneError::new(
                         ErrorKind::Conflict,
-                        format!("image id `{id}` collides with different complete metadata"),
+                        format!("image id `{id}` collides with different immutable metadata"),
                     )
-                    .with_hint("move the conflicting image files aside and retry"))
+                    .with_hint("move the conflicting image files aside and retry"));
                 }
+
+                let mut metadata = stored.metadata;
+                let mut changed = false;
+                if let Some(verification) = &source.verification {
+                    if metadata.verification().as_ref() != Some(verification) {
+                        metadata.verification_algorithm = Some(verification.algorithm);
+                        metadata.verification_digest = Some(verification.digest.clone());
+                        changed = true;
+                    }
+                }
+                if source.firmware.is_some() && metadata.firmware != source.firmware {
+                    metadata.firmware = source.firmware;
+                    changed = true;
+                }
+                if changed {
+                    metadata.generation =
+                        self.next_generation(&source.source_ref, source.architecture)?;
+                    metadata.pulled_at = self.clock.now();
+                    metadata.validate()?;
+                    atomic::write_json_with_mode(&sidecar, &metadata, SIDECAR_FILE_MODE)?;
+                }
+                Ok(Some(StoredImage {
+                    metadata,
+                    path: stored.path,
+                }))
             }
             _ => Err(FirestoneError::new(
                 ErrorKind::Conflict,
                 format!("image `{id}` has an incomplete base/sidecar pair"),
             )
-            .with_hint("move the orphaned image file aside and retry")),
+            .with_hint("retry so Firestone can recover the incomplete image pair")),
         }
     }
-
     /// Uses the pinned qemu-img 8.2.2 raw conversion argv from verify 4.
     fn convert_raw(&self, source: &Path, target: &Path) -> Result<(), FirestoneError> {
         Cmd::new(self.qemu_img.as_os_str())
@@ -1218,6 +1516,7 @@ impl ImageStore {
             .arg("qcow2")
             .arg(source.as_os_str())
             .arg(target.as_os_str())
+            .timeout(QEMU_CONVERT_TIMEOUT)
             .error_kind(ErrorKind::Dependency)
             .run()?;
         Ok(())
@@ -1231,6 +1530,7 @@ impl ImageStore {
             .arg("-f")
             .arg("qcow2")
             .arg(path.as_os_str())
+            .timeout(QEMU_INFO_TIMEOUT)
             .error_kind(ErrorKind::Dependency)
             .run()?;
         let value =
@@ -1242,28 +1542,28 @@ impl ImageStore {
                 .with_hint("install qemu-img 8.2.2 or a compatible release")
                 .with_source(source)
             })?;
-        let format = value
-            .get("format")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| missing_qemu_info_field(path, "format"))?
-            .to_owned();
+        reject_hidden_qemu_dependencies(&value, path)?;
+        let format = required_qemu_string(&value, "format", path)?;
         let virtual_size = value
             .get("virtual-size")
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| missing_qemu_info_field(path, "virtual-size"))?;
-        let backing_filename = match value.get("backing-filename") {
-            None | Some(serde_json::Value::Null) => None,
-            Some(value) => Some(
-                value
-                    .as_str()
-                    .ok_or_else(|| missing_qemu_info_field(path, "backing-filename"))?
-                    .to_owned(),
-            ),
-        };
+        let backing_filename = optional_qemu_string(&value, "backing-filename", path)?;
+        let backing_filename_format =
+            optional_qemu_string(&value, "backing-filename-format", path)?;
+        let full_backing_filename = optional_qemu_string(&value, "full-backing-filename", path)?;
+        let dirty_flag = optional_qemu_bool(&value, "dirty-flag", path)?;
+        let format_specific = parse_qcow2_format_specific(&value, path)?;
         Ok(QemuInfo {
             format,
             virtual_size,
             backing_filename,
+            backing_filename_format,
+            full_backing_filename,
+            dirty_flag,
+            corrupt: format_specific.corrupt,
+            data_file: format_specific.data_file,
+            data_file_raw: format_specific.data_file_raw,
         })
     }
 
@@ -1307,23 +1607,13 @@ impl ImageStore {
         validate_image_id(id)?;
         let sidecar = self.paths.image_metadata(id)?;
         let base = self.paths.image_base(id)?;
-        self.paths
-            .validate_owned_data_file(&sidecar, "image sidecar", SIDECAR_FILE_MODE, false)?;
-        let sidecar_length = fs::symlink_metadata(&sidecar)
-            .map_err(|source| image_file_error("inspect", &sidecar, source))?
-            .len();
-        if sidecar_length > MAX_SIDECAR_BYTES {
-            return Err(FirestoneError::new(
-                ErrorKind::Dependency,
-                format!(
-                    "image sidecar '{}' exceeds the {} byte limit",
-                    sidecar.display(),
-                    MAX_SIDECAR_BYTES
-                ),
-            )
-            .with_hint("replace the sidecar with strict version-one metadata"));
-        }
-        let bytes = read_nofollow(&sidecar, "image sidecar")?;
+        let bytes = read_owned_bounded(
+            &self.paths,
+            &sidecar,
+            "image sidecar",
+            SIDECAR_FILE_MODE,
+            MAX_SIDECAR_BYTES,
+        )?;
         let metadata = serde_json::from_slice::<ImageMetadata>(&bytes).map_err(|source| {
             FirestoneError::new(
                 ErrorKind::Dependency,
@@ -1507,21 +1797,6 @@ impl ImageStore {
         Ok(references)
     }
 
-    fn firmware_for_reference(
-        &self,
-        reference: &str,
-    ) -> Result<Option<CatalogFirmware>, FirestoneError> {
-        if self.catalog.contains_reference(reference) {
-            Ok(Some(
-                self.catalog
-                    .resolve(reference, self.architecture.as_str())?
-                    .firmware,
-            ))
-        } else {
-            Ok(None)
-        }
-    }
-
     fn absolute_local_reference(
         &self,
         reference: &str,
@@ -1614,7 +1889,7 @@ impl ImageStore {
             )
             .with_hint("restore the original image reference or recreate the machine"));
         }
-        self.firmware_for_reference(&stored.metadata.source_ref)
+        Ok(stored.metadata.firmware)
     }
 
     fn create_overlay_locked(
@@ -1701,6 +1976,7 @@ impl ImageStore {
             .arg(stored.path.as_os_str())
             .arg(partial.as_os_str())
             .arg(disk_size.as_bytes().to_string())
+            .timeout(QEMU_CREATE_TIMEOUT)
             .error_kind(ErrorKind::Dependency)
             .run()?;
         validate_created_regular_file(&partial, "machine overlay partial")?;
@@ -1816,31 +2092,140 @@ impl ImageStore {
         let entries = fs::read_dir(self.paths.images_dir())
             .map_err(|source| image_file_error("read", &self.paths.images_dir(), source))?;
         let mut removal_ids = BTreeSet::new();
+        let mut removed_partial = false;
         for entry in entries {
             let entry = entry.map_err(|source| {
                 FirestoneError::new(ErrorKind::Generic, "cannot read an images directory entry")
                     .with_source(source)
             })?;
-            let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
-                continue;
-            };
+            let name = entry.file_name().into_string().map_err(|_| {
+                FirestoneError::new(
+                    ErrorKind::Dependency,
+                    "images directory contains a non-UTF-8 file name",
+                )
+                .with_hint("move the unknown file out of the images directory")
+            })?;
             if is_known_partial_name(&name) {
                 let path = entry.path();
                 validate_regular_nofollow(&path, "image partial")?;
                 fs::remove_file(&path)
                     .map_err(|source| image_file_error("remove stale", &path, source))?;
+                removed_partial = true;
                 continue;
             }
             if let Some(id) = removal_id_from_name(&name) {
                 removal_ids.insert(id.to_owned());
             }
         }
+        if removed_partial {
+            sync_directory(&self.paths.images_dir(), "images directory")?;
+        }
         for id in removal_ids {
             self.complete_stale_removal(&id)?;
         }
-        Ok(())
+        self.recover_incomplete_pairs()
     }
 
+    fn recover_incomplete_pairs(&self) -> Result<(), FirestoneError> {
+        let mut pairs = BTreeMap::<String, ImagePairPresence>::new();
+        for entry in fs::read_dir(self.paths.images_dir())
+            .map_err(|source| image_file_error("read", &self.paths.images_dir(), source))?
+        {
+            let entry = entry.map_err(|source| {
+                FirestoneError::new(ErrorKind::Generic, "cannot read an images directory entry")
+                    .with_source(source)
+            })?;
+            let name = entry.file_name().into_string().map_err(|_| {
+                FirestoneError::new(
+                    ErrorKind::Dependency,
+                    "images directory contains a non-UTF-8 file name",
+                )
+                .with_hint("move the unknown file out of the images directory")
+            })?;
+            let Some((id, artifact)) = image_artifact_from_name(&name)? else {
+                continue;
+            };
+            let presence = pairs.entry(id).or_default();
+            match artifact {
+                ImageArtifact::Base => presence.base = true,
+                ImageArtifact::Sidecar => presence.sidecar = true,
+                ImageArtifact::SidecarTemp => presence.sidecar_temp = true,
+            }
+        }
+
+        let references = if pairs
+            .values()
+            .any(|presence| !(presence.base && presence.sidecar))
+        {
+            self.image_references()?
+        } else {
+            BTreeMap::new()
+        };
+        let mut changed = false;
+        for (id, presence) in pairs {
+            let complete = presence.base && presence.sidecar;
+            if !complete {
+                if let Some(machine_names) = references.get(&id).filter(|names| !names.is_empty()) {
+                    return Err(FirestoneError::new(
+                        ErrorKind::Checksum,
+                        format!(
+                            "referenced image `{id}` has an incomplete base/sidecar publication; referenced by machine(s): {}",
+                            machine_names.join(", ")
+                        ),
+                    )
+                    .with_hint(
+                        "restore the missing immutable image file before retrying; Firestone preserved the remaining files",
+                    ));
+                }
+            }
+
+            let base = self.paths.image_base(&id)?;
+            let sidecar = self.paths.image_metadata(&id)?;
+            let sidecar_temp = sidecar.with_file_name(format!("{id}.json.tmp"));
+            if presence.sidecar_temp {
+                let _ = read_owned_bounded(
+                    &self.paths,
+                    &sidecar_temp,
+                    "image sidecar temporary file",
+                    SIDECAR_FILE_MODE,
+                    MAX_SIDECAR_BYTES,
+                )?;
+                fs::remove_file(&sidecar_temp)
+                    .map_err(|source| image_file_error("remove stale", &sidecar_temp, source))?;
+                changed = true;
+            }
+            if complete {
+                continue;
+            }
+            if presence.sidecar {
+                let _ = read_owned_bounded(
+                    &self.paths,
+                    &sidecar,
+                    "incomplete image sidecar",
+                    SIDECAR_FILE_MODE,
+                    MAX_SIDECAR_BYTES,
+                )?;
+                fs::remove_file(&sidecar)
+                    .map_err(|source| image_file_error("remove incomplete", &sidecar, source))?;
+                changed = true;
+            }
+            if presence.base {
+                self.paths.validate_owned_data_file(
+                    &base,
+                    "incomplete image base",
+                    BASE_FILE_MODE,
+                    false,
+                )?;
+                fs::remove_file(&base)
+                    .map_err(|source| image_file_error("remove incomplete", &base, source))?;
+                changed = true;
+            }
+        }
+        if changed {
+            sync_directory(&self.paths.images_dir(), "images directory")?;
+        }
+        Ok(())
+    }
     fn complete_stale_removal(&self, id: &str) -> Result<(), FirestoneError> {
         validate_image_id(id)?;
         let base = self.paths.image_base(id)?;
@@ -1924,24 +2309,31 @@ impl ImageStoreLock {
         poll_interval: Duration,
     ) -> Result<Self, FirestoneError> {
         let path = paths.image_store_lock()?;
-        let file = OpenOptions::new()
+        let create = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(false)
+            .create_new(true)
             .mode(LOCK_FILE_MODE)
-            .custom_flags(nix::libc::O_NOFOLLOW)
-            .open(&path)
-            .map_err(|source| {
-                FirestoneError::new(
-                    ErrorKind::Dependency,
-                    format!("cannot open image store lock '{}'", path.display()),
-                )
-                .with_hint("replace a symlink or special lock file with a protected regular file")
-                .with_source(source)
-            })?;
-        paths.validate_owned_data_file(&path, "image store lock", LOCK_FILE_MODE, false)?;
-
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC)
+            .open(&path);
+        let file = match create {
+            Ok(file) => {
+                file.set_permissions(fs::Permissions::from_mode(LOCK_FILE_MODE))
+                    .map_err(|source| image_lock_error("set mode on", &path, source))?;
+                file.sync_all()
+                    .map_err(|source| image_lock_error("fsync", &path, source))?;
+                file
+            }
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => OpenOptions::new()
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC)
+                .open(&path)
+                .map_err(|source| image_lock_error("open existing", &path, source))?,
+            Err(source) => return Err(image_lock_error("create", &path, source)),
+        };
+        paths.validate_owned_data_file_handle(&path, "image store lock", LOCK_FILE_MODE, &file)?;
         let started = Instant::now();
         let mut file = file;
         loop {
@@ -2157,11 +2549,15 @@ fn parse_checksum_manifest(
 fn parse_manifest_line(line: &str, algorithm: ChecksumAlgorithm) -> Option<(String, String)> {
     let line = line.trim_end_matches('\r').trim();
     let digest_length = digest_length(algorithm);
-    if line.len() > digest_length {
-        let (candidate, rest) = line.split_at(digest_length);
-        if is_hex(candidate, digest_length)
-            && rest.as_bytes().first().is_some_and(u8::is_ascii_whitespace)
+    let bytes = line.as_bytes();
+    if bytes.len() > digest_length {
+        let candidate_bytes = bytes.get(..digest_length)?;
+        let rest_bytes = bytes.get(digest_length..)?;
+        if candidate_bytes.iter().all(u8::is_ascii_hexdigit)
+            && rest_bytes.first().is_some_and(u8::is_ascii_whitespace)
         {
+            let candidate = std::str::from_utf8(candidate_bytes).ok()?;
+            let rest = std::str::from_utf8(rest_bytes).ok()?;
             let mut filename = rest.trim_start();
             if let Some(stripped) = filename.strip_prefix('*') {
                 filename = stripped;
@@ -2244,6 +2640,32 @@ fn hex_value(value: u8) -> Option<u8> {
     }
 }
 
+fn metadata_matches_cache_source(metadata: &ImageMetadata, source: &ResolvedImageSource) -> bool {
+    if metadata.source_ref != source.source_ref
+        || metadata.architecture != source.architecture
+        || source
+            .source_format
+            .is_some_and(|format| format != metadata.source_format)
+    {
+        return false;
+    }
+    match &source.checksum {
+        ExpectedChecksum::None => {
+            metadata.source_url == source.source_url
+                && metadata.verification_algorithm.is_none()
+                && metadata.verification_digest.is_none()
+        }
+        ExpectedChecksum::Digest(verification) => {
+            metadata.source_url == source.source_url
+                && metadata.verification().as_ref() == Some(verification)
+        }
+        ExpectedChecksum::Manifest { algorithm, .. } => {
+            metadata.verification_algorithm == Some(*algorithm)
+                && metadata.verification_digest.is_some()
+        }
+    }
+}
+
 fn metadata_matches_source(
     metadata: &ImageMetadata,
     source: &ResolvedImageSource,
@@ -2252,6 +2674,7 @@ fn metadata_matches_source(
     metadata.source_ref == source.source_ref
         && metadata.source_url == source.source_url
         && metadata.architecture == source.architecture
+        && metadata.firmware == source.firmware
         && source
             .source_format
             .is_none_or(|format| format == metadata.source_format)
@@ -2350,21 +2773,110 @@ fn digest_hex(bytes: &[u8]) -> String {
     output
 }
 
-fn open_local_source(path: &Path) -> Result<File, FirestoneError> {
-    let metadata = fs::symlink_metadata(path).map_err(|source| {
+fn local_source_snapshot(metadata: &fs::Metadata) -> LocalSourceSnapshot {
+    LocalSourceSnapshot {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    }
+}
+
+fn try_open_local_source(path: &Path) -> Result<Option<OpenedLocalSource>, FirestoneError> {
+    let parent = path.parent().ok_or_else(|| {
         FirestoneError::new(
-            ErrorKind::NotFound,
-            format!("cannot inspect local image '{}'", path.display()),
+            ErrorKind::InvalidSpec,
+            format!(
+                "local image path '{}' has no parent directory",
+                path.display()
+            ),
         )
-        .with_hint("check that the path names a readable regular file")
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        FirestoneError::new(
+            ErrorKind::InvalidSpec,
+            format!("local image path '{}' has no file name", path.display()),
+        )
+    })?;
+    let canonical_parent = match fs::canonicalize(parent) {
+        Ok(parent) => parent,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(FirestoneError::new(
+                ErrorKind::InvalidSpec,
+                format!(
+                    "cannot canonicalize local image parent '{}'",
+                    parent.display()
+                ),
+            )
+            .with_hint("check every parent path component")
+            .with_source(source));
+        }
+    };
+    let parent_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(&canonical_parent)
+        .map_err(|source| {
+            FirestoneError::new(
+                ErrorKind::InvalidSpec,
+                format!(
+                    "cannot open local image parent '{}'",
+                    canonical_parent.display()
+                ),
+            )
+            .with_source(source)
+        })?;
+    let descriptor = match openat(
+        &parent_file,
+        Path::new(file_name),
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(Errno::ENOENT) => return Ok(None),
+        Err(Errno::ELOOP) => {
+            return Err(FirestoneError::new(
+                ErrorKind::InvalidSpec,
+                format!("local image '{}' is a symlink", path.display()),
+            )
+            .with_hint("use a regular raw or qcow2 file, not a final-component symlink"));
+        }
+        Err(source) => {
+            return Err(FirestoneError::new(
+                ErrorKind::Generic,
+                format!("cannot open local image '{}'", path.display()),
+            )
+            .with_hint("check that the image is a readable regular file")
+            .with_source(io::Error::from(source)));
+        }
+    };
+    let file = File::from(descriptor);
+    let metadata = file.metadata().map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::Generic,
+            format!("cannot inspect opened local image '{}'", path.display()),
+        )
         .with_source(source)
     })?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
+    if !metadata.is_file() {
         return Err(FirestoneError::new(
             ErrorKind::InvalidSpec,
             format!("local image '{}' is not a regular file", path.display()),
         )
-        .with_hint("use a regular raw or qcow2 file, not a symlink or special file"));
+        .with_hint("use a regular raw or qcow2 file, not a FIFO, device, or socket"));
+    }
+    let uid = metadata.uid();
+    let current_uid = nix::unistd::getuid().as_raw();
+    if uid != current_uid && uid != 0 {
+        return Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!("local image '{}' is owned by uid {uid}", path.display()),
+        )
+        .with_hint("use an image owned by the current user or root"));
     }
     if metadata.mode() & 0o022 != 0 {
         return Err(FirestoneError::new(
@@ -2376,18 +2888,12 @@ fn open_local_source(path: &Path) -> Result<File, FirestoneError> {
         )
         .with_hint("remove group/world write permissions before pulling the image"));
     }
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|source| {
-            FirestoneError::new(
-                ErrorKind::Generic,
-                format!("cannot open local image '{}'", path.display()),
-            )
-            .with_hint("check that the image is readable")
-            .with_source(source)
-        })
+    let canonical_path = canonical_parent.join(file_name);
+    Ok(Some(OpenedLocalSource {
+        path: canonical_path,
+        file: Arc::new(file),
+        snapshot: local_source_snapshot(&metadata),
+    }))
 }
 
 fn validate_created_regular_file(path: &Path, label: &str) -> Result<(), FirestoneError> {
@@ -2416,10 +2922,16 @@ fn validate_regular_nofollow(path: &Path, label: &str) -> Result<(), FirestoneEr
     Ok(())
 }
 
-fn read_nofollow(path: &Path, label: &str) -> Result<Vec<u8>, FirestoneError> {
+fn read_owned_bounded(
+    paths: &Paths,
+    path: &Path,
+    label: &str,
+    mode: u32,
+    limit: u64,
+) -> Result<Vec<u8>, FirestoneError> {
     let mut file = OpenOptions::new()
         .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC)
         .open(path)
         .map_err(|source| {
             FirestoneError::new(
@@ -2429,16 +2941,23 @@ fn read_nofollow(path: &Path, label: &str) -> Result<Vec<u8>, FirestoneError> {
             .with_hint("check the file permissions")
             .with_source(source)
         })?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|source| {
-        FirestoneError::new(
+    paths.validate_owned_data_file_handle(path, label, mode, &file)?;
+    bounded::read_to_end(&mut file, limit).map_err(|error| match error {
+        BoundedReadError::Io(source) => FirestoneError::new(
             ErrorKind::Generic,
             format!("cannot read {label} '{}'", path.display()),
         )
         .with_hint("check the file permissions")
-        .with_source(source)
-    })?;
-    Ok(bytes)
+        .with_source(source),
+        BoundedReadError::LimitExceeded => FirestoneError::new(
+            ErrorKind::Dependency,
+            format!(
+                "{label} '{}' exceeds the {limit} byte limit",
+                path.display()
+            ),
+        )
+        .with_hint("replace the oversized file with bounded strict metadata"),
+    })
 }
 
 fn hash_file_sha256(path: &Path) -> Result<String, FirestoneError> {
@@ -2448,7 +2967,7 @@ fn hash_file_sha256(path: &Path) -> Result<String, FirestoneError> {
 fn hash_file_with_size(path: &Path) -> Result<(String, u64), FirestoneError> {
     let mut file = OpenOptions::new()
         .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC)
         .open(path)
         .map_err(|source| image_file_error("open", path, source))?;
     let mut hasher = Sha256::new();
@@ -2595,22 +3114,194 @@ fn is_known_partial_name(name: &str) -> bool {
     digest.is_some_and(|value| is_lower_hex(value, 64))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageArtifact {
+    Base,
+    Sidecar,
+    SidecarTemp,
+}
+
+#[derive(Debug, Default)]
+struct ImagePairPresence {
+    base: bool,
+    sidecar: bool,
+    sidecar_temp: bool,
+}
+
+fn image_artifact_from_name(name: &str) -> Result<Option<(String, ImageArtifact)>, FirestoneError> {
+    let parsed = name
+        .strip_suffix(".json.tmp")
+        .map(|id| (id, ImageArtifact::SidecarTemp))
+        .or_else(|| {
+            name.strip_suffix(".json")
+                .map(|id| (id, ImageArtifact::Sidecar))
+        })
+        .or_else(|| {
+            name.strip_suffix(".qcow2")
+                .map(|id| (id, ImageArtifact::Base))
+        });
+    let Some((id, artifact)) = parsed else {
+        return Ok(None);
+    };
+    validate_image_id(id).map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::Dependency,
+            format!("images directory contains invalid image artifact name '{name}'"),
+        )
+        .with_hint("move the malformed image artifact out of the images directory")
+        .with_source(source)
+    })?;
+    Ok(Some((id.to_owned(), artifact)))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Qcow2FormatSpecific {
+    corrupt: Option<bool>,
+    data_file: Option<String>,
+    data_file_raw: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct QemuInfo {
     format: String,
     virtual_size: u64,
     backing_filename: Option<String>,
+    backing_filename_format: Option<String>,
+    full_backing_filename: Option<String>,
+    dirty_flag: Option<bool>,
+    corrupt: Option<bool>,
+    data_file: Option<String>,
+    data_file_raw: Option<bool>,
 }
 
-fn validate_base_info(id: &str, info: &QemuInfo) -> Result<(), FirestoneError> {
+fn required_qemu_string(
+    value: &serde_json::Value,
+    field: &str,
+    path: &Path,
+) -> Result<String, FirestoneError> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| missing_qemu_info_field(path, field))
+}
+
+fn optional_qemu_string(
+    value: &serde_json::Value,
+    field: &str,
+    path: &Path,
+) -> Result<Option<String>, FirestoneError> {
+    match value.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(|value| Some(value.to_owned()))
+            .ok_or_else(|| missing_qemu_info_field(path, field)),
+    }
+}
+
+fn optional_qemu_bool(
+    value: &serde_json::Value,
+    field: &str,
+    path: &Path,
+) -> Result<Option<bool>, FirestoneError> {
+    match value.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| missing_qemu_info_field(path, field)),
+    }
+}
+
+fn parse_qcow2_format_specific(
+    value: &serde_json::Value,
+    path: &Path,
+) -> Result<Qcow2FormatSpecific, FirestoneError> {
+    let format_specific = value
+        .get("format-specific")
+        .ok_or_else(|| missing_qemu_info_field(path, "format-specific"))?;
+    if format_specific.is_null() {
+        return Err(missing_qemu_info_field(path, "format-specific"));
+    }
+    let object = format_specific
+        .as_object()
+        .ok_or_else(|| missing_qemu_info_field(path, "format-specific"))?;
+    if object.get("type").and_then(serde_json::Value::as_str) != Some("qcow2") {
+        return Err(missing_qemu_info_field(path, "format-specific.type"));
+    }
+    let data = object
+        .get("data")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| missing_qemu_info_field(path, "format-specific.data"))?;
+    for key in data.keys() {
+        let normalized = key.replace('_', "-");
+        if normalized.contains("data-file") && key != "data-file" && key != "data-file-raw" {
+            return Err(missing_qemu_info_field(
+                path,
+                "format-specific.data external-file field",
+            ));
+        }
+    }
+    let data_value = serde_json::Value::Object(data.clone());
+    Ok(Qcow2FormatSpecific {
+        corrupt: optional_qemu_bool(&data_value, "corrupt", path)?,
+        data_file: optional_qemu_string(&data_value, "data-file", path)?,
+        data_file_raw: optional_qemu_bool(&data_value, "data-file-raw", path)?,
+    })
+}
+fn reject_hidden_qemu_dependencies(
+    value: &serde_json::Value,
+    path: &Path,
+) -> Result<(), FirestoneError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| missing_qemu_info_field(path, "top-level object"))?;
+    for key in object.keys() {
+        let normalized = key.replace('_', "-");
+        let known_backing = matches!(
+            key.as_str(),
+            "backing-filename" | "backing-filename-format" | "full-backing-filename"
+        );
+        if (normalized.contains("backing") && !known_backing) || normalized.contains("data-file") {
+            return Err(missing_qemu_info_field(
+                path,
+                "unknown field that may hide an external dependency",
+            ));
+        }
+    }
+    Ok(())
+}
+fn validate_qcow2_health(label: &str, info: &QemuInfo) -> Result<(), FirestoneError> {
     if info.format != "qcow2" {
         return Err(FirestoneError::new(
             ErrorKind::Dependency,
-            format!("stored image `{id}` has qemu format '{}'", info.format),
-        )
-        .with_hint("remove the invalid image and pull it again"));
+            format!("{label} has qemu format '{}'", info.format),
+        ));
     }
-    if info.backing_filename.is_some() {
+    if info.dirty_flag != Some(false) || info.corrupt != Some(false) {
+        return Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!("{label} omitted health fields or is marked dirty/corrupt by qemu-img"),
+        )
+        .with_hint("repair or replace the qcow2 image before retrying"));
+    }
+    if info.data_file.is_some() || info.data_file_raw == Some(true) {
+        return Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!("{label} uses an external qcow2 data file"),
+        )
+        .with_hint("flatten the image so every guest byte is stored in the owned qcow2 file"));
+    }
+    Ok(())
+}
+
+fn validate_base_info(id: &str, info: &QemuInfo) -> Result<(), FirestoneError> {
+    validate_qcow2_health(&format!("stored image `{id}`"), info)?;
+    if info.backing_filename.is_some()
+        || info.backing_filename_format.is_some()
+        || info.full_backing_filename.is_some()
+    {
         return Err(FirestoneError::new(
             ErrorKind::Dependency,
             format!("stored image `{id}` unexpectedly has a backing file"),
@@ -2626,28 +3317,21 @@ fn validate_overlay_info(
     requested_size: u64,
     info: &QemuInfo,
 ) -> Result<(), FirestoneError> {
-    if info.format != "qcow2" {
-        return Err(FirestoneError::new(
-            ErrorKind::Dependency,
-            format!(
-                "overlay '{}' has qemu format '{}'",
-                overlay.display(),
-                info.format
-            ),
-        )
-        .with_hint("remove the invalid overlay and retry start"));
-    }
+    validate_qcow2_health(&format!("overlay '{}'", overlay.display()), info)?;
     let expected = base.to_str().ok_or_else(|| {
         FirestoneError::new(
             ErrorKind::Dependency,
             format!("base image path '{}' is not UTF-8", base.display()),
         )
     })?;
-    if info.backing_filename.as_deref() != Some(expected) {
+    if info.backing_filename.as_deref() != Some(expected)
+        || info.full_backing_filename.as_deref() != Some(expected)
+        || info.backing_filename_format.as_deref() != Some("qcow2")
+    {
         return Err(FirestoneError::new(
             ErrorKind::Dependency,
             format!(
-                "overlay '{}' does not reference exact base '{}'",
+                "overlay '{}' does not reference exact qcow2 base '{}'",
                 overlay.display(),
                 base.display()
             ),
@@ -2690,6 +3374,15 @@ fn invalid_sidecar(id: &str, detail: &str) -> FirestoneError {
 fn image_not_found(id: &str) -> FirestoneError {
     FirestoneError::new(ErrorKind::NotFound, format!("no image with id `{id}`"))
         .with_hint("run `firestone images ls` to list stored images")
+}
+
+fn image_lock_error(operation: &str, path: &Path, source: io::Error) -> FirestoneError {
+    FirestoneError::new(
+        ErrorKind::Dependency,
+        format!("cannot {operation} image store lock '{}'", path.display()),
+    )
+    .with_hint("replace a symlink, special, or insecure lock file with a protected regular file")
+    .with_source(source)
 }
 
 fn image_file_error(operation: &str, path: &Path, source: io::Error) -> FirestoneError {
@@ -2743,6 +3436,13 @@ mod tests {
     impl Clock for FixedClock {
         fn now(&self) -> String {
             FIXED_TIME.to_owned()
+        }
+    }
+    struct StaticClock(&'static str);
+
+    impl Clock for StaticClock {
+        fn now(&self) -> String {
+            self.0.to_owned()
         }
     }
 
@@ -2901,11 +3601,13 @@ elif args[0] == "create":
     pathlib.Path(args[7]).write_bytes(data)
 elif args[0] == "info":
     data = pathlib.Path(args[4]).read_bytes()
-    info = {"format": "qcow2", "virtual-size": 4}
+    info = {"format": "qcow2", "virtual-size": 4, "dirty-flag": False, "format-specific": {"type": "qcow2", "data": {"corrupt": False}}}
     if data[4:].startswith(b"OVERLAY\n"):
         lines = data[4:].splitlines()
         info["virtual-size"] = int(lines[2])
         info["backing-filename"] = lines[1].decode()
+        info["backing-filename-format"] = "qcow2"
+        info["full-backing-filename"] = lines[1].decode()
     print(json.dumps(info, separators=(",", ":")))
 else:
     sys.exit(23)
@@ -2938,6 +3640,30 @@ else:
             ImageRef::new(path.to_string_lossy().into_owned()),
             source_base,
         )
+    }
+    fn custom_catalog(
+        root: &Path,
+        label: &str,
+        source: &str,
+    ) -> Result<Catalog, Box<dyn std::error::Error>> {
+        let path = root.join(format!("{label}.toml"));
+        fs::write(&path, source)?;
+        Ok(Catalog::load(&root.join("missing-catalog.toml"), &[path])?)
+    }
+
+    fn store_with_catalog(
+        fixture: &Fixture,
+        catalog: Catalog,
+        clock: Arc<dyn Clock>,
+    ) -> ImageStore {
+        ImageStore {
+            paths: fixture.paths.clone(),
+            catalog,
+            architecture: Arch::X86_64,
+            qemu_img: fixture.store.qemu_img.clone(),
+            http: fixture.http.clone(),
+            clock,
+        }
     }
 
     fn assert_no_image_artifacts(paths: &Paths) -> Result<(), Box<dyn std::error::Error>> {
@@ -3026,11 +3752,13 @@ else:
             r#"{{
   "version": 1,
   "id": "{id}",
+  "generation": 1,
   "source_ref": "{url}",
   "source_url": "{url}",
   "source_sha256": "{source_sha256}",
   "stored_sha256": "{source_sha256}",
   "architecture": "x86_64",
+  "firmware": null,
   "source_format": "qcow2",
   "stored_format": "qcow2",
   "verification_algorithm": "sha256",
@@ -3368,6 +4096,107 @@ else:
             fixture.paths.machine_disk_partial(name)?.display()
         );
         assert!(log.lines().any(|line| line == expected_info));
+        Ok(())
+    }
+
+    #[test]
+    fn machine_prepare_changed_catalog_override_pulls_new_identity_instead_of_old_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let old_bytes = b"QFI\xFBOLD-UBUNTU".to_vec();
+        let old_sha256 = sha256_bytes(&old_bytes);
+        let old_image_url =
+            "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img";
+        let old_manifest_url = "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS";
+        fixture.http.push(
+            old_manifest_url,
+            format!("{old_sha256}  noble-server-cloudimg-amd64.img\n").into_bytes(),
+            None,
+            Some("text/plain"),
+        )?;
+        fixture.http.push(
+            old_image_url,
+            old_bytes.clone(),
+            Some(old_bytes.len() as u64),
+            None,
+        )?;
+        let old = fixture.store.pull(
+            &ImagePullRequest::new(ImageRef::new("ubuntu:24.04"), &fixture.root),
+            &mut Vec::new(),
+        )?;
+
+        let replacement_url = "https://override.example.invalid/ubuntu-24.04.raw";
+        let replacement_bytes = b"replacement raw source".to_vec();
+        let replacement_sha256 = sha256_bytes(&replacement_bytes);
+        let override_path = fixture.root.join("override.toml");
+        fs::write(
+            &override_path,
+            format!(
+                concat!(
+                    "[[image]]\n",
+                    "distro = \"ubuntu\"\n",
+                    "version = \"24.04\"\n",
+                    "aliases = [\"noble\"]\n",
+                    "default = true\n",
+                    "firmware = \"edk2\"\n",
+                    "format = \"raw\"\n\n",
+                    "[image.arch.x86_64]\n",
+                    "url = \"{}\"\n",
+                    "sha256 = \"{}\"\n",
+                    "checksum_alg = \"sha256\"\n"
+                ),
+                replacement_url, replacement_sha256,
+            ),
+        )?;
+        fixture.http.push(
+            replacement_url,
+            replacement_bytes.clone(),
+            Some(replacement_bytes.len() as u64),
+            None,
+        )?;
+        let overridden = ImageStore {
+            paths: fixture.paths.clone(),
+            catalog: Catalog::load(&fixture.root.join("missing-catalog.toml"), &[override_path])?,
+            architecture: Arch::X86_64,
+            qemu_img: fixture.store.qemu_img.clone(),
+            http: fixture.http.clone(),
+            clock: Arc::new(FixedClock),
+        };
+        let name = "changed-override";
+        let mut state = machine_state(
+            &fixture.paths,
+            name,
+            StateImage {
+                r#ref: "ubuntu:24.04".to_owned(),
+                id: None,
+                sha256: None,
+            },
+        )?;
+        let mut lock_events = Vec::new();
+        let lock = create_machine(&fixture.paths, name, &state, &mut lock_events)?;
+        let prepared = overridden.prepare_machine_image(
+            name,
+            &mut state,
+            &fixture.root,
+            ByteSize::from_mib(1)?,
+            &lock,
+            &mut Vec::new(),
+        )?;
+        assert!(!prepared.image.cached);
+        assert_ne!(prepared.image.metadata.id, old.metadata.id);
+        assert_eq!(
+            prepared.image.metadata.source_url.as_deref(),
+            Some(replacement_url)
+        );
+        assert_eq!(prepared.image.metadata.source_format, ImageFormat::Raw);
+        assert_eq!(
+            prepared.image.metadata.verification_digest.as_deref(),
+            Some(replacement_sha256.as_str())
+        );
+        assert_eq!(
+            state.image.id.as_deref(),
+            Some(prepared.image.metadata.id.as_str())
+        );
         Ok(())
     }
 
@@ -3781,6 +4610,862 @@ else:
             .ok_or("expected unknown sidecar field rejection")?;
         assert_eq!(error.kind(), ErrorKind::Dependency);
         assert!(error.message().contains("cannot parse"));
+        let pristine = serde_json::to_value(&pulled.metadata)?;
+        for key in [
+            "version",
+            "id",
+            "generation",
+            "source_ref",
+            "source_url",
+            "source_sha256",
+            "stored_sha256",
+            "architecture",
+            "firmware",
+            "source_format",
+            "stored_format",
+            "verification_algorithm",
+            "verification_digest",
+            "size",
+            "pulled_at",
+        ] {
+            let mut missing = pristine.clone();
+            missing
+                .as_object_mut()
+                .ok_or("sidecar JSON was not an object")?
+                .remove(key);
+            atomic::write_json_with_mode(&sidecar, &missing, SIDECAR_FILE_MODE)?;
+            let missing_error = fixture
+                .store
+                .list()
+                .err()
+                .ok_or_else(|| format!("expected missing sidecar key '{key}' rejection"))?;
+            assert_eq!(missing_error.kind(), ErrorKind::Dependency);
+        }
+        for key in [
+            "source_url",
+            "firmware",
+            "verification_algorithm",
+            "verification_digest",
+        ] {
+            assert!(pristine.get(key).is_some_and(serde_json::Value::is_null));
+        }
+        let encoded = serde_json::to_vec(&pulled.metadata)?;
+        let round_trip: ImageMetadata = serde_json::from_slice(&encoded)?;
+        assert_eq!(round_trip, pulled.metadata);
+        Ok(())
+    }
+    #[test]
+    fn redirect_policy_allows_five_and_rejects_six() {
+        assert!(!redirect_limit_exceeded(5));
+        assert!(redirect_limit_exceeded(6));
+    }
+
+    #[test]
+    fn manifest_parser_handles_multibyte_digest_boundaries_without_panicking() {
+        let sha256_boundary = format!("{}é  image.qcow2", "a".repeat(63));
+        assert!(
+            parse_checksum_manifest(&sha256_boundary, ChecksumAlgorithm::Sha256, "image.qcow2",)
+                .is_err()
+        );
+        let sha512_boundary = format!("{}é  image.qcow2", "a".repeat(127));
+        assert!(
+            parse_checksum_manifest(&sha512_boundary, ChecksumAlgorithm::Sha512, "image.qcow2",)
+                .is_err()
+        );
+        assert!(
+            parse_checksum_manifest(
+                "éSHA256 (image.qcow2) = bad",
+                ChecksumAlgorithm::Sha256,
+                "image.qcow2"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn qemu_validation_rejects_external_dirty_corrupt_and_tampered_dependencies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let healthy = || QemuInfo {
+            format: "qcow2".to_owned(),
+            virtual_size: 4096,
+            backing_filename: None,
+            backing_filename_format: None,
+            full_backing_filename: None,
+            dirty_flag: Some(false),
+            corrupt: Some(false),
+            data_file: None,
+            data_file_raw: None,
+        };
+        let mut dirty = healthy();
+        dirty.dirty_flag = Some(true);
+        assert_eq!(
+            validate_base_info("dirty", &dirty)
+                .err()
+                .ok_or("dirty accepted")?
+                .kind(),
+            ErrorKind::Dependency
+        );
+        let mut corrupt = healthy();
+        corrupt.corrupt = Some(true);
+        assert_eq!(
+            validate_base_info("corrupt", &corrupt)
+                .err()
+                .ok_or("corrupt accepted")?
+                .kind(),
+            ErrorKind::Dependency
+        );
+        let mut external = healthy();
+        external.data_file = Some("outside.raw".to_owned());
+        assert_eq!(
+            validate_base_info("external", &external)
+                .err()
+                .ok_or("external data accepted")?
+                .kind(),
+            ErrorKind::Dependency
+        );
+        let mut raw_external = healthy();
+        raw_external.data_file_raw = Some(true);
+        assert!(validate_base_info("external-raw", &raw_external).is_err());
+
+        let base = Path::new("/owned/images/base.qcow2");
+        let overlay = Path::new("/owned/machines/demo/disk.qcow2");
+        let mut valid_overlay = healthy();
+        valid_overlay.backing_filename = Some(base.to_string_lossy().into_owned());
+        valid_overlay.full_backing_filename = Some(base.to_string_lossy().into_owned());
+        valid_overlay.backing_filename_format = Some("qcow2".to_owned());
+        validate_overlay_info(overlay, base, 4096, &valid_overlay)?;
+        let mut wrong_path = valid_overlay.clone();
+        wrong_path.full_backing_filename = Some("/other/base.qcow2".to_owned());
+        assert!(validate_overlay_info(overlay, base, 4096, &wrong_path).is_err());
+        let mut wrong_format = valid_overlay;
+        wrong_format.backing_filename_format = Some("raw".to_owned());
+        assert!(validate_overlay_info(overlay, base, 4096, &wrong_format).is_err());
+
+        let hidden_top =
+            serde_json::json!({"format":"qcow2","virtual-size":4,"backing_file":"outside"});
+        assert!(reject_hidden_qemu_dependencies(&hidden_top, overlay).is_err());
+        let hidden_data = serde_json::json!({
+            "format-specific": {"type":"qcow2","data":{"data_file":"outside"}}
+        });
+        assert!(parse_qcow2_format_specific(&hidden_data, overlay).is_err());
+        assert!(parse_qcow2_format_specific(&serde_json::json!({}), overlay).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn local_source_descriptor_dedupes_aliases_and_detects_swap_and_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let source_dir = fixture.root.join("sources");
+        fs::create_dir(&source_dir)?;
+        fs::set_permissions(&source_dir, fs::Permissions::from_mode(0o700))?;
+        let source = source_dir.join("base.qcow2");
+        fs::write(&source, b"QFI\xFBORIGINAL")?;
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600))?;
+        let aliased = source_dir.join("..").join("sources").join("base.qcow2");
+        let first = fixture
+            .store
+            .pull(&local_request(&aliased, &fixture.root), &mut Vec::new())?;
+        let second = fixture
+            .store
+            .pull(&local_request(&source, &fixture.root), &mut Vec::new())?;
+        assert_eq!(first.metadata.id, second.metadata.id);
+        assert_eq!(first.metadata.source_ref, source.to_string_lossy());
+
+        fixture.store.ensure_store()?;
+        {
+            let _lock = fixture.store.acquire_lock()?;
+            let held_path = fixture.write_source("held.qcow2", b"QFI\xFBHELD")?;
+            let resolved = fixture.store.resolve(
+                &ImageRef::new(held_path.to_string_lossy().into_owned()),
+                None,
+                &fixture.root,
+            )?;
+            let moved = fixture.root.join("held-original.qcow2");
+            fs::rename(&held_path, &moved)?;
+            fs::write(&held_path, b"QFI\xFBREPLACEMENT")?;
+            fs::set_permissions(&held_path, fs::Permissions::from_mode(0o600))?;
+            let error = fixture
+                .store
+                .pull_locked(resolved, &mut Vec::new())
+                .err()
+                .ok_or("expected pathname swap rejection")?;
+            assert_eq!(error.kind(), ErrorKind::Checksum);
+        }
+        {
+            let _lock = fixture.store.acquire_lock()?;
+            let changing = fixture.write_source("changing.qcow2", b"QFI\xFBSTART")?;
+            let resolved = fixture.store.resolve(
+                &ImageRef::new(changing.to_string_lossy().into_owned()),
+                None,
+                &fixture.root,
+            )?;
+            OpenOptions::new()
+                .append(true)
+                .open(&changing)?
+                .write_all(b"changed")?;
+            let error = fixture
+                .store
+                .pull_locked(resolved, &mut Vec::new())
+                .err()
+                .ok_or("expected mutation rejection")?;
+            assert_eq!(error.kind(), ErrorKind::Generic);
+        }
+
+        let fifo = fixture.root.join("source.fifo");
+        nix::unistd::mkfifo(&fifo, Mode::from_bits_truncate(0o600))?;
+        let fifo_error = fixture
+            .store
+            .resolve(
+                &ImageRef::new(fifo.to_string_lossy().into_owned()),
+                None,
+                &fixture.root,
+            )
+            .err()
+            .ok_or("expected FIFO rejection")?;
+        assert_eq!(fifo_error.kind(), ErrorKind::InvalidSpec);
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_sidecar_is_rejected_by_descriptor_bounded_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let source = fixture.write_source("bounded.qcow2", b"QFI\xFBBOUNDED")?;
+        let pulled = fixture
+            .store
+            .pull(&local_request(&source, &fixture.root), &mut Vec::new())?;
+        let sidecar = fixture.paths.image_metadata(&pulled.metadata.id)?;
+        fs::write(&sidecar, vec![b'x'; MAX_SIDECAR_BYTES as usize + 1])?;
+        fs::set_permissions(&sidecar, fs::Permissions::from_mode(SIDECAR_FILE_MODE))?;
+        let error = fixture
+            .store
+            .list()
+            .err()
+            .ok_or("expected oversized sidecar rejection")?;
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert!(error.message().contains("exceeds"));
+        Ok(())
+    }
+    #[test]
+    fn moved_manifest_catalog_uses_warm_cache_but_explicit_digest_mismatch_does_not()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let old_url = "https://cache.example.invalid/old/base.qcow2";
+        let old_manifest = "https://cache.example.invalid/old/SHA256SUMS";
+        let bytes = b"QFI\xFBWARM-CACHE".to_vec();
+        let digest = sha256_bytes(&bytes);
+        let old_catalog = custom_catalog(
+            &fixture.root,
+            "old-moving",
+            &format!(
+                concat!(
+                    "[[image]]\n",
+                    "distro = \"moving\"\n",
+                    "version = \"1\"\n",
+                    "aliases = []\n",
+                    "default = true\n",
+                    "firmware = \"rhf\"\n",
+                    "format = \"qcow2\"\n\n",
+                    "[image.arch.x86_64]\n",
+                    "url = \"{}\"\n",
+                    "checksum_url = \"{}\"\n",
+                    "checksum_alg = \"sha256\"\n"
+                ),
+                old_url, old_manifest,
+            ),
+        )?;
+        let old_store = store_with_catalog(&fixture, old_catalog, Arc::new(FixedClock));
+        fixture.http.push(
+            old_manifest,
+            format!("{digest}  base.qcow2\n").into_bytes(),
+            None,
+            Some("text/plain"),
+        )?;
+        fixture
+            .http
+            .push(old_url, bytes.clone(), Some(bytes.len() as u64), None)?;
+        let old = old_store.pull(
+            &ImagePullRequest::new(ImageRef::new("moving:1"), &fixture.root),
+            &mut Vec::new(),
+        )?;
+
+        let new_url = "https://cache.example.invalid/new/base.qcow2";
+        let new_manifest = "https://cache.example.invalid/new/SHA256SUMS";
+        let new_catalog = custom_catalog(
+            &fixture.root,
+            "new-moving",
+            &format!(
+                concat!(
+                    "[[image]]\n",
+                    "distro = \"moving\"\n",
+                    "version = \"1\"\n",
+                    "aliases = []\n",
+                    "default = true\n",
+                    "firmware = \"edk2\"\n",
+                    "format = \"qcow2\"\n\n",
+                    "[image.arch.x86_64]\n",
+                    "url = \"{}\"\n",
+                    "checksum_url = \"{}\"\n",
+                    "checksum_alg = \"sha256\"\n"
+                ),
+                new_url, new_manifest,
+            ),
+        )?;
+        let new_store = store_with_catalog(&fixture, new_catalog, Arc::new(FixedClock));
+        let name = "moving-cache";
+        let mut state = machine_state(
+            &fixture.paths,
+            name,
+            StateImage {
+                r#ref: "moving:1".to_owned(),
+                id: None,
+                sha256: None,
+            },
+        )?;
+        let lock = create_machine(&fixture.paths, name, &state, &mut Vec::new())?;
+        let prepared = new_store.prepare_machine_image(
+            name,
+            &mut state,
+            &fixture.root,
+            ByteSize::from_mib(1)?,
+            &lock,
+            &mut Vec::new(),
+        )?;
+        assert!(prepared.image.cached);
+        assert_eq!(prepared.image.metadata.id, old.metadata.id);
+        assert_eq!(prepared.image.metadata.source_url.as_deref(), Some(old_url));
+        assert_eq!(prepared.image.firmware, Some(CatalogFirmware::Rhf));
+
+        let direct_url = "https://cache.example.invalid/direct.qcow2";
+        fixture
+            .http
+            .push(direct_url, bytes.clone(), Some(bytes.len() as u64), None)?;
+        let direct = fixture.store.pull(
+            &url_request(direct_url, Some(digest.clone()), &fixture.root),
+            &mut Vec::new(),
+        )?;
+        fixture
+            .http
+            .push(direct_url, bytes.clone(), Some(bytes.len() as u64), None)?;
+        let wrong = "0".repeat(64);
+        let mismatch = fixture
+            .store
+            .pull(
+                &url_request(direct_url, Some(wrong), &fixture.root),
+                &mut Vec::new(),
+            )
+            .err()
+            .ok_or("expected explicit digest mismatch")?;
+        assert_eq!(mismatch.kind(), ErrorKind::Checksum);
+        assert_eq!(
+            fixture
+                .store
+                .inspect(&direct.metadata.id)?
+                .image
+                .metadata
+                .id,
+            direct.metadata.id
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn verifier_provenance_upgrades_without_identity_change_and_never_downgrades()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let url = "https://verify.example.invalid/base.qcow2";
+        let bytes = b"QFI\xFBPROVENANCE".to_vec();
+        let sha256 = sha256_bytes(&bytes);
+        let sha512 = sha512_bytes(&bytes);
+
+        fixture
+            .http
+            .push(url, bytes.clone(), Some(bytes.len() as u64), None)?;
+        let unchecked = fixture
+            .store
+            .pull(&url_request(url, None, &fixture.root), &mut Vec::new())?;
+        assert_eq!(unchecked.metadata.generation, 1);
+        assert!(unchecked.metadata.verification().is_none());
+
+        fixture
+            .http
+            .push(url, bytes.clone(), Some(bytes.len() as u64), None)?;
+        let checked = fixture.store.pull(
+            &url_request(url, Some(sha256.clone()), &fixture.root),
+            &mut Vec::new(),
+        )?;
+        assert_eq!(checked.metadata.id, unchecked.metadata.id);
+        assert_eq!(checked.metadata.generation, 2);
+        assert_eq!(
+            checked.metadata.verification_algorithm,
+            Some(ChecksumAlgorithm::Sha256)
+        );
+
+        fixture
+            .http
+            .push(url, bytes.clone(), Some(bytes.len() as u64), None)?;
+        fixture.store.ensure_store()?;
+        let sha512_checked = {
+            let _lock = fixture.store.acquire_lock()?;
+            fixture.store.cleanup_stale_partials()?;
+            fixture.store.pull_locked(
+                ResolvedImageSource {
+                    source_ref: url.to_owned(),
+                    source_url: Some(url.to_owned()),
+                    architecture: Arch::X86_64,
+                    source_format: Some(ImageFormat::Qcow2),
+                    firmware: None,
+                    verification: Some(ImageVerification {
+                        algorithm: ChecksumAlgorithm::Sha512,
+                        digest: sha512.clone(),
+                    }),
+                    location: ImageSourceLocation::Https(url.to_owned()),
+                    checksum: ExpectedChecksum::Digest(ImageVerification {
+                        algorithm: ChecksumAlgorithm::Sha512,
+                        digest: sha512.clone(),
+                    }),
+                    local_source: None,
+                },
+                &mut Vec::new(),
+            )?
+        };
+        assert_eq!(sha512_checked.metadata.id, unchecked.metadata.id);
+        assert_eq!(sha512_checked.metadata.generation, 3);
+        assert_eq!(
+            sha512_checked.metadata.verification_algorithm,
+            Some(ChecksumAlgorithm::Sha512)
+        );
+
+        fixture
+            .http
+            .push(url, bytes.clone(), Some(bytes.len() as u64), None)?;
+        let downgraded_request = fixture
+            .store
+            .pull(&url_request(url, None, &fixture.root), &mut Vec::new())?;
+        assert_eq!(downgraded_request.metadata.id, unchecked.metadata.id);
+        assert_eq!(downgraded_request.metadata.generation, 3);
+        assert_eq!(
+            downgraded_request.metadata.verification_algorithm,
+            Some(ChecksumAlgorithm::Sha512)
+        );
+        assert_eq!(
+            downgraded_request.metadata.verification_digest.as_deref(),
+            Some(sha512.as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn generation_selects_unique_max_despite_equal_or_backward_timestamps_and_checks_overflow()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let url = "https://generation.example.invalid/base.qcow2";
+        let first_bytes = b"QFI\xFBGENERATION-ONE".to_vec();
+        fixture.http.push(
+            url,
+            first_bytes.clone(),
+            Some(first_bytes.len() as u64),
+            None,
+        )?;
+        let first = fixture
+            .store
+            .pull(&url_request(url, None, &fixture.root), &mut Vec::new())?;
+
+        let backward_store = store_with_catalog(
+            &fixture,
+            Catalog::built_in()?,
+            Arc::new(StaticClock("2020-01-01T00:00:00Z")),
+        );
+        let second_bytes = b"QFI\xFBGENERATION-TWO".to_vec();
+        fixture.http.push(
+            url,
+            second_bytes.clone(),
+            Some(second_bytes.len() as u64),
+            None,
+        )?;
+        let second =
+            backward_store.pull(&url_request(url, None, &fixture.root), &mut Vec::new())?;
+        assert_eq!(first.metadata.generation, 1);
+        assert_eq!(second.metadata.generation, 2);
+        assert!(second.metadata.pulled_at < first.metadata.pulled_at);
+
+        {
+            let _lock = backward_store.acquire_lock()?;
+            let resolved = backward_store.resolve_persisted(url)?;
+            let latest = backward_store
+                .find_latest_for_source(&resolved)?
+                .ok_or("missing latest generation")?;
+            assert_eq!(latest.metadata.id, second.metadata.id);
+        }
+
+        let first_sidecar = fixture.paths.image_metadata(&first.metadata.id)?;
+        let mut duplicate = first.metadata.clone();
+        duplicate.generation = 2;
+        atomic::write_json_with_mode(&first_sidecar, &duplicate, SIDECAR_FILE_MODE)?;
+        {
+            let _lock = backward_store.acquire_lock()?;
+            let resolved = backward_store.resolve_persisted(url)?;
+            let ambiguous = backward_store
+                .find_latest_for_source(&resolved)
+                .err()
+                .ok_or("expected duplicate maximum generation rejection")?;
+            assert_eq!(ambiguous.kind(), ErrorKind::Conflict);
+        }
+
+        duplicate.generation = 1;
+        atomic::write_json_with_mode(&first_sidecar, &duplicate, SIDECAR_FILE_MODE)?;
+        let second_sidecar = fixture.paths.image_metadata(&second.metadata.id)?;
+        let mut maximum = second.metadata.clone();
+        maximum.generation = u64::MAX;
+        atomic::write_json_with_mode(&second_sidecar, &maximum, SIDECAR_FILE_MODE)?;
+        let third_bytes = b"QFI\xFBGENERATION-THREE".to_vec();
+        fixture.http.push(
+            url,
+            third_bytes.clone(),
+            Some(third_bytes.len() as u64),
+            None,
+        )?;
+        let overflow = backward_store
+            .pull(&url_request(url, None, &fixture.root), &mut Vec::new())
+            .err()
+            .ok_or("expected generation overflow")?;
+        assert_eq!(overflow.kind(), ErrorKind::Conflict);
+        let third_id = stable_image_id(url, Some(url), Arch::X86_64, &sha256_bytes(&third_bytes));
+        assert!(!fixture.paths.image_base(&third_id)?.exists());
+        assert!(!fixture.paths.image_metadata(&third_id)?.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_firmware_is_durable_across_warm_cache_upgrade_and_catalog_removal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let url = "https://firmware.example.invalid/base.qcow2";
+        let bytes = b"QFI\xFBFIRMWARE".to_vec();
+        let digest = sha256_bytes(&bytes);
+        let catalog_source = |firmware: &str| {
+            format!(
+                concat!(
+                    "[[image]]\n",
+                    "distro = \"firm\"\n",
+                    "version = \"1\"\n",
+                    "aliases = []\n",
+                    "default = true\n",
+                    "firmware = \"{}\"\n",
+                    "format = \"qcow2\"\n\n",
+                    "[image.arch.x86_64]\n",
+                    "url = \"{}\"\n",
+                    "sha256 = \"{}\"\n",
+                    "checksum_alg = \"sha256\"\n"
+                ),
+                firmware, url, digest,
+            )
+        };
+        let old_catalog = custom_catalog(&fixture.root, "firm-rhf", &catalog_source("rhf"))?;
+        let old_store = store_with_catalog(&fixture, old_catalog, Arc::new(FixedClock));
+        fixture
+            .http
+            .push(url, bytes.clone(), Some(bytes.len() as u64), None)?;
+        let old = old_store.pull(
+            &ImagePullRequest::new(ImageRef::new("firm:1"), &fixture.root),
+            &mut Vec::new(),
+        )?;
+        assert_eq!(old.metadata.firmware, Some(CatalogFirmware::Rhf));
+
+        let new_catalog = custom_catalog(&fixture.root, "firm-edk2", &catalog_source("edk2"))?;
+        let new_store = store_with_catalog(&fixture, new_catalog, Arc::new(FixedClock));
+        let name = "firmware-cache";
+        let mut state = machine_state(
+            &fixture.paths,
+            name,
+            StateImage {
+                r#ref: "firm:1".to_owned(),
+                id: None,
+                sha256: None,
+            },
+        )?;
+        let lock = create_machine(&fixture.paths, name, &state, &mut Vec::new())?;
+        let warm = new_store.prepare_machine_image(
+            name,
+            &mut state,
+            &fixture.root,
+            ByteSize::from_mib(1)?,
+            &lock,
+            &mut Vec::new(),
+        )?;
+        assert_eq!(warm.image.metadata.id, old.metadata.id);
+        assert_eq!(warm.image.firmware, Some(CatalogFirmware::Rhf));
+        assert_eq!(warm.image.metadata.generation, 1);
+
+        fixture
+            .http
+            .push(url, bytes.clone(), Some(bytes.len() as u64), None)?;
+        let upgraded = new_store.pull(
+            &ImagePullRequest::new(ImageRef::new("firm:1"), &fixture.root),
+            &mut Vec::new(),
+        )?;
+        assert_eq!(upgraded.metadata.id, old.metadata.id);
+        assert_eq!(upgraded.metadata.firmware, Some(CatalogFirmware::Edk2));
+        assert_eq!(upgraded.metadata.generation, 2);
+
+        let catalog_removed =
+            store_with_catalog(&fixture, Catalog::built_in()?, Arc::new(FixedClock));
+        let pinned = catalog_removed.prepare_machine_image(
+            name,
+            &mut state,
+            &fixture.root,
+            ByteSize::from_mib(1)?,
+            &lock,
+            &mut Vec::new(),
+        )?;
+        assert_eq!(pinned.image.firmware, Some(CatalogFirmware::Edk2));
+        assert_eq!(pinned.image.metadata.generation, 2);
+        Ok(())
+    }
+    #[test]
+    fn incomplete_pair_recovery_removes_unreferenced_crash_files_and_preserves_referenced_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let source = fixture.write_source("recovery.qcow2", b"QFI\xFBRECOVERY")?;
+        let request = local_request(&source, &fixture.root);
+
+        let first = fixture.store.pull(&request, &mut Vec::new())?;
+        let base = fixture.paths.image_base(&first.metadata.id)?;
+        let sidecar = fixture.paths.image_metadata(&first.metadata.id)?;
+        fs::remove_file(&sidecar)?;
+        assert!(fixture.store.list()?.is_empty());
+        assert!(!base.exists());
+
+        let second = fixture.store.pull(&request, &mut Vec::new())?;
+        let base = fixture.paths.image_base(&second.metadata.id)?;
+        let sidecar = fixture.paths.image_metadata(&second.metadata.id)?;
+        let temp = sidecar.with_file_name(format!("{}.json.tmp", second.metadata.id));
+        fs::write(&temp, b"stale sidecar temp")?;
+        fs::set_permissions(&temp, fs::Permissions::from_mode(SIDECAR_FILE_MODE))?;
+        assert_eq!(fixture.store.list()?.len(), 1);
+        assert!(!temp.exists());
+        assert!(base.exists());
+        assert!(sidecar.exists());
+
+        fs::remove_file(&base)?;
+        assert!(fixture.store.list()?.is_empty());
+        assert!(!sidecar.exists());
+
+        let third = fixture.store.pull(&request, &mut Vec::new())?;
+        let base = fixture.paths.image_base(&third.metadata.id)?;
+        let sidecar = fixture.paths.image_metadata(&third.metadata.id)?;
+        let temp = sidecar.with_file_name(format!("{}.json.tmp", third.metadata.id));
+        let sidecar_bytes = fs::read(&sidecar)?;
+        fs::remove_file(&sidecar)?;
+        fs::write(&temp, sidecar_bytes)?;
+        fs::set_permissions(&temp, fs::Permissions::from_mode(SIDECAR_FILE_MODE))?;
+        assert!(fixture.store.list()?.is_empty());
+        assert!(!base.exists());
+        assert!(!temp.exists());
+
+        let referenced = fixture.store.pull(&request, &mut Vec::new())?;
+        let name = "kept-incomplete";
+        let state = machine_state(
+            &fixture.paths,
+            name,
+            StateImage {
+                r#ref: referenced.metadata.source_ref.clone(),
+                id: Some(referenced.metadata.id.clone()),
+                sha256: Some(referenced.metadata.source_sha256.clone()),
+            },
+        )?;
+        let _machine_lock = create_machine(&fixture.paths, name, &state, &mut Vec::new())?;
+        let referenced_base = fixture.paths.image_base(&referenced.metadata.id)?;
+        let referenced_sidecar = fixture.paths.image_metadata(&referenced.metadata.id)?;
+        fs::remove_file(&referenced_sidecar)?;
+        let error = fixture
+            .store
+            .list()
+            .err()
+            .ok_or("expected referenced incomplete pair rejection")?;
+        assert_eq!(error.kind(), ErrorKind::Checksum);
+        assert!(error.message().contains(name));
+        assert!(referenced_base.exists());
+        assert!(!referenced_sidecar.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn lock_and_directory_creation_override_restrictive_umask_without_repairing_insecure_existing_lock()
+    -> Result<(), Box<dyn std::error::Error>> {
+        if env::var_os("FIRESTONE_IMAGE_UMASK_ROOT").is_some() {
+            return Ok(());
+        }
+        let fixture = Fixture::new(false)?;
+        let current = env::current_exe()?;
+        let status = Command::new(current)
+            .arg("--exact")
+            .arg("image::tests::image_store_restrictive_umask_helper")
+            .arg("--nocapture")
+            .env("FIRESTONE_IMAGE_UMASK_ROOT", &fixture.root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        assert!(status.success());
+        assert_eq!(
+            fs::symlink_metadata(fixture.paths.data_dir())?.mode() & 0o7777,
+            OWNED_DIRECTORY_MODE,
+        );
+        assert_eq!(
+            fs::symlink_metadata(fixture.paths.images_dir())?.mode() & 0o7777,
+            OWNED_DIRECTORY_MODE,
+        );
+        let lock_path = fixture.paths.image_store_lock()?;
+        assert_eq!(
+            fs::symlink_metadata(&lock_path)?.mode() & 0o7777,
+            LOCK_FILE_MODE
+        );
+
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644))?;
+        let error = ImageStoreLock::acquire(
+            &fixture.paths,
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+        )
+        .err()
+        .ok_or("expected insecure existing lock rejection")?;
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert_eq!(fs::symlink_metadata(&lock_path)?.mode() & 0o7777, 0o644);
+        Ok(())
+    }
+
+    #[test]
+    fn image_store_restrictive_umask_helper() -> Result<(), Box<dyn std::error::Error>> {
+        let Some(root) = env::var_os("FIRESTONE_IMAGE_UMASK_ROOT").map(PathBuf::from) else {
+            return Ok(());
+        };
+        nix::sys::stat::umask(Mode::from_bits_truncate(0o777));
+        let paths = test_paths(&root, root.join("firestone"))?;
+        paths.ensure_owned_data_directory(paths.data_dir(), "data directory", true)?;
+        paths.ensure_owned_data_directory(&paths.images_dir(), "images directory", false)?;
+        drop(ImageStoreLock::acquire(
+            &paths,
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_resolution_never_probes_relative_shadow_files_and_deleted_catalog_uses_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        fs::write(fixture.root.join("ubuntu:24.04"), b"shadow")?;
+        let catalog = fixture.store.resolve_persisted("ubuntu:24.04")?;
+        assert_eq!(catalog.source_ref, "ubuntu:24.04");
+        assert!(matches!(catalog.location, ImageSourceLocation::Https(_)));
+
+        let malformed_dir = fixture.root.join("https:");
+        fs::create_dir(&malformed_dir)?;
+        fs::set_permissions(&malformed_dir, fs::Permissions::from_mode(0o700))?;
+        fs::write(malformed_dir.join("shadow"), b"shadow")?;
+        assert!(fixture.store.resolve_persisted("https:/shadow").is_err());
+
+        let url = "https://gone.example.invalid/base.qcow2";
+        let bytes = b"QFI\xFBGONE-CATALOG".to_vec();
+        let digest = sha256_bytes(&bytes);
+        let gone_catalog = custom_catalog(
+            &fixture.root,
+            "gone",
+            &format!(
+                concat!(
+                    "[[image]]\n",
+                    "distro = \"gone\"\n",
+                    "version = \"1\"\n",
+                    "aliases = []\n",
+                    "default = true\n",
+                    "firmware = \"edk2\"\n",
+                    "format = \"qcow2\"\n\n",
+                    "[image.arch.x86_64]\n",
+                    "url = \"{}\"\n",
+                    "sha256 = \"{}\"\n",
+                    "checksum_alg = \"sha256\"\n"
+                ),
+                url, digest,
+            ),
+        )?;
+        let old_store = store_with_catalog(&fixture, gone_catalog, Arc::new(FixedClock));
+        fixture
+            .http
+            .push(url, bytes.clone(), Some(bytes.len() as u64), None)?;
+        let pulled = old_store.pull(
+            &ImagePullRequest::new(ImageRef::new("gone:1"), &fixture.root),
+            &mut Vec::new(),
+        )?;
+        let removed_catalog =
+            store_with_catalog(&fixture, Catalog::built_in()?, Arc::new(FixedClock));
+        let name = "gone-cache";
+        let mut state = machine_state(
+            &fixture.paths,
+            name,
+            StateImage {
+                r#ref: "gone:1".to_owned(),
+                id: None,
+                sha256: None,
+            },
+        )?;
+        let lock = create_machine(&fixture.paths, name, &state, &mut Vec::new())?;
+        let prepared = removed_catalog.prepare_machine_image(
+            name,
+            &mut state,
+            &fixture.root,
+            ByteSize::from_mib(1)?,
+            &lock,
+            &mut Vec::new(),
+        )?;
+        assert!(prepared.image.cached);
+        assert_eq!(prepared.image.metadata.id, pulled.metadata.id);
+        assert_eq!(prepared.image.firmware, Some(CatalogFirmware::Edk2));
+        Ok(())
+    }
+    #[test]
+    fn pinned_local_image_prepares_after_original_source_is_deleted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let source = fixture.write_source("ephemeral-local.qcow2", b"QFI\xFBEPHEMERAL")?;
+        let name = "deleted-local";
+        let mut state = machine_state(
+            &fixture.paths,
+            name,
+            StateImage {
+                r#ref: source.to_string_lossy().into_owned(),
+                id: None,
+                sha256: None,
+            },
+        )?;
+        let lock = create_machine(&fixture.paths, name, &state, &mut Vec::new())?;
+        let first = fixture.store.prepare_machine_image(
+            name,
+            &mut state,
+            &fixture.root,
+            ByteSize::from_mib(1)?,
+            &lock,
+            &mut Vec::new(),
+        )?;
+        assert_eq!(
+            state.image.id.as_deref(),
+            Some(first.image.metadata.id.as_str())
+        );
+        fs::remove_file(&source)?;
+
+        let second = fixture.store.prepare_machine_image(
+            name,
+            &mut state,
+            &fixture.root,
+            ByteSize::from_mib(1)?,
+            &lock,
+            &mut Vec::new(),
+        )?;
+        assert!(second.image.cached);
+        assert_eq!(second.image.metadata.id, first.image.metadata.id);
+        assert!(!source.exists());
         Ok(())
     }
 }

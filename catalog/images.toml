@@ -7,10 +7,11 @@ distro = "ubuntu"
 version = "24.04"
 aliases = ["noble"]
 default = true
-firmware = "edk2"
+firmware = "rhf"
 format = "qcow2"
 
 [image.arch.x86_64]
+firmware = "edk2"
 url = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
 checksum_url = "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS"
 checksum_alg = "sha256"
