@@ -1006,24 +1006,24 @@ pub fn stop_unsupervised(
                 FirestoneError::new(ErrorKind::Usage, "stop deadline is out of range")
             })?;
             while Instant::now() < deadline {
-                if !verified_process_alive(&record)? {
+                if !recorded_process_alive(&record)? {
                     break;
                 }
                 match api.vm_info() {
                     Ok(info) if info.state == VmState::Shutdown => {
                         let _ = api.vmm_shutdown();
-                        break;
+                        thread::sleep(LOOP_INTERVAL);
                     }
                     Ok(_) => thread::sleep(LOOP_INTERVAL),
-                    Err(_) if !verified_process_alive(&record)? => break,
-                    Err(_) => break,
+                    Err(_) if !recorded_process_alive(&record)? => break,
+                    Err(_) => thread::sleep(LOOP_INTERVAL),
                 }
             }
         }
-        if verified_process_alive(&record)? {
+        if recorded_process_alive(&record)? {
             signal_verified_group(&record, ProcessSignal::Terminate)?;
             let deadline = Instant::now() + CHILD_TERM_GRACE;
-            while Instant::now() < deadline && verified_process_alive(&record)? {
+            while Instant::now() < deadline && recorded_process_alive(&record)? {
                 thread::sleep(LOOP_INTERVAL);
             }
             reason = ExitReason::Failure(if graceful.is_err() {
@@ -1032,7 +1032,7 @@ pub fn stop_unsupervised(
                 "graceful stop timed out".to_owned()
             });
         }
-        if verified_process_alive(&record)? {
+        if recorded_process_alive(&record)? {
             signal_verified_group(&record, ProcessSignal::Kill)?;
         }
     }
@@ -2002,31 +2002,17 @@ fn process_state(pid: u32) -> Result<Option<char>, FirestoneError> {
         .and_then(|value| value.chars().next()))
 }
 
-fn verified_process_alive(record: &ProcessRecord) -> Result<bool, FirestoneError> {
+fn recorded_process_alive(record: &ProcessRecord) -> Result<bool, FirestoneError> {
     #[cfg(target_os = "linux")]
     {
-        let proc_dir = PathBuf::from("/proc").join(record.pid.to_string());
-        if !proc_dir.try_exists().map_err(|source| {
-            filesystem_error(
-                ErrorKind::Conflict,
-                format!("cannot inspect VMM pid {}", record.pid),
-                source,
-            )
-        })? {
-            return Ok(false);
-        }
-        if matches!(process_state(record.pid)?, None | Some('Z')) {
-            return Ok(false);
-        }
-        verify_linux_process(record)?;
-        Ok(true)
+        Ok(matches!(process_state(record.pid)?, Some(state) if state != 'Z'))
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = record;
         Err(FirestoneError::new(
             ErrorKind::Conflict,
-            "signal escalation for an unsupervised VMM requires Linux /proc identity",
+            "unsupervised process observation requires Linux /proc identity",
         )
         .with_hint("restore supervision or stop the verified VMM manually"))
     }
@@ -2096,12 +2082,12 @@ fn wait_for_record_exit(record: &ProcessRecord, timeout: Duration) -> Result<(),
         FirestoneError::new(ErrorKind::Usage, "process wait deadline is out of range")
     })?;
     while Instant::now() < deadline {
-        if !verified_process_alive(record)? {
+        if !recorded_process_alive(record)? {
             return Ok(());
         }
         thread::sleep(LOOP_INTERVAL);
     }
-    if verified_process_alive(record)? {
+    if recorded_process_alive(record)? {
         Err(FirestoneError::new(
             ErrorKind::Timeout,
             format!("verified VMM pid {} did not exit", record.pid),
