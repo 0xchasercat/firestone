@@ -154,7 +154,20 @@ impl<'a> VmmApi<'a> {
         match self.request_inner(Endpoint::VmmPing, None) {
             Ok(_) => Ok(true),
             Err(failure) if failure.is_liveness_negative() => Ok(false),
-            Err(failure) => Err(self.firestone_error(Endpoint::VmmPing, failure)),
+
+            Err(failure) => {
+                let error = self.firestone_error(Endpoint::VmmPing, failure);
+                if error.kind() == ErrorKind::NotRunning {
+                    Err(FirestoneError::new(
+                        ErrorKind::Conflict,
+                        format!("VMM liveness is ambiguous: {}", error.message()),
+                    )
+                    .with_hint("preserve runtime evidence and retry the liveness probe")
+                    .with_source(error))
+                } else {
+                    Err(error)
+                }
+            }
         }
     }
 
@@ -345,14 +358,14 @@ enum ClientFailure {
 
 impl ClientFailure {
     fn is_liveness_negative(&self) -> bool {
-        match self {
-            Self::Deadline { .. }
-            | Self::Protocol(_)
-            | Self::UnexpectedStatus { .. }
-            | Self::InvalidJson { .. } => true,
-            Self::Io { source, .. } => socket_error_is_unresponsive(source.kind()),
-            Self::DeadlineOutOfRange | Self::RequestBodyTooLarge => false,
-        }
+        matches!(
+            self,
+            Self::Io { source, .. }
+                if matches!(
+                    source.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                )
+        )
     }
 }
 
@@ -1295,16 +1308,21 @@ mod tests {
     }
 
     #[test]
-    fn liveness_unexpected_status_and_malformed_response_return_false()
+    fn liveness_unexpected_status_and_malformed_response_are_ambiguous()
     -> Result<(), Box<dyn std::error::Error>> {
         for response in [
             response("204 No Content", b""),
             b"not HTTP\r\n\r\n".to_vec(),
+            Vec::new(),
         ] {
             let server = FakeServer::spawn(vec![response], false)?;
             let probe = VmmApiLivenessProbe::new(TEST_TIMEOUT);
-            assert!(!probe.ping(server.path())?);
+            let error = require_error(
+                probe.ping(server.path()),
+                "ambiguous liveness response must fail closed",
+            )?;
             let _ = server.finish()?;
+            assert_ne!(error.kind(), ErrorKind::NotRunning);
         }
         Ok(())
     }

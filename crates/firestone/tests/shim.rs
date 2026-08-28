@@ -3,6 +3,7 @@ use std::{
     env,
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
+    net::Shutdown,
     os::unix::fs::PermissionsExt,
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
@@ -14,6 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "linux")]
+use firestone_core::recover_shim;
 use firestone_core::{
     Arch, Catalog, CloudInitSpec, Cmd, DependencyManifest, ErrorKind, Event, ExitReason,
     FirestoneError, Firmware, ImageRef, ImageStore, MachineLock, MachineSpec, MachineState,
@@ -61,6 +64,32 @@ impl Fixture {
         paths.ensure_machine_runtime_dir(NAME)?;
         paths.clear_machine_runtime_dir(NAME, false)?;
 
+        let (vmm_binary, vmm_behavior) = if behavior == "wrapper" {
+            let wrapper = paths.machine_vmm_executable(NAME)?;
+            fs::write(
+                &wrapper,
+                format!("#!/bin/sh\nexec \"{}\" \"$@\"\n", fake_vmm.display()),
+            )?;
+            fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700))?;
+            (wrapper, "normal")
+        } else {
+            let owned = paths.machine_vmm_executable(NAME)?;
+            fs::copy(&fake_vmm, &owned)?;
+            fs::set_permissions(&owned, fs::Permissions::from_mode(0o700))?;
+            (
+                owned,
+                if behavior == "overall-deadline" {
+                    "never-ready"
+                } else {
+                    behavior
+                },
+            )
+        };
+        let launch_overall_timeout_ms = if behavior == "overall-deadline" {
+            10_500
+        } else {
+            20_000
+        };
         let record = root.path().join("requests.log");
         let body = root.path().join("create-body.json");
         let descendant_pid = root.path().join("descendant.pid");
@@ -77,7 +106,7 @@ impl Fixture {
             "--body".to_owned(),
             body.to_string_lossy().into_owned(),
             "--behavior".to_owned(),
-            behavior.to_owned(),
+            vmm_behavior.to_owned(),
             "--console-log".to_owned(),
             console.to_string_lossy().into_owned(),
         ];
@@ -88,8 +117,8 @@ impl Fixture {
         let plan = json!({
             "version": 1,
             "name": NAME,
-            "vmm_binary": fake_vmm,
-            "vmm_binary_sha256": sha256_file(&fake_vmm)?,
+            "vmm_binary": vmm_binary,
+            "vmm_binary_sha256": sha256_file(&vmm_binary)?,
             "vmm_extra_args": extra_args,
             "vmconfig_sha256": sha256_bytes(VMCONFIG),
             "vmconfig_len": VMCONFIG.len(),
@@ -97,6 +126,7 @@ impl Fixture {
             "readiness_timeout_ms": 3000,
             "control_io_timeout_ms": 150,
             "launch_request_timeout_ms": 5000,
+            "launch_overall_timeout_ms": launch_overall_timeout_ms,
         });
         atomic::write_json_with_mode(&paths.machine_shim_plan(NAME)?, &plan, 0o600)?;
 
@@ -123,7 +153,11 @@ impl Fixture {
         state.shim_pid = Some(shim.id());
         StateStore::new(paths.machine_state(NAME)?).write_from_locked_action(&state, &lock)?;
         drop(lock);
-        wait_for_path(&paths.machine_shim_socket(NAME)?, Duration::from_secs(3))?;
+        wait_for_shim_ready(
+            &paths.machine_shim_socket(NAME)?,
+            &mut shim,
+            Duration::from_secs(3),
+        )?;
         shim.confirm_session()?;
 
         Ok(Self {
@@ -280,6 +314,26 @@ fn start_preparation_orders_image_overlay_seed_vmconfig_and_plan() -> TestResult
     assert!(paths.machine_seed_image(NAME)?.exists());
     assert!(paths.machine_vmconfig(NAME)?.exists());
     assert!(paths.machine_shim_plan(NAME)?.exists());
+    let plan: serde_json::Value =
+        serde_json::from_slice(&fs::read(paths.machine_shim_plan(NAME)?)?)?;
+    assert_eq!(
+        plan["vmm_binary"],
+        paths
+            .machine_vmm_executable(NAME)?
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(
+        fs::read(paths.machine_vmm_executable(NAME)?)?,
+        fs::read(&fake)?
+    );
+    assert_eq!(
+        fs::metadata(paths.machine_vmm_executable(NAME)?)?
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o700
+    );
     let vmconfig: serde_json::Value =
         serde_json::from_slice(&fs::read(paths.machine_vmconfig(NAME)?)?)?;
     assert_eq!(
@@ -306,6 +360,7 @@ fn start_preparation_orders_image_overlay_seed_vmconfig_and_plan() -> TestResult
         readiness: Duration::from_millis(100),
         control_io: Duration::from_millis(50),
         launch_request: Duration::from_millis(100),
+        launch_overall: Duration::from_secs(1),
     };
     spec.cloud_init.user_data = Some(root.path().join("deferred-user-data"));
     let error = require_firestone_error(
@@ -384,6 +439,7 @@ fn start_preparation_orders_image_overlay_seed_vmconfig_and_plan() -> TestResult
             readiness: Duration::from_secs(2),
             control_io: Duration::from_millis(500),
             launch_request: Duration::from_secs(3),
+            launch_overall: Duration::from_secs(15),
         },
     )?;
     let running = match launch_prepared(
@@ -478,7 +534,10 @@ fn shim_protocol_launch_status_stop_preserves_exact_bytes_and_logs() -> TestResu
     );
     assert!(record.contains("\"--api-socket\""));
     assert!(record.contains("\"--log-file\""));
-    assert!(!record.contains("FIRESTONE_"));
+    assert!(record.contains("FIRESTONE_LAUNCH_BINDING"));
+    assert!(!record.contains("FIRESTONE_CONFIG_DIR"));
+    assert!(!record.contains("FIRESTONE_DATA_DIR"));
+    assert!(!record.contains("FIRESTONE_RUNTIME_DIR"));
 
     let state = fixture.stop(Duration::from_secs(2), false)?;
     assert_eq!(state.status, MachineStatus::Stopped);
@@ -527,9 +586,7 @@ fn shim_control_malformed_oversized_slow_and_duplicate_frames_leave_server_live(
 fn shim_launch_client_disconnect_continues_and_lifetime_lock_contends() -> TestResult<()> {
     let mut fixture = Fixture::spawn("normal", None, false)?;
     let socket = fixture.paths.machine_shim_socket(NAME)?;
-    let mut launch = UnixStream::connect(&socket)?;
-    launch.write_all(b"{\"op\":\"launch\"}\n")?;
-    drop(launch);
+    send_and_shutdown(&socket, b"{\"op\":\"launch\"}\n")?;
 
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -549,7 +606,48 @@ fn shim_launch_client_disconnect_continues_and_lifetime_lock_contends() -> TestR
     assert!(lock_file.try_lock_exclusive().is_err());
     let _ = fixture.stop(Duration::from_secs(2), false)?;
     lock_file.try_lock_exclusive()?;
-    lock_file.unlock()?;
+    FileExt::unlock(&lock_file)?;
+    Ok(())
+}
+
+#[test]
+fn shim_ping_status_duplicate_and_error_response_disconnects_keep_vmm_supervised() -> TestResult<()>
+{
+    let mut fixture = Fixture::spawn("normal", None, false)?;
+    fixture.launch()?;
+    let socket = fixture.paths.machine_shim_socket(NAME)?;
+    for request in [
+        b"{\x22op\x22:\x22ping\x22}\x0a".as_slice(),
+        b"{\x22op\x22:\x22status\x22}\x0a".as_slice(),
+        b"{\x22op\x22:\x22launch\x22}\x0a".as_slice(),
+        b"{}\x0a".as_slice(),
+    ] {
+        send_and_shutdown(&socket, request)?;
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(fixture.client().status()?.status, MachineStatus::Running);
+    }
+    let shim_log = fs::read_to_string(fixture.paths.machine_shim_log(NAME)?)?;
+    assert!(shim_log.contains("response detached"));
+    let _ = fixture.stop(Duration::from_secs(2), false)?;
+    Ok(())
+}
+
+#[test]
+fn shim_stop_response_disconnect_completes_final_state_and_cleanup() -> TestResult<()> {
+    let mut fixture = Fixture::spawn("normal", None, false)?;
+    fixture.launch()?;
+    let socket = fixture.paths.machine_shim_socket(NAME)?;
+    send_and_shutdown(
+        &socket,
+        b"{\x22op\x22:\x22stop\x22,\x22timeout_s\x22:2,\x22force\x22:false}\x0a",
+    )?;
+    fixture.wait_shim()?;
+    let state = StateStore::new(fixture.paths.machine_state(NAME)?).read()?;
+    assert_eq!(state.status, MachineStatus::Stopped);
+    assert!(state.last_exit.is_some());
+    assert!(!fixture.paths.machine_runtime_dir(NAME)?.exists());
+    let shim_log = fs::read_to_string(fixture.paths.machine_shim_log(NAME)?)?;
+    assert!(shim_log.contains("control response detached"));
     Ok(())
 }
 
@@ -560,7 +658,7 @@ fn shim_launch_failure_boundaries_roll_back_to_failed_and_clean_runtime() -> Tes
         let error = require_firestone_error(fixture.launch(), "injected launch succeeded")?;
         assert!(matches!(
             error.kind(),
-            ErrorKind::Generic | ErrorKind::Timeout
+            ErrorKind::Conflict | ErrorKind::Generic | ErrorKind::Timeout
         ));
         fixture.wait_shim().or_else(|error| {
             let state = StateStore::new(fixture.paths.machine_state(NAME)?).read()?;
@@ -573,9 +671,69 @@ fn shim_launch_failure_boundaries_roll_back_to_failed_and_clean_runtime() -> Tes
         let state = StateStore::new(fixture.paths.machine_state(NAME)?).read()?;
         assert_eq!(state.status, MachineStatus::Failed, "behavior {behavior}");
         assert!(state.last_exit.is_some());
-        assert!(!fixture.paths.machine_runtime_dir(NAME)?.exists());
+        assert!(
+            !fixture.paths.machine_runtime_dir(NAME)?.exists(),
+            "runtime retained for behavior {behavior}"
+        );
         assert!(fs::read(fixture.paths.machine_console_log(NAME)?)?.starts_with(b"old\n"));
     }
+    Ok(())
+}
+
+#[test]
+fn identity_publication_failure_reaps_spawned_vmm_before_runtime_cleanup() -> TestResult<()> {
+    let mut fixture = Fixture::spawn("normal", None, false)?;
+    let identity = fixture.paths.machine_process_identity(NAME)?;
+    fs::remove_file(&identity)?;
+    fs::create_dir(&identity)?;
+    fs::set_permissions(&identity, fs::Permissions::from_mode(0o700))?;
+
+    let error = require_firestone_error(
+        fixture.launch(),
+        "identity publication failure unexpectedly launched",
+    )?;
+    assert!(matches!(
+        error.kind(),
+        ErrorKind::Generic | ErrorKind::Conflict
+    ));
+    let _ = fixture.wait_shim();
+    let state = StateStore::new(fixture.paths.machine_state(NAME)?).read()?;
+    assert_eq!(state.status, MachineStatus::Failed);
+    assert!(state.vmm_pid.is_none());
+    assert!(fixture.paths.machine_runtime_dir(NAME)?.exists());
+    Ok(())
+}
+
+#[test]
+fn overall_launch_deadline_includes_cleanup_and_terminal_response() -> TestResult<()> {
+    let mut fixture = Fixture::spawn("overall-deadline", None, false)?;
+    let started = Instant::now();
+    let error = require_firestone_error(fixture.launch(), "delayed launch unexpectedly succeeded")?;
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let _ = fixture.wait_shim();
+    let state = StateStore::new(fixture.paths.machine_state(NAME)?).read()?;
+    assert_eq!(state.status, MachineStatus::Failed);
+    assert!(!fixture.paths.machine_runtime_dir(NAME)?.exists());
+    Ok(())
+}
+
+#[test]
+fn insecure_vmm_log_cannot_mask_launch_failure_or_cleanup() -> TestResult<()> {
+    let mut fixture = Fixture::spawn("normal", None, false)?;
+    let log = fixture.paths.machine_vmm_log(NAME)?;
+    nix::unistd::mkfifo(
+        &log,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )?;
+    let started = Instant::now();
+    let error = require_firestone_error(fixture.launch(), "FIFO VMM log was accepted")?;
+    assert_eq!(error.kind(), ErrorKind::Dependency);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let _ = fixture.wait_shim();
+    let state = StateStore::new(fixture.paths.machine_state(NAME)?).read()?;
+    assert_eq!(state.status, MachineStatus::Failed);
+    assert!(!fixture.paths.machine_runtime_dir(NAME)?.exists());
     Ok(())
 }
 
@@ -622,6 +780,13 @@ fn shim_graceful_escalated_force_and_descendant_cleanup_are_deterministic() -> T
         Some(ExitReason::Failure(reason)) if reason == "graceful stop timed out"
     ));
 
+    let mut slow_api = Fixture::spawn("slow-power", None, false)?;
+    slow_api.launch()?;
+    let slow_started = Instant::now();
+    let slow_state = slow_api.stop(Duration::ZERO, false)?;
+    assert_eq!(slow_state.status, MachineStatus::Stopped);
+    assert!(slow_started.elapsed() < Duration::from_secs(3));
+
     let mut forced = Fixture::spawn("ignore-power", None, true)?;
     forced.launch()?;
     wait_for_path(&forced.descendant_pid, Duration::from_secs(2))?;
@@ -639,6 +804,17 @@ fn shim_graceful_escalated_force_and_descendant_cleanup_are_deterministic() -> T
             .join(_descendant.to_string())
             .exists()
     );
+
+    let mut threaded = Fixture::spawn("thread-descendant", None, true)?;
+    threaded.launch()?;
+    wait_for_path(&threaded.descendant_pid, Duration::from_secs(2))?;
+    let _threaded_pid = fs::read_to_string(&threaded.descendant_pid)?
+        .trim()
+        .parse::<u32>()?;
+    let _ = threaded.stop(Duration::ZERO, true)?;
+    #[cfg(target_os = "linux")]
+    assert!(std::fs::metadata(PathBuf::from("/proc").join(_threaded_pid.to_string())).is_err());
+
     Ok(())
 }
 
@@ -714,9 +890,124 @@ fn shim_crash_api_stop_uses_persisted_identity_without_pid_reuse() -> TestResult
     assert_eq!(stopped.status, MachineStatus::Stopped);
     assert!(stopped.shim_pid.is_none());
     assert!(stopped.vmm_pid.is_none());
-    assert!(!PathBuf::from("/proc").join(vmm_pid.to_string()).exists());
+    assert!(linux_process_inactive(vmm_pid)?);
     assert!(!fixture.paths.machine_runtime_dir(NAME)?.exists());
     drop(lock);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn owned_shell_wrapper_launch_recovery_and_stop_keep_exact_binding() -> TestResult<()> {
+    let mut fixture = Fixture::spawn("wrapper", None, false)?;
+    fixture.launch()?;
+    let running = StateStore::new(fixture.paths.machine_state(NAME)?).read()?;
+    let vmm_pid = running.vmm_pid.ok_or("missing wrapped VMM pid")?;
+    let mut old_shim = fixture.shim.take().ok_or("missing original shim")?;
+    old_shim.signal_process(ProcessSignal::Kill)?;
+    let _ = old_shim
+        .wait_timeout(Duration::from_secs(3))?
+        .ok_or("original shim was not reaped")?;
+
+    let mut recovery_events = Vec::new();
+    let recovered = recover_shim(
+        &fixture.paths,
+        NAME,
+        Path::new(env!("CARGO_BIN_EXE_firestone")),
+        &mut recovery_events,
+    )?;
+    assert_eq!(recovered.status, MachineStatus::Running);
+    assert_eq!(recovered.pids.vmm, Some(vmm_pid));
+    assert!(recovery_events.iter().any(|event| {
+        matches!(event, Event::StepDone { id, .. } if id.as_str() == "shim-recover")
+    }));
+
+    let stopped = fixture.stop(Duration::from_secs(2), false)?;
+    assert_eq!(stopped.status, MachineStatus::Stopped);
+    assert!(linux_process_inactive(vmm_pid)?);
+    assert!(!fixture.paths.machine_runtime_dir(NAME)?.exists());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn recovery_adopts_spawn_identity_and_state_publication_crash_windows() -> TestResult<()> {
+    for window in ["before-identity", "before-state", "after-state"] {
+        let mut fixture = Fixture::spawn("normal", None, false)?;
+        fixture.launch()?;
+        let mut state = StateStore::new(fixture.paths.machine_state(NAME)?).read()?;
+        let vmm_pid = state.vmm_pid.ok_or("missing VMM pid")?;
+        let mut old_shim = fixture.shim.take().ok_or("missing shim")?;
+        old_shim.signal_process(ProcessSignal::Kill)?;
+        let _ = old_shim
+            .wait_timeout(Duration::from_secs(3))?
+            .ok_or("shim was not reaped")?;
+
+        let identity_path = fixture.paths.machine_process_identity(NAME)?;
+        match window {
+            "before-identity" => {
+                fs::remove_file(&identity_path)?;
+                state.vmm_pid = None;
+            }
+            "before-state" => state.vmm_pid = None,
+            "after-state" => fs::remove_file(&identity_path)?,
+            _ => return Err("unknown crash window".into()),
+        }
+        let mut lock_events = Vec::new();
+        let lock =
+            MachineLock::acquire(NAME, &fixture.paths.machine_lock(NAME)?, &mut lock_events)?;
+        StateStore::new(fixture.paths.machine_state(NAME)?)
+            .write_from_locked_action(&state, &lock)?;
+        drop(lock);
+
+        let mut events = Vec::new();
+        let recovered = recover_shim(
+            &fixture.paths,
+            NAME,
+            Path::new(env!("CARGO_BIN_EXE_firestone")),
+            &mut events,
+        )?;
+        assert_eq!(recovered.pids.vmm, Some(vmm_pid), "window {window}");
+        let stopped = fixture.stop(Duration::from_millis(100), true)?;
+        assert_eq!(stopped.status, MachineStatus::Stopped, "window {window}");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn recovery_adopts_hung_vmm_without_starting_a_duplicate() -> TestResult<()> {
+    let mut fixture = Fixture::spawn("normal", None, false)?;
+    fixture.launch()?;
+    let running = StateStore::new(fixture.paths.machine_state(NAME)?).read()?;
+    let vmm_pid = running.vmm_pid.ok_or("missing VMM pid")?;
+    let mut old_shim = fixture.shim.take().ok_or("missing shim")?;
+    old_shim.signal_process(ProcessSignal::Kill)?;
+    let _ = old_shim
+        .wait_timeout(Duration::from_secs(3))?
+        .ok_or("shim was not reaped")?;
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(vmm_pid)?),
+        nix::sys::signal::Signal::SIGSTOP,
+    )?;
+
+    let mut events = Vec::new();
+    let recovered = recover_shim(
+        &fixture.paths,
+        NAME,
+        Path::new(env!("CARGO_BIN_EXE_firestone")),
+        &mut events,
+    )?;
+    assert_eq!(recovered.pids.vmm, Some(vmm_pid));
+    assert_eq!(
+        StateStore::new(fixture.paths.machine_state(NAME)?)
+            .read()?
+            .vmm_pid,
+        Some(vmm_pid)
+    );
+    let stopped = fixture.stop(Duration::ZERO, true)?;
+    assert_eq!(stopped.status, MachineStatus::Stopped);
+    assert!(linux_process_inactive(vmm_pid)?);
     Ok(())
 }
 
@@ -790,6 +1081,43 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+#[cfg(target_os = "linux")]
+fn linux_process_inactive(pid: u32) -> TestResult<bool> {
+    let path = PathBuf::from("/proc").join(pid.to_string()).join("stat");
+    let stat = match fs::read_to_string(path) {
+        Ok(stat) => stat,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(source) => return Err(source.into()),
+    };
+    let close = stat.rfind(") ").ok_or("malformed Linux process stat")?;
+    Ok(stat[close + 2..].starts_with('Z'))
+}
+
+fn wait_for_shim_ready(
+    socket: &Path,
+    process: &mut ManagedProcess,
+    timeout: Duration,
+) -> TestResult<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if process.observe_exit()? {
+            return Err(format!("shim pid {} exited before readiness", process.id()).into());
+        }
+        if ShimClient::new(socket, Duration::from_millis(100))
+            .ping()
+            .is_ok()
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                format!("shim socket {} did not become responsive", socket.display()).into(),
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn wait_for_path(path: &Path, timeout: Duration) -> TestResult<()> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -799,6 +1127,13 @@ fn wait_for_path(path: &Path, timeout: Duration) -> TestResult<()> {
         thread::sleep(Duration::from_millis(10));
     }
     Err(format!("{} did not appear", path.display()).into())
+}
+
+fn send_and_shutdown(socket: &Path, bytes: &[u8]) -> TestResult<()> {
+    let mut stream = UnixStream::connect(socket)?;
+    stream.write_all(bytes)?;
+    stream.shutdown(Shutdown::Both)?;
+    Ok(())
 }
 
 fn raw_request(socket: &Path, bytes: &[u8]) -> TestResult<String> {

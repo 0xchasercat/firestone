@@ -2544,7 +2544,7 @@ mod tests {
     #[test]
     fn vmm_ping_probe_requires_http_200() -> Result<(), Box<dyn std::error::Error>> {
         assert!(probe_vmm_status("200")?);
-        assert!(!probe_vmm_status("204")?);
+        assert!(probe_vmm_status("204").is_err());
         Ok(())
     }
 
@@ -2578,13 +2578,16 @@ mod tests {
         });
 
         let started = Instant::now();
-        let pinged = VmmApiLivenessProbe::new(Duration::from_millis(80)).ping(&socket)?;
+        let error = VmmApiLivenessProbe::new(Duration::from_millis(80))
+            .ping(&socket)
+            .err()
+            .ok_or("slow liveness probe unexpectedly returned a boolean")?;
         let elapsed = started.elapsed();
         server
             .join()
             .map_err(|_| std::io::Error::other("VMM slow-ping fixture panicked"))??;
 
-        assert!(!pinged);
+        assert_eq!(error.kind(), ErrorKind::Timeout);
         assert!(elapsed < Duration::from_millis(250));
         Ok(())
     }

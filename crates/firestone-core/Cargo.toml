@@ -12,6 +12,7 @@ fs2.workspace = true
 jiff.workspace = true
 nix.workspace = true
 reqwest.workspace = true
+rustix.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

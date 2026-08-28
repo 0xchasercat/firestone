@@ -4,7 +4,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
     os::unix::{
-        fs::{MetadataExt, OpenOptionsExt},
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
         process::CommandExt,
     },
     path::{Path, PathBuf},
@@ -15,6 +15,7 @@ use std::{
 
 use nix::{
     errno::Errno,
+    fcntl::{FcntlArg, OFlag, fcntl},
     sys::signal::{Signal, kill, killpg},
     unistd::{Pid, getpgid, getuid},
 };
@@ -608,6 +609,7 @@ impl Cmd {
         Ok(ManagedProcess {
             child,
             process_group,
+            reaped: false,
         })
     }
     /// Runs a terminal-facing process with inherited stdout and stderr.
@@ -805,6 +807,7 @@ impl ProcessSignal {
 pub struct ManagedProcess {
     child: Child,
     process_group: Option<u32>,
+    reaped: bool,
 }
 
 impl ManagedProcess {
@@ -841,40 +844,86 @@ impl ManagedProcess {
         Ok(())
     }
 
+    /// Observes child exit without reaping, keeping its pid/process-group id pinned.
+    pub fn observe_exit(&self) -> Result<bool, FirestoneError> {
+        if self.reaped {
+            return Ok(true);
+        }
+        let raw = i32::try_from(self.id()).map_err(|_| {
+            FirestoneError::new(
+                ErrorKind::Generic,
+                format!("process id {} does not fit pid_t", self.id()),
+            )
+        })?;
+        let pid = rustix::process::Pid::from_raw(raw).ok_or_else(|| {
+            FirestoneError::new(ErrorKind::Generic, "child process id cannot be zero")
+        })?;
+        let options = rustix::process::WaitIdOptions::EXITED
+            | rustix::process::WaitIdOptions::NOHANG
+            | rustix::process::WaitIdOptions::NOWAIT;
+        let status = rustix::process::waitid(rustix::process::WaitId::Pid(pid), options).map_err(
+            |source| {
+                FirestoneError::new(
+                    ErrorKind::Generic,
+                    format!("cannot observe child process {}", self.id()),
+                )
+                .with_source(std::io::Error::from_raw_os_error(source.raw_os_error()))
+            },
+        )?;
+        Ok(status.is_some_and(|status| status.exited() || status.killed() || status.dumped()))
+    }
+
+    #[must_use]
+    pub const fn is_reaped(&self) -> bool {
+        self.reaped
+    }
+
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, FirestoneError> {
-        self.child.try_wait().map_err(|source| {
+        let status = self.child.try_wait().map_err(|source| {
             FirestoneError::new(
                 ErrorKind::Generic,
                 format!("cannot inspect child process {}", self.id()),
             )
             .with_source(source)
-        })
+        })?;
+        self.reaped |= status.is_some();
+        Ok(status)
     }
 
     pub fn wait(&mut self) -> Result<ExitStatus, FirestoneError> {
-        self.child.wait().map_err(|source| {
+        let status = self.child.wait().map_err(|source| {
             FirestoneError::new(
                 ErrorKind::Generic,
                 format!("cannot reap child process {}", self.id()),
             )
             .with_source(source)
-        })
+        })?;
+        self.reaped = true;
+        Ok(status)
     }
 
     pub fn wait_timeout(
         &mut self,
         timeout: Duration,
     ) -> Result<Option<ExitStatus>, FirestoneError> {
-        self.child.wait_timeout(timeout).map_err(|source| {
+        let status = self.child.wait_timeout(timeout).map_err(|source| {
             FirestoneError::new(
                 ErrorKind::Generic,
                 format!("cannot wait for child process {}", self.id()),
             )
             .with_source(source)
-        })
+        })?;
+        self.reaped |= status.is_some();
+        Ok(status)
     }
 
     pub fn signal_process(&self, signal: ProcessSignal) -> Result<(), FirestoneError> {
+        if self.reaped {
+            return Err(FirestoneError::new(
+                ErrorKind::Conflict,
+                format!("refusing to signal already-reaped pid {}", self.id()),
+            ));
+        }
         let pid = process_pid(self.id())?;
         match kill(pid, signal.as_nix()) {
             Ok(()) | Err(Errno::ESRCH) => Ok(()),
@@ -887,6 +936,15 @@ impl ManagedProcess {
     }
 
     pub fn signal_group(&self, signal: ProcessSignal) -> Result<(), FirestoneError> {
+        if self.reaped {
+            return Err(FirestoneError::new(
+                ErrorKind::Conflict,
+                format!(
+                    "refusing to signal group of already-reaped pid {}",
+                    self.id()
+                ),
+            ));
+        }
         let group = self.process_group.ok_or_else(|| {
             FirestoneError::new(
                 ErrorKind::Generic,
@@ -955,19 +1013,48 @@ fn spawn_with_busy_retry(
     }
 }
 fn open_log(path: &Path, kind: ErrorKind) -> Result<File, FirestoneError> {
-    let file = OpenOptions::new()
-        .create(true)
+    let flags = nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK;
+    let created = match OpenOptions::new()
         .append(true)
+        .create_new(true)
         .mode(0o600)
-        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
+        .custom_flags(flags)
         .open(path)
-        .map_err(|source| {
-            FirestoneError::new(
+    {
+        Ok(file) => (file, true),
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            let file = OpenOptions::new()
+                .append(true)
+                .custom_flags(flags)
+                .open(path)
+                .map_err(|source| {
+                    FirestoneError::new(
+                        kind,
+                        format!("cannot open command log `{}`", path.display()),
+                    )
+                    .with_source(source)
+                })?;
+            (file, false)
+        }
+        Err(source) => {
+            return Err(FirestoneError::new(
                 kind,
-                format!("cannot open command log `{}`", path.display()),
+                format!("cannot create command log `{}`", path.display()),
             )
-            .with_source(source)
-        })?;
+            .with_source(source));
+        }
+    };
+    let (file, was_created) = created;
+    if was_created {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|source| {
+                FirestoneError::new(
+                    kind,
+                    format!("cannot protect command log `{}`", path.display()),
+                )
+                .with_source(source)
+            })?;
+    }
     let metadata = file.metadata().map_err(|source| {
         FirestoneError::new(
             kind,
@@ -983,17 +1070,33 @@ fn open_log(path: &Path, kind: ErrorKind) -> Result<File, FirestoneError> {
     }
     let mode = metadata.mode() & 0o7777;
     let uid = getuid().as_raw();
-    if metadata.uid() != uid || mode & 0o077 != 0 {
+    if metadata.uid() != uid || mode != 0o600 {
         return Err(FirestoneError::new(
             kind,
             format!(
-                "command log `{}` is insecure: expected uid {uid} and no group/world access, found uid {} and mode {mode:04o}",
+                "command log `{}` is insecure: expected uid {uid} and mode 0600, found uid {} and mode {mode:04o}",
                 path.display(),
                 metadata.uid()
             ),
         )
-        .with_hint("replace the log with a private regular file owned by the Firestone user"));
+        .with_hint("replace the log with a mode-0600 regular file owned by the Firestone user"));
     }
+    let current = fcntl(&file, FcntlArg::F_GETFL).map_err(|source| {
+        FirestoneError::new(
+            kind,
+            format!("cannot inspect log flags for `{}`", path.display()),
+        )
+        .with_source(std::io::Error::from_raw_os_error(source as i32))
+    })?;
+    let mut open_flags = OFlag::from_bits_truncate(current);
+    open_flags.remove(OFlag::O_NONBLOCK);
+    fcntl(&file, FcntlArg::F_SETFL(open_flags)).map_err(|source| {
+        FirestoneError::new(
+            kind,
+            format!("cannot clear nonblocking log flag for `{}`", path.display()),
+        )
+        .with_source(std::io::Error::from_raw_os_error(source as i32))
+    })?;
     Ok(file)
 }
 
@@ -1222,6 +1325,50 @@ mod tests {
         assert_eq!(output.stdout().len(), 128);
         assert!(output.stdout_truncated());
         assert!(!output.stderr_truncated());
+        Ok(())
+    }
+
+    #[test]
+    fn log_targets_reject_symlinks_fifos_and_wrong_modes_without_blocking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new()?;
+        let real = dir.path().join("real.log");
+        fs::write(&real, b"")?;
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o600))?;
+        let link = dir.path().join("link.log");
+        symlink(&real, &link)?;
+        let link_error = Cmd::new("/bin/true")
+            .stderr_log(&link)
+            .run()
+            .err()
+            .ok_or("symlink log target was accepted")?;
+        assert_eq!(link_error.kind(), crate::ErrorKind::Generic);
+
+        let fifo = dir.path().join("fifo.log");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        let started = Instant::now();
+        let fifo_error = Cmd::new("/bin/true")
+            .stderr_log(&fifo)
+            .run()
+            .err()
+            .ok_or("FIFO log target was accepted")?;
+        assert_eq!(fifo_error.kind(), crate::ErrorKind::Generic);
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let permissive = dir.path().join("permissive.log");
+        fs::write(&permissive, b"")?;
+        fs::set_permissions(&permissive, fs::Permissions::from_mode(0o644))?;
+        let mode_error = Cmd::new("/bin/true")
+            .stderr_log(&permissive)
+            .run()
+            .err()
+            .ok_or("wrong-mode log target was accepted")?;
+        assert_eq!(mode_error.kind(), crate::ErrorKind::Generic);
         Ok(())
     }
 

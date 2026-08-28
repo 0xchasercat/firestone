@@ -54,21 +54,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         std::thread::sleep(std::time::Duration::from_secs(30));
         return Ok(());
     }
+
     if let Some(pid_path) = &options.descendant_pid {
-        let child = Command::new("/bin/sleep")
-            .arg("60")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        fs::write(pid_path, format!("{}\n", child.id()))?;
+        let child_pid = if options.behavior == "thread-descendant" {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            std::thread::spawn(move || match spawn_descendant() {
+                Ok(mut child) => {
+                    let _ = sender.send(Ok(child.id()));
+                    let _ = child.wait();
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                }
+            });
+            receiver.recv()??
+        } else {
+            spawn_descendant()?.id()
+        };
+        fs::write(pid_path, format!("{child_pid}\n"))?;
     }
+
 
     let _ = fs::remove_file(&options.api_socket);
     let listener = UnixListener::bind(&options.api_socket)?;
     for connection in listener.incoming() {
         let mut stream = connection?;
         let request = read_request(&mut stream)?;
+        if request.path == "/api/v1/vm.power-button"
+            && options.behavior == "slow-power"
+        {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
         append(
             &options.record,
             format!("{} {}\n", request.method, request.path).as_bytes(),
@@ -148,6 +164,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+
+fn spawn_descendant() -> Result<std::process::Child, std::io::Error> {
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut command = Command::new("setsid");
+        command.arg("/bin/sleep").arg("60");
+        command
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut command = {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("60");
+        command
+    };
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
 }
 
 fn run_qemu(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {

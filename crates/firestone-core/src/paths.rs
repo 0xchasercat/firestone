@@ -360,6 +360,10 @@ impl Paths {
         Ok(self.machine_dir(name)?.join("vmconfig.json"))
     }
 
+    pub fn machine_vmm_executable(&self, name: &str) -> Result<PathBuf, FirestoneError> {
+        Ok(self.machine_dir(name)?.join("vmm.bin"))
+    }
+
     pub fn machine_seed_dir(&self, name: &str) -> Result<PathBuf, FirestoneError> {
         Ok(self.machine_dir(name)?.join("seed"))
     }
@@ -1724,6 +1728,10 @@ mod tests {
         assert_eq!(
             paths.machine_console_log("demo")?,
             PathBuf::from("/firestone/data/machines/demo/console.log")
+        );
+        assert_eq!(
+            paths.machine_vmm_executable("demo")?,
+            PathBuf::from("/firestone/data/machines/demo/vmm.bin")
         );
         assert_eq!(
             paths.machine_vmm_log("demo")?,

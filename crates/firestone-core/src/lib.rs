@@ -46,7 +46,7 @@ pub use paths::{PathInputs, Paths};
 pub use result::{MachineRecord, MachineSummary, MachineView, SpecResult, SpecWarningPayload};
 pub use shim::{
     PreparedStart, ShimClient, ShimPids, ShimStatus, ShimTimeouts, launch_prepared, prepare_start,
-    run_shim, stop_unsupervised, validate_m1_start_scope,
+    recover_shim, run_shim, stop_unsupervised, validate_m1_start_scope,
 };
 pub use spec::{
     Arch, ByteSize, CloudInitSpec, CloudInitSpecPatch, ColorMode, Firmware, GlobalConfig,
