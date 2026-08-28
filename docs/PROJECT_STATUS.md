@@ -5,7 +5,7 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 ## Current position
 
 - Milestone: M0, skeleton
-- Baseline: M0 workspace with validated catalog sources and exact dependency pins
+- Baseline: M0 core contracts, state, catalog, dependency evidence, and reproducible virtiofsd build recipe
 - Linux validation host: `firestone@172.203.242.136`, Ubuntu 24.04 x86_64, `/dev/kvm` present
 - Required local gate: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`
 - Required integration gate: the same commands on the Linux host
@@ -20,10 +20,10 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 | M0-02 | Atomic files, machine state, locking, liveness reconciliation | `agent/m0-state` | [#4](https://github.com/0xchasercat/firestone/pull/4) | complete | M0-00 | Reconcile matrix and lock contention tests pass |
 | M0-03a | Built-in catalog data and authoritative source validation | `agent/m0-catalog-data` | [#2](https://github.com/0xchasercat/firestone/pull/2) | complete | baseline | Initial entries have current per-architecture URLs and checksum sources; unbooted entries are marked as release gates |
 | M0-03b | Image reference parsing, catalog merge, architecture selection, resolution | `agent/m0-catalog` | [#5](https://github.com/0xchasercat/firestone/pull/5) | complete | M0-00, M0-03a | Catalog rules from sections 8.1 and 8.2 pass without network |
-| M0-04 | CLI parser, renderers, create/list/show/edit, dispatcher adapters | `agent/m0-cli` | pending | in progress | M0-01, M0-02, M0-03b | M0 no-KVM command acceptance and renderer snapshots pass |
+| M0-04 | CLI parser, renderers, create/list/show/edit, dispatcher adapters | `agent/m0-cli` | pending | ready | M0-01, M0-02, M0-03b | M0 no-KVM command acceptance and renderer snapshots pass |
 | M0-05a | Dependency manifest, real pins, download/hash tooling, third-party evidence | `agent/m0-deps` | [#3](https://github.com/0xchasercat/firestone/pull/3) | complete | baseline | Real per-architecture URLs and checksums; verified behavior recorded against exact versions |
 | M0-05b | Host checks, doctor report, unprivileged fixes, deterministic tests | `agent/m0-doctor` | pending | in progress | M0-01, M0-02, M0-05a | Section 17.3 checks and safe fixes pass without KVM |
-| M0-05c | Reproducible virtiofsd builds and Firestone-owned release assets | `agent/m0-virtiofsd-dist` | [#7](https://github.com/0xchasercat/firestone/pull/7) | ready for review | M0-05a | Both musl targets build from pinned inputs; published assets have verified immutable URLs and checksums in `deps.toml` |
+| M0-05c | Reproducible virtiofsd builds and Firestone-owned release assets | `agent/m0-virtiofsd-pins` | [#7](https://github.com/0xchasercat/firestone/pull/7) + follow-up pending | blocked | M0-05a, public asset hosting | Both musl targets build from pinned inputs; published assets have verified immutable URLs and checksums in `deps.toml` |
 | M0-06 | M0 integration, docs, Linux verification | `agent/m0-integration` | pending | blocked | M0-01 through M0-05c | M0 acceptance is green locally, in CI, and on Linux |
 
 ## Merge order
@@ -53,10 +53,11 @@ The orchestrator reviews each pull request for spec alignment, public contract d
 - M0-02 merged in PR [#4](https://github.com/0xchasercat/firestone/pull/4). It added durable atomic state writes, per-machine locking, verified shim identity, and exhaustive liveness reconciliation. Linux subprocess contention and `/proc` checks passed on the Azure host.
 - M0-03b merged in PR [#5](https://github.com/0xchasercat/firestone/pull/5). It added deterministic built-in and override catalog parsing, strict HTTPS/source validation, and default, alias, version, and architecture resolution.
 - M0-01 merged in PR [#6](https://github.com/0xchasercat/firestone/pull/6). It added the shared machine spec and patch model, typed clears, deterministic layering and persistence, startup path resolution, strict validation, scalar and port-forward types, schema/metadata drift gates, and secure runtime-directory ancestry checks.
+- The reproducible virtiofsd recipe merged in PR [#7](https://github.com/0xchasercat/firestone/pull/7). Both required musl targets reproduce byte-for-byte in GitHub and on bare metal, and deterministic tar packages preserve modes and provenance. The private-repository prerelease exists, but unauthenticated downloads return 404, so it cannot become a supported dependency pin yet.
 
 ## Known risks
 
 - Runtime portions of the SPEC section 20 checks remain open unless the decision log explicitly records exact-version evidence.
-- Upstream virtiofsd 1.14.0 has no versioned binary assets. M0-05c must publish Firestone-owned reproducible x86_64 and aarch64 musl assets before `doctor --fix` can pass M0.
+- The Firestone virtiofsd prerelease is attached to a private repository. Authenticated readback succeeds, but unauthenticated asset URLs return 404. M0-05c needs user-approved public asset hosting before `deps.toml` can switch to binary availability and `doctor --fix` can pass M0.
 - The Azure VM has only 29 GB total storage. Image-matrix tests must prune artifacts between runs.
 - aarch64 runtime testing needs a separate native host or CI runner. Cross-compilation alone cannot close M5 acceptance.
