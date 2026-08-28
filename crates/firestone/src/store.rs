@@ -775,24 +775,28 @@ impl LocalDispatcher {
             return Ok(live.state);
         }
 
-        let client = ShimClient::new(
-            self.paths.machine_shim_socket(name)?,
-            ShimTimeouts::default().control_io,
-        );
-        match client.stop(timeout, force, events) {
-            Ok(()) => {
-                let state = StateStore::new(self.paths.machine_state(name)?).read()?;
-                if state.status.is_active() {
-                    return Err(FirestoneError::new(
-                        ErrorKind::Conflict,
-                        format!("machine {name:?} remained active after shim stop"),
-                    )
-                    .with_hint(format!("retry firestone stop {name}")));
+        let use_shim_client =
+            live.supervision == Some(Supervision::Supervised) || cfg!(not(target_os = "linux"));
+        if use_shim_client {
+            let client = ShimClient::new(
+                self.paths.machine_shim_socket(name)?,
+                ShimTimeouts::default().control_io,
+            );
+            match client.stop(timeout, force, events) {
+                Ok(()) => {
+                    let state = StateStore::new(self.paths.machine_state(name)?).read()?;
+                    if state.status.is_active() {
+                        return Err(FirestoneError::new(
+                            ErrorKind::Conflict,
+                            format!("machine {name:?} remained active after shim stop"),
+                        )
+                        .with_hint(format!("retry firestone stop {name}")));
+                    }
+                    return Ok(state);
                 }
-                return Ok(state);
+                Err(error) if error.kind() == ErrorKind::NotRunning => {}
+                Err(error) => return Err(error),
             }
-            Err(error) if error.kind() == ErrorKind::NotRunning => {}
-            Err(error) => return Err(error),
         }
 
         let lock_path = self.paths.machine_lock(name)?;
