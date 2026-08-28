@@ -35,6 +35,7 @@ const IMAGE_METADATA_VERSION: u32 = 1;
 const IMAGE_ID_PREFIX: &str = "image-";
 const IMAGE_ID_HEX_LENGTH: usize = 64;
 const IMAGE_BUFFER_SIZE: usize = 1024 * 1024;
+const IMAGE_PROGRESS_INTERVAL_BYTES: u64 = 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SIDECAR_BYTES: u64 = 64 * 1024;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1070,11 +1071,6 @@ impl ImageStore {
 
         let base_path = self.paths.image_base(&id)?;
         let sidecar_path = self.paths.image_metadata(&id)?;
-        ensure_pair_absent(&base_path, &sidecar_path, &id)?;
-        cleanup.track(base_path.clone());
-        cleanup.track(sidecar_path.clone());
-        publish_no_replace(candidate, &base_path)?;
-
         let generation = self.next_generation(&source.source_ref, source.architecture)?;
         let metadata = ImageMetadata {
             version: ImageMetadataVersion,
@@ -1097,7 +1093,13 @@ impl ImageStore {
             pulled_at: self.clock.now(),
         };
         metadata.validate()?;
-        atomic::write_json_with_mode(&sidecar_path, &metadata, SIDECAR_FILE_MODE)?;
+        let sidecar_bytes = serialize_image_metadata(&sidecar_path, &metadata)?;
+
+        ensure_pair_absent(&base_path, &sidecar_path, &id)?;
+        cleanup.track(base_path.clone());
+        cleanup.track(sidecar_path.clone());
+        publish_no_replace(candidate, &base_path)?;
+        atomic::write_with_mode(&sidecar_path, &sidecar_bytes, SIDECAR_FILE_MODE)?;
         self.paths.validate_owned_data_file(
             &sidecar_path,
             "image sidecar",
@@ -1492,7 +1494,8 @@ impl ImageStore {
                         self.next_generation(&source.source_ref, source.architecture)?;
                     metadata.pulled_at = self.clock.now();
                     metadata.validate()?;
-                    atomic::write_json_with_mode(&sidecar, &metadata, SIDECAR_FILE_MODE)?;
+                    let sidecar_bytes = serialize_image_metadata(&sidecar, &metadata)?;
+                    atomic::write_with_mode(&sidecar, &sidecar_bytes, SIDECAR_FILE_MODE)?;
                 }
                 Ok(Some(StoredImage {
                     metadata,
@@ -2484,6 +2487,7 @@ fn stream_source(
     let mut sha512 = (verification_algorithm == Some(ChecksumAlgorithm::Sha512)).then(Sha512::new);
     let mut buffer = vec![0_u8; IMAGE_BUFFER_SIZE];
     let mut size = 0_u64;
+    let mut last_progress = 0_u64;
     let mut header = [0_u8; 4];
     let mut header_length = 0_usize;
 
@@ -2526,12 +2530,15 @@ fn stream_source(
             header_length += copy;
         }
         size = next_size;
-        events.emit(Event::Progress {
-            id: StepId::from("image"),
-            done: size,
-            total: expected_length,
-            unit: Unit::Bytes,
-        })?;
+        if size.saturating_sub(last_progress) >= IMAGE_PROGRESS_INTERVAL_BYTES {
+            events.emit(Event::Progress {
+                id: StepId::from("image"),
+                done: size,
+                total: expected_length,
+                unit: Unit::Bytes,
+            })?;
+            last_progress = size;
+        }
     }
 
     if let Some(expected) = expected_length {
@@ -2545,6 +2552,12 @@ fn stream_source(
             .with_hint("retry the pull; the remote response was partial"));
         }
     }
+    events.emit(Event::Progress {
+        id: StepId::from("image"),
+        done: size,
+        total: expected_length,
+        unit: Unit::Bytes,
+    })?;
     file.sync_all()
         .map_err(|source| image_file_error("fsync", output, source))?;
     let detected_format = if header_length == QCOW2_MAGIC.len() && header == QCOW2_MAGIC {
@@ -2881,7 +2894,7 @@ fn try_open_local_source(path: &Path) -> Result<Option<OpenedLocalSource>, Fires
         Mode::empty(),
     ) {
         Ok(descriptor) => descriptor,
-        Err(Errno::ENOENT) => return Ok(None),
+        Err(Errno::ENOENT | Errno::ENAMETOOLONG) => return Ok(None),
         Err(Errno::ELOOP) => {
             return Err(FirestoneError::new(
                 ErrorKind::InvalidSpec,
@@ -3002,6 +3015,32 @@ fn read_owned_bounded(
         )
         .with_hint("replace the oversized file with bounded strict metadata"),
     })
+}
+
+fn serialize_image_metadata(
+    path: &Path,
+    metadata: &ImageMetadata,
+) -> Result<Vec<u8>, FirestoneError> {
+    let mut bytes = serde_json::to_vec_pretty(metadata).map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::Generic,
+            format!("cannot serialize image sidecar '{}'", path.display()),
+        )
+        .with_hint("the image pair was not published")
+        .with_source(source)
+    })?;
+    bytes.push(b'\n');
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_SIDECAR_BYTES {
+        return Err(FirestoneError::new(
+            ErrorKind::InvalidSpec,
+            format!(
+                "image sidecar for `{}` exceeds the {} byte limit",
+                metadata.id, MAX_SIDECAR_BYTES
+            ),
+        )
+        .with_hint("shorten the canonical image reference before pulling"));
+    }
+    Ok(bytes)
 }
 
 fn hash_file_sha256(path: &Path) -> Result<String, FirestoneError> {
@@ -5698,6 +5737,180 @@ else:
         assert!(restarted.image.cached);
         assert!(restarted.overlay.cached);
         assert_eq!(restarted.overlay.path, first.overlay.path);
+        Ok(())
+    }
+    #[test]
+    fn one_byte_source_frames_have_bounded_progress_and_final_total()
+    -> Result<(), Box<dyn std::error::Error>> {
+        struct OneByteReader {
+            bytes: Vec<u8>,
+            offset: usize,
+        }
+
+        impl Read for OneByteReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if self.offset == self.bytes.len() || buffer.is_empty() {
+                    return Ok(0);
+                }
+                buffer[0] = self.bytes[self.offset];
+                self.offset += 1;
+                Ok(1)
+            }
+        }
+
+        let length = IMAGE_PROGRESS_INTERVAL_BYTES as usize + 17;
+        let mut bytes = vec![b'x'; length];
+        bytes[..QCOW2_MAGIC.len()].copy_from_slice(&QCOW2_MAGIC);
+        let mut reader = OneByteReader { bytes, offset: 0 };
+        let directory = tempfile::tempdir()?;
+        let output = directory.path().join("one-byte-source.partial");
+        let mut events = Vec::new();
+        let staged = stream_source(
+            &mut reader,
+            &output,
+            Some(length as u64),
+            ErrorKind::Checksum,
+            None,
+            &mut events,
+        )?;
+        let progress = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Progress { done, total, .. } => Some((*done, *total)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(progress.len() <= length / IMAGE_PROGRESS_INTERVAL_BYTES as usize + 1);
+        assert_eq!(progress.last(), Some(&(length as u64, Some(length as u64))));
+        assert_eq!(staged.size, length as u64);
+        Ok(())
+    }
+
+    #[test]
+    fn sidecar_limit_is_prevalidated_before_base_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let url = "https://long-reference.example.invalid/base.qcow2";
+        let image_bytes = b"QFI\xFBLONG-REFERENCE".to_vec();
+        let digest = sha256_bytes(&image_bytes);
+        let metadata_for = |version: &str| {
+            let source_ref = format!("longref:{version}");
+            let id = stable_image_id(&source_ref, Some(url), Arch::X86_64, &digest);
+            ImageMetadata {
+                version: ImageMetadataVersion,
+                id,
+                generation: 1,
+                source_ref,
+                source_url: Some(url.to_owned()),
+                source_sha256: digest.clone(),
+                stored_sha256: digest.clone(),
+                architecture: Arch::X86_64,
+                firmware: Some(CatalogFirmware::Rhf),
+                source_format: ImageFormat::Qcow2,
+                stored_format: ImageFormat::Qcow2,
+                verification_algorithm: Some(ChecksumAlgorithm::Sha256),
+                verification_digest: Some(digest.clone()),
+                size: image_bytes.len() as u64,
+                pulled_at: FIXED_TIME.to_owned(),
+            }
+        };
+
+        let template = metadata_for("a");
+        let template_path = fixture.paths.image_metadata(&template.id)?;
+        let template_length = serialize_image_metadata(&template_path, &template)?.len();
+        let padding = (MAX_SIDECAR_BYTES as usize)
+            .checked_sub(template_length)
+            .ok_or("sidecar template unexpectedly exceeded limit")?
+            + 1;
+        let exact_version = "a".repeat(padding);
+        let exact_metadata = metadata_for(&exact_version);
+        let exact_sidecar = fixture.paths.image_metadata(&exact_metadata.id)?;
+        assert_eq!(
+            serialize_image_metadata(&exact_sidecar, &exact_metadata)?.len(),
+            MAX_SIDECAR_BYTES as usize
+        );
+
+        let catalog_source = |version: &str| {
+            format!(
+                concat!(
+                    "[[image]]\n",
+                    "distro = \"longref\"\n",
+                    "version = \"{}\"\n",
+                    "aliases = []\n",
+                    "default = true\n",
+                    "firmware = \"rhf\"\n",
+                    "format = \"qcow2\"\n\n",
+                    "[image.arch.x86_64]\n",
+                    "url = \"{}\"\n",
+                    "sha256 = \"{}\"\n",
+                    "checksum_alg = \"sha256\"\n"
+                ),
+                version, url, digest,
+            )
+        };
+        let exact_catalog = custom_catalog(
+            &fixture.root,
+            "longref-exact",
+            &catalog_source(&exact_version),
+        )?;
+        let exact_store = store_with_catalog(&fixture, exact_catalog, Arc::new(FixedClock));
+        fixture.http.push(
+            url,
+            image_bytes.clone(),
+            Some(image_bytes.len() as u64),
+            None,
+        )?;
+        let exact = exact_store.pull(
+            &ImagePullRequest::new(
+                ImageRef::new(exact_metadata.source_ref.clone()),
+                &fixture.root,
+            ),
+            &mut Vec::new(),
+        )?;
+        assert_eq!(exact.metadata.id, exact_metadata.id);
+        assert_eq!(fs::read(&exact_sidecar)?.len(), MAX_SIDECAR_BYTES as usize);
+        assert_eq!(exact_store.list()?.len(), 1);
+
+        let over_version = format!("{exact_version}a");
+        let over_metadata = metadata_for(&over_version);
+        let over_sidecar = fixture.paths.image_metadata(&over_metadata.id)?;
+        let preflight = serialize_image_metadata(&over_sidecar, &over_metadata)
+            .err()
+            .ok_or("expected over-limit sidecar preflight rejection")?;
+        assert_eq!(preflight.kind(), ErrorKind::InvalidSpec);
+        assert!(preflight.message().contains("exceeds"));
+
+        let over_catalog = custom_catalog(
+            &fixture.root,
+            "longref-over",
+            &catalog_source(&over_version),
+        )?;
+        let over_store = store_with_catalog(&fixture, over_catalog, Arc::new(FixedClock));
+        fixture.http.push(
+            url,
+            image_bytes.clone(),
+            Some(image_bytes.len() as u64),
+            None,
+        )?;
+        let error = over_store
+            .pull(
+                &ImagePullRequest::new(
+                    ImageRef::new(over_metadata.source_ref.clone()),
+                    &fixture.root,
+                ),
+                &mut Vec::new(),
+            )
+            .err()
+            .ok_or("expected over-limit pull rejection")?;
+        assert_eq!(error.kind(), ErrorKind::InvalidSpec);
+        assert!(error.message().contains("exceeds"));
+        assert!(!fixture.paths.image_base(&over_metadata.id)?.exists());
+        assert!(!over_sidecar.exists());
+        for entry in fs::read_dir(fixture.paths.images_dir())? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            assert!(!name.ends_with(".partial"), "stale partial: {name}");
+        }
+        assert_eq!(over_store.list()?.len(), 1);
         Ok(())
     }
 }
