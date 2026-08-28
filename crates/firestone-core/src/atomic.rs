@@ -71,6 +71,20 @@ where
 {
     write_with_options(path, &[], None, true, |file, _contents| write_bytes(file))
 }
+
+/// Streams bytes atomically while creating the published file with the supplied mode.
+pub fn write_stream_with_mode<F>(
+    path: &Path,
+    mode: u32,
+    write_bytes: F,
+) -> Result<(), FirestoneError>
+where
+    F: FnOnce(&mut File) -> io::Result<()>,
+{
+    write_with_options(path, &[], Some(mode), true, |file, _contents| {
+        write_bytes(file)
+    })
+}
 fn write_with<F>(path: &Path, bytes: &[u8], write_bytes: F) -> Result<(), FirestoneError>
 where
     F: FnOnce(&mut File, &[u8]) -> io::Result<()>,

@@ -18,6 +18,7 @@ nix = { version = "0.30", features = ["fs", "poll", "process", "signal", "socket
 jiff = "0.2"
 minijinja = { version = "=2.24.0", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+rustix = { version = "1", features = ["process"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -26,6 +27,7 @@ sha2 = "0.10"
 shlex = "2"
 ssh-key = "0.6"
 tempfile = "3"
+signal-hook = "0.3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt"] }
 toml = "0.8"
