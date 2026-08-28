@@ -23,7 +23,7 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 | M0-04 | CLI parser, renderers, create/list/show/edit, dispatcher adapters | `agent/m0-cli` | pending | ready | M0-01, M0-02, M0-03b | M0 no-KVM command acceptance and renderer snapshots pass |
 | M0-05a | Dependency manifest, real pins, download/hash tooling, third-party evidence | `agent/m0-deps` | [#3](https://github.com/0xchasercat/firestone/pull/3) | complete | baseline | Real per-architecture URLs and checksums; verified behavior recorded against exact versions |
 | M0-05b | Host checks, doctor report, unprivileged fixes, deterministic tests | `agent/m0-doctor` | pending | in progress | M0-01, M0-02, M0-05a | Section 17.3 checks and safe fixes pass without KVM |
-| M0-05c | Reproducible virtiofsd builds and Firestone-owned release assets | `agent/m0-virtiofsd-pins` | [#7](https://github.com/0xchasercat/firestone/pull/7) + follow-up pending | ready | M0-05a | Both musl targets build from pinned inputs; published assets have verified immutable URLs and checksums in `deps.toml` |
+| M0-05c | Reproducible virtiofsd builds and Firestone-owned release assets | `agent/m0-virtiofsd-pins` | [#7](https://github.com/0xchasercat/firestone/pull/7) + [#10](https://github.com/0xchasercat/firestone/pull/10) | in review | M0-05a | Both musl targets build from pinned inputs; published assets have verified immutable URLs and checksums in `deps.toml` |
 | M0-06 | M0 integration, docs, Linux verification | `agent/m0-integration` | pending | blocked | M0-01 through M0-05c | M0 acceptance is green locally, in CI, and on Linux |
 
 ## Merge order
