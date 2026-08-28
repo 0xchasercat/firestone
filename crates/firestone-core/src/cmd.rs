@@ -650,21 +650,30 @@ fn spawn_with_busy_retry(
     deadline: Option<Instant>,
 ) -> Result<Child, std::io::Error> {
     let mut retries = 0_usize;
+    let mut last_busy = None;
     loop {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(last_busy
+                .take()
+                .unwrap_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut)));
+        }
         match command.spawn() {
             Err(source)
                 if source.kind() == std::io::ErrorKind::ExecutableFileBusy
                     && retries < EXECUTABLE_BUSY_MAX_RETRIES =>
             {
-                let delay = deadline
-                    .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-                    .unwrap_or(EXECUTABLE_BUSY_RETRY_DELAY)
-                    .min(EXECUTABLE_BUSY_RETRY_DELAY);
-                if delay.is_zero() {
-                    return Err(source);
+                if let Some(deadline) = deadline {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining <= EXECUTABLE_BUSY_RETRY_DELAY {
+                        if !remaining.is_zero() {
+                            std::thread::sleep(remaining);
+                        }
+                        return Err(source);
+                    }
                 }
-                std::thread::sleep(delay);
+                std::thread::sleep(EXECUTABLE_BUSY_RETRY_DELAY);
                 retries += 1;
+                last_busy = Some(source);
             }
             result => return result,
         }
@@ -931,6 +940,36 @@ mod tests {
             .join()
             .map_err(|_| std::io::Error::other("writer closer panicked"))?;
         assert_eq!(output.stdout(), b"ready");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writer_closing_at_deadline_boundary_cannot_enable_late_spawn()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let script = executable(&dir, "deadline-busy", "printf ran > \"$1\"")?;
+        let marker = dir.path().join("late-marker");
+        let writable = std::fs::OpenOptions::new().write(true).open(&script)?;
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            drop(writable);
+        });
+        let started = Instant::now();
+
+        let error = Cmd::new(&script)
+            .arg(marker.as_os_str())
+            .timeout(Duration::from_millis(20))
+            .run()
+            .err()
+            .ok_or("deadline-bound busy command unexpectedly started")?;
+        closer
+            .join()
+            .map_err(|_| std::io::Error::other("writer closer panicked"))?;
+        assert_eq!(error.kind(), crate::ErrorKind::Generic);
+        assert!(error.message().contains("cannot start command"));
+        assert!(!marker.exists());
+        assert!(started.elapsed() < Duration::from_secs(1));
         Ok(())
     }
 
