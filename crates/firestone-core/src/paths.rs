@@ -293,6 +293,16 @@ impl Paths {
         self.ssh_dir().join("id_ed25519.pub")
     }
 
+    #[must_use]
+    pub fn ssh_identity_lock(&self) -> PathBuf {
+        self.data_dir.join(".ssh-identity.lock")
+    }
+
+    #[must_use]
+    pub fn ssh_generation_marker(&self) -> PathBuf {
+        self.ssh_dir().join(".generating")
+    }
+
     pub fn binary_file(&self, file_name: &str) -> Result<PathBuf, FirestoneError> {
         checked_join(&self.bin_dir(), "binary file name", file_name)
     }
@@ -1696,6 +1706,14 @@ mod tests {
         assert_eq!(
             paths.ssh_public_key(),
             PathBuf::from("/firestone/data/ssh/id_ed25519.pub")
+        );
+        assert_eq!(
+            paths.ssh_identity_lock(),
+            PathBuf::from("/firestone/data/.ssh-identity.lock")
+        );
+        assert_eq!(
+            paths.ssh_generation_marker(),
+            PathBuf::from("/firestone/data/ssh/.generating")
         );
         assert_eq!(
             paths.machine_spec("demo")?,

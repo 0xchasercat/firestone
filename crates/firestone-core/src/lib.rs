@@ -17,6 +17,7 @@ pub mod paths;
 pub mod result;
 pub mod shim;
 pub mod spec;
+pub mod ssh;
 pub mod state;
 pub mod vmm;
 pub mod vmm_api;
@@ -59,6 +60,11 @@ pub use spec::{
     ParseSpecClearError, PatchMerge, PortForward, PortRange, Protocol, RealValidationHost,
     SPEC_FIELD_METADATA, SpecClear, SpecFieldMetadata, SpecWarning, StartConfig, StopConfig,
     UiConfig, ValidationContext, ValidationHost, VmmSpec, VmmSpecPatch, validate_machine_spec,
+};
+pub use ssh::{
+    SshIdentity, VSOCK_HANDSHAKE_MAX_BYTES, VSOCK_HANDSHAKE_TIMEOUT, VsockConnection, VsockPort,
+    connect_vsock, ensure_ssh_identity, invalidate_known_hosts_for_seed, machine_known_hosts_path,
+    run_vsock_proxy,
 };
 pub use state::{
     ExitReason, LastExit, LiveMachineState, LivenessObservation, MAX_MACHINE_STATE_BYTES,

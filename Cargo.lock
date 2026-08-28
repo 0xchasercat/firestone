@@ -425,6 +425,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "unicode-width",
+ "wait-timeout",
 ]
 
 [[package]]

@@ -50,7 +50,8 @@ use crate::{
     Arch, Cmd, DependencyManifest, ErrorInfo, ErrorKind, Event, EventSink, ExitReason,
     FirestoneError, ImageStore, LastExit, MachineLock, MachineSpec, MachineState, MachineStatus,
     ManagedProcess, NetMode, Paths, ProcessSignal, StateStore, StepId, VmConfigInput, VmState,
-    VmmApi, VmmApiLivenessProbe, VmmPingProbe, atomic, publish_seed, publish_vm_config,
+    VmmApi, VmmApiLivenessProbe, VmmPingProbe, atomic, ensure_ssh_identity,
+    invalidate_known_hosts_for_seed, publish_seed, publish_vm_config,
 };
 
 const PLAN_VERSION: u32 = 1;
@@ -629,7 +630,17 @@ pub fn prepare_start(
         id: StepId::from("seed"),
         label: "render cloud-init seed".to_owned(),
     })?;
+    if spec.cloud_init.provisioning {
+        ensure_ssh_identity(paths)?;
+    }
+    let previous_instance_id = state.instance_id.clone();
     let rendered = publish_seed(paths, name, spec)?;
+    invalidate_known_hosts_for_seed(
+        paths,
+        name,
+        previous_instance_id.as_deref(),
+        &rendered.instance_id,
+    )?;
     state.instance_id = Some(rendered.instance_id.clone());
     if state.mac.is_none() {
         state.mac = Some(allocated_mac(paths, name));
