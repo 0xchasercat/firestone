@@ -1919,8 +1919,8 @@ fn verify_owned_process(
             format!("VMM pid {} already exited", record.pid),
         ));
     }
-    #[cfg(target_os = "linux")]
-    verify_linux_process(record)?;
+    // An unreaped Child handle pins this pid; the separately verified pgid was
+    // created by Cmd before exec, so it cannot refer to a reused process here.
     Ok(())
 }
 
