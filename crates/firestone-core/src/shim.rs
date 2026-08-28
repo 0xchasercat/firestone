@@ -50,7 +50,7 @@ use crate::{
     Arch, Cmd, DependencyManifest, ErrorInfo, ErrorKind, Event, EventSink, ExitReason,
     FirestoneError, ImageStore, LastExit, MachineLock, MachineSpec, MachineState, MachineStatus,
     ManagedProcess, NetMode, Paths, ProcessSignal, StateStore, StepId, VmConfigInput, VmState,
-    VmmApi, atomic, publish_seed, publish_vm_config,
+    VmmApi, VmmApiLivenessProbe, VmmPingProbe, atomic, publish_seed, publish_vm_config,
 };
 
 const PLAN_VERSION: u32 = 1;
@@ -69,6 +69,7 @@ const STOP_API_PHASE_CAP: Duration = Duration::from_secs(2);
 const CONTROL_ACCEPT_BACKOFF: Duration = Duration::from_millis(10);
 const LOG_TAIL_BYTES: u64 = 64 * 1024;
 const LOG_REASON_BYTES: usize = 4096;
+const VMM_API_UNRESPONSIVE: &str = "vmm API unresponsive";
 
 static OWNER_EVIDENCE_PID: AtomicU32 = AtomicU32::new(0);
 static OWNER_EVIDENCE_STATE: AtomicU8 = AtomicU8::new(0);
@@ -217,6 +218,72 @@ struct ProcessRecord {
     launch_sha256: Option<String>,
     uid: u32,
     start_time_ticks: Option<u64>,
+}
+
+struct RecoveredVmm {
+    record: ProcessRecord,
+    #[cfg(target_os = "linux")]
+    pidfd: rustix::fd::OwnedFd,
+}
+
+impl RecoveredVmm {
+    fn new(record: ProcessRecord) -> Result<Self, FirestoneError> {
+        #[cfg(target_os = "linux")]
+        {
+            verify_linux_process(&record)?;
+            let raw = i32::try_from(record.pid).map_err(|_| reused_pid_error(record.pid))?;
+            let pid =
+                rustix::process::Pid::from_raw(raw).ok_or_else(|| reused_pid_error(record.pid))?;
+            let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
+                .map_err(|source| {
+                    FirestoneError::new(
+                        ErrorKind::Conflict,
+                        format!("cannot pin recovered VMM pid {}", record.pid),
+                    )
+                    .with_source(io::Error::from_raw_os_error(source.raw_os_error()))
+                })?;
+            verify_linux_process(&record)?;
+            Ok(Self { record, pidfd })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = record;
+            Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                "recovered VMM supervision requires Linux pidfds",
+            ))
+        }
+    }
+
+    fn record(&self) -> &ProcessRecord {
+        &self.record
+    }
+
+    fn is_alive(&self) -> Result<bool, FirestoneError> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut descriptors = [PollFd::new(self.pidfd.as_fd(), PollFlags::POLLIN)];
+            poll(&mut descriptors, PollTimeout::ZERO).map_err(|source| {
+                FirestoneError::new(
+                    ErrorKind::Generic,
+                    format!(
+                        "cannot poll recovered VMM pidfd for pid {}",
+                        self.record.pid
+                    ),
+                )
+                .with_source(io::Error::from_raw_os_error(source as i32))
+            })?;
+            let events = descriptors[0].revents().unwrap_or_else(PollFlags::empty);
+            Ok(!events.intersects(PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                "recovered VMM liveness requires Linux pidfds",
+            ))
+        }
+    }
 }
 
 struct OwnedVmm {
@@ -779,10 +846,7 @@ pub fn recover_shim(
     let state = StateStore::new(paths.machine_state(name)?).read()?;
     if !matches!(
         state.status,
-        MachineStatus::Starting
-            | MachineStatus::Running
-            | MachineStatus::Stopping
-            | MachineStatus::Failed
+        MachineStatus::Starting | MachineStatus::Running
     ) {
         return Err(FirestoneError::new(
             ErrorKind::Conflict,
@@ -1024,35 +1088,59 @@ pub fn run_shim(paths: &Paths, name: &str) -> Result<(), FirestoneError> {
         None,
     )?;
     let normal_launch = state.status == MachineStatus::Starting && state.shim_pid == Some(pid);
-    let (mut identity, recovered_vmm) = if normal_launch {
-        (
-            ProcessIdentity {
-                version: IDENTITY_VERSION,
-                shim: shim_record,
-                vmm: None,
-            },
-            None,
-        )
-    } else {
-        let (record, api_ready) =
-            recover_vmm_record(paths, name, &plan, &state, prior_identity.as_ref(), pid)?;
-        state.shim_pid = Some(pid);
-        state.vmm_pid = Some(record.pid);
-        if api_ready {
-            state.status = MachineStatus::Running;
-            if state.started_at.is_none() {
-                state.started_at = Some(now_timestamp());
+
+    let (mut identity, recovered_vmm, mut recovery_api_pending, recovered_from_starting) =
+        if normal_launch {
+            (
+                ProcessIdentity {
+                    version: IDENTITY_VERSION,
+                    shim: shim_record,
+                    vmm: None,
+                },
+                None,
+                false,
+                false,
+            )
+        } else {
+            if !matches!(
+                state.status,
+                MachineStatus::Starting | MachineStatus::Running
+            ) {
+                return Err(FirestoneError::new(
+                    ErrorKind::Conflict,
+                    format!("machine `{name}` is not in a shim-recoverable state"),
+                ));
             }
-        }
-        (
-            ProcessIdentity {
-                version: IDENTITY_VERSION,
-                shim: shim_record,
-                vmm: Some(record.clone()),
-            },
-            Some(record),
-        )
-    };
+            let prior_status = state.status;
+            let (record, api_ready) =
+                recover_vmm_record(paths, name, &plan, &state, prior_identity.as_ref(), pid)?;
+            state.shim_pid = Some(pid);
+            state.vmm_pid = Some(record.pid);
+            if api_ready {
+                state.status = MachineStatus::Running;
+                set_vmm_api_degraded(&mut state, false);
+                if state.started_at.is_none() {
+                    state.started_at = Some(now_timestamp());
+                }
+            } else if prior_status == MachineStatus::Running {
+                state.status = MachineStatus::Running;
+                set_vmm_api_degraded(&mut state, true);
+            } else {
+                state.status = MachineStatus::Starting;
+                set_vmm_api_degraded(&mut state, false);
+            }
+            (
+                ProcessIdentity {
+                    version: IDENTITY_VERSION,
+                    shim: shim_record,
+                    vmm: Some(record.clone()),
+                },
+                Some(RecoveredVmm::new(record)?),
+                std::ops::Not::not(api_ready),
+                prior_status == MachineStatus::Starting,
+            )
+        };
+
     publish_pid_and_identity(paths, name, &identity)?;
     if recovered_vmm.is_some() {
         StateStore::new(paths.machine_state(name)?).write_from_shim(&state)?;
@@ -1075,12 +1163,11 @@ pub fn run_shim(paths: &Paths, name: &str) -> Result<(), FirestoneError> {
         })?;
     let mut launched = recovered_vmm.is_some();
     let mut vmm: Option<OwnedVmm> = None;
-    let recovery_readiness_deadline =
-        if recovered_vmm.is_some() && state.status == MachineStatus::Starting {
-            Instant::now().checked_add(timeouts.readiness)
-        } else {
-            None
-        };
+    let recovery_readiness_deadline = if recovery_api_pending && recovered_from_starting {
+        Instant::now().checked_add(timeouts.readiness)
+    } else {
+        None
+    };
     let supervisor_result = (|| -> Result<(), FirestoneError> {
         loop {
             if terminating.load(Ordering::Relaxed) {
@@ -1152,7 +1239,8 @@ pub fn run_shim(paths: &Paths, name: &str) -> Result<(), FirestoneError> {
                         merge_console_log(paths, name)?;
                         cleanup_after_shim(paths, name)?;
                     }
-                } else if let Some(record) = recovered_vmm.as_ref().cloned() {
+                } else if let Some(recovered) = recovered_vmm.as_ref() {
+                    let record = recovered.record().clone();
                     let total = stop_overall_timeout(Duration::from_secs(30), timeouts.control_io)?;
                     let operation_deadline = Instant::now()
                         .checked_add(total.saturating_sub(timeouts.control_io))
@@ -1217,28 +1305,73 @@ pub fn run_shim(paths: &Paths, name: &str) -> Result<(), FirestoneError> {
                 return Ok(());
             }
 
-            if state.status == MachineStatus::Starting {
-                if let (Some(record), Some(deadline)) =
-                    (recovered_vmm.as_ref(), recovery_readiness_deadline)
+            if recovery_api_pending {
+                let recovered = recovered_vmm.as_ref().ok_or_else(|| {
+                    FirestoneError::new(
+                        ErrorKind::Generic,
+                        "pending recovery lost its process identity",
+                    )
+                })?;
+                let record = recovered.record();
+                if recovered_from_starting
+                    && recovery_readiness_deadline
+                        .is_some_and(|deadline| Instant::now() >= deadline)
                 {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if !remaining.is_zero() {
-                        let api_timeout =
-                            timeouts.api.min(Duration::from_millis(100)).min(remaining);
-                        if let Ok(ping) =
-                            VmmApi::new(&paths.machine_api_socket(name)?, api_timeout).vmm_ping()
-                        {
-                            if ping.pid == i64::from(record.pid) {
-                                state.status = MachineStatus::Running;
-                                if state.started_at.is_none() {
-                                    state.started_at = Some(now_timestamp());
-                                }
-                                StateStore::new(paths.machine_state(name)?)
-                                    .write_from_shim(&state)?;
-                                write_shim_log(&format!(
-                                    "machine `{name}` recovered VMM API became ready"
-                                ));
+                    let timeout_error = FirestoneError::new(
+                        ErrorKind::Timeout,
+                        format!(
+                            "recovered VMM API for machine `{name}` did not become ready before its deadline"
+                        ),
+                    );
+                    match terminate_recovered_process(record) {
+                        Ok(()) => {
+                            identity.vmm = None;
+                            write_final_state(
+                                paths,
+                                name,
+                                &mut state,
+                                MachineStatus::Failed,
+                                None,
+                                ExitReason::Failure(timeout_error.message().to_owned()),
+                            )?;
+                            merge_console_log(paths, name)?;
+                            cleanup_after_shim(paths, name)?;
+                            return Err(timeout_error);
+                        }
+                        Err(cleanup_error) => {
+                            identity.vmm = Some(record.clone());
+                            publish_process_identity(paths, name, &identity)?;
+                            write_recoverable_failed_state(
+                                paths,
+                                name,
+                                &mut state,
+                                record,
+                                &timeout_error,
+                            )?;
+                            return Err(cleanup_error);
+                        }
+                    }
+                }
+                let mut api_timeout = timeouts.api.min(Duration::from_millis(100));
+                if let Some(deadline) = recovery_readiness_deadline {
+                    api_timeout =
+                        api_timeout.min(deadline.saturating_duration_since(Instant::now()));
+                }
+                if !api_timeout.is_zero() {
+                    if let Ok(ping) =
+                        VmmApi::new(&paths.machine_api_socket(name)?, api_timeout).vmm_ping()
+                    {
+                        if ping.pid == i64::from(record.pid) {
+                            recovery_api_pending = false;
+                            state.status = MachineStatus::Running;
+                            set_vmm_api_degraded(&mut state, false);
+                            if state.started_at.is_none() {
+                                state.started_at = Some(now_timestamp());
                             }
+                            StateStore::new(paths.machine_state(name)?).write_from_shim(&state)?;
+                            write_shim_log(&format!(
+                                "machine `{name}` recovered VMM API became ready"
+                            ));
                         }
                     }
                 }
@@ -1288,7 +1421,7 @@ pub fn run_shim(paths: &Paths, name: &str) -> Result<(), FirestoneError> {
             }
 
             let recovered_exited = match recovered_vmm.as_ref() {
-                Some(record) => !recorded_process_alive(record)?,
+                Some(recovered) => !recovered.is_alive()?,
                 None => false,
             };
             if recovered_exited {
@@ -1511,14 +1644,14 @@ pub fn run_shim(paths: &Paths, name: &str) -> Result<(), FirestoneError> {
                                     operation_deadline,
                                     &mut sink,
                                 )
-                            } else if let Some(record) = recovered_vmm.as_ref() {
+                            } else if let Some(recovered) = recovered_vmm.as_ref() {
                                 stop_recovered_vmm(
                                     paths,
                                     name,
                                     &plan,
                                     &mut state,
                                     &mut identity,
-                                    record,
+                                    recovered.record(),
                                     guest_timeout,
                                     force,
                                     operation_deadline,
@@ -1555,8 +1688,8 @@ pub fn run_shim(paths: &Paths, name: &str) -> Result<(), FirestoneError> {
                                         } else {
                                             runtime_alive = true;
                                         }
-                                    } else if let Some(record) = recovered_vmm.as_ref() {
-                                        if recorded_process_alive(record)? {
+                                    } else if let Some(recovered) = recovered_vmm.as_ref() {
+                                        if recovered.is_alive()? {
                                             runtime_alive = true;
                                         } else {
                                             completed_without_status = true;
@@ -1620,7 +1753,7 @@ fn finalize_supervisor_result(
     state: &mut MachineState,
     identity: &mut ProcessIdentity,
     owned_vmm: &mut Option<OwnedVmm>,
-    recovered_vmm: Option<&ProcessRecord>,
+    recovered_vmm: Option<&RecoveredVmm>,
     result: Result<(), FirestoneError>,
 ) -> Result<(), FirestoneError> {
     let primary = match result {
@@ -1648,7 +1781,7 @@ fn finalize_supervisor_result(
     let retained_record = owned_vmm
         .as_ref()
         .map(|vmm| vmm.record().clone())
-        .or_else(|| recovered_vmm.cloned())
+        .or_else(|| recovered_vmm.map(|vmm| vmm.record().clone()))
         .or_else(|| identity.vmm.clone());
     let cleanup = if let Some(vmm) = owned_vmm.as_mut() {
         vmm.terminate_and_reap(true, CHILD_TERM_GRACE).map(Some)
@@ -2273,6 +2406,25 @@ fn signal_verified_tree(
     ))
 }
 
+fn terminate_recovered_process(record: &ProcessRecord) -> Result<(), FirestoneError> {
+    if !recorded_process_alive(record)? {
+        return Ok(());
+    }
+    signal_verified_tree(record, ProcessSignal::Terminate)?;
+    let term_deadline = Instant::now()
+        .checked_add(CHILD_TERM_GRACE)
+        .ok_or_else(|| {
+            FirestoneError::new(ErrorKind::Usage, "recovery TERM deadline is invalid")
+        })?;
+    while Instant::now() < term_deadline && recorded_process_alive(record)? {
+        thread::sleep(LOOP_INTERVAL);
+    }
+    if recorded_process_alive(record)? {
+        signal_verified_tree(record, ProcessSignal::Kill)?;
+    }
+    wait_for_record_exit(record, CHILD_TERM_GRACE)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stop_owned_vmm(
     paths: &Paths,
@@ -2387,6 +2539,15 @@ fn stop_owned_vmm(
     Ok(())
 }
 
+fn set_vmm_api_degraded(state: &mut MachineState, unresponsive: bool) {
+    state
+        .degraded
+        .retain(|marker| marker != VMM_API_UNRESPONSIVE);
+    if unresponsive {
+        state.degraded.push(VMM_API_UNRESPONSIVE.to_owned());
+    }
+}
+
 fn write_final_state(
     paths: &Paths,
     name: &str,
@@ -2495,12 +2656,12 @@ fn ensure_no_live_runtime(
     }
     ensure_recorded_vmm_absent(paths, name)?;
     let api_socket = paths.machine_api_socket(name)?;
-    match VmmApi::new(&api_socket, timeout).vmm_ping() {
-        Ok(_) => Err(FirestoneError::new(
+    match VmmApiLivenessProbe::new(timeout).ping(&api_socket) {
+        Ok(true) => Err(FirestoneError::new(
             ErrorKind::AlreadyRunning,
             format!("machine `{name}` already has a live VMM"),
         )),
-        Err(error) if error.kind() == ErrorKind::NotRunning => Ok(()),
+        Ok(false) => Ok(()),
         Err(error) => Err(FirestoneError::new(
             ErrorKind::Conflict,
             format!("cannot prove stale VMM socket {}", api_socket.display()),
@@ -3771,9 +3932,10 @@ fn verify_linux_process(record: &ProcessRecord) -> Result<(), FirestoneError> {
                     source,
                 )
             })?;
+            let artifact_mode = artifact_metadata.mode() & 0o7777;
             if !artifact_metadata.is_file()
                 || artifact_metadata.uid() != record.uid
-                || artifact_metadata.mode() & 0o7777 != 0o700
+                || !matches!(artifact_mode, 0o700 | 0o755)
                 || launch_argv
                     .first()
                     .ne(&encode_os_argv(&[artifact.as_os_str().to_os_string()]).first())
@@ -3829,8 +3991,36 @@ fn process_state(pid: u32) -> Result<Option<char>, FirestoneError> {
 fn recorded_process_alive(record: &ProcessRecord) -> Result<bool, FirestoneError> {
     #[cfg(target_os = "linux")]
     {
-        Ok(matches!(process_state(record.pid)?, Some(state) if state != 'Z'))
+        if !matches!(process_state(record.pid)?, Some(state) if state != 'Z') {
+            return Ok(false);
+        }
+        let current_start = process_parent_and_start(record.pid)?.map(|(_, start)| start);
+        if current_start != record.start_time_ticks {
+            return Ok(false);
+        }
+        match verify_linux_process(record) {
+            Ok(()) => Ok(true),
+
+            Err(mut error) => {
+                for _ in 0..3 {
+                    thread::sleep(Duration::from_millis(1));
+                    let exited = matches!(process_state(record.pid)?, None | Some('Z'));
+                    let reused = process_parent_and_start(record.pid)?
+                        .map(|(_, start)| start)
+                        .ne(&record.start_time_ticks);
+                    if exited || reused {
+                        return Ok(false);
+                    }
+                    match verify_linux_process(record) {
+                        Ok(()) => return Ok(true),
+                        Err(next_error) => error = next_error,
+                    }
+                }
+                Err(error)
+            }
+        }
     }
+
     #[cfg(not(target_os = "linux"))]
     {
         let _ = record;

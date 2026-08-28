@@ -976,6 +976,61 @@ fn recovery_adopts_spawn_identity_and_state_publication_crash_windows() -> TestR
 
 #[cfg(target_os = "linux")]
 #[test]
+fn starting_recovery_timeout_terminates_the_pinned_vmm() -> TestResult<()> {
+    let mut fixture = Fixture::spawn("normal", None, false)?;
+    fixture.launch()?;
+    let mut state = StateStore::new(fixture.paths.machine_state(NAME)?).read()?;
+    let vmm_pid = state.vmm_pid.ok_or("missing VMM pid")?;
+    let vmm_raw = i32::try_from(vmm_pid)?;
+    let mut old_shim = fixture.shim.take().ok_or("missing shim")?;
+    old_shim.signal_process(ProcessSignal::Kill)?;
+    let _ = old_shim
+        .wait_timeout(Duration::from_secs(3))?
+        .ok_or("shim was not reaped")?;
+
+    state.status = MachineStatus::Starting;
+    let mut lock_events = Vec::new();
+    let lock = MachineLock::acquire(NAME, &fixture.paths.machine_lock(NAME)?, &mut lock_events)?;
+    StateStore::new(fixture.paths.machine_state(NAME)?).write_from_locked_action(&state, &lock)?;
+    let plan_path = fixture.paths.machine_shim_plan(NAME)?;
+    let mut plan: serde_json::Value = serde_json::from_slice(&fs::read(&plan_path)?)?;
+    plan["readiness_timeout_ms"] = json!(500);
+    plan["control_io_timeout_ms"] = json!(1000);
+    atomic::write_json_with_mode(&plan_path, &plan, 0o600)?;
+    drop(lock);
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(vmm_raw),
+        nix::sys::signal::Signal::SIGSTOP,
+    )?;
+
+    let mut events = Vec::new();
+    let recovered = recover_shim(
+        &fixture.paths,
+        NAME,
+        Path::new(env!("CARGO_BIN_EXE_firestone")),
+        &mut events,
+    )?;
+    assert_eq!(recovered.status, MachineStatus::Starting);
+    let resume = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(550));
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(vmm_raw),
+            nix::sys::signal::Signal::SIGCONT,
+        );
+    });
+    let failed = fixture.wait_for_status(MachineStatus::Failed, Duration::from_secs(3))?;
+    resume.join().map_err(|_| "resume thread panicked")?;
+    assert!(matches!(
+        failed.last_exit.as_ref().map(|exit| &exit.reason),
+        Some(ExitReason::Failure(reason)) if reason.contains("did not become ready")
+    ));
+    assert!(linux_process_inactive(vmm_pid)?);
+    assert!(!fixture.paths.machine_runtime_dir(NAME)?.exists());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn recovery_adopts_hung_vmm_without_starting_a_duplicate() -> TestResult<()> {
     let mut fixture = Fixture::spawn("normal", None, false)?;
     fixture.launch()?;
@@ -998,13 +1053,26 @@ fn recovery_adopts_hung_vmm_without_starting_a_duplicate() -> TestResult<()> {
         Path::new(env!("CARGO_BIN_EXE_firestone")),
         &mut events,
     )?;
+
     assert_eq!(recovered.pids.vmm, Some(vmm_pid));
-    assert_eq!(
-        StateStore::new(fixture.paths.machine_state(NAME)?)
-            .read()?
-            .vmm_pid,
-        Some(vmm_pid)
-    );
+    assert_eq!(recovered.status, MachineStatus::Running);
+    assert_eq!(recovered.degraded, vec!["vmm API unresponsive"]);
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(vmm_pid)?),
+        nix::sys::signal::Signal::SIGCONT,
+    )?;
+    let ready_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let state = StateStore::new(fixture.paths.machine_state(NAME)?).read()?;
+        if state.status == MachineStatus::Running && state.degraded.is_empty() {
+            break;
+        }
+        if Instant::now() >= ready_deadline {
+            return Err("recovered VMM did not clear API degradation after SIGCONT".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
     let stopped = fixture.stop(Duration::ZERO, true)?;
     assert_eq!(stopped.status, MachineStatus::Stopped);
     assert!(linux_process_inactive(vmm_pid)?);

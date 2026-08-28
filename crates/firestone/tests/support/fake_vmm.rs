@@ -95,7 +95,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "{{\"build_version\":\"v53.0\",\"version\":\"53.0.0\",\"pid\":{},\"features\":[]}}",
                     std::process::id()
                 );
-                response(&mut stream, "200 OK", body.as_bytes())?;
+                let _ = response(&mut stream, "200 OK", body.as_bytes());
             }
             "/api/v1/vm.create" if options.behavior == "create-fail" => {
                 response(
