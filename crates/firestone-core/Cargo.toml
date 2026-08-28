@@ -6,7 +6,10 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+fatfs.workspace = true
+minijinja.workspace = true
 fs2.workspace = true
+jiff.workspace = true
 nix.workspace = true
 reqwest.workspace = true
 schemars.workspace = true
@@ -23,6 +26,7 @@ url.workspace = true
 wait-timeout.workspace = true
 
 [dev-dependencies]
+serde_yaml = "0.9"
 tempfile.workspace = true
 
 [lints]

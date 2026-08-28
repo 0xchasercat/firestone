@@ -1,14 +1,19 @@
 use std::{
     collections::BTreeMap,
     ffi::OsStr,
-    fs, io,
-    os::unix::ffi::OsStrExt,
+    fs::{self, OpenOptions},
+    io,
+    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
     path::{Path, PathBuf},
 };
 
+use crate::{
+    ErrorKind, FirestoneError, MachineLock, atomic,
+    bounded::{self, BoundedReadError},
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-use crate::{ErrorKind, FirestoneError, MachineLock, atomic};
+pub const MAX_MACHINE_STATE_BYTES: u64 = 1024 * 1024;
 
 /// The only state file version accepted by this release.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -461,14 +466,56 @@ impl StateStore {
     }
 
     pub fn read(&self) -> Result<MachineState, FirestoneError> {
-        let bytes = fs::read(&self.path).map_err(|error| {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC)
+            .open(&self.path)
+            .map_err(|error| {
+                FirestoneError::new(
+                    ErrorKind::Generic,
+                    format!("cannot read machine state {}", self.path.display()),
+                )
+                .with_hint(
+                    "check that the machine state file exists and is a readable regular file",
+                )
+                .with_source(error)
+            })?;
+        let metadata = file.metadata().map_err(|error| {
             FirestoneError::new(
                 ErrorKind::Generic,
-                format!("cannot read machine state {}", self.path.display()),
+                format!("cannot inspect machine state {}", self.path.display()),
             )
-            .with_hint("check that the machine state file exists and is readable")
             .with_source(error)
         })?;
+        if !metadata.is_file() {
+            return Err(FirestoneError::new(
+                ErrorKind::Generic,
+                format!(
+                    "machine state {} is not a regular file",
+                    self.path.display()
+                ),
+            ));
+        }
+        let bytes =
+            bounded::read_to_end(&mut file, MAX_MACHINE_STATE_BYTES).map_err(
+                |error| match error {
+                    BoundedReadError::Io(source) => FirestoneError::new(
+                        ErrorKind::Generic,
+                        format!("cannot read machine state {}", self.path.display()),
+                    )
+                    .with_hint("check that the machine state file is readable")
+                    .with_source(source),
+                    BoundedReadError::LimitExceeded => FirestoneError::new(
+                        ErrorKind::Generic,
+                        format!(
+                            "machine state {} exceeds the {} byte limit",
+                            self.path.display(),
+                            MAX_MACHINE_STATE_BYTES
+                        ),
+                    )
+                    .with_hint("replace the oversized state.json with valid machine state"),
+                },
+            )?;
         let state: MachineState = serde_json::from_slice(&bytes).map_err(|error| {
             FirestoneError::new(
                 ErrorKind::Generic,
@@ -480,7 +527,6 @@ impl StateStore {
         state.validate()?;
         Ok(state)
     }
-
     /// Writes state while the current process is the machine shim.
     ///
     /// The shim must be the sole writer from the `starting` handoff until its
@@ -550,9 +596,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ExitReason, LastExit, LivenessObservation, MachineState, MachineStatus, ReconcileRewrite,
-        StateImage, StateStore, StateVersion, Supervision, VmmPingProbe, observe_liveness,
-        reconcile, reconciled_state, verify_shim_identity,
+        ExitReason, LastExit, LivenessObservation, MAX_MACHINE_STATE_BYTES, MachineState,
+        MachineStatus, ReconcileRewrite, StateImage, StateStore, StateVersion, Supervision,
+        VmmPingProbe, observe_liveness, reconcile, reconciled_state, verify_shim_identity,
     };
     use crate::{Event, FirestoneError, MachineLock};
 
@@ -984,6 +1030,28 @@ mod tests {
         assert!(written.degraded.is_empty());
         assert_eq!(store.read()?, written);
         assert!(!machine.join("state.json.tmp").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn state_store_rejects_oversized_file_through_bounded_descriptor_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("state.json");
+        fs::write(&path, vec![b'x'; MAX_MACHINE_STATE_BYTES as usize + 1])?;
+        let error = StateStore::new(path.clone())
+            .read()
+            .err()
+            .ok_or("expected oversized state rejection")?;
+        assert_eq!(error.kind(), crate::ErrorKind::Generic);
+        assert!(error.message().contains("exceeds"));
+        fs::remove_file(&path)?;
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::from_bits_truncate(0o600))?;
+        let special = StateStore::new(path)
+            .read()
+            .err()
+            .ok_or("expected special state file rejection")?;
+        assert!(special.message().contains("not a regular file"));
         Ok(())
     }
 

@@ -26,6 +26,7 @@ pub trait ValidationHost: Send + Sync {
     fn path_exists(&self, path: &Path) -> io::Result<bool>;
     fn path_is_readable(&self, path: &Path) -> io::Result<bool>;
     fn path_is_file(&self, path: &Path) -> io::Result<bool>;
+    fn canonicalize_regular_nofollow(&self, path: &Path) -> io::Result<PathBuf>;
     fn path_is_executable(&self, path: &Path) -> io::Result<bool>;
     fn read_regular_file(&self, path: &Path) -> io::Result<Vec<u8>>;
     fn tap_device_is_tap(&self, name: &str) -> io::Result<bool>;
@@ -76,6 +77,17 @@ impl ValidationHost for RealValidationHost {
         fs::metadata(path).map(|metadata| metadata.is_file())
     }
 
+    fn canonicalize_regular_nofollow(&self, path: &Path) -> io::Result<PathBuf> {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path is not a non-symlink regular file",
+            ));
+        }
+        fs::canonicalize(path)
+    }
+
     fn path_is_executable(&self, path: &Path) -> io::Result<bool> {
         match nix::unistd::access(path, nix::unistd::AccessFlags::X_OK) {
             Ok(()) => Ok(true),
@@ -83,7 +95,6 @@ impl ValidationHost for RealValidationHost {
             Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
         }
     }
-
     fn read_regular_file(&self, path: &Path) -> io::Result<Vec<u8>> {
         let mut options = OpenOptions::new();
         options.read(true);
@@ -144,6 +155,7 @@ pub struct ValidationContext<'a> {
     pub machine_dir: &'a Path,
     pub catalog: &'a Catalog,
     pub base_image_virtual_size: Option<ByteSize>,
+    pub pinned_image: bool,
 }
 
 impl<'a> ValidationContext<'a> {
@@ -160,12 +172,19 @@ impl<'a> ValidationContext<'a> {
             machine_dir,
             catalog,
             base_image_virtual_size: None,
+            pinned_image: false,
         }
     }
 
     #[must_use]
     pub const fn with_base_image_virtual_size(mut self, size: ByteSize) -> Self {
         self.base_image_virtual_size = Some(size);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_pinned_image(mut self, pinned: bool) -> Self {
+        self.pinned_image = pinned;
         self
     }
 }
@@ -323,7 +342,23 @@ fn validate_image(
             &candidate,
             "make the image file readable or choose another image",
         )?;
-        spec.image = image_ref_from_path(&candidate)?;
+        let canonical = context
+            .host
+            .canonicalize_regular_nofollow(&candidate)
+            .map_err(|source| {
+                invalid_with_source(
+                    "image",
+                    format!("cannot canonicalize local image '{}'", candidate.display()),
+                    "use a readable non-symlink regular image file",
+                    source,
+                )
+            })?;
+        spec.image = image_ref_from_path(&canonical)?;
+        return Ok(());
+    }
+    if context.pinned_image
+        && (Path::new(&reference).is_absolute() || Catalog::is_canonical_reference(&reference))
+    {
         return Ok(());
     }
 
@@ -995,6 +1030,14 @@ mod tests {
             Ok(self.files.contains_key(path))
         }
 
+        fn canonicalize_regular_nofollow(&self, path: &Path) -> io::Result<PathBuf> {
+            if self.files.contains_key(path) {
+                Ok(path.to_path_buf())
+            } else {
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            }
+        }
+
         fn path_is_executable(&self, path: &Path) -> io::Result<bool> {
             Ok(self.executable.contains(path))
         }
@@ -1267,6 +1310,44 @@ mod tests {
     }
 
     #[test]
+    fn image_missing_absolute_local_path_is_allowed_only_for_complete_pin_context()
+    -> Result<(), crate::FirestoneError> {
+        let host = FakeHost::default();
+        let mut spec = MachineSpec {
+            image: "/deleted/base.qcow2".into(),
+            ..MachineSpec::default()
+        };
+        validate_machine_spec(&mut spec, &host.context().with_pinned_image(true))?;
+        assert_eq!(spec.image.as_str(), "/deleted/base.qcow2");
+        Ok(())
+    }
+
+    #[test]
+    fn removed_catalog_reference_is_allowed_only_for_complete_pin_context() {
+        let host = FakeHost::default();
+        let mut unpinned = MachineSpec {
+            image: "removed:1".into(),
+            ..MachineSpec::default()
+        };
+        validate_machine_spec(&mut unpinned, &host.context())
+            .expect_err("unpinned removed catalog must fail");
+
+        let mut pinned = MachineSpec {
+            image: "removed:1".into(),
+            ..MachineSpec::default()
+        };
+        validate_machine_spec(&mut pinned, &host.context().with_pinned_image(true))
+            .expect("complete pin may outlive its catalog entry");
+
+        let mut malformed = MachineSpec {
+            image: "https:/broken".into(),
+            ..MachineSpec::default()
+        };
+        validate_machine_spec(&mut malformed, &host.context().with_pinned_image(true))
+            .expect_err("malformed URL must not masquerade as a former catalog pin");
+    }
+
+    #[test]
     fn image_unreadable_local_path_returns_keyed_error() {
         let mut host = FakeHost::default();
         host.files
@@ -1362,44 +1443,33 @@ mod tests {
     }
 
     #[test]
-    fn image_custom_catalog_name_with_path_character_is_accepted() {
+    fn image_custom_catalog_name_with_path_character_is_rejected_before_validation() {
         let directory = tempfile::tempdir().expect("temporary catalog directory");
         let catalog_path = directory.path().join("custom.toml");
         fs::write(
             &catalog_path,
-            r#"
-[[image]]
-distro = "custom/os"
-version = "current"
-aliases = ["edge"]
-default = true
-firmware = "rhf"
-format = "qcow2"
-
-[image.arch.x86_64]
-url = "https://images.example.invalid/custom.qcow2"
-checksum_url = "https://images.example.invalid/SHA256SUMS"
-checksum_alg = "sha256"
-"#,
+            concat!(
+                "[[image]]\n",
+                "distro = \"custom/os\"\n",
+                "version = \"current\"\n",
+                "aliases = [\"edge\"]\n",
+                "default = true\n",
+                "firmware = \"rhf\"\n",
+                "format = \"qcow2\"\n\n",
+                "[image.arch.x86_64]\n",
+                "url = \"https://images.example.invalid/custom.qcow2\"\n",
+                "checksum_url = \"https://images.example.invalid/SHA256SUMS\"\n",
+                "checksum_alg = \"sha256\"\n",
+            ),
         )
         .expect("write custom catalog");
-        let catalog = Catalog::load(
+        let error = Catalog::load(
             &directory.path().join("missing-config.toml"),
             &[catalog_path],
         )
-        .expect("load custom catalog");
-        let host = FakeHost {
-            catalog,
-            ..FakeHost::default()
-        };
-        let mut spec = MachineSpec {
-            image: "custom/os:edge".into(),
-            ..MachineSpec::default()
-        };
-
-        validate_machine_spec(&mut spec, &host.context()).expect("custom catalog image");
+        .expect_err("path-shaped catalog component must be rejected");
+        assert_eq!(error.kind(), ErrorKind::InvalidSpec);
     }
-
     #[test]
     fn machine_load_catalog_suffix_action_image_remains_catalog_reference()
     -> Result<(), crate::FirestoneError> {
@@ -1441,11 +1511,11 @@ checksum_alg = "sha256"
     }
 
     #[test]
-    fn image_path_shaped_catalog_missing_host_arch_preserves_catalog_error() {
+    fn image_catalog_missing_host_arch_preserves_catalog_error() {
         let catalog = catalog_from_document(
             r#"
 [[image]]
-distro = "custom/os"
+distro = "custom-os"
 version = "current"
 aliases = ["edge"]
 default = true
@@ -1463,7 +1533,7 @@ checksum_alg = "sha256"
             ..FakeHost::default()
         };
         let mut spec = MachineSpec {
-            image: "custom/os:edge".into(),
+            image: "custom-os:edge".into(),
             ..MachineSpec::default()
         };
 

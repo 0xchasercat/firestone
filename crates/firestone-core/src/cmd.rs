@@ -5,7 +5,7 @@ use std::{
     io::{Read, Write},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
-    process::{Command, ExitStatus, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     thread::JoinHandle,
     time::{Duration, Instant},
 };
@@ -20,6 +20,8 @@ use wait_timeout::ChildExt;
 use crate::{ErrorKind, FirestoneError};
 
 const DEFAULT_CAPTURE_LIMIT: usize = 1024 * 1024;
+const EXECUTABLE_BUSY_RETRY_DELAY: Duration = Duration::from_millis(5);
+const EXECUTABLE_BUSY_MAX_RETRIES: usize = 20;
 
 #[derive(Debug, Clone)]
 struct CmdArg {
@@ -296,7 +298,7 @@ impl Cmd {
             }
         }
 
-        let mut child = command.spawn().map_err(|source| {
+        let mut child = spawn_with_busy_retry(&mut command, deadline).map_err(|source| {
             FirestoneError::new(
                 self.error_kind,
                 format!("cannot start command `{}`", self.program.to_string_lossy()),
@@ -511,6 +513,7 @@ impl Cmd {
             "starting interactive external process"
         );
 
+        let deadline = self.timeout.map(|timeout| Instant::now() + timeout);
         let mut command = Command::new(&self.program);
         command.args(self.args.iter().map(|arg| &arg.value));
         command.stderr(Stdio::inherit());
@@ -547,7 +550,7 @@ impl Cmd {
         }
         command.envs(&self.env);
 
-        let mut child = command.spawn().map_err(|source| {
+        let mut child = spawn_with_busy_retry(&mut command, deadline).map_err(|source| {
             FirestoneError::new(
                 self.error_kind,
                 format!("cannot start command `{}`", self.program.to_string_lossy()),
@@ -555,43 +558,46 @@ impl Cmd {
             .with_hint("check that the program exists and is executable")
             .with_source(source)
         })?;
-        let (status, timed_out) = match self.timeout {
-            Some(timeout) => match child.wait_timeout(timeout) {
-                Ok(Some(status)) => (status, false),
-                Ok(None) => {
-                    child.kill().map_err(|source| {
-                        FirestoneError::new(
+        let (status, timed_out) = match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match child.wait_timeout(remaining) {
+                    Ok(Some(status)) => (status, false),
+                    Ok(None) => {
+                        child.kill().map_err(|source| {
+                            FirestoneError::new(
+                                self.error_kind,
+                                format!(
+                                    "cannot stop timed-out command `{}`",
+                                    self.program.to_string_lossy()
+                                ),
+                            )
+                            .with_source(source)
+                        })?;
+                        let status = child.wait().map_err(|source| {
+                            FirestoneError::new(
+                                self.error_kind,
+                                format!(
+                                    "cannot wait for timed-out command `{}`",
+                                    self.program.to_string_lossy()
+                                ),
+                            )
+                            .with_source(source)
+                        })?;
+                        (status, true)
+                    }
+                    Err(source) => {
+                        return Err(FirestoneError::new(
                             self.error_kind,
                             format!(
-                                "cannot stop timed-out command `{}`",
+                                "cannot wait for command `{}`",
                                 self.program.to_string_lossy()
                             ),
                         )
-                        .with_source(source)
-                    })?;
-                    let status = child.wait().map_err(|source| {
-                        FirestoneError::new(
-                            self.error_kind,
-                            format!(
-                                "cannot wait for timed-out command `{}`",
-                                self.program.to_string_lossy()
-                            ),
-                        )
-                        .with_source(source)
-                    })?;
-                    (status, true)
+                        .with_source(source));
+                    }
                 }
-                Err(source) => {
-                    return Err(FirestoneError::new(
-                        self.error_kind,
-                        format!(
-                            "cannot wait for command `{}`",
-                            self.program.to_string_lossy()
-                        ),
-                    )
-                    .with_source(source));
-                }
-            },
+            }
             None => (
                 child.wait().map_err(|source| {
                     FirestoneError::new(
@@ -639,6 +645,40 @@ struct Captured {
     truncated: bool,
 }
 
+fn spawn_with_busy_retry(
+    command: &mut Command,
+    deadline: Option<Instant>,
+) -> Result<Child, std::io::Error> {
+    let mut retries = 0_usize;
+    let mut last_busy = None;
+    loop {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(last_busy
+                .take()
+                .unwrap_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut)));
+        }
+        match command.spawn() {
+            Err(source)
+                if source.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && retries < EXECUTABLE_BUSY_MAX_RETRIES =>
+            {
+                if let Some(deadline) = deadline {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining <= EXECUTABLE_BUSY_RETRY_DELAY {
+                        if !remaining.is_zero() {
+                            std::thread::sleep(remaining);
+                        }
+                        return Err(source);
+                    }
+                }
+                std::thread::sleep(EXECUTABLE_BUSY_RETRY_DELAY);
+                retries += 1;
+                last_busy = Some(source);
+            }
+            result => return result,
+        }
+    }
+}
 fn open_log(path: &Path, kind: ErrorKind) -> Result<File, FirestoneError> {
     OpenOptions::new()
         .create(true)
@@ -878,6 +918,79 @@ mod tests {
         assert_eq!(output.stdout().len(), 128);
         assert!(output.stdout_truncated());
         assert!(!output.stderr_truncated());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn output_retries_executable_busy_until_writer_closes() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = TempDir::new()?;
+        let script = executable(&dir, "busy-then-ready", "printf ready")?;
+        let writable = std::fs::OpenOptions::new().write(true).open(&script)?;
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            drop(writable);
+        });
+
+        let output = Cmd::new(&script)
+            .timeout(Duration::from_millis(500))
+            .run()?;
+        closer
+            .join()
+            .map_err(|_| std::io::Error::other("writer closer panicked"))?;
+        assert_eq!(output.stdout(), b"ready");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writer_closing_at_deadline_boundary_cannot_enable_late_spawn()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let script = executable(&dir, "deadline-busy", "printf ran > \"$1\"")?;
+        let marker = dir.path().join("late-marker");
+        let writable = std::fs::OpenOptions::new().write(true).open(&script)?;
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            drop(writable);
+        });
+        let started = Instant::now();
+
+        let error = Cmd::new(&script)
+            .arg(marker.as_os_str())
+            .timeout(Duration::from_millis(20))
+            .run()
+            .err()
+            .ok_or("deadline-bound busy command unexpectedly started")?;
+        closer
+            .join()
+            .map_err(|_| std::io::Error::other("writer closer panicked"))?;
+        assert_eq!(error.kind(), crate::ErrorKind::Generic);
+        assert!(error.message().contains("cannot start command"));
+        assert!(!marker.exists());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_executable_busy_is_contextual_and_deadline_bounded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let script = executable(&dir, "always-busy", "exit 0")?;
+        let _writable = std::fs::OpenOptions::new().write(true).open(&script)?;
+        let started = Instant::now();
+
+        let error = Cmd::new(&script)
+            .timeout(Duration::from_millis(30))
+            .run()
+            .err()
+            .ok_or("expected persistent executable-busy error")?;
+        assert_eq!(error.kind(), crate::ErrorKind::Generic);
+        assert!(error.message().contains("cannot start command"));
+        assert!(error.message().contains(&script.display().to_string()));
+        assert!(started.elapsed() < Duration::from_secs(1));
         Ok(())
     }
 

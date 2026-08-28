@@ -1,0 +1,58 @@
+#cloud-config
+merge_how: "list(append)+dict(recurse_dict,recurse_list,no_replace)+str()"
+hostname: {{ name }}
+disable_root: false
+ssh_pwauth: false
+ssh_authorized_keys:
+  - {{ firestone_pubkey }}
+{%- for key in user_keys %}
+  - {{ key }}
+{%- endfor %}
+users:
+  - default
+  - name: root
+    ssh_authorized_keys:
+      - {{ firestone_pubkey }}
+{%- for key in user_keys %}
+      - {{ key }}
+{%- endfor %}
+growpart:
+  mode: auto
+  devices: ["/"]
+write_files:
+  - path: /etc/systemd/system/firestone-sshd.socket
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=firestone: sshd over vsock
+      [Socket]
+      ListenStream=vsock::22
+      Accept=yes
+      [Install]
+      WantedBy=sockets.target
+  - path: /etc/systemd/system/firestone-sshd@.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=firestone: sshd over vsock (%i)
+      After=sshd-keygen.service ssh.service
+      [Service]
+      ExecStart=-/usr/sbin/sshd -i
+      StandardInput=socket
+      StandardError=journal
+  - path: /etc/systemd/system/serial-getty@hvc0.service.d/firestone-autologin.conf
+    permissions: "0644"
+    content: |
+      [Service]
+      ExecStart=
+      ExecStart=-/sbin/agetty --autologin {{ user }} --noclear %I $TERM
+{%- if mounts %}
+mounts:
+{%- for mount in mounts %}
+  - [{{ mount.tag }}, {{ mount.guest }}, "virtiofs", "{{ 'ro' if mount.readonly else 'defaults' }}", "0", "0"]
+{%- endfor %}
+{%- endif %}
+runcmd:
+  - systemctl daemon-reload
+  - systemctl enable --now firestone-sshd.socket
+  - systemctl enable --now serial-getty@hvc0.service
