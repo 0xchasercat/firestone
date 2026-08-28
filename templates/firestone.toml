@@ -1,0 +1,12 @@
+# Firestone machine specification.
+#
+# `image` accepts a catalog reference, HTTPS URL, or local qcow2/raw path.
+# `arch` defaults to the host and may be `x86_64` or `aarch64`.
+# CPU, memory, and disk values can also be set by `firestone create` flags.
+#
+# Network modes: `passt` (default), `tap`, or `none`. Repeat `forward`
+# entries for port mappings such as `8080:80` or `udp:5353:53`.
+#
+# Add `[[mount]]` tables for shared directories. Cloud-init paths are resolved
+# relative to this file. `vmm.config_overlay` is an advanced JSON merge patch.
+# The effective values for this machine follow.

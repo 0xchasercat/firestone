@@ -63,14 +63,17 @@ impl MachineStatus {
     }
 }
 
-/// The resolved immutable base image recorded for a machine.
+/// Base image selected for a machine.
+///
+/// A newly-created machine records its canonical reference before any download.
+/// The immutable id and SHA-256 become available together after image pull.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StateImage {
     #[serde(rename = "ref")]
     pub r#ref: String,
-    pub id: String,
-    pub sha256: String,
+    pub id: Option<String>,
+    pub sha256: Option<String>,
 }
 
 /// Why the previous run ended.
@@ -185,6 +188,21 @@ impl MachineState {
     /// Checks invariants that serde enforces while reading but public struct
     /// construction could otherwise bypass before a write.
     pub fn validate(&self) -> Result<(), FirestoneError> {
+        if self.image.r#ref.is_empty() {
+            return Err(invalid_state("image.ref cannot be empty"));
+        }
+        match (&self.image.id, &self.image.sha256) {
+            (None, None) => {}
+            (Some(id), Some(sha256)) if !id.is_empty() && !sha256.is_empty() => {}
+            (Some(_), Some(_)) => {
+                return Err(invalid_state("image.id and image.sha256 cannot be empty"));
+            }
+            _ => {
+                return Err(invalid_state(
+                    "image.id and image.sha256 must be absent or present together",
+                ));
+            }
+        }
         if let Some(last_exit) = &self.last_exit {
             if last_exit.code.is_some() && last_exit.signal.is_some() {
                 return Err(invalid_state(
@@ -224,10 +242,18 @@ pub struct LivenessObservation {
 }
 
 /// Whether a pinged VMM still has its expected shim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Supervision {
     Supervised,
     Unsupervised,
+}
+
+/// Effective machine state and the live VMM's current supervision status.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LiveMachineState {
+    pub state: MachineState,
+    pub supervision: Option<Supervision>,
 }
 
 /// A state-file change required by reconciliation.
@@ -535,6 +561,37 @@ mod tests {
     impl VmmPingProbe for FixedPing {
         fn ping(&self, _api_socket: &Path) -> Result<bool, FirestoneError> {
             Ok(self.0)
+        }
+    }
+
+    #[test]
+    fn state_image_before_pull_serializes_null_identity() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let image = StateImage {
+            r#ref: "ubuntu:24.04".to_owned(),
+            id: None,
+            sha256: None,
+        };
+
+        assert_eq!(
+            serde_json::to_value(image)?,
+            json!({"ref": "ubuntu:24.04", "id": null, "sha256": null})
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn machine_state_partial_or_empty_image_identity_is_rejected() {
+        for (id, sha256) in [
+            (Some("id".to_owned()), None),
+            (None, Some("sha".to_owned())),
+            (Some(String::new()), Some("sha".to_owned())),
+            (Some("id".to_owned()), Some(String::new())),
+        ] {
+            let mut state = populated_state();
+            state.image.id = id;
+            state.image.sha256 = sha256;
+            assert!(state.validate().is_err());
         }
     }
 
@@ -936,8 +993,8 @@ mod tests {
             status: MachineStatus::Running,
             image: StateImage {
                 r#ref: "ubuntu:24.04".to_owned(),
-                id: "ubuntu-24.04-x86_64-1a2b3c4d".to_owned(),
-                sha256: "abc123".to_owned(),
+                id: Some("ubuntu-24.04-x86_64-1a2b3c4d".to_owned()),
+                sha256: Some("abc123".to_owned()),
             },
             mac: Some("52:54:00:9a:1f:c3".to_owned()),
             cid: 3,

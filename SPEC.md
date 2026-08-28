@@ -305,6 +305,8 @@ Resolved once at startup into a `Paths` struct; no other code computes paths.
 
 Relative user paths keep their `.` and `..` components until the kernel resolves the complete path. Validation may canonicalize an existing complete path after the kernel resolves it; Firestone does not lexically erase missing prefixes or symlink semantics. Owned machine, image, binary and seed file names are single path components without control characters. Arbitrary user-supplied absolute paths are not restricted by the owned-name rule.
 
+Firestone-owned data directories use the same ancestry trust model as runtime paths. Existing ancestors must be real directories owned by the current uid or root and must not be renameable by another uid; root-owned sticky shared directories are allowed. The final data, `machines`, machine, `bin`, and `ssh` directories must be owned by the current uid and must not be group- or world-writable. Firestone creates owned directories with mode 0700 and refuses unsafe existing paths before reading, writing, fixing, or publishing machine data.
+
 ```
 ~/.config/firestone/
   config.toml                  global defaults (§7.3)
@@ -343,7 +345,9 @@ machines/<name>/
   passt.log  virtiofsd-0.log …
 ```
 
-`firestone rm` deletes the whole directory. Nothing about a machine lives anywhere else except its sockets in the runtime dir and its base image (shared, reference‑counted by `images prune` scanning `state.json` files).
+`firestone rm` deletes the whole directory. Nothing about a machine lives anywhere else except its sockets in the runtime dir and its base image (shared, reference-counted by `images prune` scanning `state.json` files).
+
+Creation takes the per-machine lock before writing the `.creating` publication marker. A complete machine is published only after its spec and state are durable. If a prior creator died before publication, a later `create` may acquire the unlocked incomplete directory, revalidate every owned path, remove only that stale incomplete publication, and retry. A locked creation is busy; Firestone never removes an active creation or a directory containing a complete machine.
 
 ### 6.3 `state.json`
 
@@ -365,6 +369,8 @@ machines/<name>/
   "last_exit": { "at": "2026-08-27T18:02:10Z", "code": 0, "signal": null, "reason": "guest shutdown" }
 }
 ```
+
+For a newly-created machine that has not pulled its image, `image.ref` is the canonical catalog reference (or validated URL/path) and `image.id`/`image.sha256` are null. They become non-null together after a checksum-verified pull and before any overlay references the image.
 
 `status ∈ {created, starting, running, stopping, stopped, failed}`. Transitions:
 
@@ -552,11 +558,11 @@ The host architecture selects the `[image.arch.<arch>]` table; a missing table i
 - `raw` images are converted to qcow2 at pull time (`qemu-img convert -O qcow2`) so every base is qcow2 **[verify 4]**.
 - Resume of interrupted downloads: not in v0.1 (delete partial, restart).
 - Events: `StepStart image` → `Progress` (bytes, total from `Content-Length`) → `StepDone image "ubuntu:24.04 · x86_64 · 613 MB"`, or `StepSkip image "cached"`.
-- "Current" URLs (Ubuntu `current/`, Debian `latest/`) change over time. Firestone treats the checksum as identity: re‑pulling when a newer file exists is explicit (`images pull ubuntu:24.04`), never automatic. Machines keep the base they were created with.
+- "Current" URLs (Ubuntu `current/`, Debian `latest/`) change over time. Firestone treats the checksum as identity: re-pulling when a newer file exists is explicit (`images pull ubuntu:24.04`), never automatic. A machine fixes its base when the first successful `start` resolves and records immutable `image.id` and `image.sha256` before creating the overlay; later pulls do not change that base.
 
 ### 8.4 Overlays
 
-- `create` records the resolved image id in `state.json`. The overlay is created lazily at first `start`:
+- `create` records the canonical image reference in `state.json`; `image.id` and `image.sha256` are null until the first pull resolves immutable content identity. Pull fills both fields atomically before the overlay is created at first `start`. The overlay is created lazily:
   `qemu-img create -f qcow2 -F qcow2 -b <abs base path> <machine>/disk.qcow2 <disk>`
 - cloud‑hypervisor reads qcow2 with backing files natively **[verify 5]**. Fallback if that proves unreliable for the pinned version: `qemu-img convert` to a raw per‑machine copy (slow, large) or `cp --reflink=auto` on reflink‑capable filesystems.
 - Base images are never opened read‑write. `images rm` refuses (without `--force`) while any `state.json` references the id; `images prune` removes unreferenced ones and reports bytes freed.
@@ -1129,8 +1135,10 @@ Rust, edition 2024, stable toolchain, single static binary (`x86_64-unknown-linu
 | HTTP server | `axum`, `hyper`, `hyperlocal` (unix sockets) |
 | HTTP client | `reqwest` (downloads, streaming), `hyper` + `hyperlocal` (VMM API) |
 | hashing | `sha2` |
-| terminal UI | `indicatif`, `console`, `owo-colors`, `crossterm` (raw mode for `console`) |
+| terminal UI | `indicatif`, `console`, `owo-colors`, `crossterm` (raw mode for `console`), `unicode-width` (table layout) |
 | processes / OS | `nix` (flock, setsid, signals, pidfd), `libc` |
+| command argv parsing | `shlex` (`VISUAL`/`EDITOR` only; commands still execute without a shell) |
+| timestamps | `jiff` |
 | seed image | `fatfs` |
 | templates | `minijinja` |
 | paths | `directories` |
@@ -1263,6 +1271,8 @@ Do these in the first milestone, against the pinned versions, and record results
 | CID | fixed 3 | allocation table | CH's vsock is userspace; the CID is not host‑global. |
 | REST transport | unix socket only in v0.1 | TCP with token | Auth by file permissions is simple and correct; TCP later with a token. |
 | Language | Rust | Go | Same ecosystem as the VMM; one static binary. Go would also work. |
+| Pre-pull image identity | `created` state stores the canonical image reference with null `id` and `sha256`; the first successful pull fills both before overlay creation | empty-string sentinels; download during `create`; omit `state.json` until start | `create` is specified as a local spec write and M0 must work on an empty home before M1 image pulling exists. Nulls represent unavailable identity without inventing one; image removal ignores machines until a real id is recorded. |
+| CLI support crates | `jiff` for RFC 3339 timestamps; `shlex` for `VISUAL`/`EDITOR` argv; `unicode-width` for terminal table columns | hand-written timestamp formatting, shell-word parsing, or Unicode width tables; invoke the editor through a shell | These are bounded data-formatting/parsing concerns with mature implementations. Direct argv execution preserves the no-shell process invariant, while measured display width keeps deterministic tables aligned without truncating user data. |
 | Dependency pins | cloud-hypervisor v53.0; Rust Hypervisor Firmware 0.5.0; cloud-hypervisor edk2 ch-1e1b96f126; Firestone virtiofsd v1.14.0 release `virtiofsd-v1.14.0-firestone.1` for both musl targets plus upstream source | moving `latest` URLs; edk2 newer than the VMM-tested tag; mutable virtiofsd CI artifact; distro virtiofsd | Exact release URLs and SHA-256 values make refreshes reproducible. Cloud Hypervisor v53.0 pins the edk2 build in its integration assets. Firestone's public release reproduces upstream virtiofsd v1.14.0 for x86_64 and aarch64 from the pinned source and exposes immutable anonymous-download assets verified by `scripts/pin-deps.sh verify --arch all`. |
 | Doctor passt minimum | passt 2024_12_11.09478d5 or newer, with the exact `--vhost-user` help token present | presence alone; capability token alone; semantic-version parsing | Upstream added `--vhost-user` in commit `28997fcb29b560fc0dcfd91bad5eece3ded5eb72`; tag 2024_11_27.c0fbc7e does not contain it and 2024_12_11.09478d5 is the first release tag that does. Passt uses date-and-commit release names rather than semantic versions. Checking both the release date and the pinned capability token rejects old builds and unversioned distro builds without claiming verify 14 runtime interoperability. |
 | [verify 1] firmware mapping at cloud-hypervisor v53.0 | RHF 0.5.0 uses `payload.kernel`; edk2 ch-1e1b96f126 uses `payload.firmware` | pass RHF through `payload.firmware`; pass edk2 through `payload.kernel` | The v53.0 CLI exposes distinct `--kernel` and `--firmware` inputs, `PayloadConfig` exposes the matching JSON fields, and the v53.0 README documents RHF's Xen PVH entry as valid through the kernel input and edk2 through firmware. Source and CLI checks resolve the mapping. Boot behavior remains an M1 runtime check. |
@@ -1274,6 +1284,8 @@ Do these in the first milestone, against the pinned versions, and record results
 | Portable VMM merge patch | JSON object on JSON surfaces; canonical JSON text under the same TOML key | second TOML key; TOML null sentinel; omit RFC 7396 deletion | TOML has no null scalar. Canonical object text preserves nested RFC 7396 null deletion without changing the public key or object model. |
 | XDG and HOME path inputs | absolute XDG config/data roots are honored; relative values are ignored; startup HOME is captured once as absolute | ignore XDG config/data; read environment for every expansion | Matches XDG rules and keeps path behavior stable after startup. |
 | Runtime path trust | validate XDG base ownership/mode and explicit-root ancestry before creating the Firestone leaf | recursively create and validate only the leaf | Runtime sockets are authority-bearing files. A safe leaf inside renameable or symlinked ancestry is not safe. |
+| Data path trust | validate ownership, mode, node type, and existing ancestry before accessing Firestone-owned data; create owned directories with mode 0700 | trust caller-supplied roots; validate only the final node; repair permissive directories automatically | Machine specs, state, binaries, and keys are authority-bearing. Refusing unsafe ancestry prevents another uid from replacing an owned path between validation and publication. |
+| Interrupted machine creation | lock before writing `.creating`; reclaim only an unlocked, revalidated, incomplete publication | permanent tombstone; delete every incomplete directory; publish without a marker | A crash must not reserve a name forever, but recovery must not race an active creator or remove a complete machine. |
 | User path resolution | retain `.` and `..` until complete kernel resolution; any canonicalization happens only for an existing complete path | lexical normalization before filesystem access | Lexical collapse changes meaning when a prefix is missing or a symlink participates in resolution. |
 | Relative spec paths | resolve relative paths from `firestone.toml` against the machine directory and relative action patches against their supplied base directory inside `MachineSpec::load` | process working directory at validation time; adapter-side pre-resolution | Machine behavior remains stable across CLI and REST invocations, and callers cannot accidentally skip path provenance handling. |
 | Image removal action payload | `ImageRemove` carries `force` | leave force in CLI/REST adapters | Sections 15.1, 15.4, and 16.2 expose forced image removal. The shared action must carry that choice so every interface dispatches the same operation. |
