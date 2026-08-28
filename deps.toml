@@ -53,15 +53,24 @@ install_name = "CLOUDHV_EFI-ch-1e1b96f126.fd"
 url = "https://github.com/cloud-hypervisor/edk2/releases/download/ch-1e1b96f126/CLOUDHV_EFI.fd"
 sha256 = "460cefa75c72461745ac2f8e828ac8646475f93823101980dfc3f5967175c1ef"
 
-# Upstream v1.14.0 publishes source archives but no versioned binary assets.
-# The mutable main-branch CI artifact is x86_64-only and is not safe to pin.
+# Firestone-owned binaries reproduce upstream v1.14.0 for both release targets.
 [dependency.virtiofsd]
 version = "v1.14.0"
 commit = "c2540f8db14caba81c1e37fba23fc7bf2cd7f0dd"
-release_url = "https://gitlab.com/virtio-fs/virtiofsd/-/releases/v1.14.0"
-availability = "source-only"
-missing_arches = ["x86_64", "aarch64"]
-reason = "upstream release has no versioned static binary assets"
+release_url = "https://github.com/0xchasercat/firestone/releases/tag/virtiofsd-v1.14.0-firestone.1"
+availability = "binary"
+
+[dependency.virtiofsd.x86_64]
+asset = "virtiofsd-v1.14.0-x86_64-unknown-linux-musl"
+install_name = "virtiofsd-v1.14.0"
+url = "https://github.com/0xchasercat/firestone/releases/download/virtiofsd-v1.14.0-firestone.1/virtiofsd-v1.14.0-x86_64-unknown-linux-musl"
+sha256 = "9ad3e33c45dd816b24ad483b60ca469974ba54c3b37ef93be3da2a623986646f"
+
+[dependency.virtiofsd.aarch64]
+asset = "virtiofsd-v1.14.0-aarch64-unknown-linux-musl"
+install_name = "virtiofsd-v1.14.0"
+url = "https://github.com/0xchasercat/firestone/releases/download/virtiofsd-v1.14.0-firestone.1/virtiofsd-v1.14.0-aarch64-unknown-linux-musl"
+sha256 = "e45bd62e346eca87857279d5680782e80148379fbca524a648089f642ac001d2"
 
 [dependency.virtiofsd.source]
 asset = "virtiofsd-v1.14.0.tar.gz"
