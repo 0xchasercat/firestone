@@ -43,6 +43,14 @@ case "${SOURCE_DATE_EPOCH:-}" in
     '' | *[!0-9]*) fail 'SOURCE_DATE_EPOCH must be an unsigned integer' ;;
 esac
 
+rust_sysroot=$(rustc --print sysroot)
+self_contained_lib="$rust_sysroot/lib/rustlib/$target/lib/self-contained"
+for crt_file in crti.o crtn.o libc.a; do
+    [ -f "$self_contained_lib/$crt_file" ] ||
+        fail "pinned Rust target is missing self-contained $crt_file"
+done
+readonly rust_sysroot self_contained_lib
+
 mkdir -p "$work_root/cargo-home" "$work_root/home" "$work_root/target"
 export CARGO_HOME="$work_root/cargo-home"
 export CARGO_INCREMENTAL=0
@@ -55,6 +63,7 @@ export CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 export CARGO_TARGET_DIR="$work_root/target"
 export HOME="$work_root/home"
 export LANG=C.UTF-8
+export LIBRARY_PATH="$self_contained_lib"
 export LC_ALL=C.UTF-8
 export TZ=UTC
 export RUSTFLAGS="--remap-path-prefix=$source_root=/firestone-source --remap-path-prefix=$work_root=/firestone-build --remap-path-prefix=/usr/local/cargo=/rust-cargo --remap-path-prefix=/usr/local/rustup=/rust-toolchain -C target-feature=+crt-static -C link-self-contained=yes -C link-arg=-Wl,--build-id=none"
