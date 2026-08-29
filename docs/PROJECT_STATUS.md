@@ -4,12 +4,12 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 
 ## Current position
 
-- Milestone: M4 implementation; M0 through M2 are complete, M3 code is merged, and M3 KVM acceptance is externally blocked
-- Baseline: Linux x86_64 lifecycle, SSH, console, passt/tap/virtiofs plans, cloud-init layering, and sidecar supervision are implemented through pinned dependencies
+- Milestone: M5 Linux MVP implementation; M0 through M2 are complete, M3/M4 code is merged, and their KVM acceptance is externally blocked
+- Baseline: all shared lifecycle, shell, sidecar, REST, Unix serve, and real-process equivalence behavior through M4 is merged and green in Ubuntu CI
 - Linux validation host: `firestone@172.203.242.136`, Ubuntu 24.04 x86_64, `/dev/kvm` present
 - Required local gate: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`
 - Required integration gate: the same commands on the Linux host
-- M3 blocker: draft PR #25 contains the complete gated harness, but three bounded SSH attempts to the only KVM host timed out; E2E 3, 4, 8 and verify 7, 8, 14, 16 remain open
+- KVM blocker: the only validation host times out on TCP/22; M3 E2E 3/4/8, M4 E2E 9, and final KVM acceptance remain open with secure gated harnesses merged or staged
 
 ## Work queue
 
@@ -42,7 +42,11 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 | M3-05 | M3 Linux KVM integration | `agent/m3-integration` | [draft #25](https://github.com/0xchasercat/firestone/pull/25) | blocked | M3-01 through M3-04 | Harness/static gates pass; E2E 3, 4, 8 and verify 7, 8, 14, 16 await a reachable KVM host; verify 10 and 15 remain resolved |
 | M4-01 | Axum REST router, routes, streaming, and error mapping | `agent/m4-api` | [#26](https://github.com/0xchasercat/firestone/pull/26) | complete | M3-04 | Every SPEC route projects shared actions/results, NDJSON framing and limits are exact, handler tests pass with a mocked Dispatcher, and local stable/1.85 plus final-head Ubuntu x86_64 CI are green |
 | M4-02 | Serve CLI and HTTP runtime integration | `agent/m4-serve` | [#27](https://github.com/0xchasercat/firestone/pull/27) | complete | M4-01 | Unix-only mode-0600 listener, secure stale/conflict handling, identity-safe cleanup, concurrent requests, bounded signal drain, and real CLI/curl smoke pass; final Ubuntu CI is green |
-| M4-03 | M4 REST equivalence and E2E integration | `agent/m4-integration` | [draft #28](https://github.com/0xchasercat/firestone/pull/28) | blocked | M4-01, M4-02 | Real CLI and Unix-serve no-KVM equivalence, streaming, 204, locking, disconnect, and restart tests pass; the secure E2E 9 harness is ready. E2E 9 remains open because bounded SSH attempts at 2026-08-29T19:38:22Z and 19:38:38Z both timed out on `172.203.242.136:22` after 10.06 seconds; no KVM result is claimed. |
+| M4-03 | M4 REST equivalence and E2E integration | `agent/m4-integration` | [#28](https://github.com/0xchasercat/firestone/pull/28) | blocked | M4-01, M4-02 | Real CLI/Unix-serve equivalence, streaming, 204, locking, disconnect, and restart pass; secure E2E 9 harness is merged, but E2E 9 awaits the unreachable KVM host |
+| M5-01 | CLI progress, timing, output polish, and error hints | `agent/m5-cli-polish` | pending | ready | M4 implementation | TTY progress is exact and responsive; non-TTY/JSON stay deterministic; every reachable error kind has actionable stable context and hint |
+| M5-02 | Completions, version, and Linux release artifacts | `agent/m5-release` | pending | ready | M4 implementation | Shell completions, version metadata, x86_64 musl release, checksums, and aarch64 compile-only path pass; aarch64 runtime remains user-deferred |
+| M5-03 | Catalog gate, fresh-host doctor matrix, and user guide | `agent/m5-docs-catalog` | pending | ready | M4 implementation | Catalog sources are authoritative, doctor fixes validate on Ubuntu/Fedora/Arch containers, and the user guide matches the Linux MVP |
+| M5-04 | Final Linux x86_64 MVP acceptance | `agent/m5-integration` | pending | blocked | M3-05, M4-03, M5-01 through M5-03 | Full Linux x86_64 E2E and release gates pass; aarch64 runtime, non-Linux authority, and hostile wrappers remain explicitly deferred |
 
 ## Merge order
 
