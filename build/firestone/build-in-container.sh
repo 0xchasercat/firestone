@@ -57,7 +57,7 @@ export HOME="$work_root/home"
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 export TZ=UTC
-export RUSTFLAGS="--remap-path-prefix=$source_root=/firestone-source --remap-path-prefix=$work_root=/firestone-build --remap-path-prefix=/usr/local/cargo=/rust-cargo --remap-path-prefix=/usr/local/rustup=/rust-toolchain -C link-arg=-Wl,--build-id=none"
+export RUSTFLAGS="--remap-path-prefix=$source_root=/firestone-source --remap-path-prefix=$work_root=/firestone-build --remap-path-prefix=/usr/local/cargo=/rust-cargo --remap-path-prefix=/usr/local/rustup=/rust-toolchain -C target-feature=+crt-static -C link-self-contained=yes -C link-arg=-Wl,--build-id=none"
 
 printf 'building firestone v%s for %s\n' "$FIRESTONE_VERSION" "$target"
 cargo build \
