@@ -840,14 +840,24 @@ fn validate_absent_runtime_node(path: &Path, tag: &str, label: &str) -> Result<(
 }
 
 fn reduced_environment() -> BTreeMap<OsString, OsString> {
-    ["HOME", "PATH"]
-        .into_iter()
-        .filter_map(|key| {
-            env::var_os(key)
-                .filter(|value| !value.is_empty())
-                .map(|value| (OsString::from(key), value))
-        })
-        .collect()
+    let mut environment = BTreeMap::new();
+    for key in [
+        "PATH",
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+    ] {
+        if let Some(value) = env::var_os(key).filter(|value| !value.is_empty()) {
+            environment.insert(OsString::from(key), value);
+        }
+    }
+    for (key, value) in env::vars_os() {
+        if key.as_os_str().as_bytes().starts_with(b"FIRESTONE_") {
+            environment.insert(key, value);
+        }
+    }
+    environment
 }
 
 fn validate_runtime_parent(path: &Path, uid: u32, tag: &str) -> Result<(), FirestoneError> {
@@ -1126,11 +1136,15 @@ mod tests {
                 "warn".into(),
             ]
         );
-        assert!(
-            plan.environment()
-                .keys()
-                .all(|key| key == "HOME" || key == "PATH")
-        );
+        assert!(plan.environment().keys().all(|key| {
+            matches!(
+                key.to_str(),
+                Some("PATH" | "HOME" | "XDG_CONFIG_HOME" | "XDG_DATA_HOME" | "XDG_RUNTIME_DIR")
+            ) || key
+                .as_os_str()
+                .as_encoded_bytes()
+                .starts_with(b"FIRESTONE_")
+        }));
         assert!(!plan.guest().exists());
         Ok(())
     }
