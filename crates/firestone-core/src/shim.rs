@@ -3179,40 +3179,18 @@ fn validate_shim_program(path: &Path) -> Result<PathBuf, FirestoneError> {
 }
 
 fn shim_command(paths: &Paths, program: &Path, name: &str, log: &Path) -> Cmd {
-    reduced_environment(
-        Cmd::new(program.as_os_str())
-            .arg("_shim")
-            .arg(name)
-            .cwd("/")
-            .stdin_null()
-            .stdout_append(log)
-            .stderr_append(log)
-            .error_kind(ErrorKind::Dependency),
-    )
-    .env("FIRESTONE_CONFIG_DIR", paths.config_dir().as_os_str())
-    .env("FIRESTONE_DATA_DIR", paths.data_dir().as_os_str())
-    .env("FIRESTONE_RUNTIME_DIR", paths.runtime_dir().as_os_str())
-}
-
-fn reduced_environment(mut command: Cmd) -> Cmd {
-    command = command.env_clear();
-    for key in [
-        "PATH",
-        "HOME",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-        "XDG_RUNTIME_DIR",
-    ] {
-        if let Some(value) = env::var_os(key).filter(|value| !value.is_empty()) {
-            command = command.env(key, value);
-        }
-    }
-    for (key, value) in env::vars_os() {
-        if key.to_string_lossy().starts_with("FIRESTONE_") {
-            command = command.env(key, value);
-        }
-    }
-    command
+    Cmd::new(program.as_os_str())
+        .arg("_shim")
+        .arg(name)
+        .cwd("/")
+        .stdin_null()
+        .stdout_append(log)
+        .stderr_append(log)
+        .error_kind(ErrorKind::Dependency)
+        .reduced_environment()
+        .env("FIRESTONE_CONFIG_DIR", paths.config_dir().as_os_str())
+        .env("FIRESTONE_DATA_DIR", paths.data_dir().as_os_str())
+        .env("FIRESTONE_RUNTIME_DIR", paths.runtime_dir().as_os_str())
 }
 fn vmm_environment(mut command: Cmd) -> Cmd {
     command = command.env_clear();

@@ -22,8 +22,16 @@ use crate::{
 const MINIMUM_FREE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MAX_DEPENDENCY_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 const DOCTOR_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-const MINIMUM_PASST_DATE: u32 = 20_241_211;
-const MINIMUM_PASST_VERSION: &str = "2024_12_11.09478d5";
+const MINIMUM_PASST_DATE: u32 = 20_250_217;
+const REQUIRED_PASST_FLAGS: [&str; 6] = [
+    "--foreground",
+    "--one-off",
+    "--vhost-user",
+    "--socket-path",
+    "--repair-path",
+    "--log-file",
+];
+const PASST_PORT_GRAMMAR_ARGS: [&str; 5] = ["--tcp-ports", "none", "--udp-ports", "none", "--help"];
 const CHECK_IDS: [DoctorCheckId; 13] = [
     DoctorCheckId::HostArch,
     DoctorCheckId::Kvm,
@@ -687,11 +695,11 @@ fn check_virtiofsd(context: &DoctorContext) -> DoctorCheck {
     }
 }
 
-/// Checks the local passt capability required by `[verify 14]`.
+/// Checks the local passt grammar required by verify items 14 and 15.
 ///
-/// Version and help output establish only that the installed binary exposes
-/// vhost-user mode. They do not resolve runtime interoperability with Cloud
-/// Hypervisor; the M3 network test remains the verify-14 gate.
+/// Version and help output establish the exact M3 command options. They do not
+/// resolve runtime interoperability with Cloud Hypervisor; the M3 network test
+/// remains the verify-14 gate.
 fn check_passt(context: &DoctorContext) -> DoctorCheck {
     let Some(program) = find_on_path("passt", &context.search_path) else {
         return missing_passt_check(context);
@@ -724,7 +732,7 @@ fn check_passt(context: &DoctorContext) -> DoctorCheck {
         )
         .with_hint("repair the passt installation and retry");
     }
-    let help_output = match Cmd::new(program)
+    let help_output = match Cmd::new(&program)
         .arg("--help")
         .stdin_null()
         .timeout(DOCTOR_PROBE_TIMEOUT)
@@ -753,6 +761,38 @@ fn check_passt(context: &DoctorContext) -> DoctorCheck {
         .with_hint("repair the passt installation and retry");
     }
 
+    let grammar_output = match Cmd::new(&program)
+        .args(PASST_PORT_GRAMMAR_ARGS)
+        .stdin_null()
+        .timeout(DOCTOR_PROBE_TIMEOUT)
+        .error_kind(ErrorKind::Dependency)
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return DoctorCheck::new(
+                DoctorCheckId::Passt,
+                DoctorStatus::Fail,
+                firestone_error_reason(&error),
+            )
+            .with_hint("repair the passt installation and retry");
+        }
+    };
+    if !grammar_output.success() {
+        return DoctorCheck::new(
+            DoctorCheckId::Passt,
+            DoctorStatus::Fail,
+            format!(
+                "passt TCP/UDP grammar probe failed: {}",
+                command_failure_reason(&grammar_output)
+            ),
+        )
+        .with_hint(format!(
+            "install passt {} or newer with -t/-u range support",
+            crate::PINNED_PASST_VERSION
+        ));
+    }
+
     let combined_version = format!(
         "{}\n{}",
         version_output.stdout_lossy(),
@@ -764,25 +804,39 @@ fn check_passt(context: &DoctorContext) -> DoctorCheck {
             DoctorStatus::Fail,
             "passt version output has no date-and-hash release tag",
         )
-        .with_hint(format!("install passt {MINIMUM_PASST_VERSION} or newer"));
+        .with_hint(format!(
+            "install passt {} or newer",
+            crate::PINNED_PASST_VERSION
+        ));
     };
     let help = format!(
         "{}\n{}",
         help_output.stdout_lossy(),
         help_output.stderr_lossy()
     );
-    let has_vhost_user = help.split_whitespace().any(|token| token == "--vhost-user");
-    if version.date < MINIMUM_PASST_DATE || !has_vhost_user {
+    let missing_flags = REQUIRED_PASST_FLAGS
+        .iter()
+        .copied()
+        .filter(|required| !help.split_whitespace().any(|token| token == *required))
+        .collect::<Vec<_>>();
+    if version.date < MINIMUM_PASST_DATE || !missing_flags.is_empty() {
+        let detail = if missing_flags.is_empty() {
+            "release date is too old".to_owned()
+        } else {
+            format!("missing {}", missing_flags.join(", "))
+        };
         return DoctorCheck::new(
             DoctorCheckId::Passt,
             DoctorStatus::Fail,
             format!(
-                "passt {} does not meet the {MINIMUM_PASST_VERSION} vhost-user minimum",
-                version.raw
+                "passt {} does not meet the {} M3 network minimum: {detail}",
+                version.raw,
+                crate::PINNED_PASST_VERSION
             ),
         )
         .with_hint(format!(
-            "install passt {MINIMUM_PASST_VERSION} or newer with --vhost-user support"
+            "install passt {} or newer with the vhost-user, one-off, socket, repair-path, log, and port-forward options",
+            crate::PINNED_PASST_VERSION
         ));
     }
 
@@ -790,7 +844,7 @@ fn check_passt(context: &DoctorContext) -> DoctorCheck {
         DoctorCheckId::Passt,
         DoctorStatus::Ok,
         format!(
-            "passt {} is installed and exposes --vhost-user",
+            "passt {} is installed with the pinned M3 command grammar",
             version.raw
         ),
     )
@@ -1761,7 +1815,8 @@ fn missing_passt_check(context: &DoctorContext) -> DoctorCheck {
         "passt not found on PATH",
     )
     .with_hint(format!(
-        "{package_hint}; Firestone requires {MINIMUM_PASST_VERSION} or newer with --vhost-user support"
+        "{package_hint}; Firestone requires {} or newer with the pinned M3 command options",
+        crate::PINNED_PASST_VERSION
     ))
 }
 
@@ -2047,7 +2102,7 @@ mod tests {
             )?;
             write_executable(
                 &fake_bin.join("passt"),
-                "case \"$1\" in --version) printf 'passt 2024_12_11.09478d5\\n' ;; --help) printf '%s\\n' '--vhost-user' ;; *) exit 2 ;; esac",
+                "case \"$1\" in --version) printf 'passt 2025_02_17.a1e48a0\\n' ;; --help) printf '%s\\n' '--foreground --one-off --vhost-user --socket-path --repair-path --log-file' ;; --tcp-ports) exit 0 ;; *) exit 2 ;; esac",
             )?;
             write_executable(&fake_bin.join("qemu-img"), "printf 'qemu-img fixture\\n'")?;
             write_executable(&fake_bin.join("ssh"), "printf 'OpenSSH fixture\\n' >&2")?;
@@ -2658,9 +2713,9 @@ mod tests {
     #[test]
     fn passt_version_and_capability_parsing_enforces_authoritative_minimum()
     -> Result<(), Box<dyn std::error::Error>> {
-        let minimum = parse_passt_version("passt 2024_12_11.09478d5")
+        let minimum = parse_passt_version("passt 2025_02_17.a1e48a0")
             .ok_or_else(|| std::io::Error::other("minimum version should parse"))?;
-        let old = parse_passt_version("passt 2024_11_27.c0fbc7e")
+        let old = parse_passt_version("passt 2025_01_21.4f2c8e7")
             .ok_or_else(|| std::io::Error::other("old version should parse"))?;
         assert_eq!(minimum.date, MINIMUM_PASST_DATE);
         assert!(old.date < MINIMUM_PASST_DATE);
@@ -2670,11 +2725,18 @@ mod tests {
         let passt = PathBuf::from(&fixture.context.search_path).join("passt");
         write_executable(
             &passt,
-            "case \"$1\" in --version) printf 'passt 2024_12_11.09478d5\\n' ;; --help) printf 'socket mode only\\n' ;; esac",
+            "case \"$1\" in --version) printf 'passt 2025_02_17.a1e48a0\\n' ;; --help) printf 'socket mode only\\n' ;; esac",
         )?;
         let check = check_passt(&fixture.context);
         assert_eq!(check.status, DoctorStatus::Fail);
-        assert!(check.reason.contains("vhost-user minimum"));
+        assert!(check.reason.contains("M3 network minimum"));
+        write_executable(
+            &passt,
+            "case \"$1\" in --version) printf 'passt 2025_02_17.a1e48a0\\n' ;; --help) printf '%s\\n' '--foreground --one-off --vhost-user --socket-path --repair-path --log-file' ;; --tcp-ports) exit 23 ;; esac",
+        )?;
+        let grammar = check_passt(&fixture.context);
+        assert_eq!(grammar.status, DoctorStatus::Fail);
+        assert!(grammar.reason.contains("grammar probe failed"));
         Ok(())
     }
 
@@ -2688,14 +2750,14 @@ mod tests {
         let passt = PathBuf::from(&fixture.context.search_path).join("passt");
         write_executable(
             &passt,
-            "case \"$1\" in --version) printf 'passt 2024_12_11.09478d5\\n' ;; --help) printf '%s\\n' '--vhost-user-old' ;; esac",
+            "case \"$1\" in --version) printf 'passt 2025_02_17.a1e48a0\\n' ;; --help) printf '%s\\n' '--vhost-user-old' ;; esac",
         )?;
         let substring = check_passt(&fixture.context);
         assert_eq!(substring.status, DoctorStatus::Fail);
 
         write_executable(
             &passt,
-            "case \"$1\" in --version) printf 'passt 2024_12_11.09478d5\\n' ;; --help) printf '%s\\n' '--vhost-user'; exit 2 ;; esac",
+            "case \"$1\" in --version) printf 'passt 2025_02_17.a1e48a0\\n' ;; --help) printf '%s\\n' '--foreground --one-off --vhost-user --socket-path --repair-path --log-file --tcp-ports --udp-ports'; exit 2 ;; esac",
         )?;
         let nonzero = check_passt(&fixture.context);
         assert_eq!(nonzero.status, DoctorStatus::Fail);
@@ -2728,7 +2790,7 @@ mod tests {
             check
                 .hint
                 .as_deref()
-                .is_some_and(|hint| hint.contains("2024_12_11"))
+                .is_some_and(|hint| hint.contains("2025_02_17"))
         );
         Ok(())
     }
