@@ -270,6 +270,17 @@ struct ProcessRecord {
     start_time_ticks: Option<u64>,
 }
 
+type PreservedProcessRoots = BTreeMap<u32, Option<u64>>;
+
+fn preserved_process_roots<'a>(
+    records: impl IntoIterator<Item = &'a ProcessRecord>,
+) -> PreservedProcessRoots {
+    records
+        .into_iter()
+        .map(|record| (record.pid, record.start_time_ticks))
+        .collect()
+}
+
 struct RecoveredProcess {
     label: String,
     record: ProcessRecord,
@@ -360,11 +371,16 @@ struct OwnedVmm {
     process: Option<ManagedProcess>,
     record: ProcessRecord,
     reaped_status: Option<ExitStatus>,
+    preserved_children: PreservedProcessRoots,
     console: Option<ConsoleBroker>,
 }
 
 impl OwnedVmm {
-    fn from_spawn(process: ManagedProcess, executable: PathBuf) -> Self {
+    fn from_spawn(
+        process: ManagedProcess,
+        executable: PathBuf,
+        preserved_children: PreservedProcessRoots,
+    ) -> Self {
         let pid = process.id();
         let process_group = process.process_group().unwrap_or(pid);
         OWNER_EVIDENCE_PID.store(pid, Ordering::Relaxed);
@@ -386,6 +402,7 @@ impl OwnedVmm {
                 start_time_ticks: None,
             },
             reaped_status: None,
+            preserved_children,
             console: None,
         }
     }
@@ -455,13 +472,14 @@ impl OwnedVmm {
 
         if self.reaped_status.is_none() {
             let mut descendants =
-                snapshot_owned_descendants(self.record.pid).unwrap_or_else(|error| {
-                    write_shim_log(&format!(
-                        "cannot snapshot all VMM descendants ({}); group cleanup continues",
-                        error.kind()
-                    ));
-                    BTreeMap::new()
-                });
+                snapshot_owned_descendants_preserving(self.record.pid, &self.preserved_children)
+                    .unwrap_or_else(|error| {
+                        write_shim_log(&format!(
+                            "cannot snapshot all VMM descendants ({}); group cleanup continues",
+                            error.kind()
+                        ));
+                        BTreeMap::new()
+                    });
             let process = self.process.as_mut().ok_or_else(|| {
                 FirestoneError::new(ErrorKind::NotRunning, "VMM child was already released")
             })?;
@@ -485,7 +503,9 @@ impl OwnedVmm {
                 }
             }
 
-            if let Ok(new_descendants) = snapshot_owned_descendants(self.record.pid) {
+            if let Ok(new_descendants) =
+                snapshot_owned_descendants_preserving(self.record.pid, &self.preserved_children)
+            {
                 descendants.extend(new_descendants);
             }
             // The leader is still unreaped and pins this pgid. This is the last
@@ -523,10 +543,13 @@ impl OwnedVmm {
             }
         }
 
-        // Keep the reaped ManagedProcess marker armed until every adopted child
-        // is gone. A drain error leaves this guard retryable without signalling
-        // the old numeric pgid again.
-        drain_adopted_children(overall_deadline.saturating_duration_since(Instant::now()))?;
+        // Keep the reaped ManagedProcess marker armed until every adopted VMM
+        // child except separately-owned sidecars is gone. A drain error leaves
+        // this guard retryable without signalling the old numeric pgid again.
+        drain_adopted_children_preserving(
+            overall_deadline.saturating_duration_since(Instant::now()),
+            &self.preserved_children,
+        )?;
         let status = self.reaped_status.ok_or_else(|| {
             FirestoneError::new(ErrorKind::Generic, "VMM exit status was not retained")
         })?;
@@ -2597,6 +2620,9 @@ pub fn stop_unsupervised(
         (record, identity, Vec::<RecoveredProcess>::new())
     };
 
+    let preserved_sidecars =
+        preserved_process_roots(recovered_sidecars.iter().map(RecoveredProcess::record));
+
     if state
         .vmm_pid
         .is_some_and(|recorded_pid| recorded_pid != record.pid)
@@ -2627,7 +2653,7 @@ pub fn stop_unsupervised(
     let api_cap = plan_timeouts.api.min(STOP_API_PHASE_CAP);
     let mut reason = ExitReason::GuestShutdown;
     if force {
-        signal_verified_group(&record, ProcessSignal::Kill)?;
+        signal_verified_group(&record, ProcessSignal::Kill, &preserved_sidecars)?;
         reason = ExitReason::Failure("forced stop".to_owned());
     } else {
         let power_timeout = stop_phase_timeout(overall_deadline, api_cap)?;
@@ -2655,7 +2681,7 @@ pub fn stop_unsupervised(
             }
         }
         if recorded_process_alive(&record)? {
-            signal_verified_group(&record, ProcessSignal::Terminate)?;
+            signal_verified_group(&record, ProcessSignal::Terminate, &preserved_sidecars)?;
             let term_deadline = Instant::now()
                 .checked_add(CHILD_TERM_GRACE)
                 .map_or(overall_deadline, |deadline| deadline.min(overall_deadline));
@@ -2671,7 +2697,7 @@ pub fn stop_unsupervised(
             });
         }
         if recorded_process_alive(&record)? {
-            signal_verified_group(&record, ProcessSignal::Kill)?;
+            signal_verified_group(&record, ProcessSignal::Kill, &preserved_sidecars)?;
         }
     }
     wait_for_record_exit(
@@ -3677,7 +3703,11 @@ fn launch_vmm(
             .error_kind(ErrorKind::Dependency),
     );
     let process = command.spawn_process_group()?;
-    let mut vmm = OwnedVmm::from_spawn(process, plan.vmm_binary.clone());
+    let mut vmm = OwnedVmm::from_spawn(
+        process,
+        plan.vmm_binary.clone(),
+        preserved_process_roots(identity.sidecars.values()),
+    );
     state.vmm_pid = Some(vmm.id());
     StateStore::new(paths.machine_state(name)?).write_from_shim(state)?;
     let record =
@@ -3859,6 +3889,8 @@ fn stop_recovered_vmm(
     overall_deadline: Instant,
     events: &mut dyn EventSink,
 ) -> Result<(), FirestoneError> {
+    let preserved_sidecars =
+        preserved_process_roots(recovered_sidecars.iter().map(RecoveredProcess::record));
     verify_recovered_process(record)?;
     state.status = MachineStatus::Stopping;
     StateStore::new(paths.machine_state(name)?).write_from_shim(state)?;
@@ -3874,7 +3906,7 @@ fn stop_recovered_vmm(
     let api_cap = plan.timeouts()?.api.min(STOP_API_PHASE_CAP);
     let mut reason = ExitReason::GuestShutdown;
     if force {
-        signal_verified_tree(record, ProcessSignal::Kill)?;
+        signal_verified_tree_preserving(record, ProcessSignal::Kill, &preserved_sidecars)?;
         reason = ExitReason::Failure("forced stop".to_owned());
     } else {
         let power_timeout = stop_phase_timeout(overall_deadline, api_cap)?;
@@ -3898,7 +3930,7 @@ fn stop_recovered_vmm(
             }
         }
         if recorded_process_alive(record)? {
-            signal_verified_tree(record, ProcessSignal::Terminate)?;
+            signal_verified_tree_preserving(record, ProcessSignal::Terminate, &preserved_sidecars)?;
             let term_deadline = Instant::now()
                 .checked_add(CHILD_TERM_GRACE)
                 .map_or(overall_deadline, |deadline| deadline.min(overall_deadline));
@@ -3914,7 +3946,7 @@ fn stop_recovered_vmm(
             });
         }
         if recorded_process_alive(record)? {
-            signal_verified_tree(record, ProcessSignal::Kill)?;
+            signal_verified_tree_preserving(record, ProcessSignal::Kill, &preserved_sidecars)?;
         }
     }
     let remaining = overall_deadline.saturating_duration_since(Instant::now());
@@ -3953,13 +3985,21 @@ fn verify_recovered_process(record: &ProcessRecord) -> Result<(), FirestoneError
     }
 }
 
-#[cfg(target_os = "linux")]
 fn signal_verified_tree(
     record: &ProcessRecord,
     signal: ProcessSignal,
 ) -> Result<(), FirestoneError> {
+    signal_verified_tree_preserving(record, signal, &PreservedProcessRoots::new())
+}
+
+#[cfg(target_os = "linux")]
+fn signal_verified_tree_preserving(
+    record: &ProcessRecord,
+    signal: ProcessSignal,
+    preserved_roots: &PreservedProcessRoots,
+) -> Result<(), FirestoneError> {
     verify_linux_process(record)?;
-    let descendants = snapshot_owned_descendants(record.pid)?;
+    let descendants = snapshot_owned_descendants_preserving(record.pid, preserved_roots)?;
     let leader_pid = rustix::process::Pid::from_raw(record.pid as _)
         .ok_or_else(|| FirestoneError::new(ErrorKind::Conflict, "recorded VMM pid is invalid"))?;
     let leader = rustix::process::pidfd_open(leader_pid, rustix::process::PidfdFlags::empty())
@@ -3997,7 +4037,8 @@ fn signal_verified_tree(
                     Ok(metadata)
                         if metadata.uid() == descendant.uid
                             && process_start_time(descendant.pid)?
-                                == Some(descendant.start_time_ticks) =>
+                                == Some(descendant.start_time_ticks)
+                            && process_state(descendant.pid)?.is_some_and(|state| state != 'Z') =>
                     {
                         alive = true;
                         break;
@@ -4027,9 +4068,10 @@ fn signal_verified_tree(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn signal_verified_tree(
+fn signal_verified_tree_preserving(
     _record: &ProcessRecord,
     _signal: ProcessSignal,
+    _preserved_roots: &PreservedProcessRoots,
 ) -> Result<(), FirestoneError> {
     Err(FirestoneError::new(
         ErrorKind::Dependency,
@@ -5841,14 +5883,16 @@ fn recorded_process_alive(record: &ProcessRecord) -> Result<bool, FirestoneError
 fn signal_verified_group(
     record: &ProcessRecord,
     signal: ProcessSignal,
+    preserved_roots: &PreservedProcessRoots,
 ) -> Result<(), FirestoneError> {
-    signal_verified_tree(record, signal)
+    signal_verified_tree_preserving(record, signal, preserved_roots)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn signal_verified_group(
     _record: &ProcessRecord,
     _signal: ProcessSignal,
+    _preserved_roots: &PreservedProcessRoots,
 ) -> Result<(), FirestoneError> {
     Err(FirestoneError::new(
         ErrorKind::Conflict,
@@ -5908,8 +5952,9 @@ struct DescendantIdentity {
 #[derive(Debug)]
 struct DescendantIdentity;
 
-fn snapshot_owned_descendants(
+fn snapshot_owned_descendants_preserving(
     root_pid: u32,
+    preserved_roots: &PreservedProcessRoots,
 ) -> Result<BTreeMap<u32, DescendantIdentity>, FirestoneError> {
     #[cfg(target_os = "linux")]
     {
@@ -5964,6 +6009,15 @@ fn snapshot_owned_descendants(
                 let Some((actual_parent, start_time_ticks)) = process_parent_and_start(pid)? else {
                     continue;
                 };
+                if preserved_roots
+                    .get(&pid)
+                    .is_some_and(|expected_start| match expected_start {
+                        Some(expected_start) => *expected_start == start_time_ticks,
+                        None => true,
+                    })
+                {
+                    continue;
+                }
                 if actual_parent != parent && actual_parent != shim_pid {
                     continue;
                 }
@@ -6002,7 +6056,7 @@ fn snapshot_owned_descendants(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = root_pid;
+        let _ = (root_pid, preserved_roots);
         Ok(BTreeMap::new())
     }
 }
@@ -6136,49 +6190,58 @@ fn signal_descendants(
     Ok(())
 }
 
-fn drain_adopted_children(timeout: Duration) -> Result<(), FirestoneError> {
+fn drain_adopted_children_preserving(
+    timeout: Duration,
+    preserved_roots: &PreservedProcessRoots,
+) -> Result<(), FirestoneError> {
     #[cfg(target_os = "linux")]
     {
         let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
             FirestoneError::new(ErrorKind::Usage, "child drain deadline is out of range")
         })?;
         loop {
-            let descendants = snapshot_owned_descendants(0)?;
+            let descendants = snapshot_owned_descendants_preserving(0, preserved_roots)?;
+            if descendants.is_empty() {
+                return Ok(());
+            }
             signal_descendants(&descendants, ProcessSignal::Kill)?;
             let mut reaped_any = false;
-            loop {
-                match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
-                    Ok(WaitStatus::StillAlive) | Err(Errno::ECHILD) => break,
+            for descendant in descendants.values() {
+                let raw = i32::try_from(descendant.pid).map_err(|_| {
+                    FirestoneError::new(
+                        ErrorKind::Conflict,
+                        format!("descendant pid {} does not fit pid_t", descendant.pid),
+                    )
+                })?;
+                match waitpid(Pid::from_raw(raw), Some(WaitPidFlag::WNOHANG)) {
+                    Ok(WaitStatus::StillAlive) | Err(Errno::ECHILD) => {}
                     Ok(_) => reaped_any = true,
                     Err(source) => {
                         return Err(FirestoneError::new(
                             ErrorKind::Generic,
-                            "cannot reap adopted VMM descendant",
+                            format!("cannot reap adopted VMM descendant {}", descendant.pid),
                         )
                         .with_source(io::Error::from_raw_os_error(source as i32)));
                     }
                 }
             }
-            match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
-                Err(Errno::ECHILD) => return Ok(()),
-                Ok(_) | Err(_) if Instant::now() < deadline => {
-                    if !reaped_any {
-                        thread::sleep(LOOP_INTERVAL);
-                    }
-                }
-                Ok(_) | Err(_) => {
-                    return Err(FirestoneError::new(
-                        ErrorKind::Timeout,
-                        "VMM descendants did not terminate before the drain deadline",
-                    )
-                    .with_hint("runtime recovery evidence was preserved"));
-                }
+            if Instant::now() >= deadline {
+                return Err(FirestoneError::new(
+                    ErrorKind::Timeout,
+                    "VMM descendants did not terminate before the drain deadline",
+                )
+                .with_hint("runtime recovery evidence was preserved"));
+            }
+            if !reaped_any {
+                thread::sleep(
+                    LOOP_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+                );
             }
         }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = timeout;
+        let _ = (timeout, preserved_roots);
         Ok(())
     }
 }

@@ -793,7 +793,12 @@ fn m3_sidecars_cli_lifecycle_uses_exact_plans_and_recovers_degradation() -> Test
         .args(["--json", "restart", "m3"])
         .env("FIRESTONE_FAKE_SIDECAR_RECORD", &sidecar_record)
         .output()?;
-    require_success(&restarted, "restart")?;
+    let restart_context = format!(
+        "restart; shim log:\n{}",
+        fs::read_to_string(home.join("data/machines/m3/shim.log"))
+            .unwrap_or_else(|error| format!("<unavailable: {error}>"))
+    );
+    require_success(&restarted, &restart_context)?;
     let restarted_state = wait_for_state(&state_path, Duration::from_secs(2), |state| {
         state["status"] == "running"
             && state["sidecar_pids"]
