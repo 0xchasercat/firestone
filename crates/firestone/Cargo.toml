@@ -9,8 +9,10 @@ publish = false
 axum.workspace = true
 clap.workspace = true
 firestone-core = { path = "../firestone-core" }
+futures-util.workspace = true
 hyper.workspace = true
 hyperlocal.workspace = true
+hyper-util.workspace = true
 jiff.workspace = true
 nix.workspace = true
 serde.workspace = true
@@ -19,6 +21,7 @@ shlex.workspace = true
 signal-hook.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
+tower.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]
@@ -27,7 +30,6 @@ http-body-util.workspace = true
 nix.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
-tower.workspace = true
 wait-timeout.workspace = true
 
 [lints]

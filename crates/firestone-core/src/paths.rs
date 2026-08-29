@@ -432,6 +432,10 @@ impl Paths {
     pub fn serve_socket(&self) -> PathBuf {
         self.runtime_dir.join("serve.sock")
     }
+    #[must_use]
+    pub fn serve_lock(&self) -> PathBuf {
+        self.runtime_dir.join(".serve.lock")
+    }
 
     pub fn machine_runtime_dir(&self, name: &str) -> Result<PathBuf, FirestoneError> {
         checked_join(&self.runtime_dir, "machine name", name)

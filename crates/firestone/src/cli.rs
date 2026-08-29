@@ -47,7 +47,7 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// Commands implemented by the Linux M2 CLI.
+/// Commands implemented by the Firestone CLI.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Create or reuse a machine, start it, and open an SSH shell.
@@ -99,9 +99,31 @@ pub enum Command {
     /// Check host requirements and optional safe repairs.
     Doctor(DoctorArgs),
 
+    /// Run the stateless REST API over a private Unix socket.
+    Serve(ServeArgs),
+
     /// Relay one SSH ProxyCommand connection through the machine's vsock socket.
     #[command(name = "_vsock-proxy", hide = true)]
     VsockProxy(VsockProxyArgs),
+}
+/// Arguments accepted by firestone serve.
+#[derive(Debug, Args)]
+pub struct ServeArgs {
+    /// Listen at a Unix socket inside Firestone's private runtime directory.
+    #[arg(long, value_name = "unix:PATH", value_parser = parse_unix_listener)]
+    pub listen: Option<PathBuf>,
+}
+
+fn parse_unix_listener(value: &str) -> Result<PathBuf, String> {
+    let Some(path) = value.strip_prefix("unix:") else {
+        return Err(
+            "listener must use the unix:PATH form; TCP is not available in v0.1".to_owned(),
+        );
+    };
+    if path.is_empty() {
+        return Err("unix listener path cannot be empty".to_owned());
+    }
+    Ok(PathBuf::from(path))
 }
 
 /// Arguments accepted by firestone run.
@@ -734,6 +756,31 @@ mod tests {
     }
 
     #[test]
+    fn serve_grammar_accepts_only_unix_listener_addresses() -> Result<(), clap::Error> {
+        let default = Cli::try_parse_from(["firestone", "serve"])?;
+        assert!(matches!(
+            default.command,
+            Command::Serve(arguments) if arguments.listen.is_none()
+        ));
+
+        let selected =
+            Cli::try_parse_from(["firestone", "serve", "--listen", "unix:private.sock"])?;
+        assert!(matches!(
+            selected.command,
+            Command::Serve(arguments)
+                if arguments.listen == Some(PathBuf::from("private.sock"))
+        ));
+
+        let tcp = Cli::try_parse_from(["firestone", "serve", "--listen", "tcp:127.0.0.1:8080"])
+            .expect_err("TCP must remain unavailable");
+        assert_eq!(tcp.kind(), ErrorKind::ValueValidation);
+
+        let token = Cli::try_parse_from(["firestone", "serve", "--token", "secret"])
+            .expect_err("token flags must remain unavailable");
+        assert_eq!(token.kind(), ErrorKind::UnknownArgument);
+        Ok(())
+    }
+    #[test]
     fn lifecycle_commands_capture_exact_flags_and_defaults() -> Result<(), clap::Error> {
         let start =
             Cli::try_parse_from(["firestone", "start", "dev", "--no-wait", "--timeout", "17s"])?;
@@ -965,7 +1012,7 @@ mod tests {
     }
 
     #[test]
-    fn m2_short_and_long_help_contracts_do_not_drift() {
+    fn command_help_contracts_include_unix_only_serve() {
         let command = Cli::command();
         let names = command
             .get_subcommands()
@@ -987,6 +1034,7 @@ mod tests {
             "logs",
             "images",
             "doctor",
+            "serve",
         ] {
             assert!(names.contains(name), "missing {name} command");
         }
