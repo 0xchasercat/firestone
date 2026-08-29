@@ -30,7 +30,7 @@ pub struct MachineRecord {
     pub state: MachineState,
 }
 
-/// A machine that reached the M1 running contract.
+/// A machine that reached running, plus SSH readiness when Start.wait is true.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartResult {
     pub name: String,
@@ -63,6 +63,32 @@ pub struct LogsResult {
     pub follow: bool,
 }
 
+/// OpenSSH configuration produced without exposing key material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshConfigResult {
+    pub name: String,
+    pub host: String,
+    pub config: String,
+}
+
+/// Exact remote process outcome retained by run when cleanup is required.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellResult {
+    pub name: String,
+    pub user: String,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+}
+
+/// Create/start/shell/remove outcome for one run orchestration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunResult {
+    pub name: String,
+    pub created: bool,
+    pub removed: bool,
+    pub shell: ShellResult,
+}
+
 /// Owned form of a non-fatal spec validation warning.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpecWarningPayload {
@@ -84,4 +110,37 @@ impl From<&SpecWarning> for SpecWarningPayload {
 pub struct SpecResult {
     pub spec: MachineSpec,
     pub warnings: Vec<SpecWarningPayload>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RunResult, ShellResult, SshConfigResult};
+
+    #[test]
+    fn m2_terminal_results_round_trip_without_key_material() -> Result<(), serde_json::Error> {
+        let config = SshConfigResult {
+            name: "demo".to_owned(),
+            host: "firestone.demo".to_owned(),
+            config: "Host firestone.demo\n  IdentityFile /data/ssh/id_ed25519\n".to_owned(),
+        };
+        let encoded = serde_json::to_value(&config)?;
+        assert_eq!(serde_json::from_value::<SshConfigResult>(encoded)?, config);
+
+        let run = RunResult {
+            name: "demo".to_owned(),
+            created: true,
+            removed: true,
+            shell: ShellResult {
+                name: "demo".to_owned(),
+                user: "root".to_owned(),
+                exit_code: Some(23),
+                signal: None,
+            },
+        };
+        assert_eq!(
+            serde_json::from_value::<RunResult>(serde_json::to_value(&run)?)?,
+            run
+        );
+        Ok(())
+    }
 }

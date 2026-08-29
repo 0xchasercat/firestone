@@ -7,7 +7,7 @@ use std::{
 use firestone_core::{
     DoctorCheckId, DoctorReport, DoctorStatus, ErrorInfo, ErrorKind, Event, EventSink,
     FirestoneError, Level, LogsResult, MachineStatus, MachineSummary, MachineView, RemoveResult,
-    StartResult, StopResult, Unit,
+    SshConfigResult, StartResult, StopResult, Unit,
 };
 
 use unicode_width::UnicodeWidthChar;
@@ -96,6 +96,10 @@ where
     #[must_use]
     pub const fn exit_override(&self) -> Option<u8> {
         self.exit_override
+    }
+
+    pub fn set_exit_override(&mut self, exit: u8) {
+        self.exit_override = Some(exit);
     }
 
     #[cfg(test)]
@@ -403,6 +407,11 @@ where
                     write_line(&mut self.stdout, format_args!("removed {name}"))?;
                 }
                 Ok(())
+            }
+            "ssh-config" => {
+                let result: SshConfigResult = serde_json::from_value(payload)
+                    .map_err(|error| invalid_result_payload("ssh-config", error))?;
+                write_safe_output(&mut self.stdout, &result.config).map_err(write_output_failure)
             }
             "logs" => {
                 let _: LogsResult = serde_json::from_value(payload)

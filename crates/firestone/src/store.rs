@@ -19,11 +19,11 @@ use firestone_core::{
     ErrorKind, Event, EventSink, FirestoneError, GlobalConfig, ImagePullRequest, ImageStore, Level,
     LiveMachineState, LogSource, LogsResult, MachineLock, MachineRecord, MachineSpec,
     MachineSpecPatch, MachineState, MachineStatus, MachineSummary, MachineView, Paths,
-    RealValidationHost, RemoveResult, ShimClient, ShimTimeouts, SpecResult, SpecWarningPayload,
-    StartResult, StateImage, StateStore, StateVersion, StopResult, Supervision, ValidationContext,
-    atomic, launch_prepared, prepare_start, read_reconciled_machine_state_live,
-    read_reconciled_machine_state_live_locked, run_doctor, stop_unsupervised,
-    validate_m1_start_scope,
+    ReadinessOptions, RealValidationHost, RemoveResult, ShimClient, ShimTimeouts, SpecResult,
+    SpecWarningPayload, StartResult, StateImage, StateStore, StateVersion, StopResult, Supervision,
+    ValidationContext, atomic, cancel_prepared, launch_prepared_cancellable, prepare_start,
+    read_reconciled_machine_state_live, read_reconciled_machine_state_live_locked, run_doctor,
+    stop_unsupervised, validate_m1_start_scope, wait_for_ssh_ready,
 };
 
 const SPEC_TEMPLATE: &str = include_str!("../../../templates/firestone.toml");
@@ -40,6 +40,14 @@ pub struct LocalDispatcher {
     source_base: PathBuf,
     qemu_img: PathBuf,
     shim_program: Option<PathBuf>,
+    automatic_start_timeout: bool,
+    start_cancellation: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TerminalMachine {
+    pub spec: MachineSpec,
+    pub state: MachineState,
 }
 
 impl LocalDispatcher {
@@ -55,6 +63,8 @@ impl LocalDispatcher {
             source_base,
             qemu_img: PathBuf::from("qemu-img"),
             shim_program: None,
+            automatic_start_timeout: false,
+            start_cancellation: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -63,12 +73,74 @@ impl LocalDispatcher {
         self.source_base = source_base;
         self
     }
+    #[must_use]
+    pub const fn with_automatic_start_timeout(mut self, automatic: bool) -> Self {
+        self.automatic_start_timeout = automatic;
+        self
+    }
+    #[must_use]
+    pub fn with_start_cancellation(mut self, cancellation: Arc<AtomicBool>) -> Self {
+        self.start_cancellation = cancellation;
+        self
+    }
 
     #[cfg(test)]
     fn with_programs(mut self, qemu_img: PathBuf, shim_program: PathBuf) -> Self {
         self.qemu_img = qemu_img;
         self.shim_program = Some(shim_program);
         self
+    }
+
+    pub fn find_terminal_machine(
+        &self,
+        name: &str,
+    ) -> Result<Option<TerminalMachine>, FirestoneError> {
+        match fs::symlink_metadata(self.paths.machines_dir()) {
+            Ok(_) => self.validate_machine_storage()?,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(filesystem_error(
+                    ErrorKind::Dependency,
+                    "cannot inspect the machine storage directory",
+                    "check the Firestone data directory permissions",
+                    source,
+                ));
+            }
+        }
+        let machine_dir = match self.paths.machine_dir(name) {
+            Ok(machine_dir) => machine_dir,
+            Err(error) if error.kind() == ErrorKind::InvalidSpec => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match fs::symlink_metadata(&machine_dir) {
+            Ok(_) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(filesystem_error(
+                    ErrorKind::Dependency,
+                    format!("cannot inspect machine {name}"),
+                    "check the machine directory permissions",
+                    source,
+                ));
+            }
+        }
+        ensure_machine_exists(&self.paths, name, &machine_dir)?;
+        let live = self.read_live_state(name)?;
+        let spec = self.load_machine_spec(name, &live.state)?;
+        Ok(Some(TerminalMachine {
+            spec,
+            state: live.state,
+        }))
+    }
+
+    pub fn terminal_machine(&self, name: &str) -> Result<TerminalMachine, FirestoneError> {
+        self.find_terminal_machine(name)?.ok_or_else(|| {
+            FirestoneError::new(
+                ErrorKind::NotFound,
+                format!("machine {name} does not exist"),
+            )
+            .with_hint("run firestone ls to list machines")
+        })
     }
 
     fn validate_machine_storage(&self) -> Result<(), FirestoneError> {
@@ -674,6 +746,9 @@ impl LocalDispatcher {
         events: &mut dyn EventSink,
     ) -> Result<StartResult, FirestoneError> {
         let started = Instant::now();
+        if self.start_cancellation.load(Ordering::Relaxed) {
+            return Err(start_cancelled_error(name));
+        }
         self.validate_machine_storage()?;
         let machine_dir = self.paths.machine_dir(name)?;
         ensure_machine_exists(&self.paths, name, &machine_dir)?;
@@ -692,9 +767,16 @@ impl LocalDispatcher {
 
         let image_store = self.image_store()?;
         let manifest = DependencyManifest::bundled()?;
+        let first_boot_timeout = if self.automatic_start_timeout {
+            self.global.start.timeout_first_boot.get()
+        } else {
+            timeout
+        };
         let timeouts = ShimTimeouts {
             launch_request: timeout,
             launch_overall: timeout,
+            first_boot_launch_request: first_boot_timeout,
+            first_boot_launch_overall: first_boot_timeout,
             ..ShimTimeouts::default()
         };
         let prepared = prepare_start(
@@ -709,19 +791,59 @@ impl LocalDispatcher {
             events,
             timeouts,
         )?;
-        let status = launch_prepared(&self.paths, &self.shim_program()?, prepared, lock, events)?;
+        let first_boot = prepared.seed_rewritten();
+        let effective_timeout = prepared.timeout();
+        if self.start_cancellation.load(Ordering::Relaxed) {
+            cancel_prepared(&self.paths, prepared, &lock)?;
+            return Err(start_cancelled_error(name));
+        }
+        let deadline = started.checked_add(effective_timeout).ok_or_else(|| {
+            FirestoneError::new(ErrorKind::Usage, "start timeout is out of range")
+        })?;
+        let shim_program = self.shim_program()?;
+        let status = launch_prepared_cancellable(
+            &self.paths,
+            &shim_program,
+            prepared,
+            lock,
+            events,
+            self.start_cancellation.as_ref(),
+        )?;
         if status.status != MachineStatus::Running {
             return Err(FirestoneError::new(
                 ErrorKind::Conflict,
                 format!(
-                    "machine {name:?} did not reach the M1 running contract; shim reported {:?}",
+                    "machine {name:?} did not reach running; shim reported {:?}",
                     status.status
                 ),
             )
             .with_hint(format!("inspect firestone logs {name} --source shim")));
         }
 
-        let _ = wait;
+        if self.start_cancellation.load(Ordering::Relaxed) {
+            ShimClient::new(
+                self.paths.machine_shim_socket(name)?,
+                Duration::from_secs(2),
+            )
+            .stop(Duration::ZERO, true, events)?;
+            return Err(start_cancelled_error(name));
+        }
+
+        if wait && spec.cloud_init.provisioning {
+            wait_for_ssh_ready(
+                ReadinessOptions {
+                    paths: &self.paths,
+                    current_executable: &shim_program,
+                    name,
+                    user: &spec.user,
+                    first_boot,
+                    started,
+                    deadline,
+                    cancelled: &self.start_cancellation,
+                },
+                events,
+            )?;
+        }
         Ok(StartResult {
             name: name.to_owned(),
             status: MachineStatus::Running,
@@ -1330,6 +1452,16 @@ impl Dispatcher for LocalDispatcher {
             }
         })
     }
+}
+
+fn start_cancelled_error(name: &str) -> FirestoneError {
+    FirestoneError::new(
+        ErrorKind::Interrupted,
+        format!("start for machine {name} was interrupted before readiness"),
+    )
+    .with_hint(format!(
+        "machine {name} was not left running; retry firestone start {name}"
+    ))
 }
 
 fn ensure_startable(name: &str, state: &MachineState) -> Result<(), FirestoneError> {

@@ -6,6 +6,7 @@ mod bounded;
 pub mod catalog;
 pub mod cloudinit;
 pub mod cmd;
+pub mod console;
 pub mod deps;
 pub mod dispatcher;
 pub mod doctor;
@@ -14,6 +15,7 @@ pub mod event;
 pub mod image;
 pub mod lock;
 pub mod paths;
+pub mod readiness;
 pub mod result;
 pub mod shim;
 pub mod spec;
@@ -32,6 +34,9 @@ pub use cloudinit::{
     render_cloud_init, render_cloud_init_with_guest_ssh,
 };
 pub use cmd::{Cmd, CmdOutput, ManagedProcess, ProcessSignal};
+pub use console::{
+    ConsoleBroker, ConsolePlan, ConsoleResult, RawTerminal, console_plan, relay_console,
+};
 pub use deps::{DependencyArtifact, DependencyManifest};
 pub use dispatcher::{DispatchFuture, Dispatcher, EventSink};
 pub use doctor::{
@@ -47,13 +52,15 @@ pub use image::{
 };
 pub use lock::MachineLock;
 pub use paths::{PathInputs, Paths};
+pub use readiness::{ReadinessOptions, wait_for_ssh_ready};
 pub use result::{
-    LogsResult, MachineRecord, MachineSummary, MachineView, RemoveResult, SpecResult,
-    SpecWarningPayload, StartResult, StopResult,
+    LogsResult, MachineRecord, MachineSummary, MachineView, RemoveResult, RunResult, ShellResult,
+    SpecResult, SpecWarningPayload, SshConfigResult, StartResult, StopResult,
 };
 pub use shim::{
-    PreparedStart, ShimClient, ShimPids, ShimStatus, ShimTimeouts, launch_prepared, prepare_start,
-    recover_shim, run_shim, stop_unsupervised, validate_m1_start_scope,
+    PreparedStart, ShimClient, ShimPids, ShimStatus, ShimTimeouts, cancel_prepared,
+    launch_prepared, launch_prepared_cancellable, prepare_start, recover_shim, run_shim,
+    stop_unsupervised, validate_m1_start_scope,
 };
 pub use spec::{
     Arch, ByteSize, CloudInitSpec, CloudInitSpecPatch, ColorMode, Firmware, GlobalConfig,
@@ -62,12 +69,14 @@ pub use spec::{
     ParseDurationError, ParseFirmwareError, ParseMacAddrError, ParsePortForwardError,
     ParseSpecClearError, PatchMerge, PortForward, PortRange, Protocol, RealValidationHost,
     SPEC_FIELD_METADATA, SpecClear, SpecFieldMetadata, SpecWarning, StartConfig, StopConfig,
-    UiConfig, ValidationContext, ValidationHost, VmmSpec, VmmSpecPatch, validate_machine_spec,
+    UiConfig, ValidationContext, ValidationHost, VmmSpec, VmmSpecPatch, validate_guest_user,
+    validate_machine_spec,
 };
 pub use ssh::{
-    SshIdentity, VSOCK_HANDSHAKE_MAX_BYTES, VSOCK_HANDSHAKE_TIMEOUT, VsockConnection, VsockPort,
-    connect_vsock, ensure_ssh_identity, invalidate_known_hosts_for_seed, machine_known_hosts_path,
-    run_vsock_proxy,
+    SshCommandPlan, SshConfigPlan, SshIdentity, VSOCK_HANDSHAKE_MAX_BYTES, VSOCK_HANDSHAKE_TIMEOUT,
+    VsockConnection, VsockPort, connect_vsock, ensure_ssh_identity,
+    invalidate_known_hosts_for_seed, machine_known_hosts_path, readiness_ssh_plan, run_vsock_proxy,
+    shell_ssh_plan, ssh_config_plan,
 };
 pub use state::{
     ExitReason, LastExit, LiveMachineState, LivenessObservation, MAX_MACHINE_STATE_BYTES,

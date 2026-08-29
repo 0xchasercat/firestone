@@ -9,21 +9,28 @@ use std::{
     future::Future,
     io,
     io::IsTerminal,
+    os::unix::process::ExitStatusExt,
     path::Path,
     process::ExitCode,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     task::{Context, Poll, Wake, Waker},
     thread,
+    time::Duration,
 };
 
 use clap::{Parser, error::ErrorKind as ClapErrorKind};
 use firestone_core::{
     Action, Catalog, Dispatcher, ErrorKind, Event, EventSink, FirestoneError, GlobalConfig,
-    ImageRef, Level, MachineSpec, PathInputs, Paths, RealValidationHost, ValidationContext,
+    ImageRef, Level, MachineSpec, MachineSpecPatch, MachineStatus, PathInputs, Paths,
+    ProcessSignal, RawTerminal, RealValidationHost, RunResult, ShellResult, SshConfigResult,
+    ValidationContext, console_plan, relay_console, shell_ssh_plan, ssh_config_plan,
 };
 
 use crate::{
-    cli::{Cli, Command, CreateRequest, ImageCommand},
+    cli::{Cli, Command, CreateRequest, ImageCommand, RunArgs, ShellArgs, derive_machine_name},
     render::{RenderOptions, Renderer, error_exit_code},
     store::LocalDispatcher,
 };
@@ -236,6 +243,22 @@ fn clap_error_message(error: &clap::Error) -> String {
         .unwrap_or(trimmed)
         .to_owned()
 }
+#[derive(Debug, Clone, Copy, Default)]
+struct TerminalMode {
+    stdin: bool,
+    stdout: bool,
+    stderr: bool,
+}
+
+impl TerminalMode {
+    const fn interactive(self) -> bool {
+        self.stdin && self.stderr
+    }
+
+    const fn console(self) -> bool {
+        self.stdin && self.stdout && self.stderr
+    }
+}
 
 async fn run<Stdout, Stderr>(
     cli: Cli,
@@ -246,8 +269,12 @@ where
     Stderr: io::Write + Send,
 {
     let inputs = PathInputs::capture()?;
-    let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
-    run_with_inputs_mode(cli, renderer, inputs, interactive).await
+    let terminal = TerminalMode {
+        stdin: io::stdin().is_terminal(),
+        stdout: io::stdout().is_terminal(),
+        stderr: io::stderr().is_terminal(),
+    };
+    run_with_inputs_mode(cli, renderer, inputs, terminal).await
 }
 
 #[cfg(test)]
@@ -260,21 +287,21 @@ where
     Stdout: io::Write + Send,
     Stderr: io::Write + Send,
 {
-    run_with_inputs_mode(cli, renderer, inputs, false).await
+    run_with_inputs_mode(cli, renderer, inputs, TerminalMode::default()).await
 }
 
 async fn run_with_inputs_mode<Stdout, Stderr>(
     cli: Cli,
     renderer: &mut Renderer<Stdout, Stderr>,
     mut inputs: PathInputs,
-    interactive: bool,
+    terminal: TerminalMode,
 ) -> Result<(), FirestoneError>
 where
     Stdout: io::Write + Send,
     Stderr: io::Write + Send,
 {
     let Cli {
-        json: _,
+        json,
         quiet: _,
         verbose: _,
         no_color: _,
@@ -289,6 +316,9 @@ where
     let source_base = inputs.current_dir.clone();
 
     match command {
+        Command::Run(arguments) => {
+            run_machine_command(*arguments, paths, source_base, json, terminal, renderer).await
+        }
         Command::Create(arguments) => {
             let (global, catalog) = load_user_configuration(&paths)?;
             let request = arguments.into_request().map_err(|error| {
@@ -321,10 +351,14 @@ where
             }
         }
         Command::Start(arguments) => {
+            let (cancellation, _signals) = StartSignals::register()?;
             let (global, catalog) = load_user_configuration(&paths)?;
+            let automatic_timeout = arguments.timeout.is_none();
             let timeout = arguments.timeout.unwrap_or(global.start.timeout).get();
             LocalDispatcher::new(paths, global, catalog)
                 .with_source_base(source_base)
+                .with_automatic_start_timeout(automatic_timeout)
+                .with_start_cancellation(cancellation)
                 .run(
                     Action::Start {
                         name: arguments.name,
@@ -351,10 +385,13 @@ where
                 .await
         }
         Command::Restart(arguments) => {
+            let (cancellation, _signals) = StartSignals::register()?;
             let (global, catalog) = load_user_configuration(&paths)?;
             let timeout = global.start.timeout.get();
             LocalDispatcher::new(paths, global, catalog)
                 .with_source_base(source_base)
+                .with_automatic_start_timeout(true)
+                .with_start_cancellation(cancellation)
                 .run(
                     Action::Restart {
                         name: arguments.name,
@@ -369,7 +406,7 @@ where
             let dispatcher =
                 LocalDispatcher::new(paths, global, catalog).with_source_base(source_base);
             let mut force = arguments.force || yes;
-            if !force && interactive {
+            if !force && terminal.interactive() {
                 let running = dispatcher.remove_confirmation_names(&arguments.names)?;
                 if !running.is_empty() {
                     let prompt =
@@ -419,6 +456,15 @@ where
                 .with_source_base(source_base)
                 .edit(&arguments.name, renderer)
         }
+        Command::Shell(arguments) => {
+            shell_command(arguments, paths, source_base, json, terminal, renderer).await
+        }
+        Command::SshConfig(arguments) => {
+            ssh_config_command(arguments.name, paths, source_base, renderer)
+        }
+        Command::Console(arguments) => {
+            console_command(arguments.name, paths, source_base, json, terminal)
+        }
         Command::Logs(arguments) => {
             let (global, catalog) = load_user_configuration(&paths)?;
             LocalDispatcher::new(paths, global, catalog)
@@ -458,7 +504,7 @@ where
                 }
                 ImageCommand::Remove(arguments) => {
                     let mut force = arguments.force || yes;
-                    if !force && interactive {
+                    if !force && terminal.interactive() {
                         let references = dispatcher.image_remove_confirmation(&arguments.id)?;
                         if !references.is_empty() {
                             let prompt = format!(
@@ -500,6 +546,650 @@ where
             ErrorKind::Generic,
             "hidden vsock proxy reached event dispatch",
         )),
+    }
+}
+
+struct WithoutResults<'a> {
+    inner: &'a mut dyn EventSink,
+}
+
+impl EventSink for WithoutResults<'_> {
+    fn emit(&mut self, event: Event) -> Result<(), FirestoneError> {
+        if matches!(event, Event::Result { .. }) {
+            Ok(())
+        } else {
+            self.inner.emit(event)
+        }
+    }
+}
+
+async fn dispatch_without_result(
+    dispatcher: &LocalDispatcher,
+    action: Action,
+    events: &mut dyn EventSink,
+) -> Result<(), FirestoneError> {
+    let mut filtered = WithoutResults { inner: events };
+    dispatcher.run(action, &mut filtered).await
+}
+
+async fn run_machine_command<Stdout, Stderr>(
+    arguments: RunArgs,
+    paths: Paths,
+    source_base: std::path::PathBuf,
+    json: bool,
+    terminal: TerminalMode,
+    renderer: &mut Renderer<Stdout, Stderr>,
+) -> Result<(), FirestoneError>
+where
+    Stdout: io::Write + Send,
+    Stderr: io::Write + Send,
+{
+    if json {
+        return Err(FirestoneError::new(
+            ErrorKind::Usage,
+            "run cannot mix an interactive SSH byte stream with NDJSON output",
+        )
+        .with_hint("remove --json or use create and start as separate actions"));
+    }
+
+    let (start_cancellation, start_signals) = StartSignals::register()?;
+    let (global, catalog) = load_user_configuration(&paths)?;
+    let dispatcher = LocalDispatcher::new(paths.clone(), global.clone(), catalog.clone())
+        .with_source_base(source_base.clone())
+        .with_automatic_start_timeout(true)
+        .with_start_cancellation(start_cancellation);
+    let RunArgs {
+        target,
+        name: requested_name,
+        remove,
+        spec,
+        command,
+    } = arguments;
+    let target = target.unwrap_or_else(|| "ubuntu".to_owned());
+    let patch = spec.into_patch();
+    let user_override = patch.user.clone();
+    let mut forbidden_patch = patch.clone();
+    forbidden_patch.user = None;
+    let has_spec_flags = forbidden_patch != MachineSpecPatch::default();
+
+    let exact_machine = dispatcher.find_terminal_machine(&target)?;
+    let (name, machine, create_spec, warnings) = if let Some(machine) = exact_machine {
+        if requested_name.is_some() || has_spec_flags {
+            return Err(FirestoneError::new(
+                ErrorKind::Usage,
+                format!(
+                    "run target {target} is an existing machine; specification flags do not apply"
+                ),
+            )
+            .with_hint(format!(
+                "use firestone edit {target} to change its specification"
+            )));
+        }
+        (target, Some(machine), None, Vec::new())
+    } else {
+        let image = ImageRef::new(target.clone());
+        let name = match requested_name {
+            Some(name) => name,
+            None => derive_machine_name(&image).map_err(|error| {
+                FirestoneError::new(ErrorKind::Usage, clap_error_message(&error))
+                    .with_hint("pass --name with a valid machine name")
+            })?,
+        };
+        let (_, loaded) = load_create_spec(
+            CreateRequest {
+                name: name.clone(),
+                image,
+                patch,
+                file: None,
+                edit: false,
+            },
+            &source_base,
+            &paths,
+            &global,
+            &catalog,
+        )?;
+        match dispatcher.find_terminal_machine(&name)? {
+            Some(machine) => {
+                if machine.spec.image != loaded.spec.image {
+                    return Err(FirestoneError::new(
+                        ErrorKind::Conflict,
+                        format!(
+                            "machine name {name} is already used for image {}",
+                            machine.spec.image
+                        ),
+                    )
+                    .with_hint("pass --name to choose a different machine name"));
+                }
+                if has_spec_flags {
+                    return Err(FirestoneError::new(
+                        ErrorKind::Usage,
+                        format!("run would reuse machine {name}; specification flags do not apply"),
+                    )
+                    .with_hint(format!(
+                        "use firestone edit {name} to change its specification"
+                    )));
+                }
+                (name, Some(machine), None, Vec::new())
+            }
+            None => (name, None, Some(loaded.spec), loaded.warnings),
+        }
+    };
+
+    for warning in warnings {
+        renderer.emit(Event::Log {
+            level: Level::Warn,
+            message: format!("{}: {}", warning.key, warning.message),
+        })?;
+    }
+
+    let created = create_spec.is_some();
+    let mut machine = match (machine, create_spec) {
+        (Some(machine), None) => machine,
+        (None, Some(spec)) => {
+            dispatch_without_result(
+                &dispatcher,
+                Action::Create {
+                    name: name.clone(),
+                    spec,
+                },
+                renderer,
+            )
+            .await?;
+            dispatcher.terminal_machine(&name)?
+        }
+        _ => {
+            return Err(FirestoneError::new(
+                ErrorKind::Generic,
+                "run target resolution produced an inconsistent machine plan",
+            ));
+        }
+    };
+
+    if matches!(
+        machine.state.status,
+        MachineStatus::Created | MachineStatus::Stopped | MachineStatus::Failed
+    ) {
+        let timeout = if created || machine.state.instance_id.is_none() {
+            global.start.timeout_first_boot.get()
+        } else {
+            global.start.timeout.get()
+        };
+        if let Err(error) = dispatch_without_result(
+            &dispatcher,
+            Action::Start {
+                name: name.clone(),
+                wait: true,
+                timeout,
+            },
+            renderer,
+        )
+        .await
+        {
+            let running = dispatcher
+                .find_terminal_machine(&name)
+                .ok()
+                .flatten()
+                .is_some_and(|machine| machine.state.status == MachineStatus::Running);
+            if created && remove && !running {
+                cleanup_created_machine(&dispatcher, &name, renderer).await?;
+            }
+            return Err(error);
+        }
+        machine = dispatcher.terminal_machine(&name)?;
+    } else if machine.state.status != MachineStatus::Running {
+        return Err(FirestoneError::new(
+            ErrorKind::Busy,
+            format!(
+                "machine {name} is {}; wait for its current lifecycle operation",
+                machine_status_word(machine.state.status)
+            ),
+        ));
+    }
+
+    drop(start_signals);
+    let user = user_override.unwrap_or_else(|| machine.spec.user.clone());
+    let executable = env::current_exe().map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::Dependency,
+            "cannot locate the current firestone executable for SSH ProxyCommand",
+        )
+        .with_source(source)
+    })?;
+    let plan = match shell_ssh_plan(&paths, &executable, &name, &user, terminal.stdin, command) {
+        Ok(plan) => plan,
+        Err(error) => {
+            if created && remove {
+                cleanup_created_machine(&dispatcher, &name, renderer).await?;
+            }
+            return Err(error);
+        }
+    };
+
+    if !(created && remove) {
+        return exec_ssh(plan);
+    }
+
+    let received_signal = Arc::new(AtomicUsize::new(0));
+    let signals = match RunSignals::register(Arc::clone(&received_signal)) {
+        Ok(signals) => signals,
+        Err(error) => {
+            cleanup_created_machine(&dispatcher, &name, renderer).await?;
+            return Err(error);
+        }
+    };
+    let mut child = match plan
+        .command()
+        .stdin_inherit()
+        .spawn_interactive_process_group()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            cleanup_created_machine(&dispatcher, &name, renderer).await?;
+            return Err(error);
+        }
+    };
+    let mut forwarded_signal = 0_usize;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(error) => break Err(error),
+        }
+        let signal = received_signal.load(Ordering::SeqCst);
+        if signal != 0 && signal != forwarded_signal {
+            match run_process_signal(signal).and_then(|signal| child.signal_group(signal)) {
+                Ok(()) => forwarded_signal = signal,
+                Err(error) => break Err(error),
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    if status.is_err() {
+        let _ = child.signal_group(ProcessSignal::Kill);
+        let _ = child.wait();
+    }
+    let cleanup = cleanup_created_machine(&dispatcher, &name, renderer).await;
+    cleanup?;
+    let status = status?;
+    let received = received_signal.load(Ordering::SeqCst);
+    let termination_signal = status
+        .signal()
+        .or_else(|| i32::try_from(received).ok().filter(|signal| *signal != 0));
+    let result = RunResult {
+        name: name.clone(),
+        created: true,
+        removed: true,
+        shell: ShellResult {
+            name,
+            user,
+            exit_code: status.code(),
+            signal: termination_signal,
+        },
+    };
+    drop(signals);
+    if let Some(signal) = termination_signal {
+        return match signal_hook::low_level::emulate_default_handler(signal) {
+            Ok(()) => Err(FirestoneError::new(
+                ErrorKind::Generic,
+                format!("default handler for signal {signal} returned unexpectedly"),
+            )),
+            Err(source) => Err(FirestoneError::new(
+                ErrorKind::Generic,
+                format!("cannot preserve SSH terminating signal {signal}"),
+            )
+            .with_source(source)),
+        };
+    }
+    renderer.set_exit_override(run_exit_code(&result));
+    Ok(())
+}
+
+async fn cleanup_created_machine(
+    dispatcher: &LocalDispatcher,
+    name: &str,
+    events: &mut dyn EventSink,
+) -> Result<(), FirestoneError> {
+    dispatch_without_result(
+        dispatcher,
+        Action::Remove {
+            names: vec![name.to_owned()],
+            force: true,
+        },
+        events,
+    )
+    .await
+    .map_err(|error| {
+        FirestoneError::new(
+            error.kind(),
+            format!("cannot clean up run machine {name}: {}", error.message()),
+        )
+        .with_hint(format!("remove it with firestone rm --force {name}"))
+    })?;
+    Ok(())
+}
+
+async fn shell_command<Stdout, Stderr>(
+    arguments: ShellArgs,
+    paths: Paths,
+    source_base: std::path::PathBuf,
+    json: bool,
+    terminal: TerminalMode,
+    renderer: &mut Renderer<Stdout, Stderr>,
+) -> Result<(), FirestoneError>
+where
+    Stdout: io::Write + Send,
+    Stderr: io::Write + Send,
+{
+    if json {
+        return Err(FirestoneError::new(
+            ErrorKind::Usage,
+            "shell cannot mix an SSH byte stream with NDJSON output",
+        )
+        .with_hint("remove --json and retry"));
+    }
+    let (start_cancellation, start_signals) = StartSignals::register()?;
+    let (global, catalog) = load_user_configuration(&paths)?;
+    let dispatcher = LocalDispatcher::new(paths.clone(), global.clone(), catalog)
+        .with_source_base(source_base)
+        .with_automatic_start_timeout(true)
+        .with_start_cancellation(start_cancellation);
+    let mut machine = dispatcher.terminal_machine(&arguments.name)?;
+    if machine.state.status != MachineStatus::Running {
+        if !terminal.stdin {
+            return Err(not_running_terminal_error(&arguments.name));
+        }
+        if !matches!(
+            machine.state.status,
+            MachineStatus::Created | MachineStatus::Stopped | MachineStatus::Failed
+        ) {
+            return Err(not_running_terminal_error(&arguments.name));
+        }
+        let timeout = if machine.state.instance_id.is_none() {
+            global.start.timeout_first_boot.get()
+        } else {
+            global.start.timeout.get()
+        };
+        dispatch_without_result(
+            &dispatcher,
+            Action::Start {
+                name: arguments.name.clone(),
+                wait: true,
+                timeout,
+            },
+            renderer,
+        )
+        .await?;
+        machine = dispatcher.terminal_machine(&arguments.name)?;
+    }
+    if machine.state.status != MachineStatus::Running {
+        return Err(not_running_terminal_error(&arguments.name));
+    }
+    drop(start_signals);
+    let user = arguments.user.unwrap_or(machine.spec.user);
+    let executable = env::current_exe().map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::Dependency,
+            "cannot locate the current firestone executable for SSH ProxyCommand",
+        )
+        .with_source(source)
+    })?;
+    let plan = shell_ssh_plan(
+        &paths,
+        &executable,
+        &arguments.name,
+        &user,
+        terminal.stdin,
+        arguments.command,
+    )?;
+    exec_ssh(plan)
+}
+
+fn exec_ssh(plan: firestone_core::SshCommandPlan) -> Result<(), FirestoneError> {
+    match plan.command().stdin_inherit().exec() {
+        Ok(never) => match never {},
+        Err(error) => Err(error),
+    }
+}
+
+fn ssh_config_command<Stdout, Stderr>(
+    name: String,
+    paths: Paths,
+    source_base: std::path::PathBuf,
+    renderer: &mut Renderer<Stdout, Stderr>,
+) -> Result<(), FirestoneError>
+where
+    Stdout: io::Write + Send,
+    Stderr: io::Write + Send,
+{
+    let (global, catalog) = load_user_configuration(&paths)?;
+    let dispatcher =
+        LocalDispatcher::new(paths.clone(), global, catalog).with_source_base(source_base);
+    let machine = dispatcher.terminal_machine(&name)?;
+    let executable = env::current_exe().map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::Dependency,
+            "cannot locate the current firestone executable for SSH ProxyCommand",
+        )
+        .with_source(source)
+    })?;
+    let plan = ssh_config_plan(&paths, &executable, &name, &machine.spec.user)?;
+    let payload = SshConfigResult {
+        name,
+        host: plan.host().to_owned(),
+        config: plan.block().to_owned(),
+    };
+    let payload = serde_json::to_value(payload).map_err(|source| {
+        FirestoneError::new(ErrorKind::Generic, "cannot serialize ssh-config result")
+            .with_source(source)
+    })?;
+    renderer.emit(Event::Result {
+        action: "ssh-config".to_owned(),
+        payload,
+    })
+}
+
+fn console_command(
+    name: String,
+    paths: Paths,
+    source_base: std::path::PathBuf,
+    json: bool,
+    terminal: TerminalMode,
+) -> Result<(), FirestoneError> {
+    if json {
+        return Err(FirestoneError::new(
+            ErrorKind::Usage,
+            "console cannot mix a binary terminal stream with NDJSON output",
+        )
+        .with_hint("remove --json and retry from a terminal"));
+    }
+    if !terminal.console() {
+        return Err(FirestoneError::new(
+            ErrorKind::Usage,
+            "console requires terminal stdin, stdout, and stderr",
+        )
+        .with_hint("run firestone console from an interactive terminal"));
+    }
+    let (global, catalog) = load_user_configuration(&paths)?;
+    let dispatcher =
+        LocalDispatcher::new(paths.clone(), global, catalog).with_source_base(source_base);
+    let machine = dispatcher.terminal_machine(&name)?;
+    if machine.state.status != MachineStatus::Running {
+        return Err(not_running_terminal_error(&name));
+    }
+    let plan = console_plan(&paths, &name)?;
+    let mut stream = plan.connect(Duration::from_secs(5))?;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _signals = TerminalSignals::register(Arc::clone(&cancelled))?;
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut raw = RawTerminal::enter(&stdin)?;
+    {
+        use io::Write as _;
+        let mut stderr = io::stderr().lock();
+        writeln!(stderr, "connected to {name} console · escape: Ctrl-]")
+            .and_then(|()| stderr.flush())
+            .map_err(|source| {
+                FirestoneError::new(ErrorKind::Generic, "cannot print console connection status")
+                    .with_source(source)
+            })?;
+    }
+    let mut input = stdin.lock();
+    let mut output = stdout.lock();
+    let relay = relay_console(&name, &mut stream, &mut input, &mut output, &cancelled);
+    let restore = raw.restore();
+    match (relay, restore) {
+        (Ok(_), Ok(())) => Ok(()),
+        (_, Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+    }
+}
+
+struct StartSignals {
+    id: Option<signal_hook::SigId>,
+}
+
+impl StartSignals {
+    fn register() -> Result<(Arc<AtomicBool>, Self), FirestoneError> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let id = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&cancelled))
+            .map_err(|source| {
+            FirestoneError::new(
+                ErrorKind::Generic,
+                "cannot install start cancellation handler",
+            )
+            .with_source(source)
+        })?;
+        Ok((cancelled, Self { id: Some(id) }))
+    }
+}
+
+impl Drop for StartSignals {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            signal_hook::low_level::unregister(id);
+        }
+    }
+}
+
+struct RunSignals {
+    ids: Vec<signal_hook::SigId>,
+}
+
+impl RunSignals {
+    fn register(signal_flag: Arc<AtomicUsize>) -> Result<Self, FirestoneError> {
+        let mut ids = Vec::with_capacity(4);
+        for signal in [
+            signal_hook::consts::SIGHUP,
+            signal_hook::consts::SIGINT,
+            signal_hook::consts::SIGQUIT,
+            signal_hook::consts::SIGTERM,
+        ] {
+            match signal_hook::flag::register_usize(
+                signal,
+                Arc::clone(&signal_flag),
+                usize::try_from(signal).unwrap_or_default(),
+            ) {
+                Ok(id) => ids.push(id),
+                Err(source) => {
+                    for id in ids {
+                        signal_hook::low_level::unregister(id);
+                    }
+                    return Err(FirestoneError::new(
+                        ErrorKind::Generic,
+                        "cannot install run signal handlers",
+                    )
+                    .with_source(source));
+                }
+            }
+        }
+        Ok(Self { ids })
+    }
+}
+
+impl Drop for RunSignals {
+    fn drop(&mut self) {
+        for id in self.ids.drain(..) {
+            signal_hook::low_level::unregister(id);
+        }
+    }
+}
+
+fn run_process_signal(signal: usize) -> Result<ProcessSignal, FirestoneError> {
+    match i32::try_from(signal).ok() {
+        Some(signal_hook::consts::SIGHUP) => Ok(ProcessSignal::Hangup),
+        Some(signal_hook::consts::SIGINT) => Ok(ProcessSignal::Interrupt),
+        Some(signal_hook::consts::SIGQUIT) => Ok(ProcessSignal::Quit),
+        Some(signal_hook::consts::SIGTERM) => Ok(ProcessSignal::Terminate),
+        _ => Err(FirestoneError::new(
+            ErrorKind::Generic,
+            format!("cannot forward unsupported signal {signal}"),
+        )),
+    }
+}
+
+struct TerminalSignals {
+    ids: Vec<signal_hook::SigId>,
+}
+
+impl TerminalSignals {
+    fn register(flag: Arc<AtomicBool>) -> Result<Self, FirestoneError> {
+        let mut ids = Vec::with_capacity(4);
+        for signal in [
+            signal_hook::consts::SIGINT,
+            signal_hook::consts::SIGTERM,
+            signal_hook::consts::SIGHUP,
+            signal_hook::consts::SIGQUIT,
+        ] {
+            match signal_hook::flag::register(signal, Arc::clone(&flag)) {
+                Ok(id) => ids.push(id),
+                Err(source) => {
+                    for id in ids {
+                        signal_hook::low_level::unregister(id);
+                    }
+                    return Err(FirestoneError::new(
+                        ErrorKind::Generic,
+                        "cannot install console terminal signal handlers",
+                    )
+                    .with_source(source));
+                }
+            }
+        }
+        Ok(Self { ids })
+    }
+}
+
+impl Drop for TerminalSignals {
+    fn drop(&mut self) {
+        for id in self.ids.drain(..) {
+            signal_hook::low_level::unregister(id);
+        }
+    }
+}
+
+fn not_running_terminal_error(name: &str) -> FirestoneError {
+    FirestoneError::new(
+        ErrorKind::NotRunning,
+        format!("machine {name} is not running"),
+    )
+    .with_hint(format!("start it with firestone start {name}"))
+}
+
+fn machine_status_word(status: MachineStatus) -> &'static str {
+    match status {
+        MachineStatus::Created => "created",
+        MachineStatus::Starting => "starting",
+        MachineStatus::Running => "running",
+        MachineStatus::Stopping => "stopping",
+        MachineStatus::Stopped => "stopped",
+        MachineStatus::Failed => "failed",
+    }
+}
+
+fn run_exit_code(result: &RunResult) -> u8 {
+    match (result.shell.exit_code, result.shell.signal) {
+        (Some(code), _) => u8::try_from(code).unwrap_or(1),
+        (None, Some(signal)) => u8::try_from(128_i32.saturating_add(signal)).unwrap_or(1),
+        (None, None) => 1,
     }
 }
 

@@ -612,12 +612,85 @@ impl Cmd {
             reaped: false,
         })
     }
-    /// Runs a terminal-facing process with inherited stdout and stderr.
+    /// Starts a terminal-facing process in its own process group.
     ///
-    /// This is for editors and other interactive tools whose terminal protocol
-    /// cannot be captured. Stdin follows the configured null/inherit setting;
-    /// byte-buffered stdin and stderr log capture are rejected.
-    pub fn run_interactive(&self) -> Result<(), FirestoneError> {
+    /// The caller owns signal forwarding and reaping. Stdin follows the
+    /// configured null/inherit setting and stdout/stderr are inherited.
+    pub fn spawn_interactive_process_group(&self) -> Result<ManagedProcess, FirestoneError> {
+        if matches!(self.stdin, CmdStdin::Bytes(_))
+            || self.stderr_log.is_some()
+            || self.stdout_append.is_some()
+            || self.stderr_append.is_some()
+        {
+            return Err(FirestoneError::new(
+                ErrorKind::Generic,
+                "interactive process groups cannot use buffered input or log redirection",
+            ));
+        }
+
+        let deadline = self.timeout.map(|timeout| Instant::now() + timeout);
+        let mut command = Command::new(&self.program);
+        command.args(self.args.iter().map(|arg| &arg.value));
+        command.stderr(Stdio::inherit()).process_group(0);
+        if self.interactive_stdout_to_stderr {
+            let stderr = OpenOptions::new()
+                .write(true)
+                .open("/dev/stderr")
+                .map_err(|source| {
+                    FirestoneError::new(
+                        self.error_kind,
+                        "cannot route interactive command stdout to stderr",
+                    )
+                    .with_source(source)
+                })?;
+            command.stdout(Stdio::from(stderr));
+        } else {
+            command.stdout(Stdio::inherit());
+        }
+        match self.stdin {
+            CmdStdin::Null => {
+                command.stdin(Stdio::null());
+            }
+            CmdStdin::Inherit => {
+                command.stdin(Stdio::inherit());
+            }
+            CmdStdin::Bytes(_) => {
+                return Err(FirestoneError::new(
+                    ErrorKind::Generic,
+                    "interactive process groups cannot use buffered input",
+                ));
+            }
+        }
+        if let Some(cwd) = &self.cwd {
+            command.current_dir(cwd);
+        }
+        if self.clear_env {
+            command.env_clear();
+        }
+        command.envs(&self.env);
+
+        let child = spawn_with_busy_retry(&mut command, deadline).map_err(|source| {
+            FirestoneError::new(
+                self.error_kind,
+                format!("cannot start command {}", self.program.to_string_lossy()),
+            )
+            .with_hint("check that the program exists and is executable")
+            .with_source(source)
+        })?;
+        let process_group = Some(child.id());
+        Ok(ManagedProcess {
+            child,
+            process_group,
+            reaped: false,
+        })
+    }
+
+    /// Runs a terminal-facing process with inherited stdout and stderr and
+    /// returns its exact Unix exit status.
+    ///
+    /// Stdin follows the configured null/inherit setting; byte-buffered stdin
+    /// and stderr log capture are rejected.
+    pub fn status_interactive(&self) -> Result<ExitStatus, FirestoneError> {
         if matches!(self.stdin, CmdStdin::Bytes(_)) {
             return Err(FirestoneError::new(
                 ErrorKind::Generic,
@@ -758,33 +831,110 @@ impl Cmd {
             return Err(FirestoneError::new(
                 ErrorKind::Timeout,
                 format!(
-                    "command `{}` timed out after {} ms",
+                    "command {} timed out after {} ms",
                     self.program.to_string_lossy(),
                     self.timeout.map_or(0, |timeout| timeout.as_millis())
                 ),
             )
             .with_hint("retry after increasing the command timeout"));
         }
+        Ok(status)
+    }
+
+    /// Runs an interactive command and maps a non-zero status to an error.
+    pub fn run_interactive(&self) -> Result<(), FirestoneError> {
+        let status = self.status_interactive()?;
         if status.success() {
-            Ok(())
-        } else {
-            Err(CmdOutput {
-                program: self.program.clone(),
-                status,
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-                stdout_truncated: false,
-                stderr_truncated: false,
-            }
-            .failure(self.error_kind))
+            return Ok(());
         }
+        Err(CmdOutput {
+            program: self.program.clone(),
+            status,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        }
+        .failure(self.error_kind))
+    }
+
+    /// Replaces the current process with this command.
+    ///
+    /// Successful execution never returns, preserving the child's exit and
+    /// signal status exactly.
+    pub fn exec(&self) -> Result<std::convert::Infallible, FirestoneError> {
+        if matches!(self.stdin, CmdStdin::Bytes(_))
+            || self.stderr_log.is_some()
+            || self.stdout_append.is_some()
+            || self.stderr_append.is_some()
+            || self.timeout.is_some()
+        {
+            return Err(FirestoneError::new(
+                ErrorKind::Generic,
+                "exec commands cannot use buffered input, log redirection, or a timeout",
+            ));
+        }
+
+        let logged_argv = std::iter::once(self.program.as_os_str())
+            .chain(self.args.iter().map(|arg| arg.logged.as_os_str()))
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        tracing::debug!(argv = ?logged_argv, cwd = ?self.cwd, "execing external process");
+
+        let mut command = Command::new(&self.program);
+        command.args(self.args.iter().map(|arg| &arg.value));
+        command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        match self.stdin {
+            CmdStdin::Null => {
+                command.stdin(Stdio::null());
+            }
+            CmdStdin::Inherit => {
+                command.stdin(Stdio::inherit());
+            }
+            CmdStdin::Bytes(_) => {
+                return Err(FirestoneError::new(
+                    ErrorKind::Generic,
+                    "exec commands cannot use buffered input",
+                ));
+            }
+        }
+        if self.interactive_stdout_to_stderr {
+            let stderr = OpenOptions::new()
+                .write(true)
+                .open("/dev/stderr")
+                .map_err(|source| {
+                    FirestoneError::new(
+                        self.error_kind,
+                        "cannot route exec command stdout to stderr",
+                    )
+                    .with_source(source)
+                })?;
+            command.stdout(Stdio::from(stderr));
+        }
+        if let Some(cwd) = &self.cwd {
+            command.current_dir(cwd);
+        }
+        if self.clear_env {
+            command.env_clear();
+        }
+        command.envs(&self.env);
+
+        let source = command.exec();
+        Err(FirestoneError::new(
+            self.error_kind,
+            format!("cannot exec command {}", self.program.to_string_lossy()),
+        )
+        .with_hint("check that the program exists and is executable")
+        .with_source(source))
     }
 }
 
 /// Signals accepted by the shared supervised-process primitive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessSignal {
+    Hangup,
     Interrupt,
+    Quit,
     Terminate,
     Kill,
 }
@@ -792,7 +942,9 @@ pub enum ProcessSignal {
 impl ProcessSignal {
     const fn as_nix(self) -> Signal {
         match self {
+            Self::Hangup => Signal::SIGHUP,
             Self::Interrupt => Signal::SIGINT,
+            Self::Quit => Signal::SIGQUIT,
             Self::Terminate => Signal::SIGTERM,
             Self::Kill => Signal::SIGKILL,
         }

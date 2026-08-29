@@ -14,7 +14,7 @@ rust-version = "1.85"
 clap = { version = "4", features = ["derive"] }
 fatfs = { version = "=0.3.6", default-features = false, features = ["std", "alloc"] }
 fs2 = "0.4"
-nix = { version = "0.30", features = ["fs", "hostname", "poll", "process", "signal", "socket", "user"] }
+nix = { version = "0.30", features = ["fs", "hostname", "poll", "process", "signal", "socket", "term", "user"] }
 jiff = "0.2"
 minijinja = { version = "=2.24.0", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
