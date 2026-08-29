@@ -1016,6 +1016,7 @@ mod tests {
             fs::create_dir_all(&bin_dir)?;
             for directory in [
                 root.clone(),
+                root.join("firestone"),
                 paths.data_dir().to_path_buf(),
                 paths.machines_dir(),
                 machine_dir,
