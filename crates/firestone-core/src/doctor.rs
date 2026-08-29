@@ -1521,6 +1521,46 @@ fn record_fix_failure(
         .or_insert(next);
 }
 
+fn dependency_install_io_hint(directory: &Path) -> String {
+    format!(
+        "check read/write permissions and free space for {} and retry `firestone doctor --fix`",
+        directory.display()
+    )
+}
+
+fn dependency_install_io_error(
+    artifact: &DependencyArtifact,
+    directory: &Path,
+    phase: &str,
+    source: std::io::Error,
+) -> FirestoneError {
+    FirestoneError::new(
+        ErrorKind::Dependency,
+        format!(
+            "cannot {phase} for dependency `{}` in {}",
+            artifact.dependency,
+            directory.display()
+        ),
+    )
+    .with_hint(dependency_install_io_hint(directory))
+    .with_source(source)
+}
+
+fn hash_dependency_download(
+    reader: &mut dyn Read,
+    artifact: &DependencyArtifact,
+    directory: &Path,
+) -> Result<String, FirestoneError> {
+    sha256_reader(reader).map_err(|source| {
+        dependency_install_io_error(
+            artifact,
+            directory,
+            "read partial download for hashing",
+            source,
+        )
+    })
+}
+
 fn install_artifact(
     bin_dir: &Path,
     artifact: &DependencyArtifact,
@@ -1540,45 +1580,41 @@ fn install_artifact(
         .suffix(".partial")
         .tempfile_in(bin_dir)
         .map_err(|source| {
+            dependency_install_io_error(artifact, bin_dir, "create partial download", source)
+        })?;
+    fetcher
+        .fetch(&url, partial.as_file_mut())
+        .map_err(|source| {
+            let kind = source.kind();
+            let install_hint = dependency_install_io_hint(bin_dir);
+            let hint = source.hint().map_or_else(
+                || install_hint.clone(),
+                |upstream| format!("{upstream}; {install_hint}"),
+            );
             FirestoneError::new(
-                ErrorKind::Dependency,
-                format!("cannot create partial download in {}", bin_dir.display()),
+                kind,
+                format!(
+                    "cannot stream download for dependency `{}` into {}",
+                    artifact.dependency,
+                    bin_dir.display()
+                ),
             )
-            .with_hint("check directory permissions and free space")
+            .with_hint(hint)
             .with_source(source)
         })?;
-    fetcher.fetch(&url, partial.as_file_mut())?;
     partial.as_file_mut().flush().map_err(|source| {
-        FirestoneError::new(
-            ErrorKind::Dependency,
-            format!("cannot flush download for `{}`", artifact.dependency),
-        )
-        .with_source(source)
+        dependency_install_io_error(artifact, bin_dir, "flush partial download", source)
     })?;
     partial.as_file_mut().sync_all().map_err(|source| {
-        FirestoneError::new(
-            ErrorKind::Dependency,
-            format!("cannot sync download for `{}`", artifact.dependency),
-        )
-        .with_source(source)
+        dependency_install_io_error(artifact, bin_dir, "sync partial download", source)
     })?;
     partial
         .as_file_mut()
         .seek(SeekFrom::Start(0))
         .map_err(|source| {
-            FirestoneError::new(
-                ErrorKind::Dependency,
-                format!("cannot rewind download for `{}`", artifact.dependency),
-            )
-            .with_source(source)
+            dependency_install_io_error(artifact, bin_dir, "rewind partial download", source)
         })?;
-    let actual = sha256_reader(partial.as_file_mut()).map_err(|source| {
-        FirestoneError::new(
-            ErrorKind::Checksum,
-            format!("cannot hash download for `{}`", artifact.dependency),
-        )
-        .with_source(source)
-    })?;
+    let actual = hash_dependency_download(partial.as_file_mut(), artifact, bin_dir)?;
     if actual != artifact.sha256 {
         return Err(FirestoneError::new(
             ErrorKind::Checksum,
@@ -1594,42 +1630,36 @@ fn install_artifact(
         .as_file()
         .set_permissions(fs::Permissions::from_mode(artifact.expected_mode()))
         .map_err(|source| {
-            FirestoneError::new(
-                ErrorKind::Dependency,
-                format!("cannot set mode for `{}`", artifact.dependency),
-            )
-            .with_source(source)
+            dependency_install_io_error(artifact, bin_dir, "set partial download mode", source)
         })?;
     partial.as_file().sync_all().map_err(|source| {
-        FirestoneError::new(
-            ErrorKind::Dependency,
-            format!("cannot sync mode for `{}`", artifact.dependency),
-        )
-        .with_source(source)
+        dependency_install_io_error(artifact, bin_dir, "sync partial download mode", source)
     })?;
 
     let destination = bin_dir.join(&artifact.install_name);
     partial.persist(&destination).map_err(|error| {
-        FirestoneError::new(
-            ErrorKind::Dependency,
-            format!(
-                "cannot atomically install `{}` at {}",
-                artifact.dependency,
-                destination.display()
-            ),
+        dependency_install_io_error(
+            artifact,
+            bin_dir,
+            "atomically publish downloaded artifact",
+            error.error,
         )
-        .with_source(error.error)
     })?;
-    sync_directory(bin_dir)?;
+    sync_directory(bin_dir, &artifact.dependency)?;
     artifact_state(bin_dir, artifact).map_err(|reason| {
         FirestoneError::new(
             ErrorKind::Dependency,
             format!(
-                "installed `{}` failed readback: {reason}",
-                artifact.dependency
+                "installed `{}` at {} failed readback: {reason}",
+                artifact.dependency,
+                destination.display()
             ),
         )
-        .with_hint("remove the artifact and retry `firestone doctor --fix`")
+        .with_hint(format!(
+            "{}; remove {} if readback remains invalid",
+            dependency_install_io_hint(bin_dir),
+            destination.display()
+        ))
     })
 }
 
@@ -1963,14 +1993,18 @@ fn nearest_existing_ancestor(path: &Path) -> Option<&Path> {
     path.ancestors().find(|ancestor| ancestor.exists())
 }
 
-fn sync_directory(path: &Path) -> Result<(), FirestoneError> {
+fn sync_directory(path: &Path, dependency: &str) -> Result<(), FirestoneError> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|source| {
             FirestoneError::new(
                 ErrorKind::Dependency,
-                format!("cannot sync dependency directory {}", path.display()),
+                format!(
+                    "cannot sync installed dependency `{dependency}` directory {}",
+                    path.display()
+                ),
             )
+            .with_hint(dependency_install_io_hint(path))
             .with_source(source)
         })
 }
@@ -2000,9 +2034,10 @@ mod tests {
         DoctorStatus, MAX_DEPENDENCY_ARTIFACT_BYTES, MINIMUM_PASST_DATE, Package, artifact_state,
         check_architecture, check_kvm, check_passt, check_user_namespaces,
         content_length_exceeds_limit, copy_bounded, create_firestone_dir, distro_family,
-        firestone_error_reason, generate_ssh_key, install_artifact, install_command,
-        parse_passt_version, read_reconciled_machine_state_with, reconcile_machine_state,
-        redirect_rejection, require_https, run_doctor_with,
+        firestone_error_reason, generate_ssh_key, hash_dependency_download, install_artifact,
+        install_command, parse_passt_version, read_reconciled_machine_state_with,
+        reconcile_machine_state, redirect_rejection, require_https, run_doctor_with,
+        sync_directory,
     };
     use crate::{
         DependencyArtifact, DependencyManifest, ErrorKind, ExitReason, FirestoneError, LastExit,
@@ -2640,6 +2675,74 @@ mod tests {
     }
 
     #[test]
+    fn install_io_failures_keep_dependency_kind_path_phase_and_actionable_hint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        struct DeniedReader;
+
+        impl Read for DeniedReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "read denied",
+                ))
+            }
+        }
+
+        let directory = TempDir::new()?;
+        let artifact = DependencyArtifact {
+            dependency: "cloud-hypervisor".to_owned(),
+            version: "v1".to_owned(),
+            asset: "tool".to_owned(),
+            install_name: "tool-v1".to_owned(),
+            url: "https://example.invalid/tool".to_owned(),
+            sha256: sha256(b"expected"),
+        };
+        let hash_error = hash_dependency_download(&mut DeniedReader, &artifact, directory.path())
+            .err()
+            .ok_or("expected partial download read failure")?;
+        assert_eq!(hash_error.kind(), ErrorKind::Dependency);
+        assert!(
+            hash_error
+                .message()
+                .contains("read partial download for hashing")
+        );
+        assert!(hash_error.message().contains("cloud-hypervisor"));
+        assert!(
+            hash_error
+                .message()
+                .contains(&directory.path().display().to_string())
+        );
+        let hash_hint = hash_error
+            .hint()
+            .ok_or("hash I/O error should have a hint")?;
+        for expected in [
+            "read/write permissions",
+            "free space",
+            "firestone doctor --fix",
+        ] {
+            assert!(hash_hint.contains(expected));
+        }
+
+        let missing = directory.path().join("missing-bin");
+        let sync_error = sync_directory(&missing, "cloud-hypervisor")
+            .err()
+            .ok_or("expected dependency directory sync failure")?;
+        assert_eq!(sync_error.kind(), ErrorKind::Dependency);
+        assert!(sync_error.message().contains("sync installed dependency"));
+        assert!(
+            sync_error
+                .message()
+                .contains(&missing.display().to_string())
+        );
+        let sync_hint = sync_error
+            .hint()
+            .ok_or("sync I/O error should have a hint")?;
+        assert!(sync_hint.contains("read/write permissions"));
+        assert!(sync_hint.contains("free space"));
+        Ok(())
+    }
+
+    #[test]
     fn download_checksum_mismatch_preserves_target_and_removes_partial()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = TempDir::new()?;
@@ -2691,7 +2794,22 @@ mod tests {
         fs::write(&destination, "existing corrupt artifact")?;
         fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))?;
         let failing = FakeFetcher::failing(payloads.clone());
-        assert!(install_artifact(dir.path(), &artifact, &failing).is_err());
+        let stream_error = install_artifact(dir.path(), &artifact, &failing)
+            .err()
+            .ok_or("expected injected stream failure")?;
+        assert_eq!(stream_error.kind(), ErrorKind::Dependency);
+        assert!(stream_error.message().contains("stream download"));
+        assert!(stream_error.message().contains("cloud-hypervisor"));
+        assert!(
+            stream_error
+                .message()
+                .contains(&dir.path().display().to_string())
+        );
+        let stream_hint = stream_error
+            .hint()
+            .ok_or("stream failure should have an install hint")?;
+        assert!(stream_hint.contains("read/write permissions"));
+        assert!(stream_hint.contains("free space"));
         assert_eq!(fs::read(&destination)?, b"existing corrupt artifact");
         assert_eq!(fs::read_dir(dir.path())?.count(), 1);
 
@@ -3308,10 +3426,21 @@ mod tests {
         let vendored = check(&report, DoctorCheckId::VendoredBinaries);
         assert_eq!(vendored.status, DoctorStatus::Fail);
         assert!(
+            vendored.reason.contains(
+                "fix failed: cannot stream download for dependency `cloud-hypervisor` into"
+            )
+        );
+        assert!(
             vendored
                 .reason
-                .contains("fix failed: injected stream failure")
+                .contains(&fixture.context.paths.bin_dir().display().to_string())
         );
+        let hint = vendored
+            .hint
+            .as_deref()
+            .ok_or("stream fix failure should retain its install hint")?;
+        assert!(hint.contains("read/write permissions"));
+        assert!(hint.contains("free space"));
         assert!(
             fs::read_dir(fixture.context.paths.bin_dir())?
                 .filter_map(Result::ok)
