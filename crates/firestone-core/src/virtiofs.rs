@@ -1039,7 +1039,14 @@ mod tests {
             let manifest = DependencyManifest::bundled()?;
             let artifact = manifest.artifact("virtiofsd", Arch::X86_64.as_str())?;
             let executable = paths.binary_file(&artifact.install_name)?;
-            fs::write(&executable, b"#!/bin/sh\nprintf '%s\\n' \"$@\"\nprintf 'HOME=%s\\nPATH=%s\\nCARGO_MANIFEST_DIR=%s\\n' \"${HOME-unset}\" \"${PATH-unset}\" \"${CARGO_MANIFEST_DIR-unset}\"\n")?;
+            fs::write(
+                &executable,
+                br#"#!/bin/sh
+printf '%s\n' "$@"
+printf 'HOME=%s\nPATH=%s\nCARGO_MANIFEST_DIR=%s\n' "${HOME-unset}" "${PATH-unset}" "${CARGO_MANIFEST_DIR-unset}"
+env
+"#,
+            )?;
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
             Ok(Self {
                 _temp: temp,
