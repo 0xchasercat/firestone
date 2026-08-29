@@ -4,12 +4,12 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 
 ## Current position
 
-- Milestone: M2, shell; M0 and M1 are complete
-- Baseline: Linux x86_64 boots Ubuntu 24.04 through pinned Cloud Hypervisor v53 + edk2; lifecycle, images, seed, shim recovery, CLI, and M1 KVM acceptance are complete
+- Milestone: M3, network and folders; M0 through M2 are complete
+- Baseline: Linux x86_64 cold/warm run, SSH readiness, shell, console attach/reattach, and M2 KVM acceptance pass through pinned Cloud Hypervisor v53 + edk2
 - Linux validation host: `firestone@172.203.242.136`, Ubuntu 24.04 x86_64, `/dev/kvm` present
 - Required local gate: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`
 - Required integration gate: the same commands on the Linux host
-- M1 acceptance: local and Linux gates pass; E2E 1, 5, 6, 7, serial login, and verify 1, 2, 4, 5, 6, 9, 12 are green
+- M2 acceptance: E2E 2 and 10, empty-home root prompt, and verify 11, 13, 17 are green; warm run measured 0.379 s
 
 ## Work queue
 
@@ -34,7 +34,12 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 | M2-01 | SSH identity, host-key trust, and vsock proxy transport | `agent/m2-transport` | [#17](https://github.com/0xchasercat/firestone/pull/17) | complete | M1 | Exact SSH/vsock transport contracts, key permissions, trust rotation, bounded handshake, cancellation, and binary relay pass without KVM |
 | M2-02 | Guest SSH units and cloud-init integration | `agent/m2-guest` | [#18](https://github.com/0xchasercat/firestone/pull/18) | complete | M1 | Typed deterministic guest units activate key-only root/default-user SSH, coexist with native systemd vsock, preserve first-boot hvc0 rescue, and KVM verify 11 and 17 pass |
 | M2-03 | Readiness, shell, ssh-config, console, and run CLI | `agent/m2-cli` | [#19](https://github.com/0xchasercat/firestone/pull/19) | complete | M2-01, M2-02 | Shared actions, deterministic output, interactive exec, no-wait behavior, and readiness transitions pass |
-| M2-04 | M2 Linux KVM integration | `agent/m2-integration` | [#20](https://github.com/0xchasercat/firestone/pull/20) | review | M2-01 through M2-03 | E2E 2 and 10 pass; empty-home run reaches a root prompt; verify 11, 13, and 17 close |
+| M2-04 | M2 Linux KVM integration | `agent/m2-integration` | [#20](https://github.com/0xchasercat/firestone/pull/20) | complete | M2-01 through M2-03 | E2E 2 and 10 pass; empty-home run reaches a root prompt; verify 11, 13, and 17 close |
+| M3-01 | Passt, forward grammar, and tap network plans | `agent/m3-network` | pending | ready | M2 | Exact pinned passt/tap commands, socket/config plans, forward validation, and bounded errors pass without KVM |
+| M3-02 | Virtiofsd mount plans and VmConfig mapping | `agent/m3-virtiofs` | pending | ready | M2 | Exact pinned virtiofsd commands, tags, read-only mapping, ownership, and bounded errors pass without KVM |
+| M3-03 | User cloud-init parts, SSH keys, and instance identity | `agent/m3-cloudinit` | pending | ready | M2 | MIME merge, user precedence, key rotation, seed identity, and deterministic goldens pass |
+| M3-04 | Network/filesystem sidecars and CLI lifecycle integration | `agent/m3-sidecars` | pending | blocked | M3-01 through M3-03 | Shim launch/stop/recovery integrates passt, tap, virtiofsd, forwards, mounts, and shared CLI contracts |
+| M3-05 | M3 Linux KVM integration | `agent/m3-integration` | pending | blocked | M3-01 through M3-04 | E2E 3, 4, 8 and verify 7, 8, 10, 14, 15, 16 close |
 
 ## Merge order
 
