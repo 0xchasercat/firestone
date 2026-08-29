@@ -429,21 +429,28 @@ fn check_architecture(context: &DoctorContext) -> DoctorCheck {
                 context.operating_system
             ),
         )
-        .with_hint("Firestone v0.1 requires Linux on x86_64 or aarch64");
+        .with_hint("the Firestone Linux MVP requires an x86_64 host");
     }
-    if matches!(context.architecture.as_str(), "x86_64" | "aarch64") {
+    if context.architecture == "x86_64" {
         DoctorCheck::new(
             DoctorCheckId::HostArch,
             DoctorStatus::Ok,
             format!("host architecture {} is supported", context.architecture),
         )
+    } else if context.architecture == "aarch64" {
+        DoctorCheck::new(
+            DoctorCheckId::HostArch,
+            DoctorStatus::Fail,
+            "aarch64 runtime support is deferred from the Linux x86_64 MVP",
+        )
+        .with_hint("aarch64 is compile-only until its KVM catalog matrix passes")
     } else {
         DoctorCheck::new(
             DoctorCheckId::HostArch,
             DoctorStatus::Fail,
             format!("host architecture {} is unsupported", context.architecture),
         )
-        .with_hint("Firestone v0.1 requires an x86_64 or aarch64 Linux host")
+        .with_hint("the Firestone Linux MVP requires an x86_64 host")
     }
 }
 
@@ -787,10 +794,7 @@ fn check_passt(context: &DoctorContext) -> DoctorCheck {
                 command_failure_reason(&grammar_output)
             ),
         )
-        .with_hint(format!(
-            "install passt {} or newer with -t/-u range support",
-            crate::PINNED_PASST_VERSION
-        ));
+        .with_hint(passt_install_hint(context));
     }
 
     let combined_version = format!(
@@ -804,10 +808,7 @@ fn check_passt(context: &DoctorContext) -> DoctorCheck {
             DoctorStatus::Fail,
             "passt version output has no date-and-hash release tag",
         )
-        .with_hint(format!(
-            "install passt {} or newer",
-            crate::PINNED_PASST_VERSION
-        ));
+        .with_hint(passt_install_hint(context));
     };
     let help = format!(
         "{}\n{}",
@@ -834,10 +835,7 @@ fn check_passt(context: &DoctorContext) -> DoctorCheck {
                 crate::PINNED_PASST_VERSION
             ),
         )
-        .with_hint(format!(
-            "install passt {} or newer with the vhost-user, one-off, socket, repair-path, log, and port-forward options",
-            crate::PINNED_PASST_VERSION
-        ));
+        .with_hint(passt_install_hint(context));
     }
 
     DoctorCheck::new(
@@ -1782,16 +1780,35 @@ fn parse_passt_version(output: &str) -> Option<PasstVersion> {
         let trimmed = token.trim_matches(|character: char| {
             !character.is_ascii_alphanumeric() && character != '_' && character != '.'
         });
-        let (date_part, commit) = trimmed.split_once('.')?;
+        let (date_part, packaged_commit) = trimmed.split_once('.')?;
+        let packaged_commit = packaged_commit.split('-').next()?;
+        let commit = packaged_commit.strip_prefix('g').unwrap_or(packaged_commit);
         if !(7..=40).contains(&commit.len()) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
             return None;
         }
-        let mut components = date_part.split('_');
-        let year = components.next()?.parse::<u32>().ok()?;
-        let month = components.next()?.parse::<u32>().ok()?;
-        let day = components.next()?.parse::<u32>().ok()?;
-        if components.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        let (year, month, day) = if let Some(compact) = date_part.strip_prefix("0^") {
+            if compact.len() != 8 || !compact.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            (
+                compact[0..4].parse::<u32>().ok()?,
+                compact[4..6].parse::<u32>().ok()?,
+                compact[6..8].parse::<u32>().ok()?,
+            )
+        } else {
+            let mut components = date_part.split('_');
+            let values = (
+                components.next()?.parse::<u32>().ok()?,
+                components.next()?.parse::<u32>().ok()?,
+                components.next()?.parse::<u32>().ok()?,
+            );
+            if components.next().is_some() {
+                return None;
+            }
+            values
+        };
+        if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
             return None;
         }
         let date = year
@@ -1805,19 +1822,46 @@ fn parse_passt_version(output: &str) -> Option<PasstVersion> {
     })
 }
 
+fn passt_install_hint(context: &DoctorContext) -> String {
+    let fields = fs::read_to_string(&context.os_release)
+        .ok()
+        .map(|contents| parse_os_release(&contents))
+        .unwrap_or_default();
+    if fields.get("ID").map(String::as_str) == Some("ubuntu")
+        && fields.get("VERSION_ID").map(String::as_str) == Some("24.04")
+    {
+        return concat!(
+            "Ubuntu 24.04's passt package is too old; run `sudo apt-get install -y ",
+            "build-essential ca-certificates git`, clone `https://passt.top/passt` at tag ",
+            "`2025_02_17.a1e48a0`, verify commit ",
+            "`a1e48a02ff3550eb7875a7df6726086e9b3a1213`, run `make passt` in that ",
+            "checkout, then run `sudo install -m0755 passt /usr/local/bin/passt`"
+        )
+        .to_owned();
+    }
+    install_command(context, Package::Passt).map_or_else(
+        || {
+            format!(
+                "install passt {} or newer with the pinned M3 command options",
+                crate::PINNED_PASST_VERSION
+            )
+        },
+        |command| {
+            format!(
+                "run `{command}`, then rerun doctor; Firestone requires {} or newer with the pinned M3 command options",
+                crate::PINNED_PASST_VERSION
+            )
+        },
+    )
+}
+
 fn missing_passt_check(context: &DoctorContext) -> DoctorCheck {
-    let package_hint = install_command(context, Package::Passt)
-        .map(|command| format!("the detected package command is `{command}`, but verify that its candidate is new enough"))
-        .unwrap_or_else(|| "install the passt package for this distribution".to_owned());
     DoctorCheck::new(
         DoctorCheckId::Passt,
         DoctorStatus::Fail,
         "passt not found on PATH",
     )
-    .with_hint(format!(
-        "{package_hint}; Firestone requires {} or newer with the pinned M3 command options",
-        crate::PINNED_PASST_VERSION
-    ))
+    .with_hint(passt_install_hint(context))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1954,10 +1998,11 @@ mod tests {
     use super::{
         ArtifactFetcher, CHECK_IDS, DoctorCheck, DoctorCheckId, DoctorContext, DoctorReport,
         DoctorStatus, MAX_DEPENDENCY_ARTIFACT_BYTES, MINIMUM_PASST_DATE, Package, artifact_state,
-        check_kvm, check_passt, check_user_namespaces, content_length_exceeds_limit, copy_bounded,
-        create_firestone_dir, distro_family, firestone_error_reason, generate_ssh_key,
-        install_artifact, install_command, parse_passt_version, read_reconciled_machine_state_with,
-        reconcile_machine_state, redirect_rejection, require_https, run_doctor_with,
+        check_architecture, check_kvm, check_passt, check_user_namespaces,
+        content_length_exceeds_limit, copy_bounded, create_firestone_dir, distro_family,
+        firestone_error_reason, generate_ssh_key, install_artifact, install_command,
+        parse_passt_version, read_reconciled_machine_state_with, reconcile_machine_state,
+        redirect_rejection, require_https, run_doctor_with,
     };
     use crate::{
         DependencyArtifact, DependencyManifest, ErrorKind, ExitReason, FirestoneError, LastExit,
@@ -2296,6 +2341,23 @@ mod tests {
                 .all(|check| check.status == DoctorStatus::Ok)
         );
         assert!(fetcher.calls.borrow().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn aarch64_runtime_is_reported_as_deferred() -> Result<(), Box<dyn std::error::Error>> {
+        let mut fixture = Fixture::healthy()?;
+        fixture.context.architecture = "aarch64".to_owned();
+
+        let host = check_architecture(&fixture.context);
+
+        assert_eq!(host.status, DoctorStatus::Fail);
+        assert!(host.reason.contains("runtime support is deferred"));
+        assert!(
+            host.hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("compile-only"))
+        );
         Ok(())
     }
 
@@ -2717,9 +2779,14 @@ mod tests {
             .ok_or_else(|| std::io::Error::other("minimum version should parse"))?;
         let old = parse_passt_version("passt 2025_01_21.4f2c8e7")
             .ok_or_else(|| std::io::Error::other("old version should parse"))?;
+        let fedora = parse_passt_version("passt 0^20260728.gf8df3f1-2.fc44.x86_64")
+            .ok_or_else(|| std::io::Error::other("Fedora version should parse"))?;
         assert_eq!(minimum.date, MINIMUM_PASST_DATE);
         assert!(old.date < MINIMUM_PASST_DATE);
+        assert_eq!(fedora.date, 20_260_728);
+        assert_eq!(fedora.raw, "0^20260728.gf8df3f1-2.fc44.x86_64");
         assert!(parse_passt_version("passt 4294967295_12_31.abcdef0").is_none());
+        assert!(parse_passt_version("passt 0^20260217.gnothex-2.fc44").is_none());
 
         let fixture = Fixture::healthy()?;
         let passt = PathBuf::from(&fixture.context.search_path).join("passt");
@@ -2766,7 +2833,7 @@ mod tests {
     }
 
     #[test]
-    fn passt_missing_on_unverified_distro_has_no_ineffective_fix()
+    fn ubuntu_24_04_passt_hint_names_verified_source_build()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::healthy()?;
         let passt = PathBuf::from(&fixture.context.search_path).join("passt");
@@ -2780,18 +2847,19 @@ mod tests {
 
         assert_eq!(check.status, DoctorStatus::Fail);
         assert!(check.fix.is_none());
-        assert!(
-            check
-                .hint
-                .as_deref()
-                .is_some_and(|hint| hint.contains("apt-get"))
-        );
-        assert!(
-            check
-                .hint
-                .as_deref()
-                .is_some_and(|hint| hint.contains("2025_02_17"))
-        );
+        let hint = check
+            .hint
+            .as_deref()
+            .ok_or_else(|| std::io::Error::other("Ubuntu passt failure should have a hint"))?;
+        for required in [
+            "sudo apt-get install -y build-essential ca-certificates git",
+            "https://passt.top/passt",
+            "2025_02_17.a1e48a0",
+            "a1e48a02ff3550eb7875a7df6726086e9b3a1213",
+            "sudo install -m0755 passt /usr/local/bin/passt",
+        ] {
+            assert!(hint.contains(required), "missing {required:?} in {hint:?}");
+        }
         Ok(())
     }
 

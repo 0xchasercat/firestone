@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import sys
 import unittest
@@ -151,6 +152,96 @@ class RedirectPolicyTests(unittest.TestCase):
                 {},
                 "https://mirror.example/fedora/image",
             )
+
+
+class CatalogPolicyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        catalog = Path(__file__).parents[2] / "catalog" / "images.toml"
+        self.images = validator.load_catalog(catalog)
+
+    def test_linux_mvp_catalog_policy_accepts_built_in_entries(self) -> None:
+        validator.validate_authorized_catalog(self.images)
+
+    def test_catalog_policy_rejects_missing_compile_only_aarch64_source(self) -> None:
+        images = copy.deepcopy(self.images)
+        images[0]["arch"].pop("aarch64")
+
+        with self.assertRaisesRegex(
+            validator.ValidationError,
+            "arch tables must be exactly",
+        ):
+            validator.validate_authorized_catalog(images)
+
+    def test_linux_mvp_catalog_policy_rejects_moving_source(self) -> None:
+        images = copy.deepcopy(self.images)
+        images[0]["arch"]["x86_64"]["url"] = (
+            "https://cloud-images.ubuntu.com/noble/current/image.img"
+        )
+
+        with self.assertRaisesRegex(
+            validator.ValidationError,
+            "moving path component 'current'",
+        ):
+            validator.validate_authorized_catalog(images)
+
+    def test_linux_mvp_catalog_policy_rejects_extra_release(self) -> None:
+        images = copy.deepcopy(self.images)
+        extra = copy.deepcopy(images[-1])
+        extra["version"] = "45"
+        images.append(extra)
+
+        with self.assertRaisesRegex(
+            validator.ValidationError,
+            "catalog references must be exactly",
+        ):
+            validator.validate_authorized_catalog(images)
+
+
+class VendorMetadataTests(unittest.TestCase):
+    def test_fedora_current_generic_release_matches_catalog_source(self) -> None:
+        image_url = (
+            "https://download.fedoraproject.org/pub/fedora/linux/releases/44/"
+            "Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2"
+        )
+        checksum_url = (
+            "https://download.fedoraproject.org/pub/fedora/linux/releases/44/"
+            "Cloud/x86_64/images/Fedora-Cloud-44-1.7-x86_64-CHECKSUM"
+        )
+        digest = "ab" * 32
+        document = [
+            {
+                "version": "43",
+                "arch": "x86_64",
+                "variant": "Cloud",
+                "subvariant": "Cloud_Base",
+                "link": "https://example.invalid/43.qcow2",
+                "sha256": "cd" * 32,
+            },
+            {
+                "version": "44",
+                "arch": "x86_64",
+                "variant": "Cloud",
+                "subvariant": "Cloud_Base",
+                "link": image_url,
+                "sha256": digest,
+            },
+        ]
+
+        fact, observed = validator.fedora_release_metadata(
+            "fedora:44", image_url, checksum_url, document
+        )
+
+        self.assertEqual(fact, "Fedora releases.json stable build 44-1.7")
+        self.assertEqual(observed, digest)
+
+    def test_strict_https_rejects_query_and_fragment(self) -> None:
+        for url in (
+            "https://example.invalid/image?mutable=1",
+            "https://example.invalid/image#fragment",
+        ):
+            with self.subTest(url=url):
+                with self.assertRaises(validator.ValidationError):
+                    validator.require_https(url, "source")
 
 
 if __name__ == "__main__":
