@@ -4,12 +4,12 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 
 ## Current position
 
-- Milestone: M3, network and folders; M0 through M2 are complete
-- Baseline: Linux x86_64 cold/warm run, SSH readiness, shell, console attach/reattach, and M2 KVM acceptance pass through pinned Cloud Hypervisor v53 + edk2
+- Milestone: M4 implementation; M0 through M2 are complete, M3 code is merged, and M3 KVM acceptance is externally blocked
+- Baseline: Linux x86_64 lifecycle, SSH, console, passt/tap/virtiofs plans, cloud-init layering, and sidecar supervision are implemented through pinned dependencies
 - Linux validation host: `firestone@172.203.242.136`, Ubuntu 24.04 x86_64, `/dev/kvm` present
 - Required local gate: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`
 - Required integration gate: the same commands on the Linux host
-- M2 acceptance: E2E 2 and 10, empty-home root prompt, and verify 11, 13, 17 are green; warm run measured 0.379 s
+- M3 blocker: draft PR #25 contains the complete gated harness, but three bounded SSH attempts to the only KVM host timed out; E2E 3, 4, 8 and verify 7, 8, 14, 16 remain open
 
 ## Work queue
 
@@ -39,7 +39,10 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 | M3-02 | Virtiofsd mount plans and VmConfig mapping | `agent/m3-virtiofs` | [#22](https://github.com/0xchasercat/firestone/pull/22) | complete | M2 | Exact pinned virtiofsd commands, tags, read-only mapping, ownership, and bounded errors pass without KVM |
 | M3-03 | User cloud-init parts, SSH keys, and instance identity | `agent/m3-cloudinit` | [#21](https://github.com/0xchasercat/firestone/pull/21) | complete | M2 | Canonical user-first MIME, bounded path inputs, key de-duplication/order, network-config publication, exact byte identities, target cloud-init merge evidence, and deterministic seed goldens pass |
 | M3-04 | Network/filesystem sidecars and CLI lifecycle integration | `agent/m3-sidecars` | [#24](https://github.com/0xchasercat/firestone/pull/24) | complete | M3-01 through M3-03 | Exact prepared plans drive VmConfig/results; shim launch, rollback, degradation, VMM-first stop, identity-safe reaping, and Linux recovery cover passt plus ordered virtiofsd sidecars; local stable/1.85 and final-head Ubuntu x86_64 CI pass, while pinned KVM reruns remain M3-05 |
-| M3-05 | M3 Linux KVM integration | `agent/m3-integration` | pending | ready | M3-01 through M3-04 | E2E 3, 4, 8 and verify 7, 8, 10, 14, 15, 16 close |
+| M3-05 | M3 Linux KVM integration | `agent/m3-integration` | [draft #25](https://github.com/0xchasercat/firestone/pull/25) | blocked | M3-01 through M3-04 | Harness/static gates pass; E2E 3, 4, 8 and verify 7, 8, 14, 16 await a reachable KVM host; verify 10 and 15 remain resolved |
+| M4-01 | Axum REST router, routes, streaming, and error mapping | `agent/m4-api` | pending | ready | M3-04 | Every SPEC route projects shared actions/results, NDJSON framing and limits are exact, and handler tests pass with a mocked Dispatcher |
+| M4-02 | Serve CLI and HTTP runtime integration | `agent/m4-serve` | pending | blocked | M4-01 | Bind policy, graceful shutdown, cancellation, concurrency, deterministic errors, and CLI lifecycle smoke pass |
+| M4-03 | M4 REST equivalence and E2E integration | `agent/m4-integration` | pending | blocked | M4-01, M4-02 | E2E 9 passes and REST Result payloads are byte-equal to CLI --json for the same actions |
 
 ## Merge order
 
