@@ -9,8 +9,8 @@ use serde_json::{Map, Value};
 
 use crate::{
     Arch, CatalogFirmware, DependencyManifest, ErrorKind, FirestoneError, Firmware, MacAddr,
-    MachineSpec, MachineState, NetMode, NetworkPlan, Paths, atomic,
-    virtiofs::CloudHypervisorFsConfig,
+    MachineSpec, MachineState, MountSpec, NetMode, NetworkPlan, Paths, VirtiofsPlan, atomic,
+    virtiofs::{VIRTIOFS_NUM_QUEUES, VIRTIOFS_QUEUE_SIZE, validated_vm_fs_identity},
 };
 
 /// Inputs already resolved by image and state preparation before VMM creation.
@@ -65,7 +65,7 @@ struct VmConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     net: Option<Vec<NetConfig>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    fs: Option<Vec<CloudHypervisorFsConfig>>,
+    fs: Option<Vec<FsConfig>>,
     vsock: VsockConfig,
     serial: SerialConfig,
     console: ConsoleConfig,
@@ -149,6 +149,43 @@ impl NetConfig {
                 vhost_socket: None,
                 vhost_mode: None,
             }]),
+        })
+    }
+}
+
+/// Exact Cloud Hypervisor v53 `FsConfig` shape. v53 has no DAX or read-only field.
+#[derive(Debug, Serialize)]
+pub struct FsConfig {
+    tag: String,
+    socket: PathBuf,
+    num_queues: usize,
+    queue_size: u16,
+}
+
+impl FsConfig {
+    /// Maps one validated virtiofsd plan to the exact v53 filesystem fields.
+    #[must_use]
+    pub fn from_plan(plan: &VirtiofsPlan) -> Self {
+        Self {
+            tag: plan.tag().to_owned(),
+            socket: plan.socket().to_path_buf(),
+            num_queues: VIRTIOFS_NUM_QUEUES,
+            queue_size: VIRTIOFS_QUEUE_SIZE,
+        }
+    }
+
+    fn from_mount(
+        paths: &Paths,
+        name: &str,
+        index: usize,
+        mount: &MountSpec,
+    ) -> Result<Self, FirestoneError> {
+        let (tag, socket) = validated_vm_fs_identity(paths, name, index, mount)?;
+        Ok(Self {
+            tag,
+            socket,
+            num_queues: VIRTIOFS_NUM_QUEUES,
+            queue_size: VIRTIOFS_QUEUE_SIZE,
         })
     }
 }
@@ -321,9 +358,7 @@ fn base_vm_config(
                 .mounts
                 .iter()
                 .enumerate()
-                .map(|(index, mount)| {
-                    CloudHypervisorFsConfig::from_mount(paths, input.name, index, mount)
-                })
+                .map(|(index, mount)| FsConfig::from_mount(paths, input.name, index, mount))
                 .collect::<Result<Vec<_>, FirestoneError>>()?,
         )
     };

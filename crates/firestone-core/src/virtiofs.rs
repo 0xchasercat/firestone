@@ -1,6 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
-    env,
+    collections::HashMap,
     ffi::OsString,
     fs,
     os::unix::{
@@ -12,8 +11,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-
-use serde::Serialize;
 
 use crate::{Arch, Cmd, DependencyManifest, ErrorKind, FirestoneError, MountSpec, Paths};
 
@@ -34,8 +31,8 @@ pub const VIRTIOFS_QUEUE_SIZE: u16 = 1024;
 
 const VIRTIOFSD_SOCKET_MODE: u32 = 0o700;
 const VIRTIOFSD_PID_MODE: u32 = 0o600;
-pub const DEFAULT_SOCKET_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
-pub const DEFAULT_SOCKET_READINESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+pub const DEFAULT_VIRTIOFS_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_VIRTIOFS_READINESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Isolation selected after the user-namespace doctor check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,19 +63,19 @@ impl VirtiofsSandbox {
 
 /// Sidecar cancellation behavior while its listening socket is pending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SocketCancellationPolicy {
+pub enum VirtiofsCancellationPolicy {
     AbortLaunch,
 }
 
 /// Validated bounds for one sidecar socket publication wait.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SocketReadinessPlan {
+pub struct VirtiofsReadinessPlan {
     timeout: Duration,
     poll_interval: Duration,
-    cancellation: SocketCancellationPolicy,
+    cancellation: VirtiofsCancellationPolicy,
 }
 
-impl SocketReadinessPlan {
+impl VirtiofsReadinessPlan {
     pub fn new(timeout: Duration, poll_interval: Duration) -> Result<Self, FirestoneError> {
         if timeout.is_zero() {
             return Err(FirestoneError::new(
@@ -97,7 +94,7 @@ impl SocketReadinessPlan {
         Ok(Self {
             timeout,
             poll_interval,
-            cancellation: SocketCancellationPolicy::AbortLaunch,
+            cancellation: VirtiofsCancellationPolicy::AbortLaunch,
         })
     }
 
@@ -112,17 +109,17 @@ impl SocketReadinessPlan {
     }
 
     #[must_use]
-    pub const fn cancellation(self) -> SocketCancellationPolicy {
+    pub const fn cancellation(self) -> VirtiofsCancellationPolicy {
         self.cancellation
     }
 }
 
-impl Default for SocketReadinessPlan {
+impl Default for VirtiofsReadinessPlan {
     fn default() -> Self {
         Self {
-            timeout: DEFAULT_SOCKET_READINESS_TIMEOUT,
-            poll_interval: DEFAULT_SOCKET_READINESS_POLL_INTERVAL,
-            cancellation: SocketCancellationPolicy::AbortLaunch,
+            timeout: DEFAULT_VIRTIOFS_READINESS_TIMEOUT,
+            poll_interval: DEFAULT_VIRTIOFS_READINESS_POLL_INTERVAL,
+            cancellation: VirtiofsCancellationPolicy::AbortLaunch,
         }
     }
 }
@@ -138,11 +135,10 @@ pub struct VirtiofsPlan {
     sandbox: VirtiofsSandbox,
     program: PathBuf,
     args: Vec<OsString>,
-    environment: BTreeMap<OsString, OsString>,
     socket: PathBuf,
     pid_file: PathBuf,
     log: PathBuf,
-    readiness: SocketReadinessPlan,
+    readiness: VirtiofsReadinessPlan,
     owner_uid: u32,
 }
 
@@ -188,11 +184,6 @@ impl VirtiofsPlan {
     }
 
     #[must_use]
-    pub fn environment(&self) -> &BTreeMap<OsString, OsString> {
-        &self.environment
-    }
-
-    #[must_use]
     pub fn socket(&self) -> &Path {
         &self.socket
     }
@@ -207,7 +198,7 @@ impl VirtiofsPlan {
         &self.log
     }
     #[must_use]
-    pub const fn readiness(&self) -> SocketReadinessPlan {
+    pub const fn readiness(&self) -> VirtiofsReadinessPlan {
         self.readiness
     }
 
@@ -224,18 +215,14 @@ impl VirtiofsPlan {
     /// Builds the shared process wrapper without starting the sidecar.
     #[must_use]
     pub fn command(&self) -> Cmd {
-        let mut command = Cmd::new(self.program.as_os_str())
+        Cmd::new(self.program.as_os_str())
             .args(self.args.clone())
             .cwd("/")
-            .env_clear()
+            .reduced_environment()
             .stdin_null()
             .stdout_append(&self.log)
             .stderr_append(&self.log)
-            .error_kind(ErrorKind::Dependency);
-        for (key, value) in &self.environment {
-            command = command.env(key, value);
-        }
-        command
+            .error_kind(ErrorKind::Dependency)
     }
 
     /// Waits for the pinned daemon's pid file and listening socket publication.
@@ -324,33 +311,17 @@ struct MountShape {
     guest: PathBuf,
 }
 
-/// Exact Cloud Hypervisor v53 `FsConfig` shape. v53 has no DAX field.
-#[derive(Debug, Serialize)]
-pub(crate) struct CloudHypervisorFsConfig {
-    pub(crate) tag: String,
-    pub(crate) socket: PathBuf,
-    pub(crate) num_queues: usize,
-    pub(crate) queue_size: u16,
-}
-
-impl CloudHypervisorFsConfig {
-    pub(crate) fn from_mount(
-        paths: &Paths,
-        name: &str,
-        index: usize,
-        mount: &MountSpec,
-    ) -> Result<Self, FirestoneError> {
-        let tag = mount.effective_tag(index);
-        validate_tag(&tag, index)?;
-        let socket = paths.machine_fs_socket(name, index)?;
-        validate_socket_path(&socket)?;
-        Ok(Self {
-            tag,
-            socket,
-            num_queues: VIRTIOFS_NUM_QUEUES,
-            queue_size: VIRTIOFS_QUEUE_SIZE,
-        })
-    }
+pub(crate) fn validated_vm_fs_identity(
+    paths: &Paths,
+    name: &str,
+    index: usize,
+    mount: &MountSpec,
+) -> Result<(String, PathBuf), FirestoneError> {
+    let tag = mount.effective_tag(index);
+    validate_tag(&tag, index)?;
+    let socket = paths.machine_fs_socket(name, index)?;
+    validate_socket_path(&socket)?;
+    Ok((tag, socket))
 }
 
 /// Validates every mount and builds one sidecar plan in declaration order.
@@ -372,7 +343,7 @@ pub fn prepare_virtiofs_plans(
         architecture,
         mounts,
         sandbox,
-        SocketReadinessPlan::default(),
+        VirtiofsReadinessPlan::default(),
     )
 }
 
@@ -383,7 +354,7 @@ pub fn prepare_virtiofs_plans_with_readiness(
     architecture: Arch,
     mounts: &[MountSpec],
     sandbox: VirtiofsSandbox,
-    readiness: SocketReadinessPlan,
+    readiness: VirtiofsReadinessPlan,
 ) -> Result<Vec<VirtiofsPlan>, FirestoneError> {
     let shapes = mount_shapes(mounts)?;
     if shapes.is_empty() {
@@ -403,7 +374,6 @@ pub fn prepare_virtiofs_plans_with_readiness(
         false,
     )?;
 
-    let environment = reduced_environment();
     let mut plans = Vec::with_capacity(mounts.len());
     let mut canonical_hosts = Vec::<PathBuf>::with_capacity(mounts.len());
 
@@ -458,7 +428,6 @@ pub fn prepare_virtiofs_plans_with_readiness(
             sandbox,
             program: program.clone(),
             args,
-            environment: environment.clone(),
             socket,
             pid_file,
             log,
@@ -839,27 +808,6 @@ fn validate_absent_runtime_node(path: &Path, tag: &str, label: &str) -> Result<(
     }
 }
 
-fn reduced_environment() -> BTreeMap<OsString, OsString> {
-    let mut environment = BTreeMap::new();
-    for key in [
-        "PATH",
-        "HOME",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-        "XDG_RUNTIME_DIR",
-    ] {
-        if let Some(value) = env::var_os(key).filter(|value| !value.is_empty()) {
-            environment.insert(OsString::from(key), value);
-        }
-    }
-    for (key, value) in env::vars_os() {
-        if key.as_os_str().as_bytes().starts_with(b"FIRESTONE_") {
-            environment.insert(key, value);
-        }
-    }
-    environment
-}
-
 fn validate_runtime_parent(path: &Path, uid: u32, tag: &str) -> Result<(), FirestoneError> {
     let parent = path.parent().ok_or_else(|| {
         FirestoneError::new(
@@ -993,16 +941,16 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use serde_json::json;
     use tempfile::TempDir;
 
-    use crate::{Arch, DependencyManifest, ErrorKind, MountSpec, PathInputs, Paths};
+    use crate::{Arch, DependencyManifest, ErrorKind, FsConfig, MountSpec, PathInputs, Paths};
 
     use super::{
-        DEFAULT_SOCKET_READINESS_POLL_INTERVAL, DEFAULT_SOCKET_READINESS_TIMEOUT,
-        MAX_VIRTIOFS_MOUNTS, SocketCancellationPolicy, SocketReadinessPlan,
-        VHOST_USER_SOCKET_MAX_BYTES, VIRTIOFS_NUM_QUEUES, VIRTIOFS_QUEUE_SIZE,
-        VIRTIOFS_TAG_MAX_BYTES, VirtiofsPlan, VirtiofsSandbox, prepare_virtiofs_plans,
-        validate_host_leaf, validate_socket_path,
+        DEFAULT_VIRTIOFS_READINESS_POLL_INTERVAL, DEFAULT_VIRTIOFS_READINESS_TIMEOUT,
+        MAX_VIRTIOFS_MOUNTS, VHOST_USER_SOCKET_MAX_BYTES, VIRTIOFS_NUM_QUEUES, VIRTIOFS_QUEUE_SIZE,
+        VIRTIOFS_TAG_MAX_BYTES, VirtiofsCancellationPolicy, VirtiofsPlan, VirtiofsReadinessPlan,
+        VirtiofsSandbox, prepare_virtiofs_plans, validate_host_leaf, validate_socket_path,
     };
 
     struct Fixture {
@@ -1143,7 +1091,9 @@ env
                 "warn".into(),
             ]
         );
-        assert!(plan.environment().keys().all(|key| {
+        let command = plan.command();
+        assert!(command.clears_environment());
+        assert!(command.environment().keys().all(|key| {
             matches!(
                 key.to_str(),
                 Some("PATH" | "HOME" | "XDG_CONFIG_HOME" | "XDG_DATA_HOME" | "XDG_RUNTIME_DIR")
@@ -1163,7 +1113,8 @@ env
         let mount = fixture.mount("source", "/work", false)?;
         let plans = fixture.plans(&[mount], VirtiofsSandbox::Namespace)?;
         let plan = &plans[0];
-        let output = plan.command().run()?;
+        let command = plan.command();
+        let output = command.run()?;
         let stdout = String::from_utf8(output.stdout().to_vec())?;
         let expected_args = plan
             .args()
@@ -1174,7 +1125,7 @@ env
 
         assert!(stdout.starts_with(&format!("{expected_args}\n")));
         assert!(stdout.contains("CARGO_MANIFEST_DIR=unset\n"));
-        for (key, value) in plan.environment() {
+        for (key, value) in command.environment() {
             assert!(stdout.contains(&format!(
                 "{}={}\n",
                 key.to_string_lossy(),
@@ -1222,6 +1173,28 @@ env
         );
         assert_eq!(rw_plan.num_queues(), ro_plan.num_queues());
         assert_eq!(rw_plan.queue_size(), ro_plan.queue_size());
+        Ok(())
+    }
+
+    #[test]
+    fn plan_maps_to_exact_v53_fs_config_without_readonly_or_dax()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let mut mount = fixture.mount("source", "/work", true)?;
+        mount.tag = Some("source".to_owned());
+        let plan = fixture
+            .plans(&[mount], VirtiofsSandbox::Namespace)?
+            .remove(0);
+
+        assert_eq!(
+            serde_json::to_value(FsConfig::from_plan(&plan))?,
+            json!({
+                "tag": "source",
+                "socket": plan.socket(),
+                "num_queues": 1,
+                "queue_size": 1024
+            })
+        );
         Ok(())
     }
 
@@ -1568,16 +1541,19 @@ env
             (Duration::from_secs(1), Duration::ZERO),
             (Duration::from_millis(1), Duration::from_millis(2)),
         ] {
-            let error = SocketReadinessPlan::new(timeout, poll)
+            let error = VirtiofsReadinessPlan::new(timeout, poll)
                 .err()
                 .ok_or("accepted invalid readiness bounds")?;
             assert_eq!(error.kind(), ErrorKind::InvalidSpec);
         }
 
-        let plan = SocketReadinessPlan::default();
-        assert_eq!(plan.timeout(), DEFAULT_SOCKET_READINESS_TIMEOUT);
-        assert_eq!(plan.poll_interval(), DEFAULT_SOCKET_READINESS_POLL_INTERVAL);
-        assert_eq!(plan.cancellation(), SocketCancellationPolicy::AbortLaunch);
+        let plan = VirtiofsReadinessPlan::default();
+        assert_eq!(plan.timeout(), DEFAULT_VIRTIOFS_READINESS_TIMEOUT);
+        assert_eq!(
+            plan.poll_interval(),
+            DEFAULT_VIRTIOFS_READINESS_POLL_INTERVAL
+        );
+        assert_eq!(plan.cancellation(), VirtiofsCancellationPolicy::AbortLaunch);
         Ok(())
     }
 
