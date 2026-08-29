@@ -494,9 +494,14 @@ exit "${FAKE_SSH_EXIT-0}"
     let mut cancelling = cancel_command.spawn()?;
     let start_deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Ok(bytes) = fs::read(&cancel_state)
-            && serde_json::from_slice::<serde_json::Value>(&bytes)?["status"] == "starting"
-        {
+        let starting = match fs::read(&cancel_state) {
+            Ok(bytes) => {
+                serde_json::from_slice::<serde_json::Value>(&bytes)?["status"] == "starting"
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => false,
+            Err(source) => return Err(source.into()),
+        };
+        if starting {
             break;
         }
         if Instant::now() >= start_deadline {
