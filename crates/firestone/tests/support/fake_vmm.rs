@@ -60,6 +60,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         std::thread::sleep(std::time::Duration::from_secs(30));
         return Ok(());
     }
+    if options.behavior == "delayed-ready" {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
 
     if let Some(pid_path) = &options.descendant_pid {
         let child_pid = if options.behavior == "thread-descendant" {
