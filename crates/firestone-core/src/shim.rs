@@ -1188,6 +1188,7 @@ impl OwnedStatusResponse {
 
 /// Runs the dedicated shim process until stop, signal, or VMM exit.
 pub fn run_shim(paths: &Paths, name: &str) -> Result<(), FirestoneError> {
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
     enter_shim_session()?;
     #[cfg(target_os = "linux")]
     nix::sys::prctl::set_child_subreaper(true).map_err(|source| {

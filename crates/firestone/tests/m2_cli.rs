@@ -27,8 +27,13 @@ const CONSOLE_CONNECTED: &[u8] = "connected to m2 console · escape: Ctrl-]".as_
 type TestResult = Result<(), Box<dyn Error>>;
 
 fn firestone(home: &Path, path: &OsString) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_firestone"));
-    command.arg("--home").arg(home).env("PATH", path);
+    let mut command = Command::new("sh");
+    command
+        .args(["-c", "umask 002; exec \"$@\"", "firestone-test"])
+        .arg(env!("CARGO_BIN_EXE_firestone"))
+        .arg("--home")
+        .arg(home)
+        .env("PATH", path);
     command
 }
 
@@ -329,7 +334,12 @@ exit "${FAKE_SSH_EXIT-0}"
         &["printf one argument", "--remote-flag"],
         "37",
     )?;
-    assert_eq!(run.status.code(), Some(37));
+    assert_eq!(
+        run.status.code(),
+        Some(37),
+        "run stderr:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
     assert!(
         run.stdout.is_empty(),
         "run leaked intermediate Results to stdout"
