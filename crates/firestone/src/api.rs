@@ -35,7 +35,7 @@ const DEFAULT_LOG_LINES: u32 = 200;
 const EVENT_BUFFER_CAPACITY: usize = 16;
 const JSON_CONTENT_TYPE: &str = "application/json";
 const NDJSON_CONTENT_TYPE: &str = "application/x-ndjson";
-const TEXT_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
+const TEXT_CONTENT_TYPE: &str = "text/plain";
 const INTERNAL_ERROR_JSON: &[u8] = br#"{"error":{"kind":"generic","message":"the REST adapter could not serialize a response","hint":"retry the request; if it fails again, report a Firestone bug"}}"#;
 const INTERNAL_ERROR_NDJSON: &[u8] = br#"{"error":{"kind":"generic","message":"the REST adapter could not serialize a response","hint":"retry the request; if it fails again, report a Firestone bug"}}
 "#;
