@@ -40,7 +40,7 @@ pub use console::{
     ConsoleBroker, ConsolePlan, ConsoleResult, RawTerminal, console_plan, relay_console,
 };
 pub use deps::{DependencyArtifact, DependencyManifest};
-pub use dispatcher::{DispatchFuture, Dispatcher, EventSink};
+pub use dispatcher::{DispatchFuture, Dispatcher, EventSink, block_on};
 pub use doctor::{
     DoctorCheck, DoctorCheckId, DoctorContext, DoctorReport, DoctorStatus,
     read_reconciled_machine_state_live, read_reconciled_machine_state_live_locked, run_doctor,
@@ -63,7 +63,8 @@ pub use paths::{PathInputs, Paths};
 pub use readiness::{ReadinessOptions, wait_for_ssh_ready};
 pub use result::{
     LogsResult, MachineRecord, MachineSummary, MachineView, RemoveResult, RunResult, ShellResult,
-    SpecResult, SpecWarningPayload, SshConfigResult, StartResult, StopResult,
+    SpecResult, SpecWarningPayload, SshConfigResult, StartResult, StopResult, VersionPaths,
+    VersionResult,
 };
 pub use shim::{
     PreparedStart, ShimClient, ShimPids, ShimStatus, ShimTimeouts, cancel_prepared,

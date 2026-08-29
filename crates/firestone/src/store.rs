@@ -21,9 +21,10 @@ use firestone_core::{
     MachineSpecPatch, MachineState, MachineStatus, MachineSummary, MachineView, Paths,
     ReadinessOptions, RealValidationHost, RemoveResult, ShimClient, ShimTimeouts, SpecResult,
     SpecWarningPayload, StartResult, StateImage, StateStore, StateVersion, StopResult, Supervision,
-    ValidationContext, atomic, cancel_prepared, launch_prepared_cancellable, prepare_start,
-    read_reconciled_machine_state_live, read_reconciled_machine_state_live_locked, run_doctor,
-    stop_unsupervised, wait_for_ssh_ready,
+    ValidationContext, VersionPaths, VersionResult, atomic, cancel_prepared,
+    launch_prepared_cancellable, prepare_start, read_reconciled_machine_state_live,
+    read_reconciled_machine_state_live_locked, run_doctor, stop_unsupervised,
+    validate_machine_spec, wait_for_ssh_ready,
 };
 
 const SPEC_TEMPLATE: &str = include_str!("../../../templates/firestone.toml");
@@ -284,11 +285,13 @@ impl LocalDispatcher {
     fn create_internal(
         &self,
         name: &str,
-        spec: MachineSpec,
+        mut spec: MachineSpec,
         edit: bool,
         events: &mut dyn EventSink,
     ) -> Result<(), FirestoneError> {
         let machine_dir = self.paths.machine_dir(name)?;
+        let warnings = self.validate_action_spec(&mut spec, None)?;
+        emit_spec_warnings(&warnings, events)?;
         let machines_dir = self.paths.machines_dir();
         self.paths
             .ensure_owned_data_directory(self.paths.data_dir(), "data directory", true)?;
@@ -513,7 +516,7 @@ impl LocalDispatcher {
     fn set_spec(
         &self,
         name: &str,
-        spec: MachineSpec,
+        mut spec: MachineSpec,
         events: &mut dyn EventSink,
     ) -> Result<(), FirestoneError> {
         self.validate_machine_storage()?;
@@ -523,17 +526,82 @@ impl LocalDispatcher {
         let lock = MachineLock::acquire(name, &lock_path, events)?;
         ensure_machine_exists(&self.paths, name, &machine_dir)?;
         let observed_state = self.read_live_state_locked(name, &lock)?;
+        let pinned_image_ref = pinned_image_reference(&observed_state.state);
+        let warnings = self.validate_action_spec(&mut spec, pinned_image_ref)?;
         let document = render_spec(&spec)?;
         atomic::write(&self.paths.machine_spec(name)?, document.as_bytes())?;
         emit_running_spec_warning(&observed_state.state, events)?;
+        emit_spec_warnings(&warnings, events)?;
+        emit_result(events, "edit", &SpecResult { spec, warnings })
+    }
+
+    fn patch_spec(
+        &self,
+        name: &str,
+        patch: &MachineSpecPatch,
+        events: &mut dyn EventSink,
+    ) -> Result<(), FirestoneError> {
+        self.validate_machine_storage()?;
+        let machine_dir = self.paths.machine_dir(name)?;
+        ensure_machine_exists(&self.paths, name, &machine_dir)?;
+        let lock_path = self.paths.machine_lock(name)?;
+        let lock = MachineLock::acquire(name, &lock_path, events)?;
+        ensure_machine_exists(&self.paths, name, &machine_dir)?;
+        let observed_state = self.read_live_state_locked(name, &lock)?;
+        let source = read_file(
+            &self.paths.machine_spec(name)?,
+            "machine spec",
+            ErrorKind::NotFound,
+        )?;
+        let text = std::str::from_utf8(&source).map_err(|source| {
+            FirestoneError::new(
+                ErrorKind::InvalidSpec,
+                format!("machine spec for {name:?} is not UTF-8"),
+            )
+            .with_hint("save firestone.toml as UTF-8 TOML")
+            .with_source(source)
+        })?;
+        let loaded = self.load_spec_text_with_patch(
+            text,
+            &machine_dir,
+            &self.source_base,
+            pinned_image_reference(&observed_state.state),
+            patch,
+        )?;
+        let warnings = loaded
+            .warnings
+            .iter()
+            .map(SpecWarningPayload::from)
+            .collect::<Vec<_>>();
+        let document = render_spec(&loaded.spec)?;
+        atomic::write(&self.paths.machine_spec(name)?, document.as_bytes())?;
+        emit_running_spec_warning(&observed_state.state, events)?;
+        emit_spec_warnings(&warnings, events)?;
         emit_result(
             events,
             "edit",
             &SpecResult {
-                spec,
-                warnings: Vec::new(),
+                spec: loaded.spec,
+                warnings,
             },
         )
+    }
+
+    fn validate_action_spec(
+        &self,
+        spec: &mut MachineSpec,
+        pinned_image_ref: Option<&str>,
+    ) -> Result<Vec<SpecWarningPayload>, FirestoneError> {
+        let host = RealValidationHost::new();
+        let context = ValidationContext::new(&host, &self.paths, &self.source_base, &self.catalog);
+        let context = match pinned_image_ref {
+            Some(reference) => context.with_pinned_image_ref(reference),
+            None => context,
+        };
+        Ok(validate_machine_spec(spec, &context)?
+            .iter()
+            .map(SpecWarningPayload::from)
+            .collect())
     }
 
     fn read_live_state(&self, name: &str) -> Result<LiveMachineState, FirestoneError> {
@@ -589,19 +657,30 @@ impl LocalDispatcher {
         patch_base_dir: &Path,
         pinned_image_ref: Option<&str>,
     ) -> Result<firestone_core::LoadedMachineSpec, FirestoneError> {
+        self.load_spec_text_with_patch(
+            text,
+            machine_dir,
+            patch_base_dir,
+            pinned_image_ref,
+            &MachineSpecPatch::default(),
+        )
+    }
+
+    fn load_spec_text_with_patch(
+        &self,
+        text: &str,
+        machine_dir: &Path,
+        patch_base_dir: &Path,
+        pinned_image_ref: Option<&str>,
+        patch: &MachineSpecPatch,
+    ) -> Result<firestone_core::LoadedMachineSpec, FirestoneError> {
         let host = RealValidationHost::new();
         let context = ValidationContext::new(&host, &self.paths, machine_dir, &self.catalog);
         let context = match pinned_image_ref {
             Some(reference) => context.with_pinned_image_ref(reference),
             None => context,
         };
-        MachineSpec::load(
-            text,
-            &self.global,
-            &MachineSpecPatch::default(),
-            patch_base_dir,
-            &context,
-        )
+        MachineSpec::load(text, &self.global, patch, patch_base_dir, &context)
     }
     fn doctor(&self, fix: bool, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
         let hostname = env::var("HOSTNAME")
@@ -616,6 +695,23 @@ impl LocalDispatcher {
         );
         let report = run_doctor(&context, fix)?;
         emit_result(events, "doctor", &report)
+    }
+
+    fn version(&self, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
+        let manifest = DependencyManifest::bundled()?;
+        emit_result(
+            events,
+            "version",
+            &VersionResult {
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+                deps: manifest.versions(),
+                paths: VersionPaths {
+                    config: self.paths.config_dir().display().to_string(),
+                    data: self.paths.data_dir().display().to_string(),
+                    runtime: self.paths.runtime_dir().display().to_string(),
+                },
+            },
+        )
     }
 
     fn machine_names(&self) -> Result<Vec<String>, FirestoneError> {
@@ -1280,6 +1376,9 @@ impl LocalDispatcher {
             )
         })?;
         loop {
+            if events.is_cancelled() {
+                return Ok(());
+            }
             if cancelled.load(Ordering::Relaxed) {
                 return Err(FirestoneError::new(
                     ErrorKind::Interrupted,
@@ -1424,6 +1523,7 @@ impl Dispatcher for LocalDispatcher {
                     }
                 }
                 Action::SetSpec { name, spec } => self.set_spec(&name, spec, events),
+                Action::PatchSpec { name, patch } => self.patch_spec(&name, &patch, events),
                 Action::Logs {
                     name,
                     source,
@@ -1436,13 +1536,17 @@ impl Dispatcher for LocalDispatcher {
                 Action::ImageInspect { id } => self.image_inspect(&id, events),
                 Action::ImagePrune => self.image_prune(events),
                 Action::Doctor { fix } => self.doctor(fix, events),
-                Action::PatchSpec { .. } | Action::Version => Err(FirestoneError::new(
-                    ErrorKind::Usage,
-                    "this action is not implemented by the M1 local dispatcher",
-                )
-                .with_hint("use a supported lifecycle, image, machine, or doctor action")),
+                Action::Version => self.version(events),
             }
         })
+    }
+}
+
+fn pinned_image_reference(state: &MachineState) -> Option<&str> {
+    if state.image.id.is_some() && state.image.sha256.is_some() {
+        Some(state.image.r#ref.as_str())
+    } else {
+        None
     }
 }
 
@@ -2078,8 +2182,9 @@ mod tests {
 
     use firestone_core::{
         Action, Catalog, Dispatcher, ErrorKind, Event, EventSink, FirestoneError, GlobalConfig,
-        ImageRef, LogSource, MachineLock, MachineSpec, MachineSpecPatch, MachineStatus, PathInputs,
-        Paths, RealValidationHost, StateStore, Supervision, ValidationContext,
+        ImageRef, LogSource, MachineLock, MachineSpec, MachineSpecPatch, MachineStatus,
+        NetworkSpecPatch, PathInputs, Paths, RealValidationHost, StateStore, Supervision,
+        ValidationContext,
     };
 
     use super::{
@@ -2164,6 +2269,93 @@ esac
         )?;
         fs::set_permissions(&program, fs::Permissions::from_mode(0o700))?;
         Ok(program)
+    }
+
+    #[tokio::test]
+    async fn patch_spec_appends_validates_and_persists_at_dispatcher_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, _paths) = fixture()?;
+        let mut original = MachineSpec::default();
+        original.network.forward.push("8080:80".parse()?);
+        create_machine(&dispatcher, "patched", original).await?;
+
+        let patch = MachineSpecPatch {
+            cpus: Some(4),
+            network: Some(NetworkSpecPatch {
+                forward: Some(vec!["8081:81".parse()?]),
+                ..NetworkSpecPatch::default()
+            }),
+            ..MachineSpecPatch::default()
+        };
+        let mut events = Vec::new();
+        dispatcher
+            .run(
+                Action::PatchSpec {
+                    name: "patched".to_owned(),
+                    patch,
+                },
+                &mut events,
+            )
+            .await?;
+        assert!(matches!(events.last(), Some(Event::Result { action, .. }) if action == "edit"));
+
+        let (persisted, _) = dispatcher.load_machine("patched")?;
+        assert_eq!(persisted.cpus, 4);
+        assert_eq!(
+            persisted
+                .network
+                .forward
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["8080:80", "8081:81"]
+        );
+
+        let error = dispatcher
+            .run(
+                Action::PatchSpec {
+                    name: "patched".to_owned(),
+                    patch: MachineSpecPatch {
+                        cpus: Some(0),
+                        ..MachineSpecPatch::default()
+                    },
+                },
+                &mut Vec::new(),
+            )
+            .await
+            .err()
+            .ok_or("invalid patch unexpectedly succeeded")?;
+        assert_eq!(error.kind(), ErrorKind::InvalidSpec);
+        assert_eq!(dispatcher.load_machine("patched")?.0, persisted);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn version_action_emits_typed_versions_and_resolved_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        let mut events = Vec::new();
+        dispatcher.run(Action::Version, &mut events).await?;
+        let payload = match events.as_slice() {
+            [Event::Result { action, payload }] if action == "version" => payload,
+            _ => return Err("version did not emit exactly one Result".into()),
+        };
+        assert_eq!(payload["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(payload["deps"]["cloud-hypervisor"], "v53.0");
+        assert_eq!(payload["deps"]["virtiofsd"], "v1.14.0");
+        assert_eq!(
+            payload["paths"]["config"],
+            paths.config_dir().display().to_string()
+        );
+        assert_eq!(
+            payload["paths"]["data"],
+            paths.data_dir().display().to_string()
+        );
+        assert_eq!(
+            payload["paths"]["runtime"],
+            paths.runtime_dir().display().to_string()
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -2748,21 +2940,17 @@ esac
     async fn removed_catalog_machine_requires_complete_pin_before_spec_reload()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_directory, dispatcher, paths) = fixture()?;
-        let mut events = Vec::new();
+        create_machine(&dispatcher, "retired", MachineSpec::default()).await?;
         let spec = MachineSpec {
             image: "retired:1".into(),
             ..MachineSpec::default()
         };
-        dispatcher
-            .run(
-                Action::Create {
-                    name: "retired".to_owned(),
-                    spec,
-                },
-                &mut events,
-            )
-            .await?;
-
+        fs::write(paths.machine_spec("retired")?, spec.to_toml()?)?;
+        let state_path = paths.machine_state("retired")?;
+        let mut state = StateStore::new(state_path.clone()).read()?;
+        state.image.r#ref = "retired:1".to_owned();
+        StateStore::new(state_path.clone()).write_from_shim(&state)?;
+        let mut events = Vec::new();
         let unpinned = dispatcher
             .run(Action::List, &mut events)
             .await
