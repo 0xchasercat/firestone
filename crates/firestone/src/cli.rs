@@ -4,15 +4,15 @@ use std::{
 };
 
 use clap::{ArgAction, Args, Parser, Subcommand, error::ErrorKind};
+use clap_complete::Shell;
 use firestone_core::{
     Arch, ByteSize, CloudInitSpecPatch, Firmware, HumanDuration, ImageRef, LogSource, MacAddr,
     MachineSpecPatch, MountSpec, NetMode, NetworkSpecPatch, PortForward, SpecClear, VmmSpecPatch,
     VsockPort,
 };
-
 /// Firestone's command-line interface.
 #[derive(Debug, Parser)]
-#[command(name = "firestone")]
+#[command(name = "firestone", version)]
 pub struct Cli {
     /// Print events as newline-delimited JSON and disable human output.
     #[arg(long, global = true)]
@@ -99,16 +99,23 @@ pub enum Command {
     /// Check host requirements and optional safe repairs.
     Doctor(DoctorArgs),
 
+    /// Generate a shell completion script on stdout.
+    Completions(CompletionsArgs),
+
     /// Print Firestone, pinned dependency, and resolved path versions.
     Version,
 
     /// Run the stateless REST API over a private Unix socket.
     Serve(ServeArgs),
-
-    /// Relay one SSH ProxyCommand connection through the machine's vsock socket.
-    #[command(name = "_vsock-proxy", hide = true)]
-    VsockProxy(VsockProxyArgs),
 }
+/// Arguments accepted by firestone completions.
+#[derive(Debug, Args)]
+pub struct CompletionsArgs {
+    /// Shell whose completion script should be generated.
+    #[arg(value_enum)]
+    pub shell: Shell,
+}
+
 /// Arguments accepted by firestone serve.
 #[derive(Debug, Args)]
 pub struct ServeArgs {
@@ -197,6 +204,31 @@ pub struct StartArgs {
 pub struct VsockProxyArgs {
     pub name: String,
     pub port: VsockPort,
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "firestone", disable_help_subcommand = true)]
+struct HiddenProxyCli {
+    #[arg(long, global = true, value_name = "DIR")]
+    home: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: HiddenProxyCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum HiddenProxyCommand {
+    #[command(name = "_vsock-proxy")]
+    VsockProxy(VsockProxyArgs),
+}
+
+pub fn parse_hidden_vsock_proxy(
+    arguments: Vec<OsString>,
+) -> Result<(Option<PathBuf>, VsockProxyArgs), clap::Error> {
+    let parsed = HiddenProxyCli::try_parse_from(arguments)?;
+    match parsed.command {
+        HiddenProxyCommand::VsockProxy(arguments) => Ok((parsed.home, arguments)),
+    }
 }
 
 /// Arguments accepted by firestone stop.
@@ -681,7 +713,8 @@ fn parse_vmm_config(value: &str) -> Result<serde_json::Value, String> {
 mod tests {
     use std::{collections::BTreeSet, ffi::OsString, path::PathBuf};
 
-    use clap::{Args as _, CommandFactory as _, Parser as _, error::ErrorKind};
+    use clap::{Args as _, CommandFactory as _, Parser as _, ValueEnum as _, error::ErrorKind};
+    use clap_complete::Shell;
     use firestone_core::{Arch, ByteSize, Firmware, NetMode, SPEC_FIELD_METADATA, SpecClear};
     use serde_json::json;
 
@@ -1371,6 +1404,87 @@ mod tests {
                 "short flag drift for {}",
                 field.key
             );
+        }
+    }
+
+    #[test]
+    fn completions_parser_accepts_every_supported_shell() -> Result<(), clap::Error> {
+        for shell in Shell::value_variants() {
+            let value = shell.to_string();
+            let cli = Cli::try_parse_from(["firestone", "completions", value.as_str()])?;
+            assert!(matches!(
+                cli.command,
+                Command::Completions(arguments) if arguments.shell == *shell
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn completion_scripts_cover_public_grammar_and_exclude_internals() {
+        fn assert_visible_grammar(command: &clap::Command, script: &str, shell: Shell) {
+            for argument in command
+                .get_arguments()
+                .filter(|argument| !argument.is_hide_set())
+            {
+                if let Some(long) = argument.get_long() {
+                    assert!(script.contains(long), "{shell} completion omitted --{long}");
+                }
+                if let Some(aliases) = argument.get_visible_aliases() {
+                    for alias in aliases {
+                        assert!(
+                            script.contains(alias),
+                            "{shell} completion omitted --{alias}"
+                        );
+                    }
+                }
+                if let Some(short) = argument.get_short() {
+                    assert!(
+                        script.contains(short),
+                        "{shell} completion omitted -{short}"
+                    );
+                }
+                if let Some(aliases) = argument.get_visible_short_aliases() {
+                    for alias in aliases {
+                        assert!(
+                            script.contains(alias),
+                            "{shell} completion omitted -{alias}"
+                        );
+                    }
+                }
+            }
+            for subcommand in command
+                .get_subcommands()
+                .filter(|subcommand| !subcommand.is_hide_set())
+            {
+                assert!(
+                    script.contains(subcommand.get_name()),
+                    "{shell} completion omitted {}",
+                    subcommand.get_name()
+                );
+                for alias in subcommand.get_visible_aliases() {
+                    assert!(
+                        script.contains(alias),
+                        "{shell} completion omitted alias {alias}"
+                    );
+                }
+                assert_visible_grammar(subcommand, script, shell);
+            }
+        }
+
+        for shell in Shell::value_variants() {
+            let mut command = Cli::command();
+            let mut first = Vec::new();
+            clap_complete::generate(*shell, &mut command, "firestone", &mut first);
+            let mut command = Cli::command();
+            let mut second = Vec::new();
+            clap_complete::generate(*shell, &mut command, "firestone", &mut second);
+            assert_eq!(first, second, "{shell} completion is not deterministic");
+            let script = String::from_utf8(first).expect("completion output must be UTF-8");
+            assert!(!script.contains("_shim"));
+            assert!(!script.contains("_vsock-proxy"));
+            let command = Cli::command();
+            assert_visible_grammar(&command, &script, *shell);
         }
     }
 

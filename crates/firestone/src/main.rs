@@ -8,7 +8,7 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs, io,
-    io::IsTerminal,
+    io::{IsTerminal, Write as _},
     os::unix::process::ExitStatusExt,
     path::Path,
     process::ExitCode,
@@ -20,7 +20,7 @@ use std::{
     time::Duration,
 };
 
-use clap::{Parser, error::ErrorKind as ClapErrorKind};
+use clap::{CommandFactory as _, Parser, error::ErrorKind as ClapErrorKind};
 use firestone_core::{
     Action, Catalog, Dispatcher, ErrorKind, Event, EventSink, FirestoneError, GlobalConfig,
     ImageRef, MachineSpec, MachineSpecPatch, MachineStatus, PathInputs, Paths, ProcessSignal,
@@ -29,7 +29,10 @@ use firestone_core::{
 };
 
 use crate::{
-    cli::{Cli, Command, CreateRequest, ImageCommand, RunArgs, ShellArgs, derive_machine_name},
+    cli::{
+        Cli, Command, CreateRequest, ImageCommand, RunArgs, ShellArgs, derive_machine_name,
+        parse_hidden_vsock_proxy,
+    },
     render::{RenderOptions, Renderer, error_exit_code},
     store::LocalDispatcher,
 };
@@ -48,6 +51,9 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         };
+    }
+    if hidden_vsock_proxy_requested(&arguments) {
+        return run_hidden_vsock_proxy(arguments);
     }
     let requested_json = requested_flag(&arguments, "--json");
     let requested_quiet = requested_flag(&arguments, "--quiet") || requested_flag(&arguments, "-q");
@@ -79,8 +85,8 @@ fn main() -> ExitCode {
             return ExitCode::from(render_terminal_error(&mut renderer, &error));
         }
     };
-    if matches!(&cli.command, Command::VsockProxy(_)) {
-        return run_hidden_vsock_proxy(cli);
+    if matches!(&cli.command, Command::Completions(_)) {
+        return run_completions(cli);
     }
 
     let stdout = io::stdout();
@@ -96,6 +102,74 @@ fn main() -> ExitCode {
     let result = block_on(run(cli, &mut renderer));
     ExitCode::from(finish_command(result, &mut renderer))
 }
+fn run_completions(cli: Cli) -> ExitCode {
+    let shell = match &cli.command {
+        Command::Completions(arguments) => arguments.shell,
+        _ => return ExitCode::FAILURE,
+    };
+    let mut incompatible = Vec::with_capacity(3);
+    if cli.json {
+        incompatible.push("--json");
+    }
+    if cli.quiet {
+        incompatible.push("--quiet");
+    }
+    if cli.verbose > 0 {
+        incompatible.push("--verbose");
+    }
+    if !incompatible.is_empty() {
+        let stdout = io::stdout();
+        let stderr = io::stderr();
+        let options = render_options(
+            cli.json,
+            cli.quiet,
+            cli.no_color,
+            cli.verbose,
+            stderr.is_terminal(),
+        );
+        let mut renderer = Renderer::new(stdout, stderr, options);
+        let verb = if incompatible.len() == 1 { "is" } else { "are" };
+        let error = FirestoneError::new(
+            ErrorKind::Usage,
+            format!(
+                "{} {verb} not valid with firestone completions",
+                incompatible.join(", ")
+            ),
+        )
+        .with_hint(
+            "remove output-control flags; completions writes only the shell script to stdout",
+        );
+        return ExitCode::from(finish_command(Err(error), &mut renderer));
+    }
+
+    let mut command = Cli::command();
+    let mut bytes = Vec::new();
+    clap_complete::generate(shell, &mut command, "firestone", &mut bytes);
+    let result = (|| -> io::Result<()> {
+        let stdout = io::stdout();
+        let mut stdout = stdout.lock();
+        stdout.write_all(&bytes)?;
+        stdout.flush()
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(source) if source.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(source) => {
+            let stdout = io::stdout();
+            let stderr = io::stderr();
+            let options = render_options(false, false, cli.no_color, 0, stderr.is_terminal());
+            let mut renderer = Renderer::new(stdout, stderr, options);
+            let error = FirestoneError::new(
+                ErrorKind::Generic,
+                "cannot write the shell completion script to stdout",
+            )
+            .with_hint("check the stdout consumer and retry")
+            .with_source(source);
+            ExitCode::from(finish_command(Err(error), &mut renderer))
+        }
+    }
+}
+
 fn hidden_shim_name(arguments: &[std::ffi::OsString]) -> Option<&str> {
     if arguments.len() != 3
         || arguments.get(1).map(OsString::as_os_str) != Some(OsStr::new("_shim"))
@@ -105,10 +179,29 @@ fn hidden_shim_name(arguments: &[std::ffi::OsString]) -> Option<&str> {
     arguments.get(2).and_then(|name| name.to_str())
 }
 
-fn run_hidden_vsock_proxy(cli: Cli) -> ExitCode {
-    let (home, arguments) = match cli.command {
-        Command::VsockProxy(arguments) => (cli.home, arguments),
-        _ => return ExitCode::FAILURE,
+fn hidden_vsock_proxy_requested(arguments: &[OsString]) -> bool {
+    let Some(first) = arguments.get(1).map(OsString::as_os_str) else {
+        return false;
+    };
+    if first == OsStr::new("_vsock-proxy") {
+        return true;
+    }
+    if first == OsStr::new("--home") {
+        return arguments.get(3).map(OsString::as_os_str) == Some(OsStr::new("_vsock-proxy"));
+    }
+    first
+        .to_str()
+        .is_some_and(|value| value.starts_with("--home="))
+        && arguments.get(2).map(OsString::as_os_str) == Some(OsStr::new("_vsock-proxy"))
+}
+
+fn run_hidden_vsock_proxy(arguments: Vec<OsString>) -> ExitCode {
+    let (home, arguments) = match parse_hidden_vsock_proxy(arguments) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let _ = error.print();
+            return ExitCode::from(2);
+        }
     };
     let result = (|| {
         let mut inputs = PathInputs::capture()?;
@@ -511,6 +604,10 @@ where
                 .run(Action::Doctor { fix: arguments.fix }, renderer)
                 .await
         }
+        Command::Completions(_) => Err(FirestoneError::new(
+            ErrorKind::Generic,
+            "completion command reached event dispatch",
+        )),
         Command::Version => {
             let dispatcher =
                 LocalDispatcher::new(paths, GlobalConfig::default(), Catalog::built_in()?)
@@ -535,10 +632,6 @@ where
             };
             serve::run(&paths, &socket, Arc::new(dispatcher), &global)
         }
-        Command::VsockProxy(_) => Err(FirestoneError::new(
-            ErrorKind::Generic,
-            "hidden vsock proxy reached event dispatch",
-        )),
     }
 }
 

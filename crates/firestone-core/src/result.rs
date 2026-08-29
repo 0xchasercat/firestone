@@ -114,15 +114,31 @@ pub struct SpecResult {
     pub warnings: Vec<SpecWarningPayload>,
 }
 
-/// Process and dependency versions returned by the REST version route.
+/// Reproducible build identity and runtime layout returned by the version action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionResult {
     pub version: String,
-    pub deps: BTreeMap<String, String>,
+    pub identity: VersionIdentity,
+    pub architecture: String,
+    pub dependencies: BTreeMap<String, VersionDependency>,
     pub paths: VersionPaths,
 }
 
-/// Resolved process-wide roots exposed by the REST version route.
+/// Release and optional source revision embedded in the executable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionIdentity {
+    pub release: String,
+    pub git_commit: Option<String>,
+}
+
+/// One architecture-selected dependency pin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionDependency {
+    pub version: String,
+    pub sha256: String,
+}
+
+/// Resolved process-wide roots exposed by the version action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionPaths {
     pub config: String,

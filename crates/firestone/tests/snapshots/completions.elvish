@@ -1,0 +1,545 @@
+
+use builtin;
+use str;
+
+set edit:completion:arg-completer[firestone] = {|@words|
+    fn spaces {|n|
+        builtin:repeat $n ' ' | str:join ''
+    }
+    fn cand {|text desc|
+        edit:complex-candidate $text &display=$text' '(spaces (- 14 (wcswidth $text)))$desc
+    }
+    var command = 'firestone'
+    for word $words[1..-1] {
+        if (str:has-prefix $word '-') {
+            break
+        }
+        set command = $command';'$word
+    }
+    var completions = [
+        &'firestone'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+            cand -V 'Print version'
+            cand --version 'Print version'
+            cand run 'Create or reuse a machine, start it, and open an SSH shell'
+            cand create 'Create a machine definition without booting it'
+            cand start 'Start a machine and wait for SSH readiness'
+            cand stop 'Stop a machine'
+            cand restart 'Stop and start a machine'
+            cand rm 'Stop and remove one or more machines'
+            cand ls 'List machines'
+            cand list 'List machines'
+            cand show 'Show a machine''s specification and runtime state'
+            cand edit 'Edit and validate a machine''s firestone.toml'
+            cand shell 'Open SSH over the machine''s private vsock transport'
+            cand ssh 'Open SSH over the machine''s private vsock transport'
+            cand ssh-config 'Print an OpenSSH Host block for the machine'
+            cand console 'Attach to the machine''s hvc0 console'
+            cand logs 'Print a bounded machine log'
+            cand images 'Manage the owned image store'
+            cand doctor 'Check host requirements and optional safe repairs'
+            cand completions 'Generate a shell completion script on stdout'
+            cand version 'Print Firestone, pinned dependency, and resolved path versions'
+            cand serve 'Run the stateless REST API over a private Unix socket'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'firestone;run'= {
+            cand --name 'Name a machine created from an image reference'
+            cand --arch 'arch'
+            cand --cpus 'cpus'
+            cand --memory 'memory'
+            cand --disk 'disk'
+            cand --user 'user'
+            cand --net 'net'
+            cand -p 'p'
+            cand --forward 'forward'
+            cand --tap 'tap'
+            cand --network-mac 'network-mac'
+            cand --mount 'mount'
+            cand --user-data 'user-data'
+            cand --cloud-init-network-config 'cloud-init-network-config'
+            cand --ssh-key 'ssh-key'
+            cand --vmm-binary 'vmm-binary'
+            cand --vmm-firmware 'vmm-firmware'
+            cand --vmm-arg 'vmm-arg'
+            cand --vmm-config 'vmm-config'
+            cand --clear 'clear'
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --rm 'Remove a machine created by this invocation after SSH exits'
+            cand --no-provisioning 'no-provisioning'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;create'= {
+            cand --image 'Supply IMAGE as a flag. A sole positional value is then NAME'
+            cand -f 'Layer an existing machine specification below command-line flags'
+            cand --file 'Layer an existing machine specification below command-line flags'
+            cand --arch 'arch'
+            cand --cpus 'cpus'
+            cand --memory 'memory'
+            cand --disk 'disk'
+            cand --user 'user'
+            cand --net 'net'
+            cand -p 'p'
+            cand --forward 'forward'
+            cand --tap 'tap'
+            cand --network-mac 'network-mac'
+            cand --mount 'mount'
+            cand --user-data 'user-data'
+            cand --cloud-init-network-config 'cloud-init-network-config'
+            cand --ssh-key 'ssh-key'
+            cand --vmm-binary 'vmm-binary'
+            cand --vmm-firmware 'vmm-firmware'
+            cand --vmm-arg 'vmm-arg'
+            cand --vmm-config 'vmm-config'
+            cand --clear 'clear'
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --edit 'Open the generated specification in the configured editor'
+            cand --no-provisioning 'no-provisioning'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;start'= {
+            cand --timeout 'Override the configured start deadline'
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --no-wait 'Return immediately after the VMM reaches persisted running state'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;stop'= {
+            cand --timeout 'Override the configured graceful-stop deadline'
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --force 'Skip the guest power button and kill the VMM'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;restart'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;rm'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --force 'Approve removal of running machines'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;ls'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;list'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;show'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --vmconfig 'Include the generated cloud-hypervisor configuration'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;edit'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;shell'= {
+            cand --user 'Select the guest login user'
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;ssh'= {
+            cand --user 'Select the guest login user'
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;ssh-config'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;console'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;logs'= {
+            cand --source 'Select an owned machine log'
+            cand -n 'Print the last LINES lines before following'
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand -f 'Continue printing appended log data until interrupted'
+            cand --follow 'Continue printing appended log data until interrupted'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;images'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+            cand ls 'List stored images'
+            cand pull 'Pull and verify one image'
+            cand inspect 'Verify and inspect one stored image'
+            cand rm 'Remove one stored image'
+            cand prune 'Remove all unreferenced images'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'firestone;images;ls'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;images;pull'= {
+            cand --sha256 'Verify a direct HTTPS URL with this SHA-256 digest'
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;images;inspect'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;images;rm'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --force 'Approve removal while a machine still references the image'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;images;prune'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;images;help'= {
+            cand ls 'List stored images'
+            cand pull 'Pull and verify one image'
+            cand inspect 'Verify and inspect one stored image'
+            cand rm 'Remove one stored image'
+            cand prune 'Remove all unreferenced images'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'firestone;images;help;ls'= {
+        }
+        &'firestone;images;help;pull'= {
+        }
+        &'firestone;images;help;inspect'= {
+        }
+        &'firestone;images;help;rm'= {
+        }
+        &'firestone;images;help;prune'= {
+        }
+        &'firestone;images;help;help'= {
+        }
+        &'firestone;doctor'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --fix 'Perform only the safe unprivileged repairs'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;completions'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;version'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;serve'= {
+            cand --listen 'Listen at a Unix socket inside Firestone''s private runtime directory'
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;help'= {
+            cand run 'Create or reuse a machine, start it, and open an SSH shell'
+            cand create 'Create a machine definition without booting it'
+            cand start 'Start a machine and wait for SSH readiness'
+            cand stop 'Stop a machine'
+            cand restart 'Stop and start a machine'
+            cand rm 'Stop and remove one or more machines'
+            cand ls 'List machines'
+            cand show 'Show a machine''s specification and runtime state'
+            cand edit 'Edit and validate a machine''s firestone.toml'
+            cand shell 'Open SSH over the machine''s private vsock transport'
+            cand ssh-config 'Print an OpenSSH Host block for the machine'
+            cand console 'Attach to the machine''s hvc0 console'
+            cand logs 'Print a bounded machine log'
+            cand images 'Manage the owned image store'
+            cand doctor 'Check host requirements and optional safe repairs'
+            cand completions 'Generate a shell completion script on stdout'
+            cand version 'Print Firestone, pinned dependency, and resolved path versions'
+            cand serve 'Run the stateless REST API over a private Unix socket'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'firestone;help;run'= {
+        }
+        &'firestone;help;create'= {
+        }
+        &'firestone;help;start'= {
+        }
+        &'firestone;help;stop'= {
+        }
+        &'firestone;help;restart'= {
+        }
+        &'firestone;help;rm'= {
+        }
+        &'firestone;help;ls'= {
+        }
+        &'firestone;help;show'= {
+        }
+        &'firestone;help;edit'= {
+        }
+        &'firestone;help;shell'= {
+        }
+        &'firestone;help;ssh-config'= {
+        }
+        &'firestone;help;console'= {
+        }
+        &'firestone;help;logs'= {
+        }
+        &'firestone;help;images'= {
+            cand ls 'List stored images'
+            cand pull 'Pull and verify one image'
+            cand inspect 'Verify and inspect one stored image'
+            cand rm 'Remove one stored image'
+            cand prune 'Remove all unreferenced images'
+        }
+        &'firestone;help;images;ls'= {
+        }
+        &'firestone;help;images;pull'= {
+        }
+        &'firestone;help;images;inspect'= {
+        }
+        &'firestone;help;images;rm'= {
+        }
+        &'firestone;help;images;prune'= {
+        }
+        &'firestone;help;doctor'= {
+        }
+        &'firestone;help;completions'= {
+        }
+        &'firestone;help;version'= {
+        }
+        &'firestone;help;serve'= {
+        }
+        &'firestone;help;help'= {
+        }
+    ]
+    $completions[$command]
+}

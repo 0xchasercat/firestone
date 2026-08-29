@@ -1,0 +1,1025 @@
+#compdef firestone
+
+autoload -U is-at-least
+
+_firestone() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_firestone_commands" \
+"*::: :->firestone" \
+&& ret=0
+    case $state in
+    (firestone)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:firestone-command-$line[1]:"
+        case $line[1] in
+            (run)
+_arguments "${_arguments_options[@]}" : \
+'--name=[Name a machine created from an image reference]:NAME:_default' \
+'--arch=[]:ARCH:_default' \
+'--cpus=[]:COUNT:_default' \
+'--memory=[]:SIZE:_default' \
+'--disk=[]:SIZE:_default' \
+'--user=[]:USER:_default' \
+'--net=[]:MODE:_default' \
+'*-p+[]:SPEC:_default' \
+'*--forward=[]:SPEC:_default' \
+'--tap=[]:DEV:_default' \
+'--network-mac=[]:MAC:_default' \
+'*--mount=[]:HOST:GUEST[:ro]:_default' \
+'--user-data=[]:FILE:_files' \
+'--cloud-init-network-config=[]:FILE:_files' \
+'*--ssh-key=[]:FILE:_files' \
+'--vmm-binary=[]:FILE:_files' \
+'--vmm-firmware=[]:FIRMWARE:_default' \
+'*--vmm-arg=[]:ARG:_default' \
+'--vmm-config=[]:JSON:_default' \
+'*--clear=[]:FIELD:_default' \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--rm[Remove a machine created by this invocation after SSH exits]' \
+'--no-provisioning[]' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'::target -- Existing machine name or image reference. Defaults to ubuntu:_default' \
+'*::command -- Remote command. Values are passed to OpenSSH without retokenizing:_default' \
+&& ret=0
+;;
+(create)
+_arguments "${_arguments_options[@]}" : \
+'--image=[Supply IMAGE as a flag. A sole positional value is then NAME]:IMAGE:_default' \
+'-f+[Layer an existing machine specification below command-line flags]:SPEC.toml:_files' \
+'--file=[Layer an existing machine specification below command-line flags]:SPEC.toml:_files' \
+'--arch=[]:ARCH:_default' \
+'--cpus=[]:COUNT:_default' \
+'--memory=[]:SIZE:_default' \
+'--disk=[]:SIZE:_default' \
+'--user=[]:USER:_default' \
+'--net=[]:MODE:_default' \
+'*-p+[]:SPEC:_default' \
+'*--forward=[]:SPEC:_default' \
+'--tap=[]:DEV:_default' \
+'--network-mac=[]:MAC:_default' \
+'*--mount=[]:HOST:GUEST[:ro]:_default' \
+'--user-data=[]:FILE:_files' \
+'--cloud-init-network-config=[]:FILE:_files' \
+'*--ssh-key=[]:FILE:_files' \
+'--vmm-binary=[]:FILE:_files' \
+'--vmm-firmware=[]:FIRMWARE:_default' \
+'*--vmm-arg=[]:ARG:_default' \
+'--vmm-config=[]:JSON:_default' \
+'*--clear=[]:FIELD:_default' \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--edit[Open the generated specification in the configured editor]' \
+'--no-provisioning[]' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::positional -- One value is IMAGE; two values are NAME followed by IMAGE:_default' \
+&& ret=0
+;;
+(start)
+_arguments "${_arguments_options[@]}" : \
+'--timeout=[Override the configured start deadline]:DURATION:_default' \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--no-wait[Return immediately after the VMM reaches persisted running state]' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':name:_default' \
+&& ret=0
+;;
+(stop)
+_arguments "${_arguments_options[@]}" : \
+'--timeout=[Override the configured graceful-stop deadline]:DURATION:_default' \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--force[Skip the guest power button and kill the VMM]' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':name:_default' \
+&& ret=0
+;;
+(restart)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':name:_default' \
+&& ret=0
+;;
+(rm)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--force[Approve removal of running machines]' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::names:_default' \
+&& ret=0
+;;
+(ls)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(show)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--vmconfig[Include the generated cloud-hypervisor configuration]' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':name:_default' \
+&& ret=0
+;;
+(edit)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':name:_default' \
+&& ret=0
+;;
+(shell)
+_arguments "${_arguments_options[@]}" : \
+'--user=[Select the guest login user]:USER:_default' \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':name:_default' \
+'*::command -- Remote command. Values are passed to OpenSSH without retokenizing:_default' \
+&& ret=0
+;;
+(ssh)
+_arguments "${_arguments_options[@]}" : \
+'--user=[Select the guest login user]:USER:_default' \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':name:_default' \
+'*::command -- Remote command. Values are passed to OpenSSH without retokenizing:_default' \
+&& ret=0
+;;
+(ssh-config)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':name:_default' \
+&& ret=0
+;;
+(console)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':name:_default' \
+&& ret=0
+;;
+(logs)
+_arguments "${_arguments_options[@]}" : \
+'--source=[Select an owned machine log]:SOURCE:_default' \
+'-n+[Print the last LINES lines before following]:LINES:_default' \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'-f[Continue printing appended log data until interrupted]' \
+'--follow[Continue printing appended log data until interrupted]' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':name:_default' \
+&& ret=0
+;;
+(images)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_firestone__subcmd__images_commands" \
+"*::: :->images" \
+&& ret=0
+
+    case $state in
+    (images)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:firestone-images-command-$line[1]:"
+        case $line[1] in
+            (ls)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(pull)
+_arguments "${_arguments_options[@]}" : \
+'--sha256=[Verify a direct HTTPS URL with this SHA-256 digest]:HEX:_default' \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':reference:_default' \
+&& ret=0
+;;
+(inspect)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':id:_default' \
+&& ret=0
+;;
+(rm)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--force[Approve removal while a machine still references the image]' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':id:_default' \
+&& ret=0
+;;
+(prune)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_firestone__subcmd__images__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:firestone-images-help-command-$line[1]:"
+        case $line[1] in
+            (ls)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(pull)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(inspect)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(rm)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(prune)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(doctor)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--fix[Perform only the safe unprivileged repairs]' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(completions)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':shell -- Shell whose completion script should be generated:(bash elvish fish powershell zsh)' \
+&& ret=0
+;;
+(version)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(serve)
+_arguments "${_arguments_options[@]}" : \
+'--listen=[Listen at a Unix socket inside Firestone'\''s private runtime directory]:unix:PATH:_files' \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_firestone__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:firestone-help-command-$line[1]:"
+        case $line[1] in
+            (run)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(create)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(start)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(stop)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(restart)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(rm)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(ls)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(show)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(edit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(shell)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(ssh-config)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(console)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(logs)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(images)
+_arguments "${_arguments_options[@]}" : \
+":: :_firestone__subcmd__help__subcmd__images_commands" \
+"*::: :->images" \
+&& ret=0
+
+    case $state in
+    (images)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:firestone-help-images-command-$line[1]:"
+        case $line[1] in
+            (ls)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(pull)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(inspect)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(rm)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(prune)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(doctor)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(completions)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(version)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(serve)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_firestone_commands] )) ||
+_firestone_commands() {
+    local commands; commands=(
+'run:Create or reuse a machine, start it, and open an SSH shell' \
+'create:Create a machine definition without booting it' \
+'start:Start a machine and wait for SSH readiness' \
+'stop:Stop a machine' \
+'restart:Stop and start a machine' \
+'rm:Stop and remove one or more machines' \
+'ls:List machines' \
+'list:List machines' \
+'show:Show a machine'\''s specification and runtime state' \
+'edit:Edit and validate a machine'\''s firestone.toml' \
+'shell:Open SSH over the machine'\''s private vsock transport' \
+'ssh:Open SSH over the machine'\''s private vsock transport' \
+'ssh-config:Print an OpenSSH Host block for the machine' \
+'console:Attach to the machine'\''s hvc0 console' \
+'logs:Print a bounded machine log' \
+'images:Manage the owned image store' \
+'doctor:Check host requirements and optional safe repairs' \
+'completions:Generate a shell completion script on stdout' \
+'version:Print Firestone, pinned dependency, and resolved path versions' \
+'serve:Run the stateless REST API over a private Unix socket' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'firestone commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__completions_commands] )) ||
+_firestone__subcmd__completions_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone completions commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__console_commands] )) ||
+_firestone__subcmd__console_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone console commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__create_commands] )) ||
+_firestone__subcmd__create_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone create commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__doctor_commands] )) ||
+_firestone__subcmd__doctor_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone doctor commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__edit_commands] )) ||
+_firestone__subcmd__edit_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone edit commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help_commands] )) ||
+_firestone__subcmd__help_commands() {
+    local commands; commands=(
+'run:Create or reuse a machine, start it, and open an SSH shell' \
+'create:Create a machine definition without booting it' \
+'start:Start a machine and wait for SSH readiness' \
+'stop:Stop a machine' \
+'restart:Stop and start a machine' \
+'rm:Stop and remove one or more machines' \
+'ls:List machines' \
+'show:Show a machine'\''s specification and runtime state' \
+'edit:Edit and validate a machine'\''s firestone.toml' \
+'shell:Open SSH over the machine'\''s private vsock transport' \
+'ssh-config:Print an OpenSSH Host block for the machine' \
+'console:Attach to the machine'\''s hvc0 console' \
+'logs:Print a bounded machine log' \
+'images:Manage the owned image store' \
+'doctor:Check host requirements and optional safe repairs' \
+'completions:Generate a shell completion script on stdout' \
+'version:Print Firestone, pinned dependency, and resolved path versions' \
+'serve:Run the stateless REST API over a private Unix socket' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'firestone help commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__completions_commands] )) ||
+_firestone__subcmd__help__subcmd__completions_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help completions commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__console_commands] )) ||
+_firestone__subcmd__help__subcmd__console_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help console commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__create_commands] )) ||
+_firestone__subcmd__help__subcmd__create_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help create commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__doctor_commands] )) ||
+_firestone__subcmd__help__subcmd__doctor_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help doctor commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__edit_commands] )) ||
+_firestone__subcmd__help__subcmd__edit_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help edit commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__help_commands] )) ||
+_firestone__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help help commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__images_commands] )) ||
+_firestone__subcmd__help__subcmd__images_commands() {
+    local commands; commands=(
+'ls:List stored images' \
+'pull:Pull and verify one image' \
+'inspect:Verify and inspect one stored image' \
+'rm:Remove one stored image' \
+'prune:Remove all unreferenced images' \
+    )
+    _describe -t commands 'firestone help images commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__images__subcmd__inspect_commands] )) ||
+_firestone__subcmd__help__subcmd__images__subcmd__inspect_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help images inspect commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__images__subcmd__ls_commands] )) ||
+_firestone__subcmd__help__subcmd__images__subcmd__ls_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help images ls commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__images__subcmd__prune_commands] )) ||
+_firestone__subcmd__help__subcmd__images__subcmd__prune_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help images prune commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__images__subcmd__pull_commands] )) ||
+_firestone__subcmd__help__subcmd__images__subcmd__pull_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help images pull commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__images__subcmd__rm_commands] )) ||
+_firestone__subcmd__help__subcmd__images__subcmd__rm_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help images rm commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__logs_commands] )) ||
+_firestone__subcmd__help__subcmd__logs_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help logs commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__ls_commands] )) ||
+_firestone__subcmd__help__subcmd__ls_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help ls commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__restart_commands] )) ||
+_firestone__subcmd__help__subcmd__restart_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help restart commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__rm_commands] )) ||
+_firestone__subcmd__help__subcmd__rm_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help rm commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__run_commands] )) ||
+_firestone__subcmd__help__subcmd__run_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help run commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__serve_commands] )) ||
+_firestone__subcmd__help__subcmd__serve_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help serve commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__shell_commands] )) ||
+_firestone__subcmd__help__subcmd__shell_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help shell commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__show_commands] )) ||
+_firestone__subcmd__help__subcmd__show_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help show commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__ssh-config_commands] )) ||
+_firestone__subcmd__help__subcmd__ssh-config_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help ssh-config commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__start_commands] )) ||
+_firestone__subcmd__help__subcmd__start_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help start commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__stop_commands] )) ||
+_firestone__subcmd__help__subcmd__stop_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help stop commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__version_commands] )) ||
+_firestone__subcmd__help__subcmd__version_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help version commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__images_commands] )) ||
+_firestone__subcmd__images_commands() {
+    local commands; commands=(
+'ls:List stored images' \
+'pull:Pull and verify one image' \
+'inspect:Verify and inspect one stored image' \
+'rm:Remove one stored image' \
+'prune:Remove all unreferenced images' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'firestone images commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__images__subcmd__help_commands] )) ||
+_firestone__subcmd__images__subcmd__help_commands() {
+    local commands; commands=(
+'ls:List stored images' \
+'pull:Pull and verify one image' \
+'inspect:Verify and inspect one stored image' \
+'rm:Remove one stored image' \
+'prune:Remove all unreferenced images' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'firestone images help commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__images__subcmd__help__subcmd__help_commands] )) ||
+_firestone__subcmd__images__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone images help help commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__images__subcmd__help__subcmd__inspect_commands] )) ||
+_firestone__subcmd__images__subcmd__help__subcmd__inspect_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone images help inspect commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__images__subcmd__help__subcmd__ls_commands] )) ||
+_firestone__subcmd__images__subcmd__help__subcmd__ls_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone images help ls commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__images__subcmd__help__subcmd__prune_commands] )) ||
+_firestone__subcmd__images__subcmd__help__subcmd__prune_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone images help prune commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__images__subcmd__help__subcmd__pull_commands] )) ||
+_firestone__subcmd__images__subcmd__help__subcmd__pull_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone images help pull commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__images__subcmd__help__subcmd__rm_commands] )) ||
+_firestone__subcmd__images__subcmd__help__subcmd__rm_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone images help rm commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__images__subcmd__inspect_commands] )) ||
+_firestone__subcmd__images__subcmd__inspect_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone images inspect commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__images__subcmd__ls_commands] )) ||
+_firestone__subcmd__images__subcmd__ls_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone images ls commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__images__subcmd__prune_commands] )) ||
+_firestone__subcmd__images__subcmd__prune_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone images prune commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__images__subcmd__pull_commands] )) ||
+_firestone__subcmd__images__subcmd__pull_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone images pull commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__images__subcmd__rm_commands] )) ||
+_firestone__subcmd__images__subcmd__rm_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone images rm commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__logs_commands] )) ||
+_firestone__subcmd__logs_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone logs commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__ls_commands] )) ||
+_firestone__subcmd__ls_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone ls commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__restart_commands] )) ||
+_firestone__subcmd__restart_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone restart commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__rm_commands] )) ||
+_firestone__subcmd__rm_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone rm commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__run_commands] )) ||
+_firestone__subcmd__run_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone run commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__serve_commands] )) ||
+_firestone__subcmd__serve_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone serve commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__shell_commands] )) ||
+_firestone__subcmd__shell_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone shell commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__show_commands] )) ||
+_firestone__subcmd__show_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone show commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__ssh-config_commands] )) ||
+_firestone__subcmd__ssh-config_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone ssh-config commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__start_commands] )) ||
+_firestone__subcmd__start_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone start commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__stop_commands] )) ||
+_firestone__subcmd__stop_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone stop commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__version_commands] )) ||
+_firestone__subcmd__version_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone version commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_firestone" ]; then
+    _firestone "$@"
+else
+    compdef _firestone firestone
+fi
