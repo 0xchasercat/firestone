@@ -14,7 +14,6 @@ use firestone_core::{
 };
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
 use owo_colors::OwoColorize as _;
-use std::fmt::Write as _;
 use unicode_width::UnicodeWidthChar;
 
 /// Selects structured output or the human CLI renderer.
@@ -178,17 +177,17 @@ impl TerminalProgress {
         elapsed_ms: u64,
     ) -> Result<(), FirestoneError> {
         let marker = success_marker(self.color_enabled);
-        self.settle(id, &marker, detail, elapsed_ms)
+        self.settle(id, &marker, detail, Some(elapsed_ms))
     }
 
     fn skip(&mut self, id: &StepId, reason: &str) -> Result<(), FirestoneError> {
         let marker = skip_marker(self.color_enabled);
-        self.settle(id, &marker, Some(reason), 0)
+        self.settle(id, &marker, Some(reason), None)
     }
 
     fn fail(&mut self, id: &StepId, error: &ErrorInfo) -> Result<(), FirestoneError> {
         let marker = failure_marker(self.color_enabled);
-        self.settle(id, &marker, Some(&error.message), 0)?;
+        self.settle(id, &marker, Some(&error.message), None)?;
         if let Some(hint) = &error.hint {
             self.println(format!("hint:  {}", terminal_text(hint)))?;
         }
@@ -203,10 +202,11 @@ impl TerminalProgress {
             .map(|(id, _)| id.clone());
         if let Some(id) = id {
             let marker = failure_marker(self.color_enabled);
-            self.settle(&StepId::from(id), &marker, Some(message), 0)?;
+            self.settle(&StepId::from(id), &marker, Some(message), None)?;
         }
         Ok(())
     }
+
     fn println(&self, line: impl AsRef<str>) -> Result<(), FirestoneError> {
         self.multi.println(line).map_err(write_output_failure)
     }
@@ -230,19 +230,19 @@ impl TerminalProgress {
         id: &StepId,
         marker: &str,
         detail: Option<&str>,
-        elapsed_ms: u64,
+        elapsed_ms: Option<u64>,
     ) -> Result<(), FirestoneError> {
         let bar = self.bar_for(id.as_str())?;
         self.active.remove(id.as_str());
         bar.disable_steady_tick();
-        let message = settled_message(detail, elapsed_ms, self.color_enabled);
+        let message = settled_message(detail);
         let prefix = if message.is_empty() {
             terminal_text(id.as_str())
         } else {
             padded_step_id(id.as_str())
         };
         bar.set_prefix(prefix);
-        bar.set_style(settled_style(marker)?);
+        bar.set_style(settled_style(marker, elapsed_ms, self.color_enabled)?);
         bar.finish_with_message(message);
         Ok(())
     }
@@ -315,9 +315,29 @@ fn progress_style(
         .map_err(progress_style_failure)
 }
 
-fn settled_style(marker: &str) -> Result<ProgressStyle, FirestoneError> {
-    ProgressStyle::with_template(&format!("  {marker} {{prefix}}{{wide_msg}}"))
-        .map_err(progress_style_failure)
+fn settled_style(
+    marker: &str,
+    elapsed_ms: Option<u64>,
+    color_enabled: bool,
+) -> Result<ProgressStyle, FirestoneError> {
+    ProgressStyle::with_template(&format!(
+        "  {marker} {{prefix}}{{wide_msg}}{{final_elapsed}}"
+    ))
+    .map(|style| {
+        style.with_key(
+            "final_elapsed",
+            move |_state: &ProgressState, writer: &mut dyn fmt::Write| {
+                if let Some(elapsed_ms) = elapsed_ms {
+                    if color_enabled {
+                        let _ = write!(writer, " · {}", Elapsed(elapsed_ms).dimmed());
+                    } else {
+                        let _ = write!(writer, " · {}", Elapsed(elapsed_ms));
+                    }
+                }
+            },
+        )
+    })
+    .map_err(progress_style_failure)
 }
 
 fn with_progress_keys(style: ProgressStyle, color_enabled: bool) -> ProgressStyle {
@@ -393,19 +413,8 @@ fn padded_step_id(id: &str) -> String {
     label
 }
 
-fn settled_message(detail: Option<&str>, elapsed_ms: u64, color_enabled: bool) -> String {
-    let mut message = detail.map_or_else(String::new, terminal_text);
-    if elapsed_ms > 1_000 {
-        if !message.is_empty() {
-            message.push_str(" · ");
-        }
-        if color_enabled {
-            let _ = write!(message, "{}", Elapsed(elapsed_ms).dimmed());
-        } else {
-            let _ = write!(message, "{}", Elapsed(elapsed_ms));
-        }
-    }
-    terminal_message(&message)
+fn settled_message(detail: Option<&str>) -> String {
+    terminal_message(&detail.map_or_else(String::new, terminal_text))
 }
 
 fn success_marker(color_enabled: bool) -> String {
@@ -1400,7 +1409,7 @@ mod tests {
         progress.done(&image, Some("cached"), 1_251)?;
 
         let disk = StepId::from("磁盘");
-        progress.done(&disk, Some("20G overlay"), 0)?;
+        progress.done(&disk, Some("20G overlay"), 348)?;
 
         let filesystem = StepId::from("fs");
         progress.start(&filesystem, "first mount")?;
@@ -1417,16 +1426,17 @@ mod tests {
         )?;
         drop(progress);
 
-        assert_eq!(
-            terminal.contents(),
-            concat!(
-                "  ✓ image    cached · 1.3s\n",
-                "  ✓ 磁盘     20G overlay\n",
-                "  ✓ fs       one\n",
-                "  - fs       cached\n",
-                "  ✗ ssh      timed out",
-            )
-        );
+        let contents = terminal.contents();
+        let lines = contents.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 5);
+        assert!(lines[0].starts_with("  ✓ image    cached"));
+        assert!(lines[0].ends_with("· 1.3s"));
+        assert!(lines[1].starts_with("  ✓ 磁盘     20G overlay"));
+        assert!(lines[1].ends_with("· 0.3s"));
+        assert!(lines[2].starts_with("  ✓ fs       one"));
+        assert!(lines[2].ends_with("· 0.0s"));
+        assert_eq!(lines[3], "  - fs       cached");
+        assert_eq!(lines[4], "  ✗ ssh      timed out");
         Ok(())
     }
 

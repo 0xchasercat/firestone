@@ -590,7 +590,19 @@ fn tty_progress_cli_contract_without_kvm() -> TestResult {
         .finish(Duration::from_secs(15))?;
     assert!(no_color.status.success());
     assert!(no_color.terminal_restored);
-    assert!(String::from_utf8_lossy(&no_color.stderr).contains('✓'));
+    let no_color_stderr = String::from_utf8_lossy(&no_color.stderr);
+    assert!(no_color_stderr.contains('✓'));
+    assert!(
+        no_color_stderr.split(['\r', '\n']).any(|frame| {
+            frame.rsplit_once(" · ").is_some_and(|(_, elapsed)| {
+                elapsed
+                    .split('s')
+                    .next()
+                    .is_some_and(|seconds| seconds.parse::<f64>().is_ok())
+            })
+        }),
+        "settled PTY rows omitted final elapsed time: {no_color_stderr:?}"
+    );
     for sequence in [
         b"\x1b[31m".as_slice(),
         b"\x1b[32m".as_slice(),
