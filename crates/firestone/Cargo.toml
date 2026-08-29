@@ -9,13 +9,16 @@ publish = false
 axum.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
+console.workspace = true
 firestone-core = { path = "../firestone-core" }
 futures-util.workspace = true
 hyper.workspace = true
 hyperlocal.workspace = true
 hyper-util.workspace = true
+indicatif.workspace = true
 jiff.workspace = true
 nix.workspace = true
+owo-colors.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 shlex.workspace = true
@@ -28,6 +31,7 @@ unicode-width.workspace = true
 [dev-dependencies]
 fs2.workspace = true
 http-body-util.workspace = true
+indicatif = { workspace = true, features = ["in_memory"] }
 nix.workspace = true
 sha2.workspace = true
 tempfile.workspace = true

@@ -1,15 +1,19 @@
 use std::{
+    collections::HashMap,
     error::Error as _,
     fmt,
     io::{self, Write},
+    time::Duration,
 };
 
+use console::measure_text_width;
 use firestone_core::{
     DoctorCheckId, DoctorReport, DoctorStatus, ErrorInfo, ErrorKind, Event, EventSink,
     FirestoneError, Level, LogsResult, MachineStatus, MachineSummary, MachineView, RemoveResult,
-    SshConfigResult, StartResult, StopResult, Unit, VersionResult,
+    SshConfigResult, StartResult, StepId, StopResult, Unit, VersionResult,
 };
-
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
+use owo_colors::OwoColorize as _;
 use unicode_width::UnicodeWidthChar;
 
 /// Selects structured output or the human CLI renderer.
@@ -25,7 +29,8 @@ pub struct RenderOptions {
     pub mode: OutputMode,
     pub quiet: bool,
     pub verbosity: u8,
-    pub stderr_is_terminal: bool,
+    pub color_enabled: bool,
+    pub live_progress: bool,
 }
 
 impl RenderOptions {
@@ -35,7 +40,8 @@ impl RenderOptions {
             mode: OutputMode::Human,
             quiet,
             verbosity: 0,
-            stderr_is_terminal,
+            color_enabled: stderr_is_terminal,
+            live_progress: stderr_is_terminal && !quiet,
         }
     }
 
@@ -48,6 +54,21 @@ impl RenderOptions {
     #[must_use]
     pub const fn with_quiet(mut self, quiet: bool) -> Self {
         self.quiet = quiet;
+        if quiet {
+            self.live_progress = false;
+        }
+        self
+    }
+
+    #[must_use]
+    pub const fn with_color(mut self, color_enabled: bool) -> Self {
+        self.color_enabled = color_enabled;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_live_progress(mut self, live_progress: bool) -> Self {
+        self.live_progress = live_progress && !self.quiet;
         self
     }
 
@@ -57,13 +78,382 @@ impl RenderOptions {
             mode: OutputMode::Json,
             quiet: false,
             verbosity: 0,
-            stderr_is_terminal: false,
+            color_enabled: false,
+            live_progress: false,
         }
     }
 }
+
 impl Default for RenderOptions {
     fn default() -> Self {
         Self::human(false, false)
+    }
+}
+
+const STEP_LABEL_WIDTH: usize = 8;
+const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
+const SPINNER_TICKS: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProgressLineKind {
+    Spinner,
+    BytesKnown,
+    BytesUnknown,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActiveProgressLine {
+    index: usize,
+    kind: ProgressLineKind,
+}
+
+struct TerminalProgress {
+    multi: MultiProgress,
+    bars: Vec<ProgressBar>,
+    active: HashMap<String, ActiveProgressLine>,
+    color_enabled: bool,
+}
+
+impl TerminalProgress {
+    fn stderr(color_enabled: bool) -> Self {
+        Self::with_draw_target(ProgressDrawTarget::stderr_with_hz(13), color_enabled)
+    }
+
+    fn with_draw_target(target: ProgressDrawTarget, color_enabled: bool) -> Self {
+        Self {
+            multi: MultiProgress::with_draw_target(target),
+            bars: Vec::new(),
+            active: HashMap::new(),
+            color_enabled,
+        }
+    }
+
+    fn start(&mut self, id: &StepId, label: &str) -> Result<(), FirestoneError> {
+        if let Some(bar) = self.active_bar(id.as_str()) {
+            bar.reset_elapsed();
+            bar.set_message(terminal_message(label));
+            return Ok(());
+        }
+        self.add_step(id.as_str(), label).map(|_| ())
+    }
+
+    fn update(&mut self, id: &StepId, detail: &str) -> Result<(), FirestoneError> {
+        let bar = self.bar_for(id.as_str())?;
+        bar.set_message(terminal_message(detail));
+        Ok(())
+    }
+
+    fn progress(
+        &mut self,
+        id: &StepId,
+        done: u64,
+        total: Option<u64>,
+    ) -> Result<(), FirestoneError> {
+        let bar = self.bar_for(id.as_str())?;
+        let kind = if total.is_some() {
+            ProgressLineKind::BytesKnown
+        } else {
+            ProgressLineKind::BytesUnknown
+        };
+        let current_kind = self.active.get(id.as_str()).map(|line| line.kind);
+        if current_kind != Some(kind) {
+            bar.set_style(progress_style(kind, self.color_enabled)?);
+            if let Some(line) = self.active.get_mut(id.as_str()) {
+                line.kind = kind;
+            }
+        }
+        match total {
+            Some(total) => bar.set_length(total),
+            None => bar.unset_length(),
+        }
+        bar.set_position(done);
+        Ok(())
+    }
+
+    fn done(
+        &mut self,
+        id: &StepId,
+        detail: Option<&str>,
+        elapsed_ms: u64,
+    ) -> Result<(), FirestoneError> {
+        let marker = success_marker(self.color_enabled);
+        self.settle(id, &marker, detail, Some(elapsed_ms))
+    }
+
+    fn skip(&mut self, id: &StepId, reason: &str) -> Result<(), FirestoneError> {
+        let marker = skip_marker(self.color_enabled);
+        self.settle(id, &marker, Some(reason), None)
+    }
+
+    fn fail(&mut self, id: &StepId, error: &ErrorInfo) -> Result<(), FirestoneError> {
+        let marker = failure_marker(self.color_enabled);
+        self.settle(id, &marker, Some(&error.message), None)?;
+        if let Some(hint) = &error.hint {
+            self.println(format!("hint:  {}", terminal_text(hint)))?;
+        }
+        Ok(())
+    }
+
+    fn fail_last_active(&mut self, message: &str) -> Result<(), FirestoneError> {
+        let id = self
+            .active
+            .iter()
+            .max_by_key(|(_, line)| line.index)
+            .map(|(id, _)| id.clone());
+        if let Some(id) = id {
+            let marker = failure_marker(self.color_enabled);
+            self.settle(&StepId::from(id), &marker, Some(message), None)?;
+        }
+        Ok(())
+    }
+
+    fn println(&self, line: impl AsRef<str>) -> Result<(), FirestoneError> {
+        self.multi.println(line).map_err(write_output_failure)
+    }
+
+    fn clear_active(&mut self) {
+        let active = self
+            .active
+            .drain()
+            .map(|(_, line)| line.index)
+            .collect::<Vec<_>>();
+        for index in active {
+            if let Some(bar) = self.bars.get(index) {
+                bar.disable_steady_tick();
+                bar.finish_and_clear();
+            }
+        }
+    }
+
+    fn settle(
+        &mut self,
+        id: &StepId,
+        marker: &str,
+        detail: Option<&str>,
+        elapsed_ms: Option<u64>,
+    ) -> Result<(), FirestoneError> {
+        let bar = self.bar_for(id.as_str())?;
+        self.active.remove(id.as_str());
+        bar.disable_steady_tick();
+        let message = settled_message(detail);
+        let prefix = if message.is_empty() {
+            terminal_text(id.as_str())
+        } else {
+            padded_step_id(id.as_str())
+        };
+        bar.set_prefix(prefix);
+        bar.set_style(settled_style(marker, elapsed_ms, self.color_enabled)?);
+        bar.finish_with_message(message);
+        Ok(())
+    }
+
+    fn bar_for(&mut self, id: &str) -> Result<ProgressBar, FirestoneError> {
+        match self.active_bar(id) {
+            Some(bar) => Ok(bar),
+            None => self.add_step(id, ""),
+        }
+    }
+
+    fn active_bar(&self, id: &str) -> Option<ProgressBar> {
+        self.active
+            .get(id)
+            .and_then(|line| self.bars.get(line.index))
+            .cloned()
+    }
+
+    fn add_step(&mut self, id: &str, message: &str) -> Result<ProgressBar, FirestoneError> {
+        let bar = ProgressBar::with_draw_target(None, ProgressDrawTarget::hidden());
+        bar.set_style(spinner_style(self.color_enabled)?);
+        bar.set_prefix(padded_step_id(id));
+        bar.set_message(terminal_message(message));
+        let bar = self.multi.add(bar);
+        bar.enable_steady_tick(SPINNER_INTERVAL);
+        bar.tick();
+        let index = self.bars.len();
+        self.bars.push(bar.clone());
+        self.active.insert(
+            id.to_owned(),
+            ActiveProgressLine {
+                index,
+                kind: ProgressLineKind::Spinner,
+            },
+        );
+        Ok(bar)
+    }
+}
+
+impl Drop for TerminalProgress {
+    fn drop(&mut self) {
+        self.clear_active();
+    }
+}
+
+fn spinner_style(color_enabled: bool) -> Result<ProgressStyle, FirestoneError> {
+    ProgressStyle::with_template("  {spinner} {prefix}{wide_msg}{short_elapsed}")
+        .map(|style| with_progress_keys(style.tick_chars(SPINNER_TICKS), color_enabled))
+        .map_err(progress_style_failure)
+}
+
+fn progress_style(
+    kind: ProgressLineKind,
+    color_enabled: bool,
+) -> Result<ProgressStyle, FirestoneError> {
+    let template = match kind {
+        ProgressLineKind::Spinner => "  {spinner} {prefix}{wide_msg}{short_elapsed}",
+        ProgressLineKind::BytesKnown => {
+            "  {spinner} {prefix}{msg} {wide_bar} {count}/{total_count} {rate}{short_elapsed}"
+        }
+        ProgressLineKind::BytesUnknown => "  {spinner} {prefix}{msg} {count} {rate}{short_elapsed}",
+    };
+    ProgressStyle::with_template(template)
+        .map(|style| {
+            with_progress_keys(
+                style.tick_chars(SPINNER_TICKS).progress_chars("━╸─"),
+                color_enabled,
+            )
+        })
+        .map_err(progress_style_failure)
+}
+
+fn settled_style(
+    marker: &str,
+    elapsed_ms: Option<u64>,
+    color_enabled: bool,
+) -> Result<ProgressStyle, FirestoneError> {
+    ProgressStyle::with_template(&format!(
+        "  {marker} {{prefix}}{{wide_msg}}{{final_elapsed}}"
+    ))
+    .map(|style| {
+        style.with_key(
+            "final_elapsed",
+            move |_state: &ProgressState, writer: &mut dyn fmt::Write| {
+                if let Some(elapsed_ms) = elapsed_ms {
+                    if color_enabled {
+                        let _ = write!(writer, " · {}", Elapsed(elapsed_ms).dimmed());
+                    } else {
+                        let _ = write!(writer, " · {}", Elapsed(elapsed_ms));
+                    }
+                }
+            },
+        )
+    })
+    .map_err(progress_style_failure)
+}
+
+fn with_progress_keys(style: ProgressStyle, color_enabled: bool) -> ProgressStyle {
+    style
+        .with_key(
+            "short_elapsed",
+            move |state: &ProgressState, writer: &mut dyn fmt::Write| {
+                let elapsed_ms = u64::try_from(state.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if elapsed_ms > 1_000 {
+                    if color_enabled {
+                        let _ = write!(writer, " · {}", Elapsed(elapsed_ms).dimmed());
+                    } else {
+                        let _ = write!(writer, " · {}", Elapsed(elapsed_ms));
+                    }
+                }
+            },
+        )
+        .with_key(
+            "count",
+            |state: &ProgressState, writer: &mut dyn fmt::Write| {
+                let _ = write!(writer, "{}", HumanBytes(state.pos()));
+            },
+        )
+        .with_key(
+            "total_count",
+            |state: &ProgressState, writer: &mut dyn fmt::Write| {
+                let _ = write!(writer, "{}", HumanBytes(state.len().unwrap_or(0)));
+            },
+        )
+        .with_key(
+            "rate",
+            |state: &ProgressState, writer: &mut dyn fmt::Write| {
+                let bytes = state.per_sec().max(0.0).round().min(u64::MAX as f64) as u64;
+                let _ = write!(writer, "{}/s", HumanBytes(bytes));
+            },
+        )
+}
+
+fn progress_style_failure(source: indicatif::style::TemplateError) -> FirestoneError {
+    FirestoneError::new(
+        ErrorKind::Generic,
+        "cannot initialize terminal progress renderer",
+    )
+    .with_source(source)
+}
+
+fn terminal_message(value: &str) -> String {
+    let value = terminal_text(value);
+    if value.is_empty() {
+        value
+    } else {
+        format!(" {value}")
+    }
+}
+
+fn terminal_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '\u{fffd}'
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn padded_step_id(id: &str) -> String {
+    let mut label = terminal_text(id);
+    let padding = STEP_LABEL_WIDTH.saturating_sub(measure_text_width(&label));
+    label.extend(std::iter::repeat_n(' ', padding));
+    label
+}
+
+fn settled_message(detail: Option<&str>) -> String {
+    terminal_message(&detail.map_or_else(String::new, terminal_text))
+}
+
+fn success_marker(color_enabled: bool) -> String {
+    if color_enabled {
+        "✓".green().to_string()
+    } else {
+        "✓".to_owned()
+    }
+}
+
+fn failure_marker(color_enabled: bool) -> String {
+    if color_enabled {
+        "✗".red().to_string()
+    } else {
+        "✗".to_owned()
+    }
+}
+
+fn skip_marker(color_enabled: bool) -> String {
+    if color_enabled {
+        "-".dimmed().to_string()
+    } else {
+        "-".to_owned()
+    }
+}
+
+fn warning_marker(color_enabled: bool) -> String {
+    if color_enabled {
+        "!".yellow().to_string()
+    } else {
+        "!".to_owned()
+    }
+}
+
+fn info_marker(color_enabled: bool) -> String {
+    if color_enabled {
+        "·".dimmed().to_string()
+    } else {
+        "·".to_owned()
     }
 }
 
@@ -76,6 +466,22 @@ pub struct Renderer<Stdout, Stderr> {
     stderr: Stderr,
     options: RenderOptions,
     exit_override: Option<u8>,
+    progress: Option<TerminalProgress>,
+}
+
+impl Renderer<io::Stdout, io::Stderr> {
+    pub fn stdio(options: RenderOptions) -> Self {
+        let progress = options
+            .live_progress
+            .then(|| TerminalProgress::stderr(options.color_enabled));
+        Self {
+            stdout: io::stdout(),
+            stderr: io::stderr(),
+            options,
+            exit_override: None,
+            progress,
+        }
+    }
 }
 
 impl<Stdout, Stderr> Renderer<Stdout, Stderr>
@@ -89,6 +495,7 @@ where
             stderr,
             options,
             exit_override: None,
+            progress: None,
         }
     }
 
@@ -104,15 +511,26 @@ where
 
     #[cfg(test)]
     #[must_use]
-    pub fn into_writers(self) -> (Stdout, Stderr) {
+    pub fn into_writers(mut self) -> (Stdout, Stderr) {
+        self.progress.take();
         (self.stdout, self.stderr)
     }
 
     /// Writes one interactive confirmation prompt to stderr.
     pub fn prompt(&mut self, message: &str) -> Result<(), FirestoneError> {
+        if let Some(progress) = &mut self.progress {
+            progress.clear_active();
+        }
         write_safe_arguments(&mut self.stderr, format_args!("{message}"))
             .and_then(|()| self.stderr.flush())
             .map_err(write_output_failure)
+    }
+
+    fn write_feedback_line(&mut self, arguments: fmt::Arguments<'_>) -> Result<(), FirestoneError> {
+        if let Some(progress) = &self.progress {
+            return progress.println(terminal_text(&arguments.to_string()));
+        }
+        write_line(&mut self.stderr, arguments)
     }
 
     /// Writes a terminal action error to the stream selected by the output mode.
@@ -167,29 +585,48 @@ where
     }
 
     fn render_human_error(&mut self, error: &FirestoneError) -> Result<(), FirestoneError> {
-        write_line(&mut self.stderr, format_args!("error: {}", error.message()))?;
+        self.render_human_error_inner(error, false)
+    }
+
+    pub fn render_hidden_error(&mut self, error: &FirestoneError) -> Result<(), FirestoneError> {
+        self.render_human_error_inner(error, true)
+    }
+
+    fn render_human_error_inner(
+        &mut self,
+        error: &FirestoneError,
+        include_kind: bool,
+    ) -> Result<(), FirestoneError> {
+        if let Some(progress) = &mut self.progress {
+            progress.fail_last_active(error.message())?;
+            progress.clear_active();
+        }
+        if include_kind {
+            self.write_feedback_line(format_args!("error: {}: {}", error.kind(), error.message()))?;
+        } else {
+            self.write_feedback_line(format_args!("error: {}", error.message()))?;
+        }
 
         let mut source = error.source();
         while let Some(cause) = source {
-            write_line(&mut self.stderr, format_args!("cause: {cause}"))?;
+            self.write_feedback_line(format_args!("cause: {cause}"))?;
             source = cause.source();
         }
 
         if let Some(hint) = error.hint() {
-            write_line(&mut self.stderr, format_args!("hint:  {hint}"))?;
+            self.write_feedback_line(format_args!("hint:  {hint}"))?;
         }
 
         Ok(())
     }
-
     fn render_human_event(&mut self, event: Event) -> Result<(), FirestoneError> {
         match event {
             Event::StepStart { id, label } => {
                 if self.options.quiet {
                     return Ok(());
                 }
-                if self.options.stderr_is_terminal {
-                    write_line(&mut self.stderr, format_args!("  ⠋ {id:<8} {label}"))
+                if let Some(progress) = &mut self.progress {
+                    progress.start(&id, &label)
                 } else {
                     write_line(&mut self.stderr, format_args!("[{id}] {label}"))
                 }
@@ -198,8 +635,8 @@ where
                 if self.options.quiet {
                     return Ok(());
                 }
-                if self.options.stderr_is_terminal {
-                    write_line(&mut self.stderr, format_args!("  ⠸ {id:<8} {detail}"))
+                if let Some(progress) = &mut self.progress {
+                    progress.update(&id, &detail)
                 } else {
                     write_line(&mut self.stderr, format_args!("[{id}] {detail}"))
                 }
@@ -229,8 +666,8 @@ where
                 if self.options.quiet {
                     return Ok(());
                 }
-                if self.options.stderr_is_terminal {
-                    write_line(&mut self.stderr, format_args!("  - {id:<8} {reason}"))
+                if let Some(progress) = &mut self.progress {
+                    progress.skip(&id, &reason)
                 } else {
                     write_line(&mut self.stderr, format_args!("[{id}] {reason}"))
                 }
@@ -253,106 +690,92 @@ where
             }
             Event::Output { data } => {
                 if self.options.quiet {
-                    Ok(())
+                    return Ok(());
+                }
+                if let Some(progress) = &self.progress {
+                    let stdout = &mut self.stdout;
+                    progress
+                        .multi
+                        .suspend(|| write_safe_output(stdout, &data))
+                        .map_err(write_output_failure)
                 } else {
                     write_safe_output(&mut self.stdout, &data).map_err(write_output_failure)
                 }
             }
-            Event::Result { action, payload } => self.render_result(&action, payload),
+            Event::Result { action, payload } => {
+                if let Some(progress) = &mut self.progress {
+                    progress.clear_active();
+                }
+                self.render_result(&action, payload)
+            }
         }
     }
 
     fn render_progress(
         &mut self,
-        id: &firestone_core::StepId,
+        id: &StepId,
         done: u64,
         total: Option<u64>,
         unit: Unit,
     ) -> Result<(), FirestoneError> {
-        let marker = if self.options.stderr_is_terminal {
-            "  ⠼ "
-        } else {
-            "["
-        };
+        if let Some(progress) = &mut self.progress {
+            return match unit {
+                Unit::Bytes => progress.progress(id, done, total),
+            };
+        }
 
-        match (self.options.stderr_is_terminal, total) {
-            (true, Some(total)) => write_line(
+        match total {
+            Some(total) => write_line(
                 &mut self.stderr,
                 format_args!(
-                    "{marker}{id:<8} {} / {}",
+                    "[{id}] {} / {}",
                     HumanCount::new(done, unit),
                     HumanCount::new(total, unit)
                 ),
             ),
-            (true, None) => write_line(
+            None => write_line(
                 &mut self.stderr,
-                format_args!("{marker}{id:<8} {}", HumanCount::new(done, unit)),
-            ),
-            (false, Some(total)) => write_line(
-                &mut self.stderr,
-                format_args!(
-                    "{marker}{id}] {} / {}",
-                    HumanCount::new(done, unit),
-                    HumanCount::new(total, unit)
-                ),
-            ),
-            (false, None) => write_line(
-                &mut self.stderr,
-                format_args!("{marker}{id}] {}", HumanCount::new(done, unit)),
+                format_args!("[{id}] {}", HumanCount::new(done, unit)),
             ),
         }
     }
 
     fn render_step_done(
         &mut self,
-        id: &firestone_core::StepId,
+        id: &StepId,
         detail: Option<&str>,
         elapsed_ms: u64,
     ) -> Result<(), FirestoneError> {
+        if let Some(progress) = &mut self.progress {
+            return progress.done(id, detail, elapsed_ms);
+        }
         let elapsed = (elapsed_ms > 1_000).then_some(Elapsed(elapsed_ms));
 
-        match (self.options.stderr_is_terminal, detail, elapsed) {
-            (true, Some(detail), Some(elapsed)) => write_line(
-                &mut self.stderr,
-                format_args!("  ✓ {id:<8} {detail} · {elapsed}"),
-            ),
-            (true, Some(detail), None) => {
-                write_line(&mut self.stderr, format_args!("  ✓ {id:<8} {detail}"))
-            }
-            (true, None, Some(elapsed)) => {
-                write_line(&mut self.stderr, format_args!("  ✓ {id:<8} {elapsed}"))
-            }
-            (true, None, None) => write_line(&mut self.stderr, format_args!("  ✓ {id}")),
-            (false, Some(detail), Some(elapsed)) => write_line(
+        match (detail, elapsed) {
+            (Some(detail), Some(elapsed)) => write_line(
                 &mut self.stderr,
                 format_args!("[{id}] {detail} · {elapsed}"),
             ),
-            (false, Some(detail), None) => {
-                write_line(&mut self.stderr, format_args!("[{id}] {detail}"))
-            }
-            (false, None, Some(elapsed)) => {
+            (Some(detail), None) => write_line(&mut self.stderr, format_args!("[{id}] {detail}")),
+            (None, Some(elapsed)) => {
                 write_line(&mut self.stderr, format_args!("[{id}] done · {elapsed}"))
             }
-            (false, None, None) => write_line(&mut self.stderr, format_args!("[{id}] done")),
+            (None, None) => write_line(&mut self.stderr, format_args!("[{id}] done")),
         }
     }
 
     fn render_step_failure(
         &mut self,
-        id: &firestone_core::StepId,
+        id: &StepId,
         error: &ErrorInfo,
     ) -> Result<(), FirestoneError> {
-        if self.options.stderr_is_terminal {
-            write_line(
-                &mut self.stderr,
-                format_args!("  ✗ {id:<8} {}", error.message),
-            )?;
-        } else {
-            write_line(
-                &mut self.stderr,
-                format_args!("[{id}] error: {}", error.message),
-            )?;
+        if let Some(progress) = &mut self.progress {
+            return progress.fail(id, error);
         }
+        write_line(
+            &mut self.stderr,
+            format_args!("[{id}] error: {}", error.message),
+        )?;
 
         if let Some(hint) = &error.hint {
             write_line(&mut self.stderr, format_args!("hint:  {hint}"))?;
@@ -362,24 +785,24 @@ where
     }
 
     fn render_log(&mut self, level: Level, message: &str) -> Result<(), FirestoneError> {
-        match (self.options.stderr_is_terminal, level) {
-            (true, Level::Warn) => write_line(&mut self.stderr, format_args!("  ! {message}")),
-            (true, Level::Error) => write_line(&mut self.stderr, format_args!("  ✗ {message}")),
-            (true, _) => write_line(&mut self.stderr, format_args!("  · {message}")),
-            (false, Level::Trace) => {
-                write_line(&mut self.stderr, format_args!("[trace] {message}"))
-            }
-            (false, Level::Debug) => {
-                write_line(&mut self.stderr, format_args!("[debug] {message}"))
-            }
-            (false, Level::Info) => write_line(&mut self.stderr, format_args!("{message}")),
-            (false, Level::Warn) => {
-                write_line(&mut self.stderr, format_args!("warning: {message}"))
-            }
-            (false, Level::Error) => write_line(&mut self.stderr, format_args!("error: {message}")),
+        if let Some(progress) = &self.progress {
+            let marker = match level {
+                Level::Warn => warning_marker(self.options.color_enabled),
+                Level::Error => failure_marker(self.options.color_enabled),
+                Level::Trace | Level::Debug | Level::Info => {
+                    info_marker(self.options.color_enabled)
+                }
+            };
+            return progress.println(format!("  {marker} {}", terminal_text(message)));
+        }
+        match level {
+            Level::Trace => write_line(&mut self.stderr, format_args!("[trace] {message}")),
+            Level::Debug => write_line(&mut self.stderr, format_args!("[debug] {message}")),
+            Level::Info => write_line(&mut self.stderr, format_args!("{message}")),
+            Level::Warn => write_line(&mut self.stderr, format_args!("warning: {message}")),
+            Level::Error => write_line(&mut self.stderr, format_args!("error: {message}")),
         }
     }
-
     fn render_result(
         &mut self,
         action: &str,
@@ -963,14 +1386,59 @@ mod tests {
         DoctorCheck, DoctorCheckId, DoctorReport, DoctorStatus, EventSink, ImageRef, MachineSpec,
         MachineState, MachineStatus, StateImage, StateVersion, StepId,
     };
+    use indicatif::{InMemoryTerm, ProgressDrawTarget};
     use serde_json::json;
 
     use super::{
         ErrorInfo, ErrorKind, Event, FirestoneError, Level, MachineSummary, MachineView,
-        RenderOptions, Renderer, Unit, error_exit_code, exit_code,
+        RenderOptions, Renderer, TerminalProgress, Unit, error_exit_code, exit_code,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    #[test]
+    fn terminal_progress_settles_ordered_unicode_rows_without_duplicates() -> TestResult {
+        let terminal = InMemoryTerm::new(20, 80);
+        let target = ProgressDrawTarget::term_like(Box::new(terminal.clone()));
+        let mut progress = TerminalProgress::with_draw_target(target, false);
+
+        let image = StepId::from("image");
+        progress.start(&image, "download image")?;
+        progress.update(&image, "verifying")?;
+        progress.progress(&image, 512, Some(1_024))?;
+        progress.done(&image, Some("cached"), 1_251)?;
+
+        let disk = StepId::from("磁盘");
+        progress.done(&disk, Some("20G overlay"), 348)?;
+
+        let filesystem = StepId::from("fs");
+        progress.start(&filesystem, "first mount")?;
+        progress.done(&filesystem, Some("one"), 0)?;
+        progress.skip(&filesystem, "cached")?;
+
+        progress.fail(
+            &StepId::from("ssh"),
+            &ErrorInfo {
+                kind: ErrorKind::Timeout,
+                message: "timed out".to_owned(),
+                hint: None,
+            },
+        )?;
+        drop(progress);
+
+        let contents = terminal.contents();
+        let lines = contents.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 5);
+        assert!(lines[0].starts_with("  ✓ image    cached"));
+        assert!(lines[0].ends_with("· 1.3s"));
+        assert!(lines[1].starts_with("  ✓ 磁盘     20G overlay"));
+        assert!(lines[1].ends_with("· 0.3s"));
+        assert!(lines[2].starts_with("  ✓ fs       one"));
+        assert!(lines[2].ends_with("· 0.0s"));
+        assert_eq!(lines[3], "  - fs       cached");
+        assert_eq!(lines[4], "  ✗ ssh      timed out");
+        Ok(())
+    }
 
     #[test]
     fn lifecycle_and_log_results_render_exact_human_output() -> TestResult {
@@ -1202,6 +1670,19 @@ mod tests {
         let (stdout, stderr) = renderer.into_writers();
         assert!(stdout.is_empty());
         assert_eq!(stderr, b"[debug] debug detail\nnormal detail\n");
+        let options = RenderOptions::human(false, false).with_verbosity(2);
+        let mut renderer = Renderer::new(Vec::new(), Vec::new(), options);
+        renderer.emit(Event::Log {
+            level: Level::Trace,
+            message: "trace detail".to_owned(),
+        })?;
+        renderer.emit(Event::Log {
+            level: Level::Debug,
+            message: "debug detail".to_owned(),
+        })?;
+        let (stdout, stderr) = renderer.into_writers();
+        assert!(stdout.is_empty());
+        assert_eq!(stderr, b"[trace] trace detail\n[debug] debug detail\n");
         Ok(())
     }
 
@@ -1484,6 +1965,51 @@ mod tests {
         assert!(stdout.starts_with(b"{\n  \"spec\": {\n"));
         assert!(stderr.is_empty());
         assert!(String::from_utf8_lossy(&stdout).contains("\"supervision\": null"));
+        Ok(())
+    }
+
+    #[test]
+    fn every_error_kind_renders_stable_context_and_hint() -> TestResult {
+        let kinds = [
+            ErrorKind::Generic,
+            ErrorKind::Usage,
+            ErrorKind::InvalidSpec,
+            ErrorKind::NotFound,
+            ErrorKind::NotRunning,
+            ErrorKind::Conflict,
+            ErrorKind::AlreadyExists,
+            ErrorKind::AlreadyRunning,
+            ErrorKind::Busy,
+            ErrorKind::Dependency,
+            ErrorKind::Timeout,
+            ErrorKind::Checksum,
+            ErrorKind::Interrupted,
+        ];
+
+        for kind in kinds {
+            let message = format!("{kind} operation failed for machine demo");
+            let hint = format!("correct the {kind} condition and retry");
+            let error = FirestoneError::new(kind, &message).with_hint(&hint);
+
+            let mut human =
+                Renderer::new(Vec::new(), Vec::new(), RenderOptions::human(false, false));
+            human.render_error(&error)?;
+            let (stdout, stderr) = human.into_writers();
+            assert!(stdout.is_empty());
+            assert_eq!(
+                String::from_utf8(stderr)?,
+                format!("error: {message}\nhint:  {hint}\n")
+            );
+
+            let mut json = Renderer::new(Vec::new(), Vec::new(), RenderOptions::json());
+            json.render_error(&error)?;
+            let (stdout, stderr) = json.into_writers();
+            assert!(stderr.is_empty());
+            let record: serde_json::Value = serde_json::from_slice(&stdout)?;
+            assert_eq!(record["error"]["kind"], kind.as_str());
+            assert_eq!(record["error"]["message"], message);
+            assert_eq!(record["error"]["hint"], hint);
+        }
         Ok(())
     }
 

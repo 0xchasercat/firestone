@@ -232,13 +232,26 @@ impl<'a> VmmApi<'a> {
                 format!("invalid VMM API {request} response from socket {socket}: {detail}"),
             )
             .with_hint("the socket must speak the pinned Cloud Hypervisor v53.0 HTTP contract"),
-            ClientFailure::UnexpectedStatus { status, diagnostic } => FirestoneError::new(
-                ErrorKind::Generic,
-                format!(
-                    "VMM API {request} returned unexpected HTTP status {status}: {diagnostic:?}"
-                ),
-            )
-            .with_hint("inspect the cloud-hypervisor log for this machine"),
+            ClientFailure::HttpResponse {
+                status,
+                body_preview,
+                detail,
+                timed_out,
+            } => {
+                let detail = detail.map_or_else(String::new, |detail| format!("; {detail}"));
+                let kind = if timed_out {
+                    ErrorKind::Timeout
+                } else {
+                    ErrorKind::Generic
+                };
+                FirestoneError::new(
+                    kind,
+                    format!(
+                        "VMM API {request} returned HTTP status {status}; body: \"{body_preview}\"{detail}"
+                    ),
+                )
+                .with_hint("inspect the cloud-hypervisor log for this machine")
+            }
             ClientFailure::InvalidJson { label, source } => FirestoneError::new(
                 ErrorKind::Generic,
                 format!("cannot decode {label} from VMM API {request} on socket {socket}"),
@@ -345,9 +358,11 @@ enum ClientFailure {
         source: io::Error,
     },
     Protocol(String),
-    UnexpectedStatus {
+    HttpResponse {
         status: u16,
-        diagnostic: String,
+        body_preview: String,
+        detail: Option<String>,
+        timed_out: bool,
     },
     InvalidJson {
         label: &'static str,
@@ -558,7 +573,7 @@ fn read_response(
         )?;
         if read == 0 {
             return Err(ClientFailure::Protocol(
-                "response ended before the header terminator".to_string(),
+                "response ended before the header terminator".to_owned(),
             ));
         }
         bytes.extend_from_slice(&chunk[..read]);
@@ -568,79 +583,191 @@ fn read_response(
     let buffered_body = bytes.len() - body_start;
     let body_length = if head.status == 204 {
         if head.content_length.is_some() {
-            return Err(ClientFailure::Protocol(
-                "HTTP 204 response must not include Content-Length".to_string(),
+            return Err(http_response_failure(
+                head.status,
+                &bytes[body_start..],
+                Some("HTTP 204 response must not include Content-Length".to_owned()),
             ));
         }
         if buffered_body != 0 {
-            return Err(ClientFailure::Protocol(
-                "HTTP 204 response includes unexpected body bytes".to_string(),
+            return Err(http_response_failure(
+                head.status,
+                &bytes[body_start..],
+                Some("HTTP 204 response includes unexpected body bytes".to_owned()),
             ));
         }
         0
     } else {
-        head.content_length.ok_or_else(|| {
-            ClientFailure::Protocol(format!(
-                "HTTP {} response is missing Content-Length",
-                head.status
-            ))
-        })?
+        match head.content_length {
+            Some(length) => length,
+            None => {
+                return Err(http_response_failure(
+                    head.status,
+                    &bytes[body_start..],
+                    Some(format!(
+                        "HTTP {} response is missing Content-Length",
+                        head.status
+                    )),
+                ));
+            }
+        }
     };
 
-    let body_limit = if head.status == endpoint.expected_status() {
+    let expected_status = head.status == endpoint.expected_status();
+    let body_limit = if expected_status {
         endpoint.success_body_limit()
     } else {
         MAX_ERROR_BODY_BYTES
     };
-    if body_length > body_limit {
-        return Err(ClientFailure::Protocol(format!(
-            "HTTP {} response body length {body_length} exceeds the {body_limit}-byte limit",
-            head.status
-        )));
-    }
-    if buffered_body > body_length {
-        return Err(ClientFailure::Protocol(format!(
-            "HTTP {} response includes {} extra body bytes beyond Content-Length",
+    let body_too_large = body_length > body_limit;
+    if body_too_large && expected_status {
+        return Err(http_response_failure(
             head.status,
-            buffered_body - body_length
-        )));
+            &bytes[body_start..],
+            Some(format!(
+                "HTTP {} response body length {body_length} exceeds the {body_limit}-byte limit",
+                head.status
+            )),
+        ));
+    }
+    let oversized_detail = body_too_large.then(|| {
+        format!(
+            "HTTP {} response body length {body_length} exceeds the {body_limit}-byte limit; body preview truncated",
+            head.status
+        )
+    });
+    if buffered_body > body_length {
+        return Err(http_response_failure(
+            head.status,
+            &bytes[body_start..],
+            Some(format!(
+                "HTTP {} response includes {} extra body bytes beyond Content-Length",
+                head.status,
+                buffered_body - body_length
+            )),
+        ));
     }
 
-    bytes.reserve(body_length - buffered_body);
-    while bytes.len() - body_start < body_length {
-        let remaining = body_length - (bytes.len() - body_start);
+    let read_length = body_length.min(body_limit);
+    bytes.reserve(read_length.saturating_sub(buffered_body.min(read_length)));
+    while bytes.len() - body_start < read_length {
+        let remaining = read_length - (bytes.len() - body_start);
         let mut chunk = [0_u8; IO_CHUNK_BYTES];
         let chunk_length = remaining.min(chunk.len());
-        let read = read_until_deadline(
+        let read = match read_until_deadline(
             stream,
             &mut chunk[..chunk_length],
             deadline,
             "reading response body",
-        )?;
+        ) {
+            Ok(read) => read,
+            Err(ClientFailure::Deadline { phase }) => {
+                return Err(http_response_timeout(
+                    head.status,
+                    &bytes[body_start..],
+                    combine_response_detail(
+                        oversized_detail.as_deref(),
+                        format!("response body timed out while {phase}"),
+                    ),
+                ));
+            }
+            Err(ClientFailure::Io { phase, source }) => {
+                return Err(http_response_failure(
+                    head.status,
+                    &bytes[body_start..],
+                    Some(combine_response_detail(
+                        oversized_detail.as_deref(),
+                        format!("cannot continue {phase}: {source}"),
+                    )),
+                ));
+            }
+            Err(failure) => return Err(failure),
+        };
         if read == 0 {
-            return Err(ClientFailure::Protocol(format!(
-                "HTTP {} response body ended before Content-Length {body_length}",
-                head.status
-            )));
+            return Err(http_response_failure(
+                head.status,
+                &bytes[body_start..],
+                Some(combine_response_detail(
+                    oversized_detail.as_deref(),
+                    format!(
+                        "HTTP {} response body ended before Content-Length {body_length}",
+                        head.status
+                    ),
+                )),
+            ));
         }
         bytes.extend_from_slice(&chunk[..read]);
     }
-    ensure_before_deadline(deadline, "reading response body")?;
-
-    if head.status != endpoint.expected_status() {
-        let diagnostic = std::str::from_utf8(&bytes[body_start..]).map_err(|_| {
-            ClientFailure::Protocol(format!(
-                "HTTP {} diagnostic body is not valid UTF-8",
-                head.status
-            ))
-        })?;
-        return Err(ClientFailure::UnexpectedStatus {
-            status: head.status,
-            diagnostic: diagnostic.to_string(),
-        });
+    match ensure_before_deadline(deadline, "reading response body") {
+        Ok(()) => {}
+        Err(ClientFailure::Deadline { phase }) => {
+            return Err(http_response_timeout(
+                head.status,
+                &bytes[body_start..],
+                combine_response_detail(
+                    oversized_detail.as_deref(),
+                    format!("response body timed out while {phase}"),
+                ),
+            ));
+        }
+        Err(failure) => return Err(failure),
+    }
+    if let Some(detail) = oversized_detail {
+        return Err(http_response_failure(
+            head.status,
+            &bytes[body_start..],
+            Some(detail),
+        ));
+    }
+    if !expected_status {
+        return Err(http_response_failure(
+            head.status,
+            &bytes[body_start..],
+            None,
+        ));
     }
 
     Ok(HttpResponse { bytes, body_start })
+}
+
+fn combine_response_detail(prefix: Option<&str>, detail: String) -> String {
+    match prefix {
+        Some(prefix) => format!("{prefix}; {detail}"),
+        None => detail,
+    }
+}
+
+fn http_response_failure(status: u16, body: &[u8], detail: Option<String>) -> ClientFailure {
+    ClientFailure::HttpResponse {
+        status,
+        body_preview: escaped_body_preview(body),
+        detail,
+        timed_out: false,
+    }
+}
+
+fn http_response_timeout(status: u16, body: &[u8], detail: String) -> ClientFailure {
+    ClientFailure::HttpResponse {
+        status,
+        body_preview: escaped_body_preview(body),
+        detail: Some(detail),
+        timed_out: true,
+    }
+}
+fn escaped_body_preview(body: &[u8]) -> String {
+    let bounded = &body[..body.len().min(MAX_ERROR_BODY_BYTES)];
+    let mut preview: String = match std::str::from_utf8(bounded) {
+        Ok(text) => text.chars().flat_map(char::escape_debug).collect(),
+        Err(_) => bounded
+            .iter()
+            .flat_map(|byte| std::ascii::escape_default(*byte))
+            .map(char::from)
+            .collect(),
+    };
+    if body.len() > bounded.len() {
+        preview.push_str("...[truncated]");
+    }
+    preview
 }
 
 fn parse_response_head(bytes: &[u8]) -> Result<ParsedHead, ClientFailure> {
@@ -1001,11 +1128,9 @@ mod tests {
         )?;
         let _ = server.finish()?;
         assert_eq!(error.kind(), ErrorKind::Generic);
-        assert!(
-            error
-                .message()
-                .contains("invalid VMM API GET /api/v1/vmm.ping response")
-        );
+        let message = error.message();
+        assert!(message.contains("VMM API GET /api/v1/vmm.ping"));
+        assert!(message.contains("invalid VMM API") || message.contains("returned HTTP status"));
         Ok(())
     }
 
@@ -1167,21 +1292,20 @@ mod tests {
         let _ = info_server.finish()?;
         assert!(info_error.message().contains("1048576-byte limit"));
 
-        let error_server = FakeServer::spawn(
-            vec![
-                format!(
-                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\n\r\n",
-                    MAX_ERROR_BODY_BYTES + 1
-                )
-                .into_bytes(),
-            ],
-            false,
-        )?;
+        let mut oversized_error = format!(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\n\r\n",
+            MAX_ERROR_BODY_BYTES + 1
+        )
+        .into_bytes();
+        oversized_error.extend_from_slice(b"diagnostic-prefix");
+        let error_server = FakeServer::spawn(vec![oversized_error], false)?;
         let server_error = require_error(
             VmmApi::new(error_server.path(), TEST_TIMEOUT).vmm_ping(),
             "oversized error response must fail",
         )?;
         let _ = error_server.finish()?;
+        assert!(server_error.message().contains("HTTP status 500"));
+        assert!(server_error.message().contains("diagnostic-prefix"));
         assert!(server_error.message().contains("65536-byte limit"));
         Ok(())
     }
@@ -1252,18 +1376,23 @@ mod tests {
     }
 
     #[test]
-    fn error_diagnostic_non_utf8_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
-        let server =
-            FakeServer::spawn(vec![response("500 Internal Server Error", &[0xff])], false)?;
+    fn error_diagnostic_non_utf8_preserves_status_and_escaped_body()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server = FakeServer::spawn(
+            vec![response("500 Internal Server Error", &[0xff, b'\n', 0x1b])],
+            false,
+        )?;
         let error = require_error(
             VmmApi::new(server.path(), TEST_TIMEOUT).vmm_ping(),
             "non-UTF8 diagnostic must fail",
         )?;
         let _ = server.finish()?;
+        assert_eq!(error.kind(), ErrorKind::Generic);
+        assert!(error.message().contains("HTTP status 500"));
         assert!(
-            error
-                .message()
-                .contains("diagnostic body is not valid UTF-8")
+            error.message().contains(r#"body: "\xff\n\x1b""#),
+            "{}",
+            error.message()
         );
         Ok(())
     }

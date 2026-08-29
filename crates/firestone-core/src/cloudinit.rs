@@ -751,7 +751,7 @@ fn ensure_seed_directory(path: &Path) -> Result<(), FirestoneError> {
                 .map_err(|source| seed_io_error("inspect seed directory", path, source))?;
             if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
                 return Err(FirestoneError::new(
-                    ErrorKind::InvalidSpec,
+                    ErrorKind::Dependency,
                     format!("seed path {} is not a real directory", path.display()),
                 )
                 .with_hint(
@@ -760,7 +760,7 @@ fn ensure_seed_directory(path: &Path) -> Result<(), FirestoneError> {
             }
             if metadata.permissions().mode() & 0o022 != 0 {
                 return Err(FirestoneError::new(
-                    ErrorKind::InvalidSpec,
+                    ErrorKind::Dependency,
                     format!(
                         "seed directory {} is group- or world-writable",
                         path.display()
@@ -848,8 +848,9 @@ mod tests {
 
     use super::{
         MAX_NETWORK_CONFIG_BYTES, MAX_SSH_KEY_FILE_BYTES, MAX_USER_DATA_BYTES, SEED_IMAGE_SIZE,
-        VOLUME_ID, parse_public_keys, parse_user_data, publish_seed, publish_seed_with_sshd_path,
-        render_cloud_init, render_cloud_init_bytes, render_cloud_init_with_guest_ssh,
+        VOLUME_ID, ensure_seed_directory, parse_public_keys, parse_user_data, publish_seed,
+        publish_seed_with_sshd_path, render_cloud_init, render_cloud_init_bytes,
+        render_cloud_init_with_guest_ssh,
     };
 
     const FIRESTONE_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKg0J8YPh7wARkZSlBzFAoJez6gssTQUuPu4Qy3z8T1P firestone@test\n";
@@ -929,6 +930,28 @@ mod tests {
             ],
             ..MachineSpec::default()
         }
+    }
+
+    #[test]
+    fn seed_directory_trust_failures_are_dependencies() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let seed = temp.path().join("seed");
+        fs::write(&seed, b"not a directory")?;
+        let wrong_type = ensure_seed_directory(&seed)
+            .err()
+            .ok_or("seed file should fail")?;
+        assert_eq!(wrong_type.kind(), ErrorKind::Dependency);
+        assert!(wrong_type.hint().is_some());
+
+        fs::remove_file(&seed)?;
+        fs::create_dir(&seed)?;
+        fs::set_permissions(&seed, fs::Permissions::from_mode(0o777))?;
+        let insecure = ensure_seed_directory(&seed)
+            .err()
+            .ok_or("writable seed directory should fail")?;
+        assert_eq!(insecure.kind(), ErrorKind::Dependency);
+        assert!(insecure.hint().is_some());
+        Ok(())
     }
 
     #[test]

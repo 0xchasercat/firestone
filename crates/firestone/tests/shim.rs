@@ -666,10 +666,22 @@ fn shim_launch_failure_boundaries_roll_back_to_failed_and_clean_runtime() -> Tes
     for behavior in ["exit-before-api", "never-ready", "create-fail", "boot-fail"] {
         let mut fixture = Fixture::spawn(behavior, Some(b"old\n"), false)?;
         let error = require_firestone_error(fixture.launch(), "injected launch succeeded")?;
-        assert!(matches!(
-            error.kind(),
-            ErrorKind::Conflict | ErrorKind::Generic | ErrorKind::Timeout
-        ));
+        if behavior == "exit-before-api" {
+            assert_eq!(error.kind(), ErrorKind::Dependency);
+            assert!(error.message().contains("cloud-hypervisor"));
+            assert!(error.message().contains("status 1"));
+            assert!(
+                error
+                    .message()
+                    .contains("fake-vmm: injected exit before API bind")
+            );
+            assert!(error.hint().is_some());
+        } else {
+            assert!(matches!(
+                error.kind(),
+                ErrorKind::Conflict | ErrorKind::Generic | ErrorKind::Timeout
+            ));
+        }
         fixture.wait_shim().or_else(|error| {
             let state = StateStore::new(fixture.paths.machine_state(NAME)?).read()?;
             if state.status == MachineStatus::Failed {

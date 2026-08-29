@@ -320,6 +320,19 @@ impl PasstPlan {
     ) -> Result<(), FirestoneError> {
         self.readiness.wait_ready(deadline, cancelled)
     }
+
+    pub(crate) fn wait_ready_while<F>(
+        &self,
+        deadline: Instant,
+        cancelled: &AtomicBool,
+        check_process: F,
+    ) -> Result<(), FirestoneError>
+    where
+        F: FnMut() -> Result<(), FirestoneError>,
+    {
+        self.readiness
+            .wait_ready_while(deadline, cancelled, check_process)
+    }
 }
 
 /// Assumption Firestone makes about a TAP interface it never creates.
@@ -507,6 +520,18 @@ impl SocketReadinessPlan {
         deadline: Instant,
         cancelled: &AtomicBool,
     ) -> Result<(), FirestoneError> {
+        self.wait_ready_while(deadline, cancelled, || Ok(()))
+    }
+
+    pub(crate) fn wait_ready_while<F>(
+        &self,
+        deadline: Instant,
+        cancelled: &AtomicBool,
+        mut check_process: F,
+    ) -> Result<(), FirestoneError>
+    where
+        F: FnMut() -> Result<(), FirestoneError>,
+    {
         let deadline = self.bounded_deadline(Instant::now(), deadline)?;
         loop {
             if cancelled.load(Ordering::Relaxed) {
@@ -519,6 +544,7 @@ impl SocketReadinessPlan {
                 )
                 .with_hint("the launch must stop passt and roll back before starting the VMM"));
             }
+            check_process()?;
             let now = Instant::now();
             if now >= deadline {
                 return Err(FirestoneError::new(
@@ -1223,6 +1249,17 @@ mod tests {
             .wait_ready(Instant::now(), &cancelled)
             .expect_err("expired readiness must fail");
         assert_eq!(error.kind(), ErrorKind::Timeout);
+
+        let error = plan
+            .wait_ready_while(Instant::now() + Duration::from_secs(1), &cancelled, || {
+                Err(crate::FirestoneError::new(
+                    ErrorKind::Dependency,
+                    "passt exited with status 23",
+                ))
+            })
+            .expect_err("sidecar process failure must win over readiness timeout");
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert!(error.message().contains("status 23"));
 
         let listener = UnixListener::bind(plan.socket().path())?;
         fs::set_permissions(
