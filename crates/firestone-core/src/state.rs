@@ -485,6 +485,7 @@ impl StateStore {
                 ErrorKind::Generic,
                 format!("cannot inspect machine state {}", self.path.display()),
             )
+            .with_hint("check that the machine state path is a readable regular file")
             .with_source(error)
         })?;
         if !metadata.is_file() {
@@ -494,7 +495,8 @@ impl StateStore {
                     "machine state {} is not a regular file",
                     self.path.display()
                 ),
-            ));
+            )
+            .with_hint("replace the machine state path with its mode-0600 state.json file"));
         }
         let bytes =
             bounded::read_to_end(&mut file, MAX_MACHINE_STATE_BYTES).map_err(
@@ -1052,6 +1054,7 @@ mod tests {
             .err()
             .ok_or("expected special state file rejection")?;
         assert!(special.message().contains("not a regular file"));
+        assert!(special.hint().is_some());
         Ok(())
     }
 

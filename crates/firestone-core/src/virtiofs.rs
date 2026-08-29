@@ -309,6 +309,18 @@ impl VirtiofsPlan {
         deadline: Instant,
         cancelled: &AtomicBool,
     ) -> Result<(), FirestoneError> {
+        self.wait_ready_while(deadline, cancelled, || Ok(()))
+    }
+
+    pub(crate) fn wait_ready_while<F>(
+        &self,
+        deadline: Instant,
+        cancelled: &AtomicBool,
+        mut check_process: F,
+    ) -> Result<(), FirestoneError>
+    where
+        F: FnMut() -> Result<(), FirestoneError>,
+    {
         loop {
             if cancelled.load(Ordering::Relaxed) {
                 return Err(FirestoneError::new(
@@ -317,6 +329,7 @@ impl VirtiofsPlan {
                 )
                 .with_hint("stop the partially launched sidecars before retrying"));
             }
+            check_process()?;
 
             match self.validate_ready_files() {
                 Ok(true) => return Ok(()),
@@ -828,14 +841,14 @@ fn validate_socket_path(path: &Path) -> Result<(), FirestoneError> {
     let bytes = path.as_os_str().as_bytes();
     if path.to_str().is_none() {
         return Err(FirestoneError::new(
-            ErrorKind::Dependency,
+            ErrorKind::InvalidSpec,
             format!("virtiofsd socket path '{}' is not UTF-8", path.display()),
         )
         .with_hint("use a UTF-8 FIRESTONE_RUNTIME_DIR"));
     }
     if bytes.len() > VHOST_USER_SOCKET_MAX_BYTES {
         return Err(FirestoneError::new(
-            ErrorKind::Dependency,
+            ErrorKind::InvalidSpec,
             format!(
                 "virtiofsd socket path '{}' is {} bytes; Linux permits at most {VHOST_USER_SOCKET_MAX_BYTES}",
                 path.display(),
@@ -1006,7 +1019,9 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    use crate::{Arch, DependencyManifest, ErrorKind, FsConfig, MountSpec, PathInputs, Paths};
+    use crate::{
+        Arch, DependencyManifest, ErrorKind, FirestoneError, FsConfig, MountSpec, PathInputs, Paths,
+    };
 
     use super::{
         DEFAULT_VIRTIOFS_READINESS_POLL_INTERVAL, DEFAULT_VIRTIOFS_READINESS_TIMEOUT,
@@ -1529,8 +1544,14 @@ env
         let error = validate_socket_path(&over)
             .err()
             .ok_or("accepted overlong socket path")?;
-        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert_eq!(error.kind(), ErrorKind::InvalidSpec);
         assert!(error.message().contains("at most 107"));
+        let non_utf8 = PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xff]));
+        let error = validate_socket_path(&non_utf8)
+            .err()
+            .ok_or("accepted non-UTF-8 socket path")?;
+        assert_eq!(error.kind(), ErrorKind::InvalidSpec);
+
         Ok(())
     }
 
@@ -1566,6 +1587,18 @@ env
         let plan = fixture
             .plans(&[mount], VirtiofsSandbox::Namespace)?
             .remove(0);
+
+        let exited = plan
+            .wait_ready_while(Instant::now(), &AtomicBool::new(false), || {
+                Err(FirestoneError::new(
+                    ErrorKind::Dependency,
+                    "virtiofsd exited with signal 15",
+                ))
+            })
+            .err()
+            .ok_or("sidecar process failure must win over readiness timeout")?;
+        assert_eq!(exited.kind(), ErrorKind::Dependency);
+        assert!(exited.message().contains("signal 15"));
 
         let timeout = plan
             .wait_ready(Instant::now(), &AtomicBool::new(false))

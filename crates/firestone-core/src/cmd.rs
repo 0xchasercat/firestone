@@ -3,10 +3,10 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs::{File, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     os::unix::{
         fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-        process::CommandExt,
+        process::{CommandExt, ExitStatusExt},
     },
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
@@ -27,13 +27,19 @@ use crate::{ErrorKind, FirestoneError};
 const DEFAULT_CAPTURE_LIMIT: usize = 1024 * 1024;
 const EXECUTABLE_BUSY_RETRY_DELAY: Duration = Duration::from_millis(5);
 const EXECUTABLE_BUSY_MAX_RETRIES: usize = 20;
+const PROCESS_LOG_TAIL_BYTES: u64 = 64 * 1024;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct CmdArg {
     value: OsString,
     logged: OsString,
 }
 
+impl std::fmt::Debug for CmdArg {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("CmdArg").field(&self.logged).finish()
+    }
+}
 #[derive(Debug, Clone, Default)]
 enum CmdStdin {
     #[default]
@@ -115,6 +121,7 @@ impl CmdOutput {
                 self.program.to_string_lossy()
             ),
         )
+        .with_hint("inspect the reported stderr, correct the command failure, and retry")
     }
 }
 
@@ -123,7 +130,7 @@ impl CmdOutput {
 /// Arguments are logged at debug level. Use [`Cmd::secret_arg`] for values that
 /// must be passed on argv but must not be written to a log. Stdin bytes and
 /// environment values are never logged.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Cmd {
     program: OsString,
     args: Vec<CmdArg>,
@@ -140,6 +147,34 @@ pub struct Cmd {
     interactive_stdout_to_stderr: bool,
 }
 
+impl std::fmt::Debug for Cmd {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let stdin = match &self.stdin {
+            CmdStdin::Null => "null",
+            CmdStdin::Inherit => "inherit",
+            CmdStdin::Bytes(_) => "bytes <redacted>",
+        };
+        formatter
+            .debug_struct("Cmd")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field("cwd", &self.cwd)
+            .field("clear_env", &self.clear_env)
+            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .field("stdin", &stdin)
+            .field("stderr_log", &self.stderr_log)
+            .field("stdout_append", &self.stdout_append)
+            .field("stderr_append", &self.stderr_append)
+            .field("error_kind", &self.error_kind)
+            .field("timeout", &self.timeout)
+            .field("capture_limit", &self.capture_limit)
+            .field(
+                "interactive_stdout_to_stderr",
+                &self.interactive_stdout_to_stderr,
+            )
+            .finish()
+    }
+}
 impl Cmd {
     #[must_use]
     pub fn new(program: impl Into<OsString>) -> Self {
@@ -377,13 +412,8 @@ impl Cmd {
             }
         }
 
-        let mut child = spawn_with_busy_retry(&mut command, deadline).map_err(|source| {
-            FirestoneError::new(
-                self.error_kind,
-                format!("cannot start command `{}`", self.program.to_string_lossy()),
-            )
-            .with_source(source)
-        })?;
+        let mut child = spawn_with_busy_retry(&mut command, deadline)
+            .map_err(|source| command_start_error(self.error_kind, &self.program, source))?;
         let process_group = child.id();
         let Some(stdout) = child.stdout.take() else {
             let _ = kill_process_group(process_group);
@@ -463,31 +493,35 @@ impl Cmd {
             }
             None => child.wait(),
         };
-        if let Some(writer) = stdin_writer {
+        let stdin_error = if let Some(writer) = stdin_writer {
             match join_before_deadline(writer, deadline, process_group, &mut timed_out) {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) if timed_out => {}
-                Ok(Err(source)) => {
-                    return Err(FirestoneError::new(
+                Ok(Ok(())) => None,
+                Ok(Err(_)) if timed_out => None,
+                Ok(Err(source)) => Some(
+                    FirestoneError::new(
                         self.error_kind,
                         format!(
                             "cannot write stdin for command `{}`",
                             self.program.to_string_lossy()
                         ),
                     )
-                    .with_source(source));
-                }
-                Err(_) => {
-                    return Err(FirestoneError::new(
+                    .with_hint("verify the command input and retry")
+                    .with_source(source),
+                ),
+                Err(_) => Some(
+                    FirestoneError::new(
                         self.error_kind,
                         format!(
                             "stdin writer panicked for command `{}`",
                             self.program.to_string_lossy()
                         ),
-                    ));
-                }
+                    )
+                    .with_hint("retry the command; preserve the error if it recurs"),
+                ),
             }
-        }
+        } else {
+            None
+        };
 
         let stdout = join_capture(
             stdout_reader,
@@ -532,17 +566,23 @@ impl Cmd {
                     self.timeout.map_or(0, |timeout| timeout.as_millis())
                 ),
             )
-            .with_hint("retry after increasing the command timeout"));
+            .with_hint("inspect the reported process output and retry the command"));
         }
 
-        Ok(CmdOutput {
+        let output = CmdOutput {
             program: self.program.clone(),
             status,
             stdout: stdout.bytes,
             stderr: stderr.bytes,
             stdout_truncated: stdout.truncated,
             stderr_truncated: stderr.truncated,
-        })
+        };
+        if output.success() {
+            if let Some(error) = stdin_error {
+                return Err(error);
+            }
+        }
+        Ok(output)
     }
 
     /// Runs the process and maps a non-zero exit to a contextual error.
@@ -655,18 +695,18 @@ impl Cmd {
         }
 
         let deadline = self.timeout.map(|timeout| Instant::now() + timeout);
-        let child = spawn_with_busy_retry(&mut command, deadline).map_err(|source| {
-            FirestoneError::new(
-                self.error_kind,
-                format!("cannot start command `{}`", self.program.to_string_lossy()),
-            )
-            .with_source(source)
-        })?;
+        let child = spawn_with_busy_retry(&mut command, deadline)
+            .map_err(|source| command_start_error(self.error_kind, &self.program, source))?;
         let process_group = process_group.then_some(child.id());
         Ok(ManagedProcess {
             child,
             process_group,
             reaped: false,
+            diagnostic: ProcessDiagnostic {
+                program: self.program.clone(),
+                kind: self.error_kind,
+                log: Some(stderr_path.clone()),
+            },
         })
     }
     /// Starts a terminal-facing process in its own process group.
@@ -726,19 +766,18 @@ impl Cmd {
         }
         command.envs(&self.env);
 
-        let child = spawn_with_busy_retry(&mut command, deadline).map_err(|source| {
-            FirestoneError::new(
-                self.error_kind,
-                format!("cannot start command {}", self.program.to_string_lossy()),
-            )
-            .with_hint("check that the program exists and is executable")
-            .with_source(source)
-        })?;
+        let child = spawn_with_busy_retry(&mut command, deadline)
+            .map_err(|source| command_start_error(self.error_kind, &self.program, source))?;
         let process_group = Some(child.id());
         Ok(ManagedProcess {
             child,
             process_group,
             reaped: false,
+            diagnostic: ProcessDiagnostic {
+                program: self.program.clone(),
+                kind: self.error_kind,
+                log: None,
+            },
         })
     }
 
@@ -822,14 +861,8 @@ impl Cmd {
         }
         command.envs(&self.env);
 
-        let mut child = spawn_with_busy_retry(&mut command, deadline).map_err(|source| {
-            FirestoneError::new(
-                self.error_kind,
-                format!("cannot start command `{}`", self.program.to_string_lossy()),
-            )
-            .with_hint("check that the program exists and is executable")
-            .with_source(source)
-        })?;
+        let mut child = spawn_with_busy_retry(&mut command, deadline)
+            .map_err(|source| command_start_error(self.error_kind, &self.program, source))?;
         let (status, timed_out) = match deadline {
             Some(deadline) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -893,7 +926,7 @@ impl Cmd {
                     self.timeout.map_or(0, |timeout| timeout.as_millis())
                 ),
             )
-            .with_hint("retry after increasing the command timeout"));
+            .with_hint("inspect the reported process output and retry the command"));
         }
         Ok(status)
     }
@@ -904,15 +937,16 @@ impl Cmd {
         if status.success() {
             return Ok(());
         }
-        Err(CmdOutput {
+        Err(ProcessDiagnostic {
             program: self.program.clone(),
-            status,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-            stdout_truncated: false,
-            stderr_truncated: false,
+            kind: self.error_kind,
+            log: None,
         }
-        .failure(self.error_kind))
+        .exit_error(
+            status,
+            "interactive command failed",
+            "inspect the terminal output, correct the command failure, and retry",
+        ))
     }
 
     /// Replaces the current process with this command.
@@ -1008,6 +1042,40 @@ impl ProcessSignal {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ProcessDiagnostic {
+    program: OsString,
+    kind: ErrorKind,
+    log: Option<PathBuf>,
+}
+
+impl ProcessDiagnostic {
+    pub(crate) fn exit_error(
+        &self,
+        status: ExitStatus,
+        context: &str,
+        hint: impl Into<String>,
+    ) -> FirestoneError {
+        let status = status_label(status);
+        let suffix = match self.log.as_deref() {
+            Some(path) => match read_process_log_tail(path) {
+                Ok(lines) if lines.is_empty() => "last 10 log lines: <empty>".to_owned(),
+                Ok(lines) => format!("last 10 log lines:\n{}", lines.join("\n")),
+                Err(source) => format!("last log lines unavailable: {source}"),
+            },
+            None => "last log lines unavailable: stderr was inherited".to_owned(),
+        };
+        FirestoneError::new(
+            self.kind,
+            format!(
+                "{context}: command `{}` exited with status {status}; {suffix}",
+                self.program.to_string_lossy()
+            ),
+        )
+        .with_hint(hint)
+    }
+}
+
 /// A long-running child and the process group created for it.
 ///
 /// Dropping this value deliberately does not kill the child. Supervisors must
@@ -1017,6 +1085,7 @@ pub struct ManagedProcess {
     child: Child,
     process_group: Option<u32>,
     reaped: bool,
+    diagnostic: ProcessDiagnostic,
 }
 
 impl ManagedProcess {
@@ -1028,6 +1097,20 @@ impl ManagedProcess {
     #[must_use]
     pub const fn process_group(&self) -> Option<u32> {
         self.process_group
+    }
+
+    #[must_use]
+    pub(crate) fn diagnostic(&self) -> ProcessDiagnostic {
+        self.diagnostic.clone()
+    }
+
+    pub fn exit_error(
+        &self,
+        status: ExitStatus,
+        context: &str,
+        hint: impl Into<String>,
+    ) -> FirestoneError {
+        self.diagnostic.exit_error(status, context, hint)
     }
 
     /// Confirms that a session-candidate child made its pid the process-group id.
@@ -1187,6 +1270,18 @@ struct Captured {
     truncated: bool,
 }
 
+fn command_start_error(kind: ErrorKind, program: &OsStr, source: std::io::Error) -> FirestoneError {
+    FirestoneError::new(
+        kind,
+        format!(
+            "cannot start command `{}`: {source}",
+            program.to_string_lossy()
+        ),
+    )
+    .with_hint("check that the program exists and is executable")
+    .with_source(source)
+}
+
 fn spawn_with_busy_retry(
     command: &mut Command,
     deadline: Option<Instant>,
@@ -1221,9 +1316,39 @@ fn spawn_with_busy_retry(
         }
     }
 }
+fn read_process_log_tail(path: &Path) -> Result<Vec<String>, std::io::Error> {
+    let flags = nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    let mode = metadata.mode() & 0o7777;
+    let uid = getuid().as_raw();
+    if !metadata.is_file() || metadata.uid() != uid || mode != 0o600 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "process log {} must be a mode-0600 regular file owned by uid {uid}",
+                path.display()
+            ),
+        ));
+    }
+    let length = metadata.len();
+    file.seek(SeekFrom::Start(
+        length.saturating_sub(PROCESS_LOG_TAIL_BYTES),
+    ))?;
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(length.min(PROCESS_LOG_TAIL_BYTES)).unwrap_or(64 * 1024),
+    );
+    file.take(PROCESS_LOG_TAIL_BYTES).read_to_end(&mut bytes)?;
+    Ok(last_lines(&bytes, 10))
+}
+
 fn open_log(path: &Path, kind: ErrorKind) -> Result<File, FirestoneError> {
     let flags = nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK;
     let created = match OpenOptions::new()
+        .read(true)
         .append(true)
         .create_new(true)
         .mode(0o600)
@@ -1233,6 +1358,7 @@ fn open_log(path: &Path, kind: ErrorKind) -> Result<File, FirestoneError> {
         Ok(file) => (file, true),
         Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
             let file = OpenOptions::new()
+                .read(true)
                 .append(true)
                 .custom_flags(flags)
                 .open(path)
@@ -1419,7 +1545,17 @@ fn last_lines(bytes: &[u8], count: usize) -> Vec<String> {
         .take(count)
         .map(|line| {
             let mut characters = line.chars();
-            let mut bounded = characters.by_ref().take(4096).collect::<String>();
+            let mut bounded = characters
+                .by_ref()
+                .take(4096)
+                .map(|character| {
+                    if character.is_control() {
+                        '\u{fffd}'
+                    } else {
+                        character
+                    }
+                })
+                .collect::<String>();
             if characters.next().is_some() {
                 bounded.push_str("...[truncated]");
             }
@@ -1431,10 +1567,11 @@ fn last_lines(bytes: &[u8], count: usize) -> Vec<String> {
 }
 
 fn status_label(status: ExitStatus) -> String {
-    status.code().map_or_else(
-        || "terminated by signal".to_owned(),
-        |code| code.to_string(),
-    )
+    match (status.code(), status.signal()) {
+        (Some(code), _) => code.to_string(),
+        (None, Some(signal)) => format!("terminated by signal {signal}"),
+        (None, None) => "terminated without an exit code or signal".to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -1508,6 +1645,79 @@ mod tests {
         assert!(!message.contains("line-2\n"));
         assert!(message.contains("line-3"));
         assert!(message.contains("line-12"));
+        Ok(())
+    }
+
+    #[test]
+    fn run_nonzero_after_stdin_closes_reports_status_and_tail()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let script = executable(
+            &dir,
+            "closed-stdin",
+            "i=1; while [ \"$i\" -le 12 ]; do printf 'line-%s\\n' \"$i\" >&2; i=$((i + 1)); done; exit 23",
+        )?;
+
+        let error = Cmd::new(&script)
+            .stdin_bytes(vec![b'x'; 1024 * 1024])
+            .run()
+            .err()
+            .ok_or("command should fail")?;
+
+        assert!(error.message().contains("status 23"));
+        assert!(error.message().contains("line-3"));
+        assert!(error.message().contains("line-12"));
+        assert!(error.hint().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn run_signaled_process_reports_signal_number() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let script = executable(&dir, "signaled", "kill -TERM $$")?;
+
+        let error = Cmd::new(&script)
+            .run()
+            .err()
+            .ok_or("signaled command should fail")?;
+
+        assert!(error.message().contains("terminated by signal 15"));
+        Ok(())
+    }
+
+    #[test]
+    fn managed_process_exit_reports_program_status_and_safe_log_tail()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let script = executable(
+            &dir,
+            "managed-failure",
+            "printf 'line-1\\nline-2\\n\\033[31mline-3\\033[0m\\n' >&2; i=4; while [ \"$i\" -le 12 ]; do printf 'line-%s\\n' \"$i\" >&2; i=$((i + 1)); done; exit 23",
+        )?;
+        let stdout_log = dir.path().join("managed.stdout.log");
+        let stderr_log = dir.path().join("managed.stderr.log");
+        let mut process = Cmd::new(&script)
+            .stdout_append(&stdout_log)
+            .stderr_append(&stderr_log)
+            .error_kind(crate::ErrorKind::Dependency)
+            .spawn_process_group()?;
+        let status = process.wait()?;
+
+        let error = process.exit_error(
+            status,
+            "sidecar failed before readiness",
+            "inspect the sidecar log and retry",
+        );
+        let message = error.message();
+        assert_eq!(error.kind(), crate::ErrorKind::Dependency);
+        assert!(message.contains(&script.display().to_string()));
+        assert!(message.contains("status 23"));
+        assert!(!message.contains("line-2\n"));
+        assert!(message.contains("line-3"));
+        assert!(message.contains("line-12"));
+        assert!(!message.contains('\u{1b}'));
+        assert!(message.contains('\u{fffd}'));
+        assert_eq!(error.hint(), Some("inspect the sidecar log and retry"));
         Ok(())
     }
 
@@ -1735,5 +1945,23 @@ mod tests {
                 .and_then(|error| error.hint().map(str::to_owned))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn command_debug_redacts_secret_arguments_stdin_and_environment_values() {
+        let command = Cmd::new("program")
+            .arg("visible")
+            .secret_arg("PRIVATE_KEY_MATERIAL")
+            .env("TOKEN", "ENVIRONMENT_SECRET")
+            .stdin_bytes(b"CLOUD_INIT_SECRET".to_vec());
+
+        let debug = format!("{command:?}");
+
+        assert!(debug.contains("visible"));
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("TOKEN"));
+        assert!(!debug.contains("PRIVATE_KEY_MATERIAL"));
+        assert!(!debug.contains("ENVIRONMENT_SECRET"));
+        assert!(!debug.contains("CLOUD_INIT_SECRET"));
     }
 }

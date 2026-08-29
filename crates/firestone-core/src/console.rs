@@ -284,25 +284,22 @@ pub struct RawTerminal {
     original: Option<Termios>,
 }
 
+fn terminal_setup_error(operation: &str, source: nix::errno::Errno) -> FirestoneError {
+    FirestoneError::new(ErrorKind::Dependency, format!("cannot {operation}"))
+        .with_hint("run the command from an interactive terminal that supports termios")
+        .with_source(io::Error::from(source))
+}
+
 impl RawTerminal {
     pub fn enter<F: AsFd>(terminal: &F) -> Result<Self, FirestoneError> {
-        let fd = dup(terminal.as_fd()).map_err(|source| {
-            FirestoneError::new(
-                ErrorKind::Dependency,
-                "cannot duplicate the terminal descriptor",
-            )
-            .with_source(io::Error::from(source))
-        })?;
-        let original = tcgetattr(&fd).map_err(|source| {
-            FirestoneError::new(ErrorKind::Dependency, "cannot read terminal mode")
-                .with_source(io::Error::from(source))
-        })?;
+        let fd = dup(terminal.as_fd())
+            .map_err(|source| terminal_setup_error("duplicate the terminal descriptor", source))?;
+        let original =
+            tcgetattr(&fd).map_err(|source| terminal_setup_error("read terminal mode", source))?;
         let mut raw = original.clone();
         cfmakeraw(&mut raw);
-        tcsetattr(&fd, SetArg::TCSANOW, &raw).map_err(|source| {
-            FirestoneError::new(ErrorKind::Dependency, "cannot switch terminal to raw mode")
-                .with_source(io::Error::from(source))
-        })?;
+        tcsetattr(&fd, SetArg::TCSANOW, &raw)
+            .map_err(|source| terminal_setup_error("switch terminal to raw mode", source))?;
         Ok(Self {
             fd,
             original: Some(original),
@@ -673,7 +670,8 @@ fn validate_runtime_log(
                 "machine {name} PTY staging log '{}' is insecure: expected a current-user mode-0600 regular file",
                 path.display()
             ),
-        ));
+        )
+        .with_hint("remove the insecure runtime log and retry the machine operation"));
     }
     Ok(())
 }
@@ -714,6 +712,9 @@ fn console_io_error(name: &str, phase: &str, source: io::Error) -> FirestoneErro
     FirestoneError::new(
         ErrorKind::Generic,
         format!("cannot {phase} for machine `{name}`"),
+    )
+    .with_hint(
+        "retry the console connection; if it fails again, inspect the machine shim and console logs",
     )
     .with_source(source)
 }
@@ -757,8 +758,23 @@ mod tests {
     use crate::{ErrorKind, PathInputs, Paths};
 
     use super::{
-        CONSOLE_SOCKET_MODE, ConsoleBroker, ConsoleResult, RawTerminal, console_plan, relay_console,
+        CONSOLE_SOCKET_MODE, ConsoleBroker, ConsoleResult, RawTerminal, console_io_error,
+        console_plan, relay_console,
     };
+
+    #[test]
+    fn console_io_failure_has_machine_context_and_hint() {
+        let error = console_io_error(
+            "demo",
+            "relay console output",
+            std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+        );
+
+        assert_eq!(error.kind(), ErrorKind::Generic);
+        assert!(error.message().contains("demo"));
+        assert!(error.message().contains("relay console output"));
+        assert!(error.hint().is_some());
+    }
 
     struct Fixture {
         _temp: TempDir,
@@ -890,6 +906,18 @@ mod tests {
         server.read_exact(&mut received)?;
         assert_eq!(&received, b"before");
         assert!(output.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn raw_terminal_rejects_non_terminal_with_hint() -> Result<(), Box<dyn std::error::Error>> {
+        let not_a_terminal = fs::File::open("/dev/null")?;
+        let error = RawTerminal::enter(&not_a_terminal)
+            .err()
+            .ok_or("/dev/null should not support termios")?;
+
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert!(error.hint().is_some());
         Ok(())
     }
 

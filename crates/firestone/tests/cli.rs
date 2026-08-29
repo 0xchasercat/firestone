@@ -3,11 +3,21 @@ use std::{
     error::Error,
     ffi::OsString,
     fs,
-    os::unix::fs::PermissionsExt,
+    io::Read,
+    os::{fd::AsFd as _, unix::fs::PermissionsExt},
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Child, ChildStdout, Command, ExitStatus, Output, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
+};
+
+use nix::{
+    poll::{PollFd, PollFlags, poll},
+    pty::{Winsize, openpty},
 };
 use wait_timeout::ChildExt as _;
 
@@ -28,6 +38,27 @@ fn invalid_argument_json_requested_emits_structured_usage_error() -> TestResult 
             .as_str()
             .is_some_and(|message| { message.contains("unexpected argument '--bogus'") })
     );
+    Ok(())
+}
+
+#[test]
+fn stdout_broken_pipe_is_a_normal_exit() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let home = directory.path().join("home");
+    let (reader, writer) = nix::unistd::pipe()?;
+    drop(reader);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_firestone"))
+        .args(["--home"])
+        .arg(&home)
+        .arg("version")
+        .stdout(Stdio::from(writer))
+        .stderr(Stdio::piped())
+        .output()?;
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
     Ok(())
 }
 
@@ -211,6 +242,433 @@ impl Drop for MachineCleanup {
                 .status();
         }
     }
+}
+
+struct PtyOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    terminal_restored: bool,
+}
+
+struct PtyCommand {
+    child: Option<Child>,
+    terminal: Option<fs::File>,
+    original_termios: nix::sys::termios::Termios,
+    stdout: Option<ChildStdout>,
+    reader: Option<thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+    reader_done: Arc<AtomicBool>,
+}
+
+impl PtyCommand {
+    fn spawn(
+        mut command: Command,
+        rows: u16,
+        columns: u16,
+        term: &str,
+    ) -> Result<Self, Box<dyn Error>> {
+        let size = Winsize {
+            ws_row: rows,
+            ws_col: columns,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let opened = openpty(Some(&size), None)?;
+        let mut master = fs::File::from(opened.master);
+        let terminal = fs::File::from(opened.slave);
+        let original_termios = nix::sys::termios::tcgetattr(&terminal)?;
+        command
+            .env("TERM", term)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(terminal.try_clone()?));
+        let mut child = command.spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("PTY command stdout is not piped")?;
+        drop(command);
+        let reader_done = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&reader_done);
+        let reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            loop {
+                let (ready, events) = {
+                    let mut descriptors = [PollFd::new(
+                        master.as_fd(),
+                        PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
+                    )];
+                    let ready = poll(&mut descriptors, 50_u16)?;
+                    (
+                        ready,
+                        descriptors[0].revents().unwrap_or_else(PollFlags::empty),
+                    )
+                };
+                if events.contains(PollFlags::POLLIN) {
+                    let mut chunk = [0_u8; 4096];
+                    match master.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+                        Err(source) if source.raw_os_error() == Some(nix::libc::EIO) => break,
+                        Err(source) => return Err(source),
+                    }
+                    continue;
+                }
+                if events.intersects(PollFlags::POLLHUP | PollFlags::POLLERR)
+                    || (ready == 0 && done.load(Ordering::Relaxed))
+                {
+                    break;
+                }
+            }
+            Ok(bytes)
+        });
+        Ok(Self {
+            child: Some(child),
+            terminal: Some(terminal),
+            original_termios,
+            stdout: Some(stdout),
+            reader: Some(reader),
+            reader_done,
+        })
+    }
+
+    fn resize(&self, rows: u16, columns: u16) -> Result<(), Box<dyn Error>> {
+        let terminal = self
+            .terminal
+            .as_ref()
+            .ok_or("PTY terminal is already closed")?;
+        let output = Command::new("stty")
+            .arg("rows")
+            .arg(rows.to_string())
+            .arg("cols")
+            .arg(columns.to_string())
+            .stdin(Stdio::from(terminal.try_clone()?))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "cannot resize PTY: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn signal(&self, signal: nix::sys::signal::Signal) -> Result<(), Box<dyn Error>> {
+        let child = self.child.as_ref().ok_or("PTY command already exited")?;
+        let pid = i32::try_from(child.id()).map_err(|_| "PTY child pid overflowed i32")?;
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), signal)?;
+        Ok(())
+    }
+
+    fn finish(mut self, timeout: Duration) -> Result<PtyOutput, Box<dyn Error>> {
+        let mut child = self.child.take().ok_or("PTY command already exited")?;
+        let status = match child.wait_timeout(timeout)? {
+            Some(status) => status,
+            None => {
+                child.kill()?;
+                let _ = child.wait();
+                self.terminal.take();
+                return Err("PTY command did not exit before its deadline".into());
+            }
+        };
+        let current_termios = nix::sys::termios::tcgetattr(
+            self.terminal
+                .as_ref()
+                .ok_or("PTY terminal is already closed")?,
+        )?;
+        let terminal_restored = terminal_modes_equal(&self.original_termios, &current_termios);
+        self.terminal.take();
+
+        let mut stdout = Vec::new();
+        let mut stdout_pipe = self
+            .stdout
+            .take()
+            .ok_or("PTY command stdout is unavailable")?;
+        loop {
+            let (ready, events) = {
+                let mut descriptors = [PollFd::new(
+                    stdout_pipe.as_fd(),
+                    PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
+                )];
+                let ready = poll(&mut descriptors, 50_u16)?;
+                (
+                    ready,
+                    descriptors[0].revents().unwrap_or_else(PollFlags::empty),
+                )
+            };
+            if events.contains(PollFlags::POLLIN) {
+                let mut chunk = [0_u8; 4096];
+                let read = stdout_pipe.read(&mut chunk)?;
+                if read == 0 {
+                    break;
+                }
+                stdout.extend_from_slice(&chunk[..read]);
+                continue;
+            }
+            if ready == 0 || events.intersects(PollFlags::POLLHUP | PollFlags::POLLERR) {
+                break;
+            }
+        }
+        self.reader_done.store(true, Ordering::Relaxed);
+        let stderr = self
+            .reader
+            .take()
+            .ok_or("PTY reader is unavailable")?
+            .join()
+            .map_err(|_| "PTY reader panicked")??;
+        Ok(PtyOutput {
+            status,
+            stdout,
+            stderr,
+            terminal_restored,
+        })
+    }
+}
+
+impl Drop for PtyCommand {
+    fn drop(&mut self) {
+        self.reader_done.store(true, Ordering::Relaxed);
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.terminal.take();
+    }
+}
+
+fn terminal_modes_equal(
+    left: &nix::sys::termios::Termios,
+    right: &nix::sys::termios::Termios,
+) -> bool {
+    left.input_flags == right.input_flags
+        && left.output_flags == right.output_flags
+        && left.control_flags == right.control_flags
+        && left.local_flags == right.local_flags
+        && left.control_chars == right.control_chars
+}
+
+#[test]
+fn tty_progress_cli_contract_without_kvm() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = fs::canonicalize(directory.path())?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(
+        env!("CARGO_BIN_EXE_firestone"),
+        fs::Permissions::from_mode(0o755),
+    )?;
+    let home = root.join("home");
+    let fake_vmm = compile_fake_vmm(&root)?;
+    let bin = root.join("bin");
+    fs::create_dir(&bin)?;
+    let qemu_img = bin.join("qemu-img");
+    fs::copy(&fake_vmm, &qemu_img)?;
+    fs::set_permissions(&qemu_img, fs::Permissions::from_mode(0o700))?;
+    let mut path_entries = vec![bin];
+    if let Some(existing) = env::var_os("PATH") {
+        path_entries.extend(env::split_paths(&existing));
+    }
+    let path = env::join_paths(path_entries)?;
+    let source = root.join("progress-base.qcow2");
+    fs::write(&source, b"QFI\xfbTTY-PROGRESS")?;
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600))?;
+    let firmware = root.join("progress-firmware.fd");
+    fs::write(&firmware, b"firmware")?;
+    fs::set_permissions(&firmware, fs::Permissions::from_mode(0o600))?;
+    let names = [
+        ("animated", "delayed-ready"),
+        ("api-error", "create-fail"),
+        ("timeout", "normal"),
+        ("interrupt", "delayed-ready"),
+    ];
+    let _cleanup = MachineCleanup {
+        home: home.clone(),
+        path: path.clone(),
+        names: names.iter().map(|(name, _)| (*name).to_owned()).collect(),
+    };
+    for (name, behavior) in names {
+        let output =
+            create_fake_machine(&home, &path, name, &source, &firmware, &fake_vmm, behavior)?;
+        require_success(&output, &format!("create {name}"))?;
+    }
+
+    let mut animated_command = firestone(&home, &path);
+    animated_command
+        .args(["start", "animated", "--no-wait", "--timeout", "20s"])
+        .env_remove("NO_COLOR");
+    let animated = PtyCommand::spawn(animated_command, 12, 38, "xterm-256color")?;
+    thread::sleep(Duration::from_millis(250));
+    animated.resize(30, 100)?;
+    let animated = animated.finish(Duration::from_secs(20))?;
+    assert!(animated.status.success());
+    assert_eq!(animated.stdout, b"animated is running\n");
+    assert!(animated.terminal_restored);
+    let animated_stderr = String::from_utf8_lossy(&animated.stderr);
+    let distinct_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        .into_iter()
+        .filter(|frame| animated_stderr.contains(frame))
+        .count();
+    assert!(
+        distinct_frames >= 2,
+        "expected animated spinner frames, stderr was {animated_stderr:?}"
+    );
+    assert!(animated_stderr.contains('✓'));
+    assert!(animated.stderr.windows(5).any(|bytes| bytes == b"\x1b[32m"));
+
+    let mut api_error_command = firestone(&home, &path);
+    api_error_command
+        .args(["start", "api-error", "--no-wait", "--timeout", "20s"])
+        .env_remove("NO_COLOR");
+    let api_error = PtyCommand::spawn(api_error_command, 24, 100, "xterm-256color")?
+        .finish(Duration::from_secs(15))?;
+    let api_error_stderr = String::from_utf8_lossy(&api_error.stderr);
+    let api_error_tail = api_error_stderr
+        .chars()
+        .rev()
+        .take(2_000)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    assert_eq!(
+        api_error.status.code(),
+        Some(1),
+        "API failure stderr tail was {api_error_tail:?}"
+    );
+    assert!(api_error.stdout.is_empty());
+    assert!(api_error.terminal_restored);
+    assert!(api_error_stderr.contains('✗'));
+    assert!(api_error_stderr.contains("HTTP status 500"));
+    assert!(api_error_stderr.contains("injected create failure"));
+
+    let mut timeout_command = firestone(&home, &path);
+    timeout_command.args(["start", "timeout", "--timeout", "1s"]);
+    let timeout = PtyCommand::spawn(timeout_command, 24, 100, "xterm-256color")?
+        .finish(Duration::from_secs(15))?;
+    assert_eq!(timeout.status.code(), Some(6));
+    assert!(timeout.stdout.is_empty());
+    assert!(timeout.terminal_restored);
+    let timeout_stderr = String::from_utf8_lossy(&timeout.stderr);
+    assert!(timeout_stderr.contains('✗'));
+    assert!(timeout_stderr.contains("timed out") || timeout_stderr.contains("deadline"));
+
+    let mut interrupt_command = firestone(&home, &path);
+    interrupt_command.args(["start", "interrupt", "--timeout", "20s"]);
+    let interrupt = PtyCommand::spawn(interrupt_command, 24, 100, "xterm-256color")?;
+    thread::sleep(Duration::from_millis(250));
+    interrupt.signal(nix::sys::signal::Signal::SIGINT)?;
+    let interrupt = interrupt.finish(Duration::from_secs(15))?;
+    assert_eq!(interrupt.status.code(), Some(130));
+    assert!(interrupt.stdout.is_empty());
+    assert!(interrupt.terminal_restored);
+    assert!(
+        !interrupt
+            .stderr
+            .windows(6)
+            .any(|bytes| bytes == b"\x1b[?25l")
+    );
+    assert!(String::from_utf8_lossy(&interrupt.stderr).contains("interrupted"));
+
+    let make_source = |name: &str| -> Result<PathBuf, Box<dyn Error>> {
+        let path = root.join(format!("{name}.qcow2"));
+        let mut bytes = b"QFI\xfb".to_vec();
+        bytes.extend_from_slice(name.as_bytes());
+        fs::write(&path, bytes)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        Ok(path)
+    };
+
+    let no_color_source = make_source("no-color")?;
+    let mut no_color_command = firestone(&home, &path);
+    no_color_command
+        .args(["images", "pull"])
+        .arg(&no_color_source)
+        .env("NO_COLOR", "1");
+    let no_color = PtyCommand::spawn(no_color_command, 24, 100, "xterm-256color")?
+        .finish(Duration::from_secs(15))?;
+    assert!(no_color.status.success());
+    assert!(no_color.terminal_restored);
+    assert!(String::from_utf8_lossy(&no_color.stderr).contains('✓'));
+    for sequence in [
+        b"\x1b[31m".as_slice(),
+        b"\x1b[32m".as_slice(),
+        b"\x1b[33m".as_slice(),
+        b"\x1b[2m".as_slice(),
+    ] {
+        assert!(
+            !no_color
+                .stderr
+                .windows(sequence.len())
+                .any(|bytes| bytes == sequence)
+        );
+    }
+
+    let mut no_color_flag_command = firestone(&home, &path);
+    no_color_flag_command
+        .args(["--no-color", "images", "pull"])
+        .arg(&no_color_source)
+        .env_remove("NO_COLOR");
+    let no_color_flag = PtyCommand::spawn(no_color_flag_command, 24, 100, "xterm-256color")?
+        .finish(Duration::from_secs(15))?;
+    assert!(no_color_flag.status.success());
+    assert!(no_color_flag.terminal_restored);
+    for sequence in [
+        b"\x1b[31m".as_slice(),
+        b"\x1b[32m".as_slice(),
+        b"\x1b[33m".as_slice(),
+        b"\x1b[2m".as_slice(),
+    ] {
+        assert!(
+            !no_color_flag
+                .stderr
+                .windows(sequence.len())
+                .any(|bytes| bytes == sequence)
+        );
+    }
+
+    let dumb_source = make_source("dumb")?;
+    let mut dumb_command = firestone(&home, &path);
+    dumb_command.args(["images", "pull"]).arg(&dumb_source);
+    let dumb = PtyCommand::spawn(dumb_command, 24, 100, "dumb")?.finish(Duration::from_secs(15))?;
+    assert!(dumb.status.success());
+    assert!(dumb.terminal_restored);
+    assert!(!dumb.stderr.contains(&0x1b));
+    assert!(String::from_utf8_lossy(&dumb.stderr).contains("[image]"));
+
+    let quiet_source = make_source("quiet")?;
+    let mut quiet_command = firestone(&home, &path);
+    quiet_command
+        .args(["--quiet", "images", "pull"])
+        .arg(&quiet_source);
+    let quiet = PtyCommand::spawn(quiet_command, 24, 100, "xterm-256color")?
+        .finish(Duration::from_secs(15))?;
+    assert!(quiet.status.success());
+    assert!(quiet.terminal_restored);
+    assert!(quiet.stderr.is_empty());
+    assert!(!quiet.stdout.is_empty());
+
+    let plain_source = make_source("plain")?;
+    let plain = firestone(&home, &path)
+        .args(["images", "pull"])
+        .arg(&plain_source)
+        .output()?;
+    assert!(plain.status.success());
+    assert!(!plain.stderr.contains(&0x1b));
+    assert!(!plain.stderr.contains(&b'\r'));
+    assert!(String::from_utf8_lossy(&plain.stderr).contains("[image]"));
+
+    let json_source = make_source("json")?;
+    let json = firestone(&home, &path)
+        .args(["--json", "images", "pull"])
+        .arg(&json_source)
+        .output()?;
+    assert!(json.status.success());
+    assert!(json.stderr.is_empty());
+    assert!(!json.stdout.contains(&0x1b));
+    assert!(!ndjson(&json)?.is_empty());
+    Ok(())
 }
 
 #[test]

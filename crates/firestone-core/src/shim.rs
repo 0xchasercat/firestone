@@ -43,8 +43,11 @@ use nix::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
 use sha2::{Digest, Sha256};
 use std::os::unix::ffi::OsStrExt;
+
+use crate::cmd::ProcessDiagnostic;
 
 use crate::{
     Arch, Cmd, ConsoleBroker, DependencyManifest, ErrorInfo, ErrorKind, Event, EventSink,
@@ -369,6 +372,7 @@ impl RecoveredProcess {
 
 struct OwnedVmm {
     process: Option<ManagedProcess>,
+    diagnostic: ProcessDiagnostic,
     record: ProcessRecord,
     reaped_status: Option<ExitStatus>,
     preserved_children: PreservedProcessRoots,
@@ -383,10 +387,12 @@ impl OwnedVmm {
     ) -> Self {
         let pid = process.id();
         let process_group = process.process_group().unwrap_or(pid);
+        let diagnostic = process.diagnostic();
         OWNER_EVIDENCE_PID.store(pid, Ordering::Relaxed);
         OWNER_EVIDENCE_STATE.store(OWNER_ARMED, Ordering::Release);
         Self {
             process: Some(process),
+            diagnostic,
             record: ProcessRecord {
                 pid,
                 process_group,
@@ -432,6 +438,14 @@ impl OwnedVmm {
     fn retained_status(&self) -> Option<ExitStatus> {
         self.reaped_status
     }
+    fn exit_error(&self, status: ExitStatus, context: &str) -> FirestoneError {
+        self.diagnostic.exit_error(
+            status,
+            context,
+            "inspect the cloud-hypervisor log and retry the machine start",
+        )
+    }
+
     fn observe_exit(&self) -> Result<bool, FirestoneError> {
         if self.reaped_status.is_some() {
             return Ok(true);
@@ -623,6 +637,7 @@ struct RuntimeArtifact {
 struct OwnedSidecar {
     name: String,
     process: Option<ManagedProcess>,
+    diagnostic: ProcessDiagnostic,
     record: ProcessRecord,
     reaped_status: Option<ExitStatus>,
     artifacts: Vec<RuntimeArtifact>,
@@ -637,9 +652,11 @@ impl OwnedSidecar {
     ) -> Self {
         let pid = process.id();
         let process_group = process.process_group().unwrap_or(pid);
+        let diagnostic = process.diagnostic();
         Self {
             name,
             process: Some(process),
+            diagnostic,
             record: ProcessRecord {
                 pid,
                 process_group,
@@ -663,6 +680,16 @@ impl OwnedSidecar {
         &self.name
     }
 
+    fn exit_error(&self, status: ExitStatus, context: &str) -> FirestoneError {
+        self.diagnostic.exit_error(
+            status,
+            context,
+            format!(
+                "inspect the {} process log and retry the machine start",
+                self.name
+            ),
+        )
+    }
     fn id(&self) -> u32 {
         self.process
             .as_ref()
@@ -882,6 +909,7 @@ pub fn prepare_start(
             ErrorKind::Conflict,
             format!("machine `{name}` has no persisted MAC address"),
         )
+        .with_hint("repair state.json before starting the machine")
     })?;
     let mac = mac_value.parse().map_err(|source| {
         FirestoneError::new(
@@ -1053,14 +1081,18 @@ pub fn prepare_start(
         Ok(prepared) => Ok(prepared),
         Err(error) => {
             if let Err(cleanup_error) = paths.clear_machine_runtime_dir(name, true) {
-                return Err(FirestoneError::new(
-                    cleanup_error.kind(),
-                    format!(
-                        "{}; failed to clean prepared runtime: {}",
-                        error.message(),
-                        cleanup_error.message()
-                    ),
-                ));
+                let kind = error.kind();
+                let hint = error.hint().map(str::to_owned);
+                let message = format!(
+                    "{}; failed to clean prepared runtime: {}",
+                    error.message(),
+                    cleanup_error.message()
+                );
+                let mut combined = FirestoneError::new(kind, message).with_source(error);
+                if let Some(hint) = hint {
+                    combined = combined.with_hint(hint);
+                }
+                return Err(combined);
             }
             Err(error)
         }
@@ -2784,7 +2816,7 @@ fn preflight_launch_argv(argv: &[OsString]) -> Result<(), FirestoneError> {
 }
 
 fn capture_launch_process_record(
-    vmm: &OwnedVmm,
+    vmm: &mut OwnedVmm,
     plan: &LaunchPlan,
     launch_argv: &[OsString],
     launch_binding: &str,
@@ -2804,7 +2836,17 @@ fn capture_launch_process_record(
         ) {
             Ok(record) => return Ok(record),
             Err(error) => {
-                if vmm.observe_exit()? || Instant::now() >= deadline {
+                if vmm.observe_exit()? {
+                    let status = vmm.reap_exited_group()?;
+                    return Err(vmm.exit_error(
+                        status,
+                        &format!(
+                            "cloud-hypervisor for machine `{}` exited before process identity capture",
+                            plan.name
+                        ),
+                    ));
+                }
+                if Instant::now() >= deadline {
                     return Err(error);
                 }
                 thread::sleep(Duration::from_millis(1));
@@ -2812,7 +2854,6 @@ fn capture_launch_process_record(
         }
     }
 }
-
 fn sidecar_argv(command: &Cmd) -> Vec<OsString> {
     std::iter::once(command.program().to_os_string())
         .chain(command.arguments().map(OsStr::to_os_string))
@@ -3090,7 +3131,7 @@ fn recover_sidecar_processes(
 }
 
 fn capture_sidecar_process_record(
-    sidecar: &OwnedSidecar,
+    sidecar: &mut OwnedSidecar,
     program: &Path,
     executable_sha256: &str,
     launch_argv: &[OsString],
@@ -3111,7 +3152,15 @@ fn capture_sidecar_process_record(
         ) {
             Ok(record) => return Ok(record),
             Err(error) => {
-                if sidecar.observe_exit()? || Instant::now() >= deadline {
+                if sidecar.observe_exit()? {
+                    let context = format!(
+                        "sidecar {} exited before process identity capture",
+                        sidecar.name()
+                    );
+                    let status = sidecar.reap_exited()?;
+                    return Err(sidecar.exit_error(status, &context));
+                }
+                if Instant::now() >= deadline {
                     return Err(error);
                 }
                 thread::sleep(Duration::from_millis(1));
@@ -3154,7 +3203,7 @@ fn spawn_sidecar(
         .insert(sidecar_name.clone(), sidecar.id());
     StateStore::new(paths.machine_state(machine)?).write_from_shim(state)?;
     let record = capture_sidecar_process_record(
-        &sidecar,
+        &mut sidecar,
         program,
         &executable_sha256,
         &launch_argv,
@@ -3239,15 +3288,13 @@ fn virtiofs_artifacts(plan: &VirtiofsPlan, uid: u32) -> Vec<RuntimeArtifact> {
     ]
 }
 
-fn ensure_sidecar_alive(sidecar: &OwnedSidecar) -> Result<(), FirestoneError> {
-    if sidecar.observe_exit()? {
-        Err(FirestoneError::new(
-            ErrorKind::Dependency,
-            format!("sidecar {} exited before VMM launch", sidecar.name()),
-        ))
-    } else {
-        Ok(())
+fn ensure_sidecar_alive(sidecar: &mut OwnedSidecar) -> Result<(), FirestoneError> {
+    if !sidecar.observe_exit()? {
+        return Ok(());
     }
+    let context = format!("sidecar {} exited before VMM launch", sidecar.name());
+    let status = sidecar.reap_exited()?;
+    Err(sidecar.exit_error(status, &context))
 }
 
 fn passt_step_detail(plan: &crate::PasstPlan) -> String {
@@ -3312,10 +3359,12 @@ fn launch_sidecars(
                     work_deadline,
                 )?;
                 sidecars.push(sidecar);
-                passt.wait_ready(work_deadline, terminating)?;
-                ensure_sidecar_alive(sidecars.last().ok_or_else(|| {
+                let sidecar = sidecars.last_mut().ok_or_else(|| {
                     FirestoneError::new(ErrorKind::Generic, "passt owner disappeared")
-                })?)?;
+                })?;
+                passt.wait_ready_while(work_deadline, terminating, || {
+                    ensure_sidecar_alive(sidecar)
+                })?;
                 events.emit(Event::StepDone {
                     id: StepId::from("net"),
                     detail: Some(passt_step_detail(passt)),
@@ -3349,10 +3398,12 @@ fn launch_sidecars(
                     work_deadline,
                 )?;
                 sidecars.push(sidecar);
-                filesystem.wait_ready(work_deadline, terminating)?;
-                ensure_sidecar_alive(sidecars.last().ok_or_else(|| {
+                let sidecar = sidecars.last_mut().ok_or_else(|| {
                     FirestoneError::new(ErrorKind::Generic, "virtiofsd owner disappeared")
-                })?)?;
+                })?;
+                filesystem.wait_ready_while(work_deadline, terminating, || {
+                    ensure_sidecar_alive(sidecar)
+                })?;
                 let readonly = if filesystem.readonly() {
                     " · read-only"
                 } else {
@@ -3484,7 +3535,7 @@ fn stop_owned_sidecars(
     }
 }
 
-fn ensure_owned_sidecars_alive(sidecars: &[OwnedSidecar]) -> Result<(), FirestoneError> {
+fn ensure_owned_sidecars_alive(sidecars: &mut [OwnedSidecar]) -> Result<(), FirestoneError> {
     for sidecar in sidecars {
         ensure_sidecar_alive(sidecar)?;
     }
@@ -3664,7 +3715,7 @@ fn launch_vmm(
     let work_deadline = launch_deadline
         .checked_sub(CHILD_TERM_GRACE.saturating_mul(2))
         .unwrap_or_else(Instant::now);
-    let sidecars = launch_sidecars(
+    let mut sidecars = launch_sidecars(
         paths,
         name,
         plan,
@@ -3675,7 +3726,7 @@ fn launch_vmm(
         work_deadline,
         launch_deadline,
     )?;
-    ensure_owned_sidecars_alive(&sidecars)?;
+    ensure_owned_sidecars_alive(&mut sidecars)?;
     write_shim_log(&format!("machine `{name}` launching cloud-hypervisor"));
     events.emit(Event::StepStart {
         id: StepId::from("vmm"),
@@ -3710,8 +3761,13 @@ fn launch_vmm(
     );
     state.vmm_pid = Some(vmm.id());
     StateStore::new(paths.machine_state(name)?).write_from_shim(state)?;
-    let record =
-        capture_launch_process_record(&vmm, plan, &launch_argv, &launch_binding, work_deadline)?;
+    let record = capture_launch_process_record(
+        &mut vmm,
+        plan,
+        &launch_argv,
+        &launch_binding,
+        work_deadline,
+    )?;
     vmm.bind_record(record.clone());
     identity.vmm = Some(record);
     publish_process_identity(paths, name, identity)?;
@@ -3721,7 +3777,7 @@ fn launch_vmm(
         .checked_add(timeouts.readiness)
         .map_or(work_deadline, |deadline| deadline.min(work_deadline));
     let ping = loop {
-        if let Err(error) = ensure_owned_sidecars_alive(&sidecars) {
+        if let Err(error) = ensure_owned_sidecars_alive(&mut sidecars) {
             terminate_launch_vmm(&mut vmm, launch_deadline)?;
             return Err(error);
         }
@@ -3734,10 +3790,9 @@ fn launch_vmm(
         }
         if vmm.observe_exit()? {
             let status = vmm.reap_exited_group()?;
-            let reason = status_description(status);
-            return Err(FirestoneError::new(
-                ErrorKind::Generic,
-                format!("cloud-hypervisor exited before API readiness: {reason}"),
+            return Err(vmm.exit_error(
+                status,
+                &format!("cloud-hypervisor for machine `{name}` exited before API readiness"),
             ));
         }
         if Instant::now() >= phase_deadline {
@@ -3787,7 +3842,7 @@ fn launch_vmm(
     identity.vmm = Some(record);
     publish_process_identity(paths, name, identity)?;
 
-    if let Err(error) = ensure_owned_sidecars_alive(&sidecars) {
+    if let Err(error) = ensure_owned_sidecars_alive(&mut sidecars) {
         terminate_launch_vmm(&mut vmm, launch_deadline)?;
         return Err(error);
     }
@@ -3797,7 +3852,7 @@ fn launch_vmm(
         return Err(error);
     }
     secure_console_log(paths, name)?;
-    if let Err(error) = ensure_owned_sidecars_alive(&sidecars) {
+    if let Err(error) = ensure_owned_sidecars_alive(&mut sidecars) {
         terminate_launch_vmm(&mut vmm, launch_deadline)?;
         return Err(error);
     }
@@ -3833,7 +3888,7 @@ fn launch_vmm(
         detail: Some(format!("cloud-hypervisor {}", ping.build_version)),
         elapsed_ms: 0,
     })?;
-    if let Err(error) = ensure_owned_sidecars_alive(&sidecars) {
+    if let Err(error) = ensure_owned_sidecars_alive(&mut sidecars) {
         terminate_launch_vmm(&mut vmm, launch_deadline)?;
         return Err(error);
     }
@@ -6449,9 +6504,10 @@ fn read_request(
 fn connect_control_socket(path: &Path, deadline: Instant) -> Result<UnixStream, FirestoneError> {
     let address = UnixAddr::new(path).map_err(|source| {
         FirestoneError::new(
-            ErrorKind::NotRunning,
+            ErrorKind::InvalidSpec,
             format!("cannot address shim socket {}", path.display()),
         )
+        .with_hint("set FIRESTONE_RUNTIME_DIR to a shorter absolute path")
         .with_source(io::Error::from(source))
     })?;
     loop {
@@ -6459,7 +6515,8 @@ fn connect_control_socket(path: &Path, deadline: Instant) -> Result<UnixStream, 
             return Err(FirestoneError::new(
                 ErrorKind::Timeout,
                 format!("timed out connecting to shim socket {}", path.display()),
-            ));
+            )
+            .with_hint("start the machine or inspect its shim log, then retry"));
         }
         let flags = {
             #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -6512,9 +6569,10 @@ fn connect_control_socket(path: &Path, deadline: Instant) -> Result<UnixStream, 
             }
             Err(source) => {
                 return Err(FirestoneError::new(
-                    ErrorKind::NotRunning,
+                    ErrorKind::Generic,
                     format!("cannot connect to shim socket {}", path.display()),
                 )
+                .with_hint("inspect the private runtime directory and shim socket permissions")
                 .with_source(io::Error::from(source)));
             }
         }
@@ -6531,7 +6589,8 @@ fn wait_control_connect(
         return Err(FirestoneError::new(
             ErrorKind::Timeout,
             format!("timed out connecting to shim socket {}", path.display()),
-        ));
+        )
+        .with_hint("start the machine or inspect its shim log, then retry"));
     }
     let timeout = PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX);
     let mut descriptors = [PollFd::new(stream.as_fd(), PollFlags::POLLOUT)];
@@ -6546,7 +6605,8 @@ fn wait_control_connect(
         return Err(FirestoneError::new(
             ErrorKind::Timeout,
             format!("timed out connecting to shim socket {}", path.display()),
-        ));
+        )
+        .with_hint("start the machine or inspect its shim log, then retry"));
     }
     let pending = getsockopt(stream, SocketError).map_err(|source| {
         FirestoneError::new(
@@ -6556,16 +6616,32 @@ fn wait_control_connect(
         .with_source(io::Error::from(source))
     })?;
     if pending == 0 {
-        Ok(())
-    } else {
-        Err(FirestoneError::new(
-            ErrorKind::NotRunning,
-            format!("cannot connect to shim socket {}", path.display()),
-        )
-        .with_source(io::Error::from_raw_os_error(pending)))
+        return Ok(());
     }
+    let stale = matches!(
+        pending,
+        value if value == Errno::ENOENT as i32
+            || value == Errno::ECONNREFUSED as i32
+            || value == Errno::EAGAIN as i32
+    );
+    let (kind, hint) = if stale {
+        (
+            ErrorKind::NotRunning,
+            "start the machine or wait for its shim socket, then retry",
+        )
+    } else {
+        (
+            ErrorKind::Generic,
+            "inspect the private runtime directory and shim socket permissions",
+        )
+    };
+    Err(FirestoneError::new(
+        kind,
+        format!("cannot connect to shim socket {}", path.display()),
+    )
+    .with_hint(hint)
+    .with_source(io::Error::from_raw_os_error(pending)))
 }
-
 fn read_frame(
     mut stream: impl Read,
     limit: usize,
@@ -6861,12 +6937,11 @@ fn wait_for_shim_socket(
             return Err(start_interrupted_error());
         }
         if process.observe_exit()? {
-            return Err(FirestoneError::new(
-                ErrorKind::Generic,
-                format!(
-                    "shim process {} exited before its control socket was ready",
-                    process.id()
-                ),
+            let status = process.wait()?;
+            return Err(process.exit_error(
+                status,
+                &format!("shim for machine `{name}` exited before its control socket was ready"),
+                "inspect the machine shim log and retry the machine start",
             ));
         }
         if Instant::now() >= deadline {
@@ -7247,18 +7322,6 @@ fn vmm_failure_reason(paths: &Paths, name: &str, fallback: &str) -> Result<Strin
         .map(str::trim)
         .unwrap_or(fallback);
     Ok(reason.chars().take(LOG_REASON_BYTES).collect())
-}
-
-fn status_description(status: ExitStatus) -> String {
-    status.code().map_or_else(
-        || {
-            status.signal().map_or_else(
-                || "unknown status".to_owned(),
-                |signal| format!("signal {signal}"),
-            )
-        },
-        |code| format!("code {code}"),
-    )
 }
 
 fn now_timestamp() -> String {

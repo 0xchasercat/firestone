@@ -84,6 +84,9 @@ impl ReadinessBackend for SystemReadiness<'_> {
                                 path.display()
                             ),
                         )
+                        .with_hint(
+                            "inspect the machine console log and Firestone data directory permissions",
+                        )
                         .with_source(source)
                     })
             }
@@ -96,6 +99,7 @@ impl ReadinessBackend for SystemReadiness<'_> {
                     path.display()
                 ),
             )
+            .with_hint("inspect the machine console log and Firestone data directory permissions")
             .with_source(source)),
         }
     }

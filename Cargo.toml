@@ -14,16 +14,19 @@ rust-version = "1.85"
 axum = { version = "=0.8.4", default-features = false, features = ["http1", "json", "query", "tokio"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "=4.6.9"
-futures-util = { version = "=0.3.34", default-features = false, features = ["async-await", "std"] }
+console = "=0.16.4"
 fatfs = { version = "=0.3.6", default-features = false, features = ["std", "alloc"] }
 fs2 = "0.4"
+futures-util = { version = "=0.3.34", default-features = false, features = ["async-await", "std"] }
 http-body-util = "=0.1.3"
 hyper = { version = "=1.6.0", features = ["http1", "server"] }
 hyperlocal = { version = "=0.9.1", default-features = false, features = ["server"] }
 hyper-util = { version = "=0.1.17", default-features = false, features = ["tokio"] }
-nix = { version = "0.30", features = ["fs", "hostname", "poll", "process", "signal", "socket", "term", "user"] }
+indicatif = "=0.18.6"
 jiff = "0.2"
 minijinja = { version = "=2.24.0", features = ["serde"] }
+nix = { version = "0.30", features = ["fs", "hostname", "poll", "process", "signal", "socket", "term", "user"] }
+owo-colors = "=4.4.0"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 rustix = { version = "1", features = ["process"] }
 schemars = "1"

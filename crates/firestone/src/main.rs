@@ -44,10 +44,7 @@ fn main() -> ExitCode {
         return match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                eprintln!("firestone shim: {}", error.message());
-                if let Some(hint) = error.hint() {
-                    eprintln!("hint: {hint}");
-                }
+                render_hidden_error(&error);
                 ExitCode::FAILURE
             }
         };
@@ -70,16 +67,15 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(error) => {
-            let stdout = io::stdout();
-            let stderr = io::stderr();
             let options = render_options(
                 requested_json,
                 requested_quiet,
                 requested_no_color,
                 0,
-                stderr.is_terminal(),
+                io::stderr().is_terminal(),
+                true,
             );
-            let mut renderer = Renderer::new(stdout, stderr, options);
+            let mut renderer = Renderer::stdio(options);
             let error = FirestoneError::new(ErrorKind::Usage, clap_error_message(&error))
                 .with_hint("run `firestone --help` for command usage");
             return ExitCode::from(render_terminal_error(&mut renderer, &error));
@@ -89,16 +85,16 @@ fn main() -> ExitCode {
         return run_completions(cli);
     }
 
-    let stdout = io::stdout();
-    let stderr = io::stderr();
+    let allow_live_progress = !matches!(&cli.command, Command::Serve(_));
     let options = render_options(
         cli.json,
         cli.quiet,
         cli.no_color,
         cli.verbose,
-        stderr.is_terminal(),
+        io::stderr().is_terminal(),
+        allow_live_progress,
     );
-    let mut renderer = Renderer::new(stdout, stderr, options);
+    let mut renderer = Renderer::stdio(options);
     let result = block_on(run(cli, &mut renderer));
     ExitCode::from(finish_command(result, &mut renderer))
 }
@@ -126,6 +122,7 @@ fn run_completions(cli: Cli) -> ExitCode {
             cli.no_color,
             cli.verbose,
             stderr.is_terminal(),
+            false,
         );
         let mut renderer = Renderer::new(stdout, stderr, options);
         let verb = if incompatible.len() == 1 { "is" } else { "are" };
@@ -157,7 +154,8 @@ fn run_completions(cli: Cli) -> ExitCode {
         Err(source) => {
             let stdout = io::stdout();
             let stderr = io::stderr();
-            let options = render_options(false, false, cli.no_color, 0, stderr.is_terminal());
+            let options =
+                render_options(false, false, cli.no_color, 0, stderr.is_terminal(), false);
             let mut renderer = Renderer::new(stdout, stderr, options);
             let error = FirestoneError::new(
                 ErrorKind::Generic,
@@ -177,6 +175,11 @@ fn hidden_shim_name(arguments: &[std::ffi::OsString]) -> Option<&str> {
         return None;
     }
     arguments.get(2).and_then(|name| name.to_str())
+}
+
+fn render_hidden_error(error: &FirestoneError) {
+    let mut renderer = Renderer::new(io::sink(), io::stderr(), RenderOptions::human(false, false));
+    let _ = renderer.render_hidden_error(error);
 }
 
 fn hidden_vsock_proxy_requested(arguments: &[OsString]) -> bool {
@@ -220,17 +223,7 @@ fn run_hidden_vsock_proxy(arguments: Vec<OsString>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            use io::Write as _;
-            let mut stderr = io::stderr().lock();
-            let _ = writeln!(
-                stderr,
-                "firestone _vsock-proxy: {}: {}",
-                error.kind(),
-                error.message()
-            );
-            if let Some(hint) = error.hint() {
-                let _ = writeln!(stderr, "hint: {hint}");
-            }
+            render_hidden_error(&error);
             ExitCode::from(error_exit_code(&error))
         }
     }
@@ -239,15 +232,23 @@ fn run_hidden_vsock_proxy(arguments: Vec<OsString>) -> ExitCode {
 fn render_options(
     json: bool,
     quiet: bool,
-    _no_color: bool,
+    no_color: bool,
     verbosity: u8,
     stderr_is_terminal: bool,
+    allow_live_progress: bool,
 ) -> RenderOptions {
     if json {
-        RenderOptions::json().with_quiet(quiet)
-    } else {
-        RenderOptions::human(quiet, stderr_is_terminal).with_verbosity(verbosity)
+        return RenderOptions::json().with_quiet(quiet);
     }
+
+    let dumb_terminal = env::var_os("TERM").is_some_and(|value| value == OsStr::new("dumb"));
+    let color_enabled =
+        stderr_is_terminal && !dumb_terminal && !no_color && env::var_os("NO_COLOR").is_none();
+    let live_progress = stderr_is_terminal && !dumb_terminal && allow_live_progress;
+    RenderOptions::human(quiet, stderr_is_terminal)
+        .with_verbosity(verbosity)
+        .with_color(color_enabled)
+        .with_live_progress(live_progress)
 }
 
 fn finish_command<Stdout, Stderr>(
@@ -819,21 +820,16 @@ where
         return Err(FirestoneError::new(
             ErrorKind::Busy,
             format!(
-                "machine {name} is {}; wait for its current lifecycle operation",
+                "machine {name} is {}",
                 machine_status_word(machine.state.status)
             ),
-        ));
+        )
+        .with_hint("wait for the current lifecycle operation to finish, then retry"));
     }
 
     drop(start_signals);
     let user = user_override.unwrap_or_else(|| machine.spec.user.clone());
-    let executable = env::current_exe().map_err(|source| {
-        FirestoneError::new(
-            ErrorKind::Dependency,
-            "cannot locate the current firestone executable for SSH ProxyCommand",
-        )
-        .with_source(source)
-    })?;
+    let executable = current_firestone_executable()?;
     let plan = match shell_ssh_plan(&paths, &executable, &name, &user, terminal.stdin, command) {
         Ok(plan) => plan,
         Err(error) => {
@@ -911,11 +907,15 @@ where
             Ok(()) => Err(FirestoneError::new(
                 ErrorKind::Generic,
                 format!("default handler for signal {signal} returned unexpectedly"),
+            )
+            .with_hint(
+                "report the unexpected default signal-handler return as an internal CLI error",
             )),
             Err(source) => Err(FirestoneError::new(
                 ErrorKind::Generic,
                 format!("cannot preserve SSH terminating signal {signal}"),
             )
+            .with_hint("retry the command from a foreground terminal")
             .with_source(source)),
         };
     }
@@ -1005,13 +1005,7 @@ where
     }
     drop(start_signals);
     let user = arguments.user.unwrap_or(machine.spec.user);
-    let executable = env::current_exe().map_err(|source| {
-        FirestoneError::new(
-            ErrorKind::Dependency,
-            "cannot locate the current firestone executable for SSH ProxyCommand",
-        )
-        .with_source(source)
-    })?;
+    let executable = current_firestone_executable()?;
     let plan = shell_ssh_plan(
         &paths,
         &executable,
@@ -1044,13 +1038,7 @@ where
     let dispatcher =
         LocalDispatcher::new(paths.clone(), global, catalog).with_source_base(source_base);
     let machine = dispatcher.terminal_machine(&name)?;
-    let executable = env::current_exe().map_err(|source| {
-        FirestoneError::new(
-            ErrorKind::Dependency,
-            "cannot locate the current firestone executable for SSH ProxyCommand",
-        )
-        .with_source(source)
-    })?;
+    let executable = current_firestone_executable()?;
     let plan = ssh_config_plan(&paths, &executable, &name, &machine.spec.user)?;
     let payload = SshConfigResult {
         name,
@@ -1123,6 +1111,12 @@ fn console_command(
     }
 }
 
+fn signal_handler_error(message: &'static str, source: io::Error) -> FirestoneError {
+    FirestoneError::new(ErrorKind::Generic, message)
+        .with_hint("retry from a foreground terminal; if the failure repeats, inspect process signal limits")
+        .with_source(source)
+}
+
 struct StartSignals {
     id: Option<signal_hook::SigId>,
 }
@@ -1132,11 +1126,7 @@ impl StartSignals {
         let cancelled = Arc::new(AtomicBool::new(false));
         let id = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&cancelled))
             .map_err(|source| {
-            FirestoneError::new(
-                ErrorKind::Generic,
-                "cannot install start cancellation handler",
-            )
-            .with_source(source)
+            signal_handler_error("cannot install start cancellation handler", source)
         })?;
         Ok((cancelled, Self { id: Some(id) }))
     }
@@ -1173,11 +1163,10 @@ impl RunSignals {
                     for id in ids {
                         signal_hook::low_level::unregister(id);
                     }
-                    return Err(FirestoneError::new(
-                        ErrorKind::Generic,
+                    return Err(signal_handler_error(
                         "cannot install run signal handlers",
-                    )
-                    .with_source(source));
+                        source,
+                    ));
                 }
             }
         }
@@ -1202,7 +1191,8 @@ fn run_process_signal(signal: usize) -> Result<ProcessSignal, FirestoneError> {
         _ => Err(FirestoneError::new(
             ErrorKind::Generic,
             format!("cannot forward unsupported signal {signal}"),
-        )),
+        )
+        .with_hint("retry; if the signal recurs, report it as an internal CLI error")),
     }
 }
 
@@ -1225,11 +1215,10 @@ impl TerminalSignals {
                     for id in ids {
                         signal_hook::low_level::unregister(id);
                     }
-                    return Err(FirestoneError::new(
-                        ErrorKind::Generic,
+                    return Err(signal_handler_error(
                         "cannot install console terminal signal handlers",
-                    )
-                    .with_source(source));
+                        source,
+                    ));
                 }
             }
         }
@@ -1243,6 +1232,17 @@ impl Drop for TerminalSignals {
             signal_hook::low_level::unregister(id);
         }
     }
+}
+
+fn current_firestone_executable() -> Result<std::path::PathBuf, FirestoneError> {
+    env::current_exe().map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::Dependency,
+            "cannot locate the current firestone executable for SSH ProxyCommand",
+        )
+        .with_hint("run the installed firestone executable directly and retry")
+        .with_source(source)
+    })
 }
 
 fn not_running_terminal_error(name: &str) -> FirestoneError {
@@ -1377,14 +1377,13 @@ mod tests {
     };
     use serde_json::json;
 
+    use super::{
+        CreateRequest, finish_command, load_create_spec, load_global_config, render_options,
+        run_with_inputs, signal_handler_error,
+    };
     use crate::{
         cli::Cli,
         render::{OutputMode, RenderOptions, Renderer},
-    };
-
-    use super::{
-        CreateRequest, finish_command, load_create_spec, load_global_config, render_options,
-        run_with_inputs,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1421,6 +1420,17 @@ mod tests {
         let root = std::fs::canonicalize(directory.path())?;
         let paths = Paths::from_inputs(&path_inputs(&root))?;
         Ok((directory, paths))
+    }
+
+    #[test]
+    fn signal_registration_error_has_recovery_hint() {
+        let error = signal_handler_error(
+            "cannot install test signal handler",
+            io::Error::other("injected"),
+        );
+
+        assert_eq!(error.message(), "cannot install test signal handler");
+        assert!(error.hint().is_some());
     }
 
     #[test]
@@ -1502,7 +1512,7 @@ mod tests {
 
     #[test]
     fn render_options_with_json_quiet_retains_quiet_mode() {
-        let options = render_options(true, true, false, 0, false);
+        let options = render_options(true, true, false, 0, false, true);
 
         assert_eq!(options.mode, OutputMode::Json);
         assert!(options.quiet);

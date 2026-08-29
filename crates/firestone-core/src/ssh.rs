@@ -992,13 +992,13 @@ fn connect_vsock_socket(
     }
     let address = UnixAddr::new(path).map_err(|source| {
         FirestoneError::new(
-            ErrorKind::NotRunning,
+            ErrorKind::InvalidSpec,
             format!(
                 "cannot address machine `{name}` vsock socket {}",
                 path.display()
             ),
         )
-        .with_hint("start the machine and retry")
+        .with_hint("set FIRESTONE_RUNTIME_DIR to a shorter absolute path")
         .with_source(io::Error::from(source))
     })?;
     let flags = {
@@ -1019,6 +1019,7 @@ fn connect_vsock_socket(
     )
     .map_err(|source| {
         FirestoneError::new(ErrorKind::Generic, "cannot create vsock proxy socket")
+            .with_hint("check process file-descriptor limits and retry")
             .with_source(io::Error::from(source))
     })?;
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -1028,6 +1029,7 @@ fn connect_vsock_socket(
                 ErrorKind::Generic,
                 "cannot make vsock proxy socket nonblocking",
             )
+            .with_hint("check process file-descriptor limits and retry")
             .with_source(io::Error::from(source))
         })?;
         fcntl(&descriptor, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(|source| {
@@ -1035,6 +1037,7 @@ fn connect_vsock_socket(
                 ErrorKind::Generic,
                 "cannot make vsock proxy socket close-on-exec",
             )
+            .with_hint("check process file-descriptor limits and retry")
             .with_source(io::Error::from(source))
         })?;
     }
@@ -1048,6 +1051,7 @@ fn connect_vsock_socket(
                     ErrorKind::Generic,
                     format!("cannot inspect machine `{name}` vsock connection"),
                 )
+                .with_hint("check the machine runtime directory and retry")
                 .with_source(io::Error::from(source))
             })?;
             if pending == 0 {
@@ -1246,6 +1250,7 @@ fn wait_for_vsock(
                     ErrorKind::Generic,
                     format!("cannot poll machine `{name}` vsock socket while {phase}"),
                 )
+                .with_hint("check the machine runtime directory and retry")
                 .with_source(io::Error::from(source)));
             }
         }
@@ -1317,6 +1322,7 @@ where
             ErrorKind::Generic,
             format!("cannot clone machine `{name}` vsock stream for stdin relay"),
         )
+        .with_hint("check process file-descriptor limits and retry")
         .with_source(source)
     })?;
     let mut download = stream.try_clone().map_err(|source| {
@@ -1324,6 +1330,7 @@ where
             ErrorKind::Generic,
             format!("cannot clone machine `{name}` vsock stream for stdout relay"),
         )
+        .with_hint("check process file-descriptor limits and retry")
         .with_source(source)
     })?;
     let (sender, receiver) = mpsc::channel();
@@ -1343,6 +1350,7 @@ where
                 ErrorKind::Generic,
                 format!("cannot start machine `{name}` stdin relay"),
             )
+            .with_hint("check process thread limits and retry")
             .with_source(source)
         })?;
     let download_sender = sender.clone();
@@ -1361,6 +1369,7 @@ where
                 ErrorKind::Generic,
                 format!("cannot start machine `{name}` stdout relay"),
             )
+            .with_hint("check process thread limits and retry")
             .with_source(source)
         })?;
     drop(sender);
@@ -1371,6 +1380,7 @@ where
                 ErrorKind::Generic,
                 format!("machine `{name}` vsock relay workers stopped unexpectedly"),
             )
+            .with_hint("retry; if the failure repeats, inspect the machine and shim logs")
             .with_source(source)
         })?;
         match completion.direction {

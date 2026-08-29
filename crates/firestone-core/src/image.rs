@@ -1162,7 +1162,7 @@ impl ImageStore {
                     &mut input,
                     partial,
                     Some(opened.snapshot.size),
-                    ErrorKind::Generic,
+                    ErrorKind::Checksum,
                     source.verification.as_ref().map(|value| value.algorithm),
                     events,
                 )?;
@@ -1309,7 +1309,7 @@ impl ImageStore {
         let mut limited = response.body.take(MAX_MANIFEST_BYTES + 1);
         limited.read_to_end(&mut bytes).map_err(|source| {
             FirestoneError::new(
-                ErrorKind::Checksum,
+                ErrorKind::Generic,
                 format!("cannot read checksum manifest '{url}'"),
             )
             .with_hint("retry the pull")
@@ -1601,10 +1601,8 @@ impl ImageStore {
             .with_source(source)
         })?;
         for entry in entries {
-            let entry = entry.map_err(|source| {
-                FirestoneError::new(ErrorKind::Generic, "cannot read an images directory entry")
-                    .with_source(source)
-            })?;
+            let entry =
+                entry.map_err(|source| directory_entry_error(&self.paths.images_dir(), source))?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
                 return Err(FirestoneError::new(
@@ -1766,10 +1764,7 @@ impl ImageStore {
                 .with_source(source)
             })?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| {
-                FirestoneError::new(ErrorKind::Generic, "cannot read a machines directory entry")
-                    .with_source(source)
-            })?;
+            .map_err(|source| directory_entry_error(&machines_dir, source))?;
         entries.sort_by_key(std::fs::DirEntry::file_name);
 
         let mut references: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -1885,7 +1880,8 @@ impl ImageStore {
             return Err(FirestoneError::new(
                 ErrorKind::Conflict,
                 format!("machine `{name}` has no pinned source SHA-256"),
-            ));
+            )
+            .with_hint("recreate the machine to publish a complete image identity"));
         };
         if stored.metadata.source_sha256 != source_sha256 {
             return Err(FirestoneError::new(
@@ -2114,10 +2110,8 @@ impl ImageStore {
         let mut removal_ids = BTreeSet::new();
         let mut removed_partial = false;
         for entry in entries {
-            let entry = entry.map_err(|source| {
-                FirestoneError::new(ErrorKind::Generic, "cannot read an images directory entry")
-                    .with_source(source)
-            })?;
+            let entry =
+                entry.map_err(|source| directory_entry_error(&self.paths.images_dir(), source))?;
             let name = entry.file_name().into_string().map_err(|_| {
                 FirestoneError::new(
                     ErrorKind::Dependency,
@@ -2151,10 +2145,8 @@ impl ImageStore {
         for entry in fs::read_dir(self.paths.images_dir())
             .map_err(|source| image_file_error("read", &self.paths.images_dir(), source))?
         {
-            let entry = entry.map_err(|source| {
-                FirestoneError::new(ErrorKind::Generic, "cannot read an images directory entry")
-                    .with_source(source)
-            })?;
+            let entry =
+                entry.map_err(|source| directory_entry_error(&self.paths.images_dir(), source))?;
             let name = entry.file_name().into_string().map_err(|_| {
                 FirestoneError::new(
                     ErrorKind::Dependency,
@@ -2487,7 +2479,7 @@ fn stream_source(
     input: &mut dyn Read,
     output: &Path,
     expected_length: Option<u64>,
-    source_error_kind: ErrorKind,
+    integrity_error_kind: ErrorKind,
     verification_algorithm: Option<ChecksumAlgorithm>,
     events: &mut dyn EventSink,
 ) -> Result<StagedSource, FirestoneError> {
@@ -2511,7 +2503,7 @@ fn stream_source(
     loop {
         let read = input.read(&mut buffer).map_err(|source| {
             FirestoneError::new(
-                source_error_kind,
+                ErrorKind::Generic,
                 format!(
                     "cannot read image source while writing '{}'",
                     output.display()
@@ -2529,7 +2521,7 @@ fn stream_source(
         if let Some(expected) = expected_length {
             if next_size > expected {
                 return Err(FirestoneError::new(
-                    source_error_kind,
+                    integrity_error_kind,
                     format!("image source exceeded declared Content-Length of {expected} bytes"),
                 )
                 .with_hint("retry the pull; the remote response was inconsistent"));
@@ -2561,7 +2553,7 @@ fn stream_source(
     if let Some(expected) = expected_length {
         if size != expected {
             return Err(FirestoneError::new(
-                source_error_kind,
+                integrity_error_kind,
                 format!(
                     "image source ended after {size} bytes; Content-Length declared {expected}"
                 ),
@@ -3489,6 +3481,18 @@ fn image_lock_error(operation: &str, path: &Path, source: io::Error) -> Fireston
         format!("cannot {operation} image store lock '{}'", path.display()),
     )
     .with_hint("replace a symlink, special, or insecure lock file with a protected regular file")
+    .with_source(source)
+}
+
+fn directory_entry_error(directory: &Path, source: io::Error) -> FirestoneError {
+    FirestoneError::new(
+        ErrorKind::Generic,
+        format!(
+            "cannot read an entry in directory '{}'",
+            directory.display()
+        ),
+    )
+    .with_hint("check the Firestone data directory permissions and retry")
     .with_source(source)
 }
 
@@ -4922,7 +4926,7 @@ else:
                 .pull_locked(resolved, &mut Vec::new())
                 .err()
                 .ok_or("expected mutation rejection")?;
-            assert_eq!(error.kind(), ErrorKind::Generic);
+            assert_eq!(error.kind(), ErrorKind::Checksum);
         }
 
         let fifo = fixture.root.join("source.fifo");
@@ -5777,6 +5781,47 @@ sshd_path = "{}"
         assert_eq!(restarted.overlay.path, first.overlay.path);
         Ok(())
     }
+    #[test]
+    fn directory_entry_failure_names_parent_and_has_hint() {
+        let directory = Path::new("/var/lib/firestone/images");
+        let error = directory_entry_error(directory, std::io::Error::other("injected"));
+
+        assert_eq!(error.kind(), ErrorKind::Generic);
+        assert!(error.message().contains(&directory.display().to_string()));
+        assert!(error.hint().is_some());
+    }
+
+    #[test]
+    fn source_read_failure_is_transport_not_checksum() -> Result<(), Box<dyn std::error::Error>> {
+        struct FailingReader;
+
+        impl std::io::Read for FailingReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("injected transport failure"))
+            }
+        }
+
+        let directory = tempfile::tempdir()?;
+        let output = directory.path().join("failing-source.partial");
+        let mut reader = FailingReader;
+        let mut events = Vec::new();
+        let error = stream_source(
+            &mut reader,
+            &output,
+            None,
+            ErrorKind::Checksum,
+            None,
+            &mut events,
+        )
+        .err()
+        .ok_or("failing source read succeeded")?;
+
+        assert_eq!(error.kind(), ErrorKind::Generic);
+        assert!(error.message().contains("cannot read image source"));
+        assert!(error.hint().is_some());
+        Ok(())
+    }
+
     #[test]
     fn one_byte_source_frames_have_bounded_progress_and_final_total()
     -> Result<(), Box<dyn std::error::Error>> {
