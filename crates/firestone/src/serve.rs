@@ -716,7 +716,10 @@ fn validate_existing_socket(
     expected_uid: u32,
 ) -> Result<(), FirestoneError> {
     let kind = SFlag::from_bits_truncate(stat.st_mode);
-    let mode = (stat.st_mode as u32) & 0o7777;
+    #[cfg(target_os = "macos")]
+    let mode = u32::from(stat.st_mode) & 0o7777;
+    #[cfg(not(target_os = "macos"))]
+    let mode = stat.st_mode & 0o7777;
     if !kind.contains(SFlag::S_IFSOCK) || stat.st_uid != expected_uid || mode != 0o600 {
         return Err(FirestoneError::new(
             ErrorKind::Dependency,
