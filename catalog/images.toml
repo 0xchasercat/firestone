@@ -1,25 +1,24 @@
-# Ubuntu 24.04 x86_64 reached systemd and ssh.socket under pinned edk2 after
-# raw-to-qcow2 conversion and overlay creation. RHF 0.5.0 panicked while
-# resolving its LABEL root. All aarch64 and remaining verify 3 gates stay open.
+# Linux x86_64 MVP catalog. Both architecture locators are immutable current
+# vendor builds selected on 2026-08-30; aarch64 remains compile-only. E2E 11
+# is the x86_64 boot-to-SSH gate, and source validation is not a boot claim.
 
 [[image]]
 distro = "ubuntu"
 version = "24.04"
 aliases = ["noble"]
 default = true
-firmware = "rhf"
+firmware = "edk2"
 format = "qcow2"
 sshd_path = "/usr/sbin/sshd"
 
 [image.arch.x86_64]
-firmware = "edk2"
-url = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
-checksum_url = "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS"
+url = "https://cloud-images.ubuntu.com/releases/noble/release-20260826/ubuntu-24.04-server-cloudimg-amd64.img"
+checksum_url = "https://cloud-images.ubuntu.com/releases/noble/release-20260826/SHA256SUMS"
 checksum_alg = "sha256"
 
 [image.arch.aarch64]
-url = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img"
-checksum_url = "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS"
+url = "https://cloud-images.ubuntu.com/releases/noble/release-20260826/ubuntu-24.04-server-cloudimg-arm64.img"
+checksum_url = "https://cloud-images.ubuntu.com/releases/noble/release-20260826/SHA256SUMS"
 checksum_alg = "sha256"
 
 [[image]]
@@ -27,17 +26,18 @@ distro = "ubuntu"
 version = "22.04"
 aliases = ["jammy"]
 default = false
-firmware = "rhf"
+firmware = "edk2"
 format = "qcow2"
+sshd_path = "/usr/sbin/sshd"
 
 [image.arch.x86_64]
-url = "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
-checksum_url = "https://cloud-images.ubuntu.com/jammy/current/SHA256SUMS"
+url = "https://cloud-images.ubuntu.com/releases/jammy/release-20260826/ubuntu-22.04-server-cloudimg-amd64.img"
+checksum_url = "https://cloud-images.ubuntu.com/releases/jammy/release-20260826/SHA256SUMS"
 checksum_alg = "sha256"
 
 [image.arch.aarch64]
-url = "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-arm64.img"
-checksum_url = "https://cloud-images.ubuntu.com/jammy/current/SHA256SUMS"
+url = "https://cloud-images.ubuntu.com/releases/jammy/release-20260826/ubuntu-22.04-server-cloudimg-arm64.img"
+checksum_url = "https://cloud-images.ubuntu.com/releases/jammy/release-20260826/SHA256SUMS"
 checksum_alg = "sha256"
 
 [[image]]
@@ -45,17 +45,18 @@ distro = "debian"
 version = "12"
 aliases = ["bookworm"]
 default = true
-firmware = "rhf"
+firmware = "edk2"
 format = "qcow2"
+sshd_path = "/usr/sbin/sshd"
 
 [image.arch.x86_64]
-url = "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
-checksum_url = "https://cloud.debian.org/images/cloud/bookworm/latest/SHA512SUMS"
+url = "https://cloud.debian.org/images/cloud/bookworm/20260821-2577/debian-12-genericcloud-amd64-20260821-2577.qcow2"
+checksum_url = "https://cloud.debian.org/images/cloud/bookworm/20260821-2577/SHA512SUMS"
 checksum_alg = "sha512"
 
 [image.arch.aarch64]
-url = "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-arm64.qcow2"
-checksum_url = "https://cloud.debian.org/images/cloud/bookworm/latest/SHA512SUMS"
+url = "https://cloud.debian.org/images/cloud/bookworm/20260821-2577/debian-12-genericcloud-arm64-20260821-2577.qcow2"
+checksum_url = "https://cloud.debian.org/images/cloud/bookworm/20260821-2577/SHA512SUMS"
 checksum_alg = "sha512"
 
 [[image]]
@@ -63,17 +64,18 @@ distro = "debian"
 version = "13"
 aliases = ["trixie"]
 default = false
-firmware = "rhf"
+firmware = "edk2"
 format = "qcow2"
+sshd_path = "/usr/sbin/sshd"
 
 [image.arch.x86_64]
-url = "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
-checksum_url = "https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS"
+url = "https://cloud.debian.org/images/cloud/trixie/20260826-2582/debian-13-genericcloud-amd64-20260826-2582.qcow2"
+checksum_url = "https://cloud.debian.org/images/cloud/trixie/20260826-2582/SHA512SUMS"
 checksum_alg = "sha512"
 
 [image.arch.aarch64]
-url = "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2"
-checksum_url = "https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS"
+url = "https://cloud.debian.org/images/cloud/trixie/20260826-2582/debian-13-genericcloud-arm64-20260826-2582.qcow2"
+checksum_url = "https://cloud.debian.org/images/cloud/trixie/20260826-2582/SHA512SUMS"
 checksum_alg = "sha512"
 
 [[image]]
@@ -81,8 +83,9 @@ distro = "fedora"
 version = "44"
 aliases = []
 default = true
-firmware = "rhf"
+firmware = "edk2"
 format = "qcow2"
+sshd_path = "/usr/sbin/sshd"
 
 [image.arch.x86_64]
 url = "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2"

@@ -809,6 +809,11 @@ checksum_alg = "sha512"
 
         assert_eq!(catalog.len(), 5);
         assert_eq!(sources, 10);
+        assert!(
+            catalog
+                .entries()
+                .all(|entry| entry.arch.keys().eq(["aarch64", "x86_64"]))
+        );
         Ok(())
     }
 
@@ -817,15 +822,16 @@ checksum_alg = "sha512"
         let catalog = Catalog::built_in()?;
 
         let default = catalog.resolve("ubuntu", "x86_64")?;
-        let ubuntu_aarch64 = catalog.resolve("ubuntu", "aarch64")?;
-        let alias = catalog.resolve("debian:bookworm", "aarch64")?;
+        let compile_only = catalog.resolve("ubuntu", "aarch64")?;
+        let alias = catalog.resolve("debian:bookworm", "x86_64")?;
 
         assert_eq!(default.canonical_reference, "ubuntu:24.04");
         assert_eq!(default.architecture, "x86_64");
         assert_eq!(default.firmware, CatalogFirmware::Edk2);
-        assert_eq!(ubuntu_aarch64.firmware, CatalogFirmware::Rhf);
+        assert_eq!(compile_only.architecture, "aarch64");
+        assert_eq!(compile_only.firmware, CatalogFirmware::Edk2);
         assert_eq!(alias.canonical_reference, "debian:12");
-        assert_eq!(alias.architecture, "aarch64");
+        assert_eq!(alias.architecture, "x86_64");
         Ok(())
     }
 
@@ -848,7 +854,7 @@ checksum_alg = "sha512"
         let resolved = catalog.resolve("debian:13", "x86_64")?;
 
         assert_eq!(resolved.canonical_reference, "debian:13");
-        assert_eq!(resolved.firmware, CatalogFirmware::Rhf);
+        assert_eq!(resolved.firmware, CatalogFirmware::Edk2);
         assert_eq!(resolved.format, ImageFormat::Qcow2);
         assert_eq!(resolved.sshd_path.as_str(), "/usr/sbin/sshd");
         assert_eq!(resolved.checksum_algorithm, ChecksumAlgorithm::Sha512);

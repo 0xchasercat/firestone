@@ -429,21 +429,28 @@ fn check_architecture(context: &DoctorContext) -> DoctorCheck {
                 context.operating_system
             ),
         )
-        .with_hint("Firestone v0.1 requires Linux on x86_64 or aarch64");
+        .with_hint("the Firestone Linux MVP requires an x86_64 host");
     }
-    if matches!(context.architecture.as_str(), "x86_64" | "aarch64") {
+    if context.architecture == "x86_64" {
         DoctorCheck::new(
             DoctorCheckId::HostArch,
             DoctorStatus::Ok,
             format!("host architecture {} is supported", context.architecture),
         )
+    } else if context.architecture == "aarch64" {
+        DoctorCheck::new(
+            DoctorCheckId::HostArch,
+            DoctorStatus::Fail,
+            "aarch64 runtime support is deferred from the Linux x86_64 MVP",
+        )
+        .with_hint("aarch64 is compile-only until its KVM catalog matrix passes")
     } else {
         DoctorCheck::new(
             DoctorCheckId::HostArch,
             DoctorStatus::Fail,
             format!("host architecture {} is unsupported", context.architecture),
         )
-        .with_hint("Firestone v0.1 requires an x86_64 or aarch64 Linux host")
+        .with_hint("the Firestone Linux MVP requires an x86_64 host")
     }
 }
 
@@ -787,10 +794,7 @@ fn check_passt(context: &DoctorContext) -> DoctorCheck {
                 command_failure_reason(&grammar_output)
             ),
         )
-        .with_hint(format!(
-            "install passt {} or newer with -t/-u range support",
-            crate::PINNED_PASST_VERSION
-        ));
+        .with_hint(passt_install_hint(context));
     }
 
     let combined_version = format!(
@@ -804,10 +808,7 @@ fn check_passt(context: &DoctorContext) -> DoctorCheck {
             DoctorStatus::Fail,
             "passt version output has no date-and-hash release tag",
         )
-        .with_hint(format!(
-            "install passt {} or newer",
-            crate::PINNED_PASST_VERSION
-        ));
+        .with_hint(passt_install_hint(context));
     };
     let help = format!(
         "{}\n{}",
@@ -834,10 +835,7 @@ fn check_passt(context: &DoctorContext) -> DoctorCheck {
                 crate::PINNED_PASST_VERSION
             ),
         )
-        .with_hint(format!(
-            "install passt {} or newer with the vhost-user, one-off, socket, repair-path, log, and port-forward options",
-            crate::PINNED_PASST_VERSION
-        ));
+        .with_hint(passt_install_hint(context));
     }
 
     DoctorCheck::new(
@@ -1523,6 +1521,46 @@ fn record_fix_failure(
         .or_insert(next);
 }
 
+fn dependency_install_io_hint(directory: &Path) -> String {
+    format!(
+        "check read/write permissions and free space for {} and retry `firestone doctor --fix`",
+        directory.display()
+    )
+}
+
+fn dependency_install_io_error(
+    artifact: &DependencyArtifact,
+    directory: &Path,
+    phase: &str,
+    source: std::io::Error,
+) -> FirestoneError {
+    FirestoneError::new(
+        ErrorKind::Dependency,
+        format!(
+            "cannot {phase} for dependency `{}` in {}",
+            artifact.dependency,
+            directory.display()
+        ),
+    )
+    .with_hint(dependency_install_io_hint(directory))
+    .with_source(source)
+}
+
+fn hash_dependency_download(
+    reader: &mut dyn Read,
+    artifact: &DependencyArtifact,
+    directory: &Path,
+) -> Result<String, FirestoneError> {
+    sha256_reader(reader).map_err(|source| {
+        dependency_install_io_error(
+            artifact,
+            directory,
+            "read partial download for hashing",
+            source,
+        )
+    })
+}
+
 fn install_artifact(
     bin_dir: &Path,
     artifact: &DependencyArtifact,
@@ -1542,45 +1580,41 @@ fn install_artifact(
         .suffix(".partial")
         .tempfile_in(bin_dir)
         .map_err(|source| {
+            dependency_install_io_error(artifact, bin_dir, "create partial download", source)
+        })?;
+    fetcher
+        .fetch(&url, partial.as_file_mut())
+        .map_err(|source| {
+            let kind = source.kind();
+            let install_hint = dependency_install_io_hint(bin_dir);
+            let hint = source.hint().map_or_else(
+                || install_hint.clone(),
+                |upstream| format!("{upstream}; {install_hint}"),
+            );
             FirestoneError::new(
-                ErrorKind::Dependency,
-                format!("cannot create partial download in {}", bin_dir.display()),
+                kind,
+                format!(
+                    "cannot stream download for dependency `{}` into {}",
+                    artifact.dependency,
+                    bin_dir.display()
+                ),
             )
-            .with_hint("check directory permissions and free space")
+            .with_hint(hint)
             .with_source(source)
         })?;
-    fetcher.fetch(&url, partial.as_file_mut())?;
     partial.as_file_mut().flush().map_err(|source| {
-        FirestoneError::new(
-            ErrorKind::Dependency,
-            format!("cannot flush download for `{}`", artifact.dependency),
-        )
-        .with_source(source)
+        dependency_install_io_error(artifact, bin_dir, "flush partial download", source)
     })?;
     partial.as_file_mut().sync_all().map_err(|source| {
-        FirestoneError::new(
-            ErrorKind::Dependency,
-            format!("cannot sync download for `{}`", artifact.dependency),
-        )
-        .with_source(source)
+        dependency_install_io_error(artifact, bin_dir, "sync partial download", source)
     })?;
     partial
         .as_file_mut()
         .seek(SeekFrom::Start(0))
         .map_err(|source| {
-            FirestoneError::new(
-                ErrorKind::Dependency,
-                format!("cannot rewind download for `{}`", artifact.dependency),
-            )
-            .with_source(source)
+            dependency_install_io_error(artifact, bin_dir, "rewind partial download", source)
         })?;
-    let actual = sha256_reader(partial.as_file_mut()).map_err(|source| {
-        FirestoneError::new(
-            ErrorKind::Checksum,
-            format!("cannot hash download for `{}`", artifact.dependency),
-        )
-        .with_source(source)
-    })?;
+    let actual = hash_dependency_download(partial.as_file_mut(), artifact, bin_dir)?;
     if actual != artifact.sha256 {
         return Err(FirestoneError::new(
             ErrorKind::Checksum,
@@ -1596,42 +1630,36 @@ fn install_artifact(
         .as_file()
         .set_permissions(fs::Permissions::from_mode(artifact.expected_mode()))
         .map_err(|source| {
-            FirestoneError::new(
-                ErrorKind::Dependency,
-                format!("cannot set mode for `{}`", artifact.dependency),
-            )
-            .with_source(source)
+            dependency_install_io_error(artifact, bin_dir, "set partial download mode", source)
         })?;
     partial.as_file().sync_all().map_err(|source| {
-        FirestoneError::new(
-            ErrorKind::Dependency,
-            format!("cannot sync mode for `{}`", artifact.dependency),
-        )
-        .with_source(source)
+        dependency_install_io_error(artifact, bin_dir, "sync partial download mode", source)
     })?;
 
     let destination = bin_dir.join(&artifact.install_name);
     partial.persist(&destination).map_err(|error| {
-        FirestoneError::new(
-            ErrorKind::Dependency,
-            format!(
-                "cannot atomically install `{}` at {}",
-                artifact.dependency,
-                destination.display()
-            ),
+        dependency_install_io_error(
+            artifact,
+            bin_dir,
+            "atomically publish downloaded artifact",
+            error.error,
         )
-        .with_source(error.error)
     })?;
-    sync_directory(bin_dir)?;
+    sync_directory(bin_dir, &artifact.dependency)?;
     artifact_state(bin_dir, artifact).map_err(|reason| {
         FirestoneError::new(
             ErrorKind::Dependency,
             format!(
-                "installed `{}` failed readback: {reason}",
-                artifact.dependency
+                "installed `{}` at {} failed readback: {reason}",
+                artifact.dependency,
+                destination.display()
             ),
         )
-        .with_hint("remove the artifact and retry `firestone doctor --fix`")
+        .with_hint(format!(
+            "{}; remove {} if readback remains invalid",
+            dependency_install_io_hint(bin_dir),
+            destination.display()
+        ))
     })
 }
 
@@ -1782,16 +1810,35 @@ fn parse_passt_version(output: &str) -> Option<PasstVersion> {
         let trimmed = token.trim_matches(|character: char| {
             !character.is_ascii_alphanumeric() && character != '_' && character != '.'
         });
-        let (date_part, commit) = trimmed.split_once('.')?;
+        let (date_part, packaged_commit) = trimmed.split_once('.')?;
+        let packaged_commit = packaged_commit.split('-').next()?;
+        let commit = packaged_commit.strip_prefix('g').unwrap_or(packaged_commit);
         if !(7..=40).contains(&commit.len()) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
             return None;
         }
-        let mut components = date_part.split('_');
-        let year = components.next()?.parse::<u32>().ok()?;
-        let month = components.next()?.parse::<u32>().ok()?;
-        let day = components.next()?.parse::<u32>().ok()?;
-        if components.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        let (year, month, day) = if let Some(compact) = date_part.strip_prefix("0^") {
+            if compact.len() != 8 || !compact.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            (
+                compact[0..4].parse::<u32>().ok()?,
+                compact[4..6].parse::<u32>().ok()?,
+                compact[6..8].parse::<u32>().ok()?,
+            )
+        } else {
+            let mut components = date_part.split('_');
+            let values = (
+                components.next()?.parse::<u32>().ok()?,
+                components.next()?.parse::<u32>().ok()?,
+                components.next()?.parse::<u32>().ok()?,
+            );
+            if components.next().is_some() {
+                return None;
+            }
+            values
+        };
+        if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
             return None;
         }
         let date = year
@@ -1805,19 +1852,46 @@ fn parse_passt_version(output: &str) -> Option<PasstVersion> {
     })
 }
 
+fn passt_install_hint(context: &DoctorContext) -> String {
+    let fields = fs::read_to_string(&context.os_release)
+        .ok()
+        .map(|contents| parse_os_release(&contents))
+        .unwrap_or_default();
+    if fields.get("ID").map(String::as_str) == Some("ubuntu")
+        && fields.get("VERSION_ID").map(String::as_str) == Some("24.04")
+    {
+        return concat!(
+            "Ubuntu 24.04's passt package is too old; run `sudo apt-get install -y ",
+            "build-essential ca-certificates git`, clone `https://passt.top/passt` at tag ",
+            "`2025_02_17.a1e48a0`, verify commit ",
+            "`a1e48a02ff3550eb7875a7df6726086e9b3a1213`, run `make passt` in that ",
+            "checkout, then run `sudo install -m0755 passt /usr/local/bin/passt`"
+        )
+        .to_owned();
+    }
+    install_command(context, Package::Passt).map_or_else(
+        || {
+            format!(
+                "install passt {} or newer with the pinned M3 command options",
+                crate::PINNED_PASST_VERSION
+            )
+        },
+        |command| {
+            format!(
+                "run `{command}`, then rerun doctor; Firestone requires {} or newer with the pinned M3 command options",
+                crate::PINNED_PASST_VERSION
+            )
+        },
+    )
+}
+
 fn missing_passt_check(context: &DoctorContext) -> DoctorCheck {
-    let package_hint = install_command(context, Package::Passt)
-        .map(|command| format!("the detected package command is `{command}`, but verify that its candidate is new enough"))
-        .unwrap_or_else(|| "install the passt package for this distribution".to_owned());
     DoctorCheck::new(
         DoctorCheckId::Passt,
         DoctorStatus::Fail,
         "passt not found on PATH",
     )
-    .with_hint(format!(
-        "{package_hint}; Firestone requires {} or newer with the pinned M3 command options",
-        crate::PINNED_PASST_VERSION
-    ))
+    .with_hint(passt_install_hint(context))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1919,14 +1993,18 @@ fn nearest_existing_ancestor(path: &Path) -> Option<&Path> {
     path.ancestors().find(|ancestor| ancestor.exists())
 }
 
-fn sync_directory(path: &Path) -> Result<(), FirestoneError> {
+fn sync_directory(path: &Path, dependency: &str) -> Result<(), FirestoneError> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|source| {
             FirestoneError::new(
                 ErrorKind::Dependency,
-                format!("cannot sync dependency directory {}", path.display()),
+                format!(
+                    "cannot sync installed dependency `{dependency}` directory {}",
+                    path.display()
+                ),
             )
+            .with_hint(dependency_install_io_hint(path))
             .with_source(source)
         })
 }
@@ -1954,10 +2032,12 @@ mod tests {
     use super::{
         ArtifactFetcher, CHECK_IDS, DoctorCheck, DoctorCheckId, DoctorContext, DoctorReport,
         DoctorStatus, MAX_DEPENDENCY_ARTIFACT_BYTES, MINIMUM_PASST_DATE, Package, artifact_state,
-        check_kvm, check_passt, check_user_namespaces, content_length_exceeds_limit, copy_bounded,
-        create_firestone_dir, distro_family, firestone_error_reason, generate_ssh_key,
-        install_artifact, install_command, parse_passt_version, read_reconciled_machine_state_with,
+        check_architecture, check_kvm, check_passt, check_user_namespaces,
+        content_length_exceeds_limit, copy_bounded, create_firestone_dir, distro_family,
+        firestone_error_reason, generate_ssh_key, hash_dependency_download, install_artifact,
+        install_command, parse_passt_version, read_reconciled_machine_state_with,
         reconcile_machine_state, redirect_rejection, require_https, run_doctor_with,
+        sync_directory,
     };
     use crate::{
         DependencyArtifact, DependencyManifest, ErrorKind, ExitReason, FirestoneError, LastExit,
@@ -2300,6 +2380,23 @@ mod tests {
     }
 
     #[test]
+    fn aarch64_runtime_is_reported_as_deferred() -> Result<(), Box<dyn std::error::Error>> {
+        let mut fixture = Fixture::healthy()?;
+        fixture.context.architecture = "aarch64".to_owned();
+
+        let host = check_architecture(&fixture.context);
+
+        assert_eq!(host.status, DoctorStatus::Fail);
+        assert!(host.reason.contains("runtime support is deferred"));
+        assert!(
+            host.hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("compile-only"))
+        );
+        Ok(())
+    }
+
+    #[test]
     fn report_mixed_failures_preserves_spec_order_and_does_not_short_circuit()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut fixture = Fixture::healthy()?;
@@ -2578,6 +2675,74 @@ mod tests {
     }
 
     #[test]
+    fn install_io_failures_keep_dependency_kind_path_phase_and_actionable_hint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        struct DeniedReader;
+
+        impl Read for DeniedReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "read denied",
+                ))
+            }
+        }
+
+        let directory = TempDir::new()?;
+        let artifact = DependencyArtifact {
+            dependency: "cloud-hypervisor".to_owned(),
+            version: "v1".to_owned(),
+            asset: "tool".to_owned(),
+            install_name: "tool-v1".to_owned(),
+            url: "https://example.invalid/tool".to_owned(),
+            sha256: sha256(b"expected"),
+        };
+        let hash_error = hash_dependency_download(&mut DeniedReader, &artifact, directory.path())
+            .err()
+            .ok_or("expected partial download read failure")?;
+        assert_eq!(hash_error.kind(), ErrorKind::Dependency);
+        assert!(
+            hash_error
+                .message()
+                .contains("read partial download for hashing")
+        );
+        assert!(hash_error.message().contains("cloud-hypervisor"));
+        assert!(
+            hash_error
+                .message()
+                .contains(&directory.path().display().to_string())
+        );
+        let hash_hint = hash_error
+            .hint()
+            .ok_or("hash I/O error should have a hint")?;
+        for expected in [
+            "read/write permissions",
+            "free space",
+            "firestone doctor --fix",
+        ] {
+            assert!(hash_hint.contains(expected));
+        }
+
+        let missing = directory.path().join("missing-bin");
+        let sync_error = sync_directory(&missing, "cloud-hypervisor")
+            .err()
+            .ok_or("expected dependency directory sync failure")?;
+        assert_eq!(sync_error.kind(), ErrorKind::Dependency);
+        assert!(sync_error.message().contains("sync installed dependency"));
+        assert!(
+            sync_error
+                .message()
+                .contains(&missing.display().to_string())
+        );
+        let sync_hint = sync_error
+            .hint()
+            .ok_or("sync I/O error should have a hint")?;
+        assert!(sync_hint.contains("read/write permissions"));
+        assert!(sync_hint.contains("free space"));
+        Ok(())
+    }
+
+    #[test]
     fn download_checksum_mismatch_preserves_target_and_removes_partial()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = TempDir::new()?;
@@ -2629,7 +2794,22 @@ mod tests {
         fs::write(&destination, "existing corrupt artifact")?;
         fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))?;
         let failing = FakeFetcher::failing(payloads.clone());
-        assert!(install_artifact(dir.path(), &artifact, &failing).is_err());
+        let stream_error = install_artifact(dir.path(), &artifact, &failing)
+            .err()
+            .ok_or("expected injected stream failure")?;
+        assert_eq!(stream_error.kind(), ErrorKind::Dependency);
+        assert!(stream_error.message().contains("stream download"));
+        assert!(stream_error.message().contains("cloud-hypervisor"));
+        assert!(
+            stream_error
+                .message()
+                .contains(&dir.path().display().to_string())
+        );
+        let stream_hint = stream_error
+            .hint()
+            .ok_or("stream failure should have an install hint")?;
+        assert!(stream_hint.contains("read/write permissions"));
+        assert!(stream_hint.contains("free space"));
         assert_eq!(fs::read(&destination)?, b"existing corrupt artifact");
         assert_eq!(fs::read_dir(dir.path())?.count(), 1);
 
@@ -2717,9 +2897,14 @@ mod tests {
             .ok_or_else(|| std::io::Error::other("minimum version should parse"))?;
         let old = parse_passt_version("passt 2025_01_21.4f2c8e7")
             .ok_or_else(|| std::io::Error::other("old version should parse"))?;
+        let fedora = parse_passt_version("passt 0^20260728.gf8df3f1-2.fc44.x86_64")
+            .ok_or_else(|| std::io::Error::other("Fedora version should parse"))?;
         assert_eq!(minimum.date, MINIMUM_PASST_DATE);
         assert!(old.date < MINIMUM_PASST_DATE);
+        assert_eq!(fedora.date, 20_260_728);
+        assert_eq!(fedora.raw, "0^20260728.gf8df3f1-2.fc44.x86_64");
         assert!(parse_passt_version("passt 4294967295_12_31.abcdef0").is_none());
+        assert!(parse_passt_version("passt 0^20260217.gnothex-2.fc44").is_none());
 
         let fixture = Fixture::healthy()?;
         let passt = PathBuf::from(&fixture.context.search_path).join("passt");
@@ -2766,7 +2951,7 @@ mod tests {
     }
 
     #[test]
-    fn passt_missing_on_unverified_distro_has_no_ineffective_fix()
+    fn ubuntu_24_04_passt_hint_names_verified_source_build()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::healthy()?;
         let passt = PathBuf::from(&fixture.context.search_path).join("passt");
@@ -2780,18 +2965,19 @@ mod tests {
 
         assert_eq!(check.status, DoctorStatus::Fail);
         assert!(check.fix.is_none());
-        assert!(
-            check
-                .hint
-                .as_deref()
-                .is_some_and(|hint| hint.contains("apt-get"))
-        );
-        assert!(
-            check
-                .hint
-                .as_deref()
-                .is_some_and(|hint| hint.contains("2025_02_17"))
-        );
+        let hint = check
+            .hint
+            .as_deref()
+            .ok_or_else(|| std::io::Error::other("Ubuntu passt failure should have a hint"))?;
+        for required in [
+            "sudo apt-get install -y build-essential ca-certificates git",
+            "https://passt.top/passt",
+            "2025_02_17.a1e48a0",
+            "a1e48a02ff3550eb7875a7df6726086e9b3a1213",
+            "sudo install -m0755 passt /usr/local/bin/passt",
+        ] {
+            assert!(hint.contains(required), "missing {required:?} in {hint:?}");
+        }
         Ok(())
     }
 
@@ -3240,10 +3426,21 @@ mod tests {
         let vendored = check(&report, DoctorCheckId::VendoredBinaries);
         assert_eq!(vendored.status, DoctorStatus::Fail);
         assert!(
+            vendored.reason.contains(
+                "fix failed: cannot stream download for dependency `cloud-hypervisor` into"
+            )
+        );
+        assert!(
             vendored
                 .reason
-                .contains("fix failed: injected stream failure")
+                .contains(&fixture.context.paths.bin_dir().display().to_string())
         );
+        let hint = vendored
+            .hint
+            .as_deref()
+            .ok_or("stream fix failure should retain its install hint")?;
+        assert!(hint.contains("read/write permissions"));
+        assert!(hint.contains("free space"));
         assert!(
             fs::read_dir(fixture.context.paths.bin_dir())?
                 .filter_map(Result::ok)

@@ -4039,15 +4039,12 @@ else:
         let fixture = Fixture::new(false)?;
         let bytes = b"QFI\xFBDEBIAN".to_vec();
         let digest = sha512_bytes(&bytes);
-        let image_url = "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2";
-        let manifest_url = "https://cloud.debian.org/images/cloud/bookworm/latest/SHA512SUMS";
+        let image_url = "https://cloud.debian.org/images/cloud/bookworm/20260821-2577/debian-12-genericcloud-amd64-20260821-2577.qcow2";
+        let manifest_url =
+            "https://cloud.debian.org/images/cloud/bookworm/20260821-2577/SHA512SUMS";
         fixture.http.push(
             manifest_url,
-            format!(
-                "{digest}  debian-12-genericcloud-amd64.qcow2
-"
-            )
-            .into_bytes(),
+            format!("{digest}  debian-12-genericcloud-amd64-20260821-2577.qcow2\n").into_bytes(),
             None,
             Some("text/plain"),
         )?;
@@ -4214,12 +4211,12 @@ else:
         let fixture = Fixture::new(false)?;
         let old_bytes = b"QFI\xFBOLD-UBUNTU".to_vec();
         let old_sha256 = sha256_bytes(&old_bytes);
-        let old_image_url =
-            "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img";
-        let old_manifest_url = "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS";
+        let old_image_url = "https://cloud-images.ubuntu.com/releases/noble/release-20260826/ubuntu-24.04-server-cloudimg-amd64.img";
+        let old_manifest_url =
+            "https://cloud-images.ubuntu.com/releases/noble/release-20260826/SHA256SUMS";
         fixture.http.push(
             old_manifest_url,
-            format!("{old_sha256}  noble-server-cloudimg-amd64.img\n").into_bytes(),
+            format!("{old_sha256}  ubuntu-24.04-server-cloudimg-amd64.img\n").into_bytes(),
             None,
             Some("text/plain"),
         )?;
@@ -4315,11 +4312,12 @@ else:
         let fixture = Fixture::new(false)?;
         let bytes = b"QFI\xFBCACHED-DEBIAN".to_vec();
         let digest = sha512_bytes(&bytes);
-        let image_url = "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2";
-        let manifest_url = "https://cloud.debian.org/images/cloud/bookworm/latest/SHA512SUMS";
+        let image_url = "https://cloud.debian.org/images/cloud/bookworm/20260821-2577/debian-12-genericcloud-amd64-20260821-2577.qcow2";
+        let manifest_url =
+            "https://cloud.debian.org/images/cloud/bookworm/20260821-2577/SHA512SUMS";
         fixture.http.push(
             manifest_url,
-            format!("{digest}  debian-12-genericcloud-amd64.qcow2\n").into_bytes(),
+            format!("{digest}  debian-12-genericcloud-amd64-20260821-2577.qcow2\n").into_bytes(),
             None,
             Some("text/plain"),
         )?;
@@ -4354,7 +4352,7 @@ else:
         assert!(prepared.image.cached);
         assert_eq!(prepared.image.metadata.id, pulled.metadata.id);
         assert_eq!(state.image.r#ref, "debian:12");
-        assert_eq!(prepared.image.firmware, Some(CatalogFirmware::Rhf));
+        assert_eq!(prepared.image.firmware, Some(CatalogFirmware::Edk2));
         Ok(())
     }
 

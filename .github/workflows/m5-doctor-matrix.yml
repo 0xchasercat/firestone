@@ -1,0 +1,140 @@
+name: M5 catalog, docs, and doctor matrix
+
+on:
+  push:
+    paths:
+      - "README.md"
+      - "SPEC.md"
+      - "catalog/**"
+      - "crates/firestone-core/src/catalog.rs"
+      - "crates/firestone-core/src/doctor.rs"
+      - "deps.toml"
+      - "docs/**"
+      - "scripts/m5-catalog-kvm-e2e.py"
+      - "scripts/m5-doctor-matrix.py"
+      - "scripts/validate-catalog-images.py"
+      - "scripts/validate-docs.py"
+      - "scripts/tests/**"
+      - ".github/workflows/m5-doctor-matrix.yml"
+  pull_request:
+    paths:
+      - "README.md"
+      - "SPEC.md"
+      - "catalog/**"
+      - "crates/firestone-core/src/catalog.rs"
+      - "crates/firestone-core/src/doctor.rs"
+      - "deps.toml"
+      - "docs/**"
+      - "scripts/m5-catalog-kvm-e2e.py"
+      - "scripts/m5-doctor-matrix.py"
+      - "scripts/validate-catalog-images.py"
+      - "scripts/validate-docs.py"
+      - "scripts/tests/**"
+      - ".github/workflows/m5-doctor-matrix.yml"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build and validate Linux x86_64 inputs
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build Firestone
+        run: cargo build --locked --release --package firestone
+      - name: Run Python validator tests
+        run: python3 -m unittest discover --start-directory scripts/tests --pattern 'test_*.py'
+      - name: Validate current catalog sources
+        run: python3 scripts/validate-catalog-images.py
+      - name: Validate guide commands and local links
+        run: >-
+          python3 scripts/validate-docs.py --binary target/release/firestone
+          README.md docs/*.md docs/verification/*.md
+      - name: Upload Firestone binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: firestone-doctor-matrix
+          path: target/release/firestone
+          if-no-files-found: error
+          retention-days: 1
+
+  doctor:
+    name: Doctor on ${{ matrix.name }}
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu 24.04
+            distro: ubuntu
+            image: ubuntu:24.04
+          - name: Fedora 44
+            distro: fedora
+            image: fedora:44
+          - name: Arch Linux
+            distro: arch
+            image: archlinux:base
+    container:
+      image: ${{ matrix.image }}
+      options: --tmpfs /matrix-home:rw,size=1g,mode=0755
+    steps:
+      - name: Install Ubuntu test packages
+        if: matrix.distro == 'ubuntu'
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install --yes --no-install-recommends \
+            ca-certificates openssh-client passt passwd python3 qemu-utils util-linux
+      - name: Install Fedora test packages
+        if: matrix.distro == 'fedora'
+        run: |
+          dnf --assumeyes install \
+            ca-certificates openssh-clients passt python3 qemu-img shadow-utils util-linux
+      - name: Install Arch test packages
+        if: matrix.distro == 'arch'
+        run: |
+          pacman -Syu --noconfirm --disable-sandbox \
+            ca-certificates openssh passt python qemu-img shadow util-linux
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Download Firestone binary
+        uses: actions/download-artifact@v4
+        with:
+          name: firestone-doctor-matrix
+          path: dist
+      - name: Create unprivileged host fixture
+        run: |
+          chmod 0755 dist/firestone
+          if ! getent group kvm >/dev/null; then
+            groupadd --gid 4242 kvm
+          fi
+          useradd --uid 10001 --home-dir /matrix-home/firestone --create-home --shell /bin/sh firestone
+          chmod 0700 /matrix-home/firestone
+          chown firestone:firestone /matrix-home/firestone
+          test ! -e /dev/kvm
+          install --owner root --group kvm --mode 0660 /dev/null /dev/kvm
+          test -f /dev/kvm
+          test ! -c /dev/kvm
+      - name: Run fresh-host doctor checks
+        run: |
+          runuser -u firestone -- env \
+            -u FIRESTONE_HOME \
+            -u FIRESTONE_CONFIG_DIR \
+            -u FIRESTONE_DATA_DIR \
+            -u FIRESTONE_RUNTIME_DIR \
+            -u XDG_CONFIG_HOME \
+            -u XDG_DATA_HOME \
+            -u XDG_RUNTIME_DIR \
+            HOME=/matrix-home/firestone \
+            python3 scripts/m5-doctor-matrix.py \
+              --distro "${{ matrix.distro }}" \
+              --firestone "$PWD/dist/firestone"
