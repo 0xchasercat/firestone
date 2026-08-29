@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 use clap::{ArgAction, Args, Parser, Subcommand, error::ErrorKind};
 use firestone_core::{
@@ -44,13 +47,16 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// Commands implemented by the Linux M1 CLI.
+/// Commands implemented by the Linux M2 CLI.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Create or reuse a machine, start it, and open an SSH shell.
+    Run(Box<RunArgs>),
+
     /// Create a machine definition without booting it.
     Create(Box<CreateArgs>),
 
-    /// Start a machine and wait for the M1 running contract.
+    /// Start a machine and wait for SSH readiness.
     Start(StartArgs),
 
     /// Stop a machine.
@@ -73,6 +79,17 @@ pub enum Command {
     /// Edit and validate a machine's firestone.toml.
     Edit(EditArgs),
 
+    /// Open SSH over the machine's private vsock transport.
+    #[command(visible_alias = "ssh")]
+    Shell(ShellArgs),
+
+    /// Print an OpenSSH Host block for the machine.
+    #[command(name = "ssh-config")]
+    SshConfig(SshConfigArgs),
+
+    /// Attach to the machine's hvc0 console.
+    Console(ConsoleArgs),
+
     /// Print a bounded machine log.
     Logs(LogsArgs),
 
@@ -87,12 +104,61 @@ pub enum Command {
     VsockProxy(VsockProxyArgs),
 }
 
+/// Arguments accepted by firestone run.
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    /// Existing machine name or image reference. Defaults to ubuntu.
+    #[arg(value_name = "IMAGE|NAME")]
+    pub target: Option<String>,
+
+    /// Name a machine created from an image reference.
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// Remove a machine created by this invocation after SSH exits.
+    #[arg(long = "rm")]
+    pub remove: bool,
+
+    #[command(flatten)]
+    pub spec: SpecArgs,
+
+    /// Remote command. Values are passed to OpenSSH without retokenizing.
+    #[arg(last = true, value_name = "CMD")]
+    pub command: Vec<OsString>,
+}
+
+/// Arguments accepted by firestone shell.
+#[derive(Debug, Args)]
+pub struct ShellArgs {
+    pub name: String,
+
+    /// Select the guest login user.
+    #[arg(long, value_name = "USER")]
+    pub user: Option<String>,
+
+    /// Remote command. Values are passed to OpenSSH without retokenizing.
+    #[arg(last = true, value_name = "CMD")]
+    pub command: Vec<OsString>,
+}
+
+/// Arguments accepted by firestone ssh-config.
+#[derive(Debug, Args)]
+pub struct SshConfigArgs {
+    pub name: String,
+}
+
+/// Arguments accepted by firestone console.
+#[derive(Debug, Args)]
+pub struct ConsoleArgs {
+    pub name: String,
+}
+
 /// Arguments accepted by firestone start.
 #[derive(Debug, Args)]
 pub struct StartArgs {
     pub name: String,
 
-    /// Return after the M1 running contract without later readiness checks.
+    /// Return immediately after the VMM reaches persisted running state.
     #[arg(long)]
     pub no_wait: bool,
 
@@ -511,7 +577,7 @@ fn resolve_create_target(
     Ok((name, image))
 }
 
-fn derive_machine_name(image: &ImageRef) -> Result<String, clap::Error> {
+pub(crate) fn derive_machine_name(image: &ImageRef) -> Result<String, clap::Error> {
     let value = image.as_str();
     let candidate = if value.contains('/') {
         let suffix = match value.find(['?', '#']) {
@@ -588,7 +654,7 @@ fn parse_vmm_config(value: &str) -> Result<serde_json::Value, String> {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use std::{collections::BTreeSet, path::PathBuf};
+    use std::{collections::BTreeSet, ffi::OsString, path::PathBuf};
 
     use clap::{Args as _, CommandFactory as _, Parser as _, error::ErrorKind};
     use firestone_core::{Arch, ByteSize, Firmware, NetMode, SPEC_FIELD_METADATA, SpecClear};
@@ -830,13 +896,98 @@ mod tests {
     }
 
     #[test]
-    fn m1_short_and_long_help_contracts_do_not_drift() {
+    fn run_grammar_preserves_target_flags_and_post_separator_argv() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from([
+            "firestone",
+            "run",
+            "ubuntu:24.04",
+            "--name",
+            "dev",
+            "--rm",
+            "--cpus",
+            "4",
+            "--user",
+            "builder",
+            "--",
+            "printf one argument",
+            "--remote-flag",
+        ])?;
+        match cli.command {
+            Command::Run(arguments) => {
+                assert_eq!(arguments.target.as_deref(), Some("ubuntu:24.04"));
+                assert_eq!(arguments.name.as_deref(), Some("dev"));
+                assert!(arguments.remove);
+                assert_eq!(arguments.spec.cpus, Some(4));
+                assert_eq!(arguments.spec.user.as_deref(), Some("builder"));
+                assert_eq!(
+                    arguments.command,
+                    vec![
+                        OsString::from("printf one argument"),
+                        OsString::from("--remote-flag"),
+                    ]
+                );
+            }
+            _ => panic!("expected run command"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shell_alias_and_separator_preserve_remote_argv() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from([
+            "firestone",
+            "ssh",
+            "dev",
+            "--user",
+            "root",
+            "--",
+            "echo two words",
+            "-n",
+        ])?;
+        match cli.command {
+            Command::Shell(arguments) => {
+                assert_eq!(arguments.name, "dev");
+                assert_eq!(arguments.user.as_deref(), Some("root"));
+                assert_eq!(
+                    arguments.command,
+                    vec![OsString::from("echo two words"), OsString::from("-n")]
+                );
+            }
+            _ => panic!("expected shell command"),
+        }
+        let missing_separator = Cli::try_parse_from(["firestone", "shell", "dev", "echo"])
+            .expect_err("remote command without -- must fail");
+        assert!(matches!(
+            missing_separator.kind(),
+            ErrorKind::UnknownArgument | ErrorKind::TooManyValues
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn m2_short_and_long_help_contracts_do_not_drift() {
         let command = Cli::command();
         let names = command
             .get_subcommands()
             .map(clap::Command::get_name)
             .collect::<BTreeSet<_>>();
-        for name in ["start", "stop", "restart", "rm", "logs", "images", "show"] {
+        for name in [
+            "run",
+            "create",
+            "start",
+            "stop",
+            "restart",
+            "rm",
+            "ls",
+            "show",
+            "edit",
+            "shell",
+            "ssh-config",
+            "console",
+            "logs",
+            "images",
+            "doctor",
+        ] {
             assert!(names.contains(name), "missing {name} command");
         }
 

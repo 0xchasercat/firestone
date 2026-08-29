@@ -47,10 +47,10 @@ use sha2::{Digest, Sha256};
 use std::os::unix::ffi::OsStrExt;
 
 use crate::{
-    Arch, Cmd, DependencyManifest, ErrorInfo, ErrorKind, Event, EventSink, ExitReason,
-    FirestoneError, ImageStore, LastExit, MachineLock, MachineSpec, MachineState, MachineStatus,
-    ManagedProcess, NetMode, Paths, ProcessSignal, StateStore, StepId, VmConfigInput, VmState,
-    VmmApi, VmmApiLivenessProbe, VmmPingProbe, atomic, ensure_ssh_identity,
+    Arch, Cmd, ConsoleBroker, DependencyManifest, ErrorInfo, ErrorKind, Event, EventSink,
+    ExitReason, FirestoneError, ImageStore, LastExit, MachineLock, MachineSpec, MachineState,
+    MachineStatus, ManagedProcess, NetMode, Paths, ProcessSignal, StateStore, StepId,
+    VmConfigInput, VmState, VmmApi, VmmApiLivenessProbe, VmmPingProbe, atomic, ensure_ssh_identity,
     invalidate_known_hosts_for_seed, publish_seed_with_sshd_path, publish_vm_config,
 };
 
@@ -85,6 +85,8 @@ pub struct ShimTimeouts {
     pub control_io: Duration,
     pub launch_request: Duration,
     pub launch_overall: Duration,
+    pub first_boot_launch_request: Duration,
+    pub first_boot_launch_overall: Duration,
 }
 
 impl Default for ShimTimeouts {
@@ -95,6 +97,8 @@ impl Default for ShimTimeouts {
             control_io: Duration::from_secs(2),
             launch_request: Duration::from_secs(30),
             launch_overall: Duration::from_secs(30),
+            first_boot_launch_request: Duration::from_secs(30),
+            first_boot_launch_overall: Duration::from_secs(30),
         }
     }
 }
@@ -107,6 +111,8 @@ impl ShimTimeouts {
             ("control_io", self.control_io),
             ("launch_request", self.launch_request),
             ("launch_overall", self.launch_overall),
+            ("first_boot_launch_request", self.first_boot_launch_request),
+            ("first_boot_launch_overall", self.first_boot_launch_overall),
         ] {
             if duration.is_zero() {
                 return Err(FirestoneError::new(
@@ -133,6 +139,8 @@ pub struct PreparedStart {
     name: String,
     state: MachineState,
     previous_status: MachineStatus,
+    seed_rewritten: bool,
+    timeout: Duration,
 }
 
 impl PreparedStart {
@@ -144,6 +152,15 @@ impl PreparedStart {
     #[must_use]
     pub fn state(&self) -> &MachineState {
         &self.state
+    }
+    #[must_use]
+    pub const fn seed_rewritten(&self) -> bool {
+        self.seed_rewritten
+    }
+
+    #[must_use]
+    pub const fn timeout(&self) -> Duration {
+        self.timeout
     }
 }
 
@@ -191,6 +208,8 @@ impl LaunchPlan {
             control_io: Duration::from_millis(self.control_io_timeout_ms),
             launch_request: Duration::from_millis(self.launch_request_timeout_ms),
             launch_overall: Duration::from_millis(self.launch_overall_timeout_ms),
+            first_boot_launch_request: Duration::from_millis(self.launch_request_timeout_ms),
+            first_boot_launch_overall: Duration::from_millis(self.launch_overall_timeout_ms),
         };
         timeouts.validate()
     }
@@ -291,6 +310,7 @@ struct OwnedVmm {
     process: Option<ManagedProcess>,
     record: ProcessRecord,
     reaped_status: Option<ExitStatus>,
+    console: Option<ConsoleBroker>,
 }
 
 impl OwnedVmm {
@@ -316,11 +336,16 @@ impl OwnedVmm {
                 start_time_ticks: None,
             },
             reaped_status: None,
+            console: None,
         }
     }
 
     fn bind_record(&mut self, record: ProcessRecord) {
         self.record = record;
+    }
+
+    fn attach_console(&mut self, broker: ConsoleBroker) {
+        self.console = Some(broker);
     }
 
     fn id(&self) -> u32 {
@@ -438,6 +463,14 @@ impl OwnedVmm {
                 ));
             }
             self.reaped_status = Some(process.wait()?);
+        }
+        if let Some(console) = self.console.take() {
+            if let Err(error) = console.shutdown() {
+                write_shim_log(&format!(
+                    "console broker shutdown failed ({}); VMM cleanup continues",
+                    error.kind()
+                ));
+            }
         }
 
         // Keep the reaped ManagedProcess marker armed until every adopted child
@@ -581,7 +614,7 @@ pub fn prepare_start(
     timeouts: ShimTimeouts,
 ) -> Result<PreparedStart, FirestoneError> {
     validate_m1_start_scope(spec)?;
-    let timeouts = timeouts.validate()?;
+    let mut timeouts = timeouts.validate()?;
     match state.status {
         MachineStatus::Created | MachineStatus::Stopped | MachineStatus::Failed => {}
         MachineStatus::Starting | MachineStatus::Running | MachineStatus::Stopping => {
@@ -633,6 +666,16 @@ pub fn prepare_start(
     if spec.cloud_init.provisioning {
         ensure_ssh_identity(paths)?;
     }
+    let seed_existed = paths
+        .machine_seed_image(name)?
+        .try_exists()
+        .map_err(|source| {
+            filesystem_error(
+                ErrorKind::Generic,
+                format!("cannot inspect machine {name} cloud-init seed"),
+                source,
+            )
+        })?;
     let previous_instance_id = state.instance_id.clone();
     let rendered =
         publish_seed_with_sshd_path(paths, name, spec, &prepared_image.image.metadata.sshd_path)?;
@@ -642,6 +685,12 @@ pub fn prepare_start(
         previous_instance_id.as_deref(),
         &rendered.instance_id,
     )?;
+    let seed_rewritten =
+        !seed_existed || previous_instance_id.as_deref() != Some(rendered.instance_id.as_str());
+    if seed_rewritten {
+        timeouts.launch_request = timeouts.first_boot_launch_request;
+        timeouts.launch_overall = timeouts.first_boot_launch_overall;
+    }
     state.instance_id = Some(rendered.instance_id.clone());
     if state.mac.is_none() {
         state.mac = Some(allocated_mac(paths, name));
@@ -701,7 +750,35 @@ pub fn prepare_start(
         name: name.to_owned(),
         state,
         previous_status,
+        seed_rewritten,
+        timeout: timeouts.launch_overall,
     })
+}
+
+/// Rolls a prepared-but-unlaunched start back to its prior lifecycle state.
+pub fn cancel_prepared(
+    paths: &Paths,
+    mut prepared: PreparedStart,
+    lock: &MachineLock,
+) -> Result<(), FirestoneError> {
+    validate_machine_lock(paths, &prepared.name, lock)?;
+    prepared.state.status = prepared.previous_status;
+    prepared.state.shim_pid = None;
+    prepared.state.vmm_pid = None;
+    prepared.state.started_at = None;
+    prepared.state.sidecar_pids.clear();
+    prepared.state.degraded.clear();
+    StateStore::new(paths.machine_state(&prepared.name)?)
+        .write_from_locked_action(&prepared.state, lock)?;
+    paths.clear_machine_runtime_dir(&prepared.name, true)
+}
+
+fn start_interrupted_error() -> FirestoneError {
+    FirestoneError::new(
+        ErrorKind::Interrupted,
+        "machine start interrupted by SIGINT",
+    )
+    .with_hint("retry the start command when ready")
 }
 
 struct ShimChildReaper {
@@ -743,11 +820,28 @@ impl ShimChildReaper {
 pub fn launch_prepared(
     paths: &Paths,
     shim_program: &Path,
-    mut prepared: PreparedStart,
+    prepared: PreparedStart,
     lock: MachineLock,
     events: &mut dyn EventSink,
 ) -> Result<ShimStatus, FirestoneError> {
+    let cancellation = AtomicBool::new(false);
+    launch_prepared_cancellable(paths, shim_program, prepared, lock, events, &cancellation)
+}
+
+/// Launches a prepared machine while allowing the caller to cancel with SIGINT semantics.
+pub fn launch_prepared_cancellable(
+    paths: &Paths,
+    shim_program: &Path,
+    mut prepared: PreparedStart,
+    lock: MachineLock,
+    events: &mut dyn EventSink,
+    cancellation: &AtomicBool,
+) -> Result<ShimStatus, FirestoneError> {
     validate_machine_lock(paths, &prepared.name, &lock)?;
+    if cancellation.load(Ordering::Relaxed) {
+        cancel_prepared(paths, prepared, &lock)?;
+        return Err(start_interrupted_error());
+    }
     let shim_reaper = ShimChildReaper::start()?;
     let plan = match read_launch_plan(paths, &prepared.name) {
         Ok(plan) => plan,
@@ -808,10 +902,19 @@ pub fn launch_prepared(
         .ok_or_else(|| {
             FirestoneError::new(ErrorKind::Usage, "shim launch deadline is out of range")
         })?;
-    if let Err(error) =
-        wait_for_shim_socket(paths, &prepared.name, &socket, &mut process, wait_deadline)
-    {
-        terminate_unready_shim(paths, &prepared.name, &mut process, &prepared.state, &error)?;
+    if let Err(error) = wait_for_shim_socket(
+        paths,
+        &prepared.name,
+        &socket,
+        &mut process,
+        wait_deadline,
+        Some(cancellation),
+    ) {
+        if error.kind() == ErrorKind::Interrupted {
+            terminate_cancelled_shim(paths, prepared, &mut process)?;
+        } else {
+            terminate_unready_shim(paths, &prepared.name, &mut process, &prepared.state, &error)?;
+        }
         return Err(error);
     }
     if let Err(error) = process.confirm_session() {
@@ -831,8 +934,18 @@ pub fn launch_prepared(
             FirestoneError::new(ErrorKind::Usage, "launch client deadline is out of range")
         })?;
     let client = ShimClient::new(socket, client_timeout);
+    let launch_result = client.launch_cancellable(events, cancellation);
+    if launch_result
+        .as_ref()
+        .is_err_and(|error| error.kind() == ErrorKind::Interrupted)
+        || cancellation.load(Ordering::Relaxed)
+    {
+        let error = start_interrupted_error();
+        terminate_cancelled_shim(paths, prepared, &mut process)?;
+        return Err(error);
+    }
     shim_reaper.submit(process)?;
-    client.launch(events)?;
+    launch_result?;
     let status = ShimClient::new(
         paths.machine_shim_socket(&prepared.name)?,
         plan_timeouts.control_io,
@@ -884,7 +997,7 @@ pub fn recover_shim(
         .ok_or_else(|| {
             FirestoneError::new(ErrorKind::Usage, "shim recovery deadline is out of range")
         })?;
-    if let Err(error) = wait_for_shim_socket(paths, name, &socket, &mut process, deadline) {
+    if let Err(error) = wait_for_shim_socket(paths, name, &socket, &mut process, deadline, None) {
         terminate_recovery_candidate(&mut process)?;
         return Err(error);
     }
@@ -934,17 +1047,31 @@ impl ShimClient {
     }
 
     pub fn ping(&self) -> Result<(), FirestoneError> {
-        let terminal = self.request(br#"{"op":"ping"}"#, None, self.timeout)?;
+        let terminal = self.request(br#"{"op":"ping"}"#, None, self.timeout, None)?;
         require_ok_terminal(&terminal)
     }
 
     pub fn launch(&self, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
-        let terminal = self.request(br#"{"op":"launch"}"#, Some(events), self.timeout)?;
+        let terminal = self.request(br#"{"op":"launch"}"#, Some(events), self.timeout, None)?;
+        require_ok_terminal(&terminal)
+    }
+
+    fn launch_cancellable(
+        &self,
+        events: &mut dyn EventSink,
+        cancellation: &AtomicBool,
+    ) -> Result<(), FirestoneError> {
+        let terminal = self.request(
+            br#"{"op":"launch"}"#,
+            Some(events),
+            self.timeout,
+            Some(cancellation),
+        )?;
         require_ok_terminal(&terminal)
     }
 
     pub fn status(&self) -> Result<ShimStatus, FirestoneError> {
-        let terminal = self.request(br#"{"op":"status"}"#, None, self.timeout)?;
+        let terminal = self.request(br#"{"op":"status"}"#, None, self.timeout, None)?;
         if terminal.get("ok").and_then(Value::as_bool) != Some(true) {
             return Err(error_from_terminal(&terminal)?);
         }
@@ -981,7 +1108,7 @@ impl ShimClient {
                 .with_source(source)
         })?;
         let total = stop_overall_timeout(timeout, self.timeout)?;
-        let terminal = self.request(&request, Some(events), total)?;
+        let terminal = self.request(&request, Some(events), total, None)?;
         require_ok_terminal(&terminal)
     }
 
@@ -990,6 +1117,7 @@ impl ShimClient {
         request: &[u8],
         mut events: Option<&mut dyn EventSink>,
         timeout: Duration,
+        cancellation: Option<&AtomicBool>,
     ) -> Result<Value, FirestoneError> {
         if request.len() > MAX_CONTROL_REQUEST_BYTES {
             return Err(protocol_error("shim request exceeds the 4096 byte limit"));
@@ -1002,7 +1130,12 @@ impl ShimClient {
         write_frame(&mut stream, request, deadline)?;
         let mut total = 0_usize;
         loop {
-            let frame = read_frame(&mut stream, MAX_CONTROL_RESPONSE_BYTES, deadline)?;
+            let frame = read_frame(
+                &mut stream,
+                MAX_CONTROL_RESPONSE_BYTES,
+                deadline,
+                cancellation,
+            )?;
             total = total
                 .checked_add(frame.len())
                 .ok_or_else(|| protocol_error("shim response stream length overflowed usize"))?;
@@ -2249,6 +2382,19 @@ fn launch_vmm(
         terminate_launch_vmm(&mut vmm, launch_deadline)?;
         return Err(error);
     }
+    let console_result = (|| {
+        let info_timeout = launch_phase_timeout(work_deadline, timeouts.api, "vm.info console")?;
+        let info = VmmApi::new(&api_socket, info_timeout).vm_info()?;
+        let pty_path = console_pty_path(name, &info.config)?;
+        ConsoleBroker::start(paths, name, &pty_path)
+    })();
+    match console_result {
+        Ok(console) => vmm.attach_console(console),
+        Err(error) => {
+            terminate_launch_vmm(&mut vmm, launch_deadline)?;
+            return Err(error);
+        }
+    }
     ensure_launch_before_deadline(work_deadline, "publishing running state")?;
     state.status = MachineStatus::Running;
     StateStore::new(paths.machine_state(name)?).write_from_shim(state)?;
@@ -2260,6 +2406,40 @@ fn launch_vmm(
     })?;
     OWNER_EVIDENCE_STATE.store(0, Ordering::Release);
     Ok(vmm)
+}
+
+fn console_pty_path(name: &str, config: &Value) -> Result<PathBuf, FirestoneError> {
+    let mode = config
+        .pointer("/console/mode")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            FirestoneError::new(
+                ErrorKind::Conflict,
+                format!("cloud-hypervisor did not report a console mode for machine {name}"),
+            )
+            .with_hint("verify the pinned Cloud Hypervisor v53 console contract")
+        })?;
+    if mode != "Pty" {
+        return Err(FirestoneError::new(
+            ErrorKind::Conflict,
+            format!(
+                "cloud-hypervisor reported console mode {mode:?} for machine {name}, expected Pty"
+            ),
+        )
+        .with_hint("remove VMM console overrides and restart the machine"));
+    }
+    let path = config
+        .pointer("/console/file")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            FirestoneError::new(
+                ErrorKind::Conflict,
+                format!("cloud-hypervisor did not publish the console PTY path for machine {name}"),
+            )
+            .with_hint("verify the pinned Cloud Hypervisor v53 vm.info response")
+        })?;
+    Ok(PathBuf::from(path))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4589,7 +4769,7 @@ fn read_request(
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| FirestoneError::new(ErrorKind::Usage, "control deadline is out of range"))?;
-    let frame = read_frame(stream, MAX_CONTROL_REQUEST_BYTES, deadline)?;
+    let frame = read_frame(stream, MAX_CONTROL_REQUEST_BYTES, deadline, None)?;
     let mut trailing = [0_u8; 1];
     match stream.read(&mut trailing) {
         Ok(0) => {}
@@ -4736,10 +4916,14 @@ fn read_frame(
     mut stream: impl Read,
     limit: usize,
     deadline: Instant,
+    cancellation: Option<&AtomicBool>,
 ) -> Result<Vec<u8>, FirestoneError> {
     let mut frame = Vec::with_capacity(limit.min(4096));
     let mut byte = [0_u8; 1];
     loop {
+        if cancellation.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(start_interrupted_error());
+        }
         if Instant::now() >= deadline {
             return Err(FirestoneError::new(
                 ErrorKind::Timeout,
@@ -5016,8 +5200,12 @@ fn wait_for_shim_socket(
     socket: &Path,
     process: &mut ManagedProcess,
     deadline: Instant,
+    cancellation: Option<&AtomicBool>,
 ) -> Result<(), FirestoneError> {
     loop {
+        if cancellation.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(start_interrupted_error());
+        }
         if process.observe_exit()? {
             return Err(FirestoneError::new(
                 ErrorKind::Generic,
@@ -5072,6 +5260,44 @@ fn rollback_before_shim(
     StateStore::new(paths.machine_state(&prepared.name)?)
         .write_from_locked_action(&prepared.state, lock)?;
     paths.clear_machine_runtime_dir(&prepared.name, true)
+}
+
+fn terminate_cancelled_shim(
+    paths: &Paths,
+    prepared: PreparedStart,
+    process: &mut ManagedProcess,
+) -> Result<(), FirestoneError> {
+    if process.observe_exit()? {
+        let _ = process.wait()?;
+    } else {
+        process.signal_process(ProcessSignal::Terminate)?;
+        if process.wait_timeout(CHILD_TERM_GRACE)?.is_none() {
+            process.signal_process(ProcessSignal::Kill)?;
+            if process.wait_timeout(CHILD_TERM_GRACE)?.is_none() {
+                return Err(FirestoneError::new(
+                    ErrorKind::Timeout,
+                    format!(
+                        "cannot reap cancelled shim pid {} after SIGKILL",
+                        process.id()
+                    ),
+                ));
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let vmm =
+        read_process_identity_optional(paths, &prepared.name)?.and_then(|identity| identity.vmm);
+    #[cfg(target_os = "linux")]
+    if let Some(vmm) = vmm.as_ref() {
+        terminate_recovered_process(vmm)?;
+    }
+    let mut events = Vec::new();
+    let lock = MachineLock::acquire(
+        &prepared.name,
+        &paths.machine_lock(&prepared.name)?,
+        &mut events,
+    )?;
+    cancel_prepared(paths, prepared, &lock)
 }
 
 fn terminate_unready_shim(

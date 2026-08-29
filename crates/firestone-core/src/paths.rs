@@ -453,6 +453,10 @@ impl Paths {
         Ok(self.machine_runtime_dir(name)?.join("console.sock"))
     }
 
+    pub fn machine_console_pty_log(&self, name: &str) -> Result<PathBuf, FirestoneError> {
+        Ok(self.machine_runtime_dir(name)?.join("console.pty.log"))
+    }
+
     pub fn machine_net_socket(&self, name: &str) -> Result<PathBuf, FirestoneError> {
         Ok(self.machine_runtime_dir(name)?.join("net.sock"))
     }
@@ -1790,6 +1794,10 @@ mod tests {
         assert_eq!(
             paths.machine_console_socket("demo")?,
             PathBuf::from("/firestone/run/demo/console.sock")
+        );
+        assert_eq!(
+            paths.machine_console_pty_log("demo")?,
+            PathBuf::from("/firestone/run/demo/console.pty.log")
         );
         assert_eq!(
             paths.machine_net_socket("demo")?,

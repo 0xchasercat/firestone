@@ -282,4 +282,20 @@ mod tests {
             assert!(value.parse::<LogSource>().is_err(), "accepted {value}");
         }
     }
+    #[test]
+    fn start_readiness_action_round_trips_wait_and_timeout() -> Result<(), serde_json::Error> {
+        for wait in [false, true] {
+            let action = Action::Start {
+                name: "ubuntu".to_owned(),
+                wait,
+                timeout: std::time::Duration::from_millis(12_345),
+            };
+            let encoded = serde_json::to_value(&action)?;
+            assert_eq!(encoded["type"], "Start");
+            assert_eq!(encoded["name"], "ubuntu");
+            assert_eq!(encoded["wait"], wait);
+            assert_eq!(serde_json::from_value::<Action>(encoded)?, action);
+        }
+        Ok(())
+    }
 }

@@ -1,10 +1,10 @@
 use std::{
     env,
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
-    process::{Command, ExitCode, Stdio},
+    process::{Child, Command, ExitCode, Stdio},
 };
 
 struct Options {
@@ -75,6 +75,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
 
+    let pty = FakePty::open()?;
     let _ = fs::remove_file(&options.api_socket);
     let listener = UnixListener::bind(&options.api_socket)?;
     for connection in listener.incoming() {
@@ -106,6 +107,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "/api/v1/vm.create" => {
                 fs::write(&options.body, &request.body)?;
+                start_vsock(&request.body)?;
                 if let Some(console) = &options.console_log {
                     fs::write(console, b"current boot\n")?;
                 }
@@ -144,7 +146,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "Running"
                 };
                 let body = format!(
-                    "{{\"config\":{{}},\"state\":\"{state}\",\"memory_actual_size\":1,\"device_tree\":null}}"
+                    "{{\"config\":{{\"console\":{{\"mode\":\"Pty\",\"file\":{:?}}}}},\"state\":\"{state}\",\"memory_actual_size\":1,\"device_tree\":null}}",
+                    pty.path
                 );
                 response(&mut stream, "200 OK", body.as_bytes())?;
             }
@@ -165,7 +168,76 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+fn start_vsock(config: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    let config = std::str::from_utf8(config)?;
+    let Some(vsock) = config.find("\"vsock\"") else {
+        return Ok(());
+    };
+    let tail = &config[vsock..];
+    let marker = "\"socket\":\"";
+    let start = tail.find(marker).ok_or("VmConfig vsock has no socket")? + marker.len();
+    let tail = &tail[start..];
+    let end = tail.find('"').ok_or("unterminated VmConfig vsock socket")?;
+    let path = PathBuf::from(&tail[..end]);
+    let _ = fs::remove_file(&path);
+    let listener = UnixListener::bind(&path)?;
+    std::thread::Builder::new()
+        .name("fake-vsock".to_owned())
+        .spawn(move || {
+            for connection in listener.incoming() {
+                let Ok(mut stream) = connection else {
+                    break;
+                };
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while request.len() < 64 && !request.ends_with(b"\n") {
+                    match stream.read(&mut byte) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => request.push(byte[0]),
+                    }
+                }
+                if request == b"CONNECT 22\n" {
+                    let _ = stream.write_all(b"OK 1024\n");
+                }
+            }
+        })?;
+    Ok(())
+}
 
+struct FakePty {
+    child: Child,
+    path: String,
+}
+
+impl FakePty {
+    fn open() -> Result<Self, Box<dyn std::error::Error>> {
+        let script = "import os,pty,signal,tty\nm,s=pty.openpty()\ntty.setraw(s)\nprint(os.ttyname(s), flush=True)\nsignal.pause()\n";
+        let mut child = Command::new("python3")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let stdout = child.stdout.take().ok_or("fake PTY helper has no stdout")?;
+        let mut path = String::new();
+        BufReader::new(stdout).read_line(&mut path)?;
+        let path = path.trim_end().to_owned();
+        if path.is_empty() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("fake PTY helper returned an empty path".into());
+        }
+        Ok(Self { child, path })
+    }
+}
+
+impl Drop for FakePty {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
 
 fn spawn_descendant() -> Result<std::process::Child, std::io::Error> {
     #[cfg(target_os = "linux")]

@@ -361,6 +361,8 @@ fn start_preparation_orders_image_overlay_seed_vmconfig_and_plan() -> TestResult
         control_io: Duration::from_millis(50),
         launch_request: Duration::from_millis(100),
         launch_overall: Duration::from_secs(1),
+        first_boot_launch_request: Duration::from_millis(100),
+        first_boot_launch_overall: Duration::from_secs(1),
     };
     spec.cloud_init.user_data = Some(root.path().join("deferred-user-data"));
     let error = require_firestone_error(
@@ -440,6 +442,8 @@ fn start_preparation_orders_image_overlay_seed_vmconfig_and_plan() -> TestResult
             control_io: Duration::from_millis(500),
             launch_request: Duration::from_secs(3),
             launch_overall: Duration::from_secs(15),
+            first_boot_launch_request: Duration::from_secs(3),
+            first_boot_launch_overall: Duration::from_secs(15),
         },
     )?;
     let running = match launch_prepared(

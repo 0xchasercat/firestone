@@ -106,6 +106,211 @@ impl SshIdentity {
     }
 }
 
+/// Exact argv for one system OpenSSH invocation.
+///
+/// The plan contains paths and argv only. It never reads or stores private-key
+/// bytes. Callers can exec it for a shell or run it as a bounded readiness probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshCommandPlan {
+    program: OsString,
+    args: Vec<OsString>,
+}
+
+impl SshCommandPlan {
+    #[must_use]
+    pub fn program(&self) -> &OsStr {
+        &self.program
+    }
+
+    #[must_use]
+    pub fn args(&self) -> &[OsString] {
+        &self.args
+    }
+
+    #[must_use]
+    pub fn command(&self) -> Cmd {
+        Cmd::new(self.program.clone()).args(self.args.clone())
+    }
+}
+
+/// Validated OpenSSH configuration text for one machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshConfigPlan {
+    host: String,
+    block: String,
+}
+
+impl SshConfigPlan {
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    #[must_use]
+    pub fn block(&self) -> &str {
+        &self.block
+    }
+}
+
+/// Builds the exact system OpenSSH command used by firestone shell.
+pub fn shell_ssh_plan(
+    paths: &Paths,
+    current_executable: &Path,
+    name: &str,
+    user: &str,
+    allocate_tty: bool,
+    remote_command: Vec<OsString>,
+) -> Result<SshCommandPlan, FirestoneError> {
+    ssh_command_plan(
+        paths,
+        current_executable,
+        name,
+        user,
+        allocate_tty,
+        false,
+        remote_command,
+    )
+}
+
+/// Builds the bounded BatchMode probe used by start readiness.
+pub fn readiness_ssh_plan(
+    paths: &Paths,
+    current_executable: &Path,
+    name: &str,
+    user: &str,
+) -> Result<SshCommandPlan, FirestoneError> {
+    ssh_command_plan(
+        paths,
+        current_executable,
+        name,
+        user,
+        false,
+        true,
+        vec![OsString::from("true")],
+    )
+}
+
+/// Builds a safely quoted OpenSSH Host block without loading key material.
+pub fn ssh_config_plan(
+    paths: &Paths,
+    current_executable: &Path,
+    name: &str,
+    user: &str,
+) -> Result<SshConfigPlan, FirestoneError> {
+    crate::spec::validate_guest_user(user)?;
+    let identity = ensure_ssh_identity(paths)?;
+    let known_hosts = machine_known_hosts_path(paths, name)?;
+    let proxy = proxy_command(paths, current_executable, name)?;
+    let identity = ssh_config_word(identity.private_key(), "SSH identity")?;
+    let known_hosts = ssh_config_word(&known_hosts, "machine known_hosts")?;
+    let host = format!("firestone.{name}");
+    let block = format!(
+        "Host {host}\n  User {user}\n  ProxyCommand {proxy}\n  IdentityFile {identity}\n  IdentitiesOnly yes\n  UserKnownHostsFile {known_hosts}\n  StrictHostKeyChecking accept-new\n"
+    );
+    Ok(SshConfigPlan { host, block })
+}
+
+fn ssh_command_plan(
+    paths: &Paths,
+    current_executable: &Path,
+    name: &str,
+    user: &str,
+    allocate_tty: bool,
+    batch_mode: bool,
+    remote_command: Vec<OsString>,
+) -> Result<SshCommandPlan, FirestoneError> {
+    crate::spec::validate_guest_user(user)?;
+    let identity = ensure_ssh_identity(paths)?;
+    let known_hosts = machine_known_hosts_path(paths, name)?;
+    let proxy = proxy_command(paths, current_executable, name)?;
+    let identity = ssh_config_word(identity.private_key(), "SSH identity")?;
+    let known_hosts = ssh_config_word(&known_hosts, "machine known_hosts")?;
+
+    let mut args = Vec::with_capacity(13 + usize::from(batch_mode) * 2 + remote_command.len());
+    push_ssh_option(&mut args, format!("ProxyCommand={proxy}"));
+    push_ssh_option(&mut args, format!("IdentityFile={identity}"));
+    push_ssh_option(&mut args, "IdentitiesOnly=yes");
+    push_ssh_option(&mut args, format!("UserKnownHostsFile={known_hosts}"));
+    push_ssh_option(&mut args, "StrictHostKeyChecking=accept-new");
+    push_ssh_option(&mut args, "LogLevel=ERROR");
+    if batch_mode {
+        push_ssh_option(&mut args, "BatchMode=yes");
+    }
+    if allocate_tty {
+        args.push(OsString::from("-t"));
+    }
+    args.push(OsString::from(format!("{user}@firestone.{name}")));
+    args.extend(remote_command);
+
+    Ok(SshCommandPlan {
+        program: OsString::from("ssh"),
+        args,
+    })
+}
+fn proxy_command(
+    paths: &Paths,
+    current_executable: &Path,
+    name: &str,
+) -> Result<String, FirestoneError> {
+    let config = shell_word(paths.config_dir().as_os_str(), "Firestone config directory")?;
+    let data = shell_word(paths.data_dir().as_os_str(), "Firestone data directory")?;
+    let runtime = shell_word(
+        paths.runtime_dir().as_os_str(),
+        "Firestone runtime directory",
+    )?;
+    let executable = shell_word(current_executable.as_os_str(), "firestone executable")?;
+    let name = shell_word(OsStr::new(name), "machine name")?;
+    Ok(format!(
+        "FIRESTONE_CONFIG_DIR={config} FIRESTONE_DATA_DIR={data} FIRESTONE_RUNTIME_DIR={runtime} {executable} _vsock-proxy {name} 22"
+    ))
+}
+
+fn push_ssh_option(args: &mut Vec<OsString>, option: impl Into<OsString>) {
+    args.push(OsString::from("-o"));
+    args.push(option.into());
+}
+
+fn shell_word(value: &OsStr, label: &str) -> Result<String, FirestoneError> {
+    let value = value.to_str().ok_or_else(|| {
+        FirestoneError::new(
+            ErrorKind::Dependency,
+            format!("{label} cannot be represented in an OpenSSH ProxyCommand"),
+        )
+        .with_hint("install Firestone at a UTF-8 path")
+    })?;
+    let value = value.replace('%', "%%");
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.+:".contains(&byte))
+    {
+        return Ok(value);
+    }
+    Ok(format!("'{}'", value.replace('\'', "'\"'\"'")))
+}
+
+fn ssh_config_word(path: &Path, label: &str) -> Result<String, FirestoneError> {
+    let value = path.to_str().ok_or_else(|| {
+        FirestoneError::new(
+            ErrorKind::Dependency,
+            format!("{label} path cannot be represented in OpenSSH configuration"),
+        )
+        .with_hint("use a UTF-8 Firestone data path")
+    })?;
+    let value = value.replace('%', "%%");
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.+:~".contains(&byte))
+    {
+        return Ok(value);
+    }
+    Ok(format!(
+        "\"{}\"",
+        value.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
+}
+
 /// A completed Cloud Hypervisor v53 host-to-guest vsock handshake.
 #[derive(Debug)]
 pub struct VsockConnection {
@@ -1240,6 +1445,7 @@ fn identity_io_error(operation: &str, path: &Path, source: io::Error) -> Firesto
 #[allow(clippy::expect_used)]
 mod tests {
     use std::{
+        ffi::OsString,
         fs,
         os::unix::fs::{MetadataExt, PermissionsExt, symlink},
         path::{Path, PathBuf},
@@ -1270,7 +1476,7 @@ mod tests {
             let paths = Paths::from_inputs(&PathInputs {
                 current_dir: root.clone(),
                 home_dir: None,
-                firestone_home: Some(root.join("home")),
+                firestone_home: Some(root.join("home with % space")),
                 firestone_config_dir: None,
                 firestone_data_dir: None,
                 firestone_runtime_dir: None,
@@ -1605,6 +1811,123 @@ exit 23"#,
             fs::metadata(identity.private_key())?.permissions().mode() & 0o7777,
             0o600
         );
+        Ok(())
+    }
+    #[test]
+    fn shell_plan_uses_exact_options_tty_and_unretokenized_command()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let keygen = fixture.keygen(&successful_keygen_body(&fixture, false)?)?;
+        let identity =
+            ensure_ssh_identity_with(&fixture.paths, keygen.as_os_str(), "fixture-host")?;
+        let executable = fixture.root.join("bin with space/firestone");
+        let known_hosts = machine_known_hosts_path(&fixture.paths, "demo")?;
+        fs::write(&known_hosts, b"existing-host-key\n")?;
+        fs::set_permissions(&known_hosts, fs::Permissions::from_mode(0o600))?;
+        let remote = vec![OsString::from("printf '%s'"), OsString::from("-n")];
+        let plan = super::shell_ssh_plan(
+            &fixture.paths,
+            &executable,
+            "demo",
+            "root",
+            true,
+            remote.clone(),
+        )?;
+        let proxy = format!(
+            "ProxyCommand={}",
+            super::proxy_command(&fixture.paths, &executable, "demo")?
+        );
+        let identity_option = format!(
+            "IdentityFile={}",
+            super::ssh_config_word(identity.private_key(), "SSH identity")?
+        );
+        let known_hosts_option = format!(
+            "UserKnownHostsFile={}",
+            super::ssh_config_word(&known_hosts, "machine known_hosts")?
+        );
+        let expected = vec![
+            OsString::from("-o"),
+            OsString::from(proxy),
+            OsString::from("-o"),
+            OsString::from(identity_option),
+            OsString::from("-o"),
+            OsString::from("IdentitiesOnly=yes"),
+            OsString::from("-o"),
+            OsString::from(known_hosts_option),
+            OsString::from("-o"),
+            OsString::from("StrictHostKeyChecking=accept-new"),
+            OsString::from("-o"),
+            OsString::from("LogLevel=ERROR"),
+            OsString::from("-t"),
+            OsString::from("root@firestone.demo"),
+            remote[0].clone(),
+            remote[1].clone(),
+        ];
+        assert_eq!(plan.program(), std::ffi::OsStr::new("ssh"));
+        assert_eq!(plan.args(), expected);
+        let parsed = crate::Cmd::new("ssh")
+            .arg("-G")
+            .args(plan.args().to_vec())
+            .output()?;
+        assert!(parsed.success(), "{}", parsed.stderr_lossy());
+        let parsed = parsed.stdout_lossy();
+        assert!(
+            parsed.lines().any(|line| {
+                line.starts_with("identityfile ") && line.ends_with("/ssh/id_ed25519")
+            }),
+            "{parsed}"
+        );
+        assert!(
+            parsed.lines().any(|line| {
+                line.starts_with("userknownhostsfile ") && line.ends_with("/demo/known_hosts")
+            }),
+            "{parsed}"
+        );
+        assert_eq!(fs::read(&known_hosts)?, b"existing-host-key\n");
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_plan_adds_batch_mode_without_tty() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let keygen = fixture.keygen(&successful_keygen_body(&fixture, false)?)?;
+        ensure_ssh_identity_with(&fixture.paths, keygen.as_os_str(), "fixture-host")?;
+        let plan = super::readiness_ssh_plan(
+            &fixture.paths,
+            std::path::Path::new("/usr/bin/firestone"),
+            "demo",
+            "root",
+        )?;
+        assert!(
+            plan.args()
+                .windows(2)
+                .any(|pair| { pair == [OsString::from("-o"), OsString::from("BatchMode=yes")] })
+        );
+        assert!(!plan.args().iter().any(|argument| argument == "-t"));
+        assert_eq!(plan.args().last(), Some(&OsString::from("true")));
+        Ok(())
+    }
+
+    #[test]
+    fn ssh_config_plan_is_exact_quoted_and_contains_no_key_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let keygen = fixture.keygen(&successful_keygen_body(&fixture, false)?)?;
+        let identity =
+            ensure_ssh_identity_with(&fixture.paths, keygen.as_os_str(), "fixture-host")?;
+        let executable = fixture.root.join("bin with space/firestone");
+        let known_hosts = fixture.paths.machine_known_hosts("demo")?;
+        let plan = super::ssh_config_plan(&fixture.paths, &executable, "demo", "root")?;
+        let proxy = super::proxy_command(&fixture.paths, &executable, "demo")?;
+        let identity_word = super::ssh_config_word(identity.private_key(), "SSH identity")?;
+        let known_hosts_word = super::ssh_config_word(&known_hosts, "machine known_hosts")?;
+        let expected = format!(
+            "Host firestone.demo\n  User root\n  ProxyCommand {proxy}\n  IdentityFile {identity_word}\n  IdentitiesOnly yes\n  UserKnownHostsFile {known_hosts_word}\n  StrictHostKeyChecking accept-new\n",
+        );
+        assert_eq!(plan.host(), "firestone.demo");
+        assert_eq!(plan.block(), expected);
+        assert!(!plan.block().contains("PRIVATE-TEST-BYTES"));
+        assert!(!plan.block().contains("ssh-ed25519 AAAA"));
         Ok(())
     }
 }

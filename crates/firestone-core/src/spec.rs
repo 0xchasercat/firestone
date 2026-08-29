@@ -23,7 +23,8 @@ pub use value::{
     ParseDurationError, ParseFirmwareError, ParseMacAddrError,
 };
 
-pub(crate) fn validate_guest_user(user: &str) -> Result<(), FirestoneError> {
+/// Validates a guest login name before it is passed to cloud-init or OpenSSH.
+pub fn validate_guest_user(user: &str) -> Result<(), FirestoneError> {
     validation::validate_user(user)
 }
 
