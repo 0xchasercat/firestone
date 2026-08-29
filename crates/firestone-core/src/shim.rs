@@ -7232,6 +7232,8 @@ mod tests {
     use super::{ProcessRecord, process_record, verify_linux_process};
     use super::{authorize_peer, import_custom_vmm};
     use crate::{ErrorKind, FirestoneError, PathInputs, Paths};
+    #[cfg(target_os = "linux")]
+    use std::path::PathBuf;
 
     fn require_error<T>(result: Result<T, FirestoneError>, label: &str) -> FirestoneError {
         match result {
