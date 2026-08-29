@@ -21,15 +21,17 @@ readonly target source_root work_root output_root recipe_root
 case "$target" in
     x86_64-unknown-linux-musl)
         expected_machine='Advanced Micro Devices X86-64'
+        dynamic_libc=/lib/ld-musl-x86_64.so.1
         ;;
     aarch64-unknown-linux-musl)
         expected_machine='AArch64'
+        dynamic_libc=/lib/ld-musl-aarch64.so.1
         ;;
     *)
         fail "unsupported release target '$target'"
         ;;
 esac
-readonly expected_machine
+readonly expected_machine dynamic_libc
 
 export RUSTUP_TOOLCHAIN="$RUST_VERSION"
 "$recipe_root/verify-inputs.sh" "$source_root" "$target"
@@ -49,9 +51,13 @@ for crt_file in crti.o crtn.o libc.a; do
     [ -f "$self_contained_lib/$crt_file" ] ||
         fail "pinned Rust target is missing self-contained $crt_file"
 done
-readonly rust_sysroot self_contained_lib
-
-mkdir -p "$work_root/cargo-home" "$work_root/home" "$work_root/target"
+[ -f "$dynamic_libc" ] || fail "pinned image is missing $dynamic_libc"
+host_link_dir="$work_root/host-link"
+mkdir -p "$host_link_dir" "$work_root/cargo-home" "$work_root/home" "$work_root/target"
+ln -s "$self_contained_lib/crti.o" "$host_link_dir/crti.o"
+ln -s "$self_contained_lib/crtn.o" "$host_link_dir/crtn.o"
+ln -s "$dynamic_libc" "$host_link_dir/libc.so"
+readonly rust_sysroot self_contained_lib host_link_dir
 export CARGO_HOME="$work_root/cargo-home"
 export CARGO_INCREMENTAL=0
 export CARGO_NET_GIT_FETCH_WITH_CLI=false
@@ -63,7 +69,7 @@ export CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 export CARGO_TARGET_DIR="$work_root/target"
 export HOME="$work_root/home"
 export LANG=C.UTF-8
-export LIBRARY_PATH="$self_contained_lib"
+export LIBRARY_PATH="$host_link_dir"
 export LC_ALL=C.UTF-8
 export TZ=UTC
 export RUSTFLAGS="--remap-path-prefix=$source_root=/firestone-source --remap-path-prefix=$work_root=/firestone-build --remap-path-prefix=/usr/local/cargo=/rust-cargo --remap-path-prefix=/usr/local/rustup=/rust-toolchain -C target-feature=+crt-static -C link-self-contained=yes -C link-arg=-Wl,--build-id=none"
