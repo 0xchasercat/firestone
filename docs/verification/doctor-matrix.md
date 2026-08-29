@@ -77,3 +77,5 @@ python3 scripts/m5-doctor-matrix.py --distro arch --firestone /path/to/firestone
 ```
 
 The CI definition in `.github/workflows/m5-doctor-matrix.yml` performs the complete setup. Its Ubuntu 24.04 runner builds the Linux x86_64 binary once, then the three container jobs install their own native packages and run the same unprivileged harness. The container option mounts a one-GiB tmpfs at `/matrix-home` so the free-space warning is deterministic.
+
+GitHub Actions run [33276918451](https://github.com/0xchasercat/firestone/actions/runs/33276918451) passed the build, live catalog audit, Python tests, guide validation, and all three doctor rows. The Ubuntu job finished in 28 seconds, Fedora in 33 seconds, and Arch in 17 seconds. These remained non-KVM checks.
