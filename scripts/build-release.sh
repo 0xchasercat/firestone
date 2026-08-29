@@ -18,6 +18,40 @@ fail() {
     printf 'build-release: %s\n' "$*" >&2
     exit 1
 }
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        fail 'sha256sum or shasum is required'
+    fi
+}
+
+download() {
+    local url=$1
+    local expected_sha=$2
+    local output=$3
+    local actual_sha
+
+    [[ $url == https://* ]] || fail "download URL is not HTTPS: $url"
+    printf 'download %s\n' "$url" >&2
+    curl \
+        --fail \
+        --location \
+        --proto '=https' \
+        --proto-redir '=https' \
+        --silent \
+        --show-error \
+        --retry 3 \
+        --retry-all-errors \
+        --connect-timeout 20 \
+        --output "$output" \
+        "$url"
+    actual_sha=$(sha256_file "$output")
+    [[ $actual_sha == "$expected_sha" ]] ||
+        fail "$url checksum mismatch: expected $expected_sha, got $actual_sha"
+}
 
 cleanup() {
     if [[ -n ${work_dir:-} && -d $work_dir && $work_dir != / ]]; then
@@ -59,7 +93,7 @@ case "$target" in
 esac
 [[ -n $requested_output ]] || fail '--output-dir is required'
 
-for command_name in docker git; do
+for command_name in curl docker git; do
     command -v "$command_name" >/dev/null 2>&1 || fail "$command_name is required"
 done
 
@@ -71,6 +105,19 @@ readonly script_dir repository_root recipe_root
 # shellcheck disable=SC1091 # The file is resolved from the repository root above.
 source "$recipe_root/versions.env"
 [[ $RUST_IMAGE =~ @sha256:[0-9a-f]{64}$ ]] || fail 'Rust image is not pinned by digest'
+case "$target_arch" in
+    x86_64)
+        musl_headers_url=$MUSL_HEADERS_X86_64_URL
+        musl_headers_sha=$MUSL_HEADERS_X86_64_SHA256
+        ;;
+    aarch64)
+        musl_headers_url=$MUSL_HEADERS_AARCH64_URL
+        musl_headers_sha=$MUSL_HEADERS_AARCH64_SHA256
+        ;;
+esac
+[[ $musl_headers_url == https://* ]] || fail 'musl headers URL must be HTTPS'
+[[ $musl_headers_sha =~ ^[0-9a-f]{64}$ ]] || fail 'musl headers checksum must be lowercase SHA-256'
+readonly musl_headers_url musl_headers_sha
 
 host_arch=$(uname -m)
 case "$host_arch" in
@@ -104,7 +151,8 @@ shopt -u nullglob dotglob
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/firestone-release-build.XXXXXX")
 readonly work_dir
 trap cleanup EXIT
-mkdir -p "$work_dir/cargo-home" "$work_dir/home" "$work_dir/target"
+mkdir -p "$work_dir/cargo-home" "$work_dir/home" "$work_dir/inputs" "$work_dir/target"
+download "$musl_headers_url" "$musl_headers_sha" "$work_dir/inputs/musl-dev.apk"
 
 docker pull "$RUST_IMAGE"
 docker run \

@@ -22,16 +22,20 @@ case "$target" in
     x86_64-unknown-linux-musl)
         expected_machine='Advanced Micro Devices X86-64'
         dynamic_libc=/lib/ld-musl-x86_64.so.1
+        musl_headers_arch=x86_64
+        musl_headers_sha=$MUSL_HEADERS_X86_64_SHA256
         ;;
     aarch64-unknown-linux-musl)
         expected_machine='AArch64'
         dynamic_libc=/lib/ld-musl-aarch64.so.1
+        musl_headers_arch=aarch64
+        musl_headers_sha=$MUSL_HEADERS_AARCH64_SHA256
         ;;
     *)
         fail "unsupported release target '$target'"
         ;;
 esac
-readonly expected_machine dynamic_libc
+readonly expected_machine dynamic_libc musl_headers_arch musl_headers_sha
 
 export RUSTUP_TOOLCHAIN="$RUST_VERSION"
 "$recipe_root/verify-inputs.sh" "$source_root" "$target"
@@ -44,6 +48,26 @@ esac
 case "${SOURCE_DATE_EPOCH:-}" in
     '' | *[!0-9]*) fail 'SOURCE_DATE_EPOCH must be an unsigned integer' ;;
 esac
+musl_headers_apk="$work_root/inputs/musl-dev.apk"
+[ -f "$musl_headers_apk" ] || fail "pinned musl headers are missing: $musl_headers_apk"
+actual_headers_sha=$(sha256sum "$musl_headers_apk" | awk '{print $1}')
+[ "$actual_headers_sha" = "$musl_headers_sha" ] ||
+    fail "musl headers checksum mismatch: expected $musl_headers_sha, got $actual_headers_sha"
+musl_headers_root="$work_root/musl-headers"
+mkdir -p "$musl_headers_root"
+tar -xzf "$musl_headers_apk" -C "$musl_headers_root"
+musl_package_name=$(awk -F' = ' '/^pkgname = / {print $2}' "$musl_headers_root/.PKGINFO")
+musl_package_version=$(awk -F' = ' '/^pkgver = / {print $2}' "$musl_headers_root/.PKGINFO")
+musl_package_arch=$(awk -F' = ' '/^arch = / {print $2}' "$musl_headers_root/.PKGINFO")
+[ "$musl_package_name" = musl-dev ] || fail "headers package is '$musl_package_name', expected 'musl-dev'"
+[ "$musl_package_version" = "$MUSL_HEADERS_VERSION" ] ||
+    fail "musl headers version is '$musl_package_version', expected '$MUSL_HEADERS_VERSION'"
+[ "$musl_package_arch" = "$musl_headers_arch" ] ||
+    fail "musl headers architecture is '$musl_package_arch', expected '$musl_headers_arch'"
+for header in assert.h stdint.h; do
+    [ -f "$musl_headers_root/usr/include/$header" ] || fail "musl headers package is missing $header"
+done
+readonly musl_headers_apk musl_headers_root actual_headers_sha
 
 rust_sysroot=$(rustc --print sysroot)
 self_contained_lib="$rust_sysroot/lib/rustlib/$target/lib/self-contained"
@@ -59,6 +83,7 @@ ln -s "$self_contained_lib/crtn.o" "$host_link_dir/crtn.o"
 ln -s "$dynamic_libc" "$host_link_dir/libc.so"
 readonly rust_sysroot self_contained_lib host_link_dir
 export CARGO_HOME="$work_root/cargo-home"
+export C_INCLUDE_PATH="$musl_headers_root/usr/include"
 export CARGO_INCREMENTAL=0
 export CARGO_NET_GIT_FETCH_WITH_CLI=false
 export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
