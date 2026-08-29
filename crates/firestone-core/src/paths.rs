@@ -467,6 +467,12 @@ impl Paths {
             .join(format!("fs{index}.sock")))
     }
 
+    pub fn machine_fs_pid_file(&self, name: &str, index: usize) -> Result<PathBuf, FirestoneError> {
+        Ok(self
+            .machine_runtime_dir(name)?
+            .join(format!("fs{index}.sock.pid")))
+    }
+
     pub fn machine_shim_pid(&self, name: &str) -> Result<PathBuf, FirestoneError> {
         Ok(self.machine_runtime_dir(name)?.join("shim.pid"))
     }
@@ -1806,6 +1812,10 @@ mod tests {
         assert_eq!(
             paths.machine_fs_socket("demo", 0)?,
             PathBuf::from("/firestone/run/demo/fs0.sock")
+        );
+        assert_eq!(
+            paths.machine_fs_pid_file("demo", 0)?,
+            PathBuf::from("/firestone/run/demo/fs0.sock.pid")
         );
         assert_eq!(
             paths.machine_shim_pid("demo")?,

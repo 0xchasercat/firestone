@@ -10,6 +10,7 @@ use serde_json::{Map, Value};
 use crate::{
     Arch, CatalogFirmware, DependencyManifest, ErrorKind, FirestoneError, Firmware, MacAddr,
     MachineSpec, MachineState, NetMode, NetworkPlan, Paths, atomic,
+    virtiofs::CloudHypervisorFsConfig,
 };
 
 /// Inputs already resolved by image and state preparation before VMM creation.
@@ -64,7 +65,7 @@ struct VmConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     net: Option<Vec<NetConfig>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    fs: Option<Vec<FsConfig>>,
+    fs: Option<Vec<CloudHypervisorFsConfig>>,
     vsock: VsockConfig,
     serial: SerialConfig,
     console: ConsoleConfig,
@@ -155,14 +156,6 @@ impl NetConfig {
 #[derive(Debug, Serialize)]
 enum VhostMode {
     Client,
-}
-
-#[derive(Debug, Serialize)]
-struct FsConfig {
-    tag: String,
-    socket: PathBuf,
-    num_queues: usize,
-    queue_size: u16,
 }
 
 #[derive(Debug, Serialize)]
@@ -329,12 +322,7 @@ fn base_vm_config(
                 .iter()
                 .enumerate()
                 .map(|(index, mount)| {
-                    Ok(FsConfig {
-                        tag: mount.effective_tag(index),
-                        socket: paths.machine_fs_socket(input.name, index)?,
-                        num_queues: 1,
-                        queue_size: 1024,
-                    })
+                    CloudHypervisorFsConfig::from_mount(paths, input.name, index, mount)
                 })
                 .collect::<Result<Vec<_>, FirestoneError>>()?,
         )
