@@ -1537,7 +1537,7 @@ guest = "/machine"
     fn global_config_missing_keys_uses_documented_defaults() -> Result<(), crate::FirestoneError> {
         let config = GlobalConfig::from_toml("")?;
         assert_eq!(config, GlobalConfig::default());
-        assert_eq!(config.start.timeout_first_boot.get().as_secs(), 180);
+        assert_eq!(config.start.timeout_first_boot.get().as_secs(), 300);
         assert_eq!(config.start.timeout.get().as_secs(), 60);
         assert_eq!(config.stop.timeout.get().as_secs(), 30);
         assert_eq!(config.ui.color, ColorMode::Auto);

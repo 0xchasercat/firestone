@@ -244,6 +244,76 @@ fn proxy_socket_eof_exits_while_stdin_remains_open() -> TestResult {
 }
 
 #[test]
+fn proxy_flushes_server_bytes_before_socket_eof() -> TestResult {
+    let fixture = Fixture::new()?;
+    let listener = fixture.listener("demo")?;
+    let response = b"server-first-without-newline".to_vec();
+    let expected_response = response.clone();
+    let response_len = expected_response.len();
+    let server = thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mut stream = accept_handshake(listener)?;
+        stream.write_all(b"OK 1073741824\n")?;
+        stream.write_all(&response)?;
+        let mut request = [0_u8; 1];
+        stream.read_exact(&mut request)?;
+        if request != *b"x" {
+            return Err(format!("unexpected request byte: {request:?}").into());
+        }
+        Ok(())
+    });
+    let mut child = fixture.command().spawn()?;
+    let mut stdin = child.stdin.take().ok_or("child stdin was not piped")?;
+    let mut stdout = child.stdout.take().ok_or("child stdout was not piped")?;
+    let (progress_sender, progress_receiver) = mpsc::channel();
+    let output_reader = thread::spawn(move || {
+        let mut prefix = vec![0_u8; response_len];
+        let progress = stdout
+            .read_exact(&mut prefix)
+            .map(|()| prefix.clone())
+            .map_err(|error| error.to_string());
+        let _ = progress_sender.send(progress);
+        let mut remainder = Vec::new();
+        let result = stdout.read_to_end(&mut remainder);
+        result.map(|_| {
+            prefix.extend(remainder);
+            prefix
+        })
+    });
+
+    let progress = match progress_receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(progress) => progress.map_err(|error| format!("proxy stdout failed: {error}"))?,
+        Err(error) => {
+            let _ = child.kill();
+            drop(stdin);
+            let _ = child.wait();
+            let _ = server.join();
+            let _ = output_reader.join();
+            return Err(format!("proxy did not flush server bytes before EOF: {error}").into());
+        }
+    };
+    assert_eq!(progress, expected_response);
+    stdin.write_all(b"x")?;
+    drop(stdin);
+    let status = child
+        .wait_timeout(PROCESS_TIMEOUT)?
+        .ok_or("proxy did not exit after the server closed")?;
+    let stdout = output_reader
+        .join()
+        .map_err(|_| "stdout reader panicked")??;
+    let mut stderr = Vec::new();
+    child
+        .stderr
+        .take()
+        .ok_or("child stderr was not piped")?
+        .read_to_end(&mut stderr)?;
+    server.join().map_err(|_| "server panicked")??;
+
+    assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, expected_response);
+    assert!(stderr.is_empty());
+    Ok(())
+}
+#[test]
 fn proxy_relays_backpressured_binary_streams_losslessly() -> TestResult {
     let fixture = Fixture::new()?;
     let listener = fixture.listener("demo")?;

@@ -357,7 +357,7 @@ exit "${FAKE_SSH_EXIT-0}"
     assert!(ssh_calls.contains("ENV=visible"));
     assert!(!ssh_calls.contains("ARG=-t\n"));
     let expected_proxy = format!(
-        "FIRESTONE_CONFIG_DIR={} FIRESTONE_DATA_DIR={} FIRESTONE_RUNTIME_DIR={} {} _vsock-proxy m2 22",
+        "env FIRESTONE_CONFIG_DIR={} FIRESTONE_DATA_DIR={} FIRESTONE_RUNTIME_DIR={} {} _vsock-proxy m2 22",
         home.join("config").display(),
         home.join("data").display(),
         home.join("run").display(),

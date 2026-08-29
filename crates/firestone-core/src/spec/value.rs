@@ -436,7 +436,7 @@ pub struct ParseFirmwareError;
 pub struct HumanDuration(Duration);
 
 impl HumanDuration {
-    pub(crate) const DEFAULT_FIRST_BOOT_TIMEOUT: Self = Self(Duration::from_secs(180));
+    pub(crate) const DEFAULT_FIRST_BOOT_TIMEOUT: Self = Self(Duration::from_secs(300));
     pub(crate) const DEFAULT_START_TIMEOUT: Self = Self(Duration::from_secs(60));
     pub(crate) const DEFAULT_STOP_TIMEOUT: Self = Self(Duration::from_secs(30));
 
