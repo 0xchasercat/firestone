@@ -952,7 +952,6 @@ impl ProcessSignal {
 }
 
 /// A long-running child and the process group created for it.
-/// A long-running child and the process group created for it.
 ///
 /// Dropping this value deliberately does not kill the child. Supervisors must
 /// make their teardown policy explicit and reap every direct child.

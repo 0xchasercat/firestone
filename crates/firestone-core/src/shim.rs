@@ -2556,7 +2556,9 @@ fn signal_verified_tree(
         })?;
     verify_linux_process(record)?;
     let rustix_signal = match signal {
+        ProcessSignal::Hangup => rustix::process::Signal::HUP,
         ProcessSignal::Interrupt => rustix::process::Signal::INT,
+        ProcessSignal::Quit => rustix::process::Signal::QUIT,
         ProcessSignal::Terminate => rustix::process::Signal::TERM,
         ProcessSignal::Kill => rustix::process::Signal::KILL,
     };
@@ -4506,7 +4508,9 @@ fn signal_descendants(
     #[cfg(target_os = "linux")]
     {
         let signal = match signal {
+            ProcessSignal::Hangup => rustix::process::Signal::HUP,
             ProcessSignal::Interrupt => rustix::process::Signal::INT,
+            ProcessSignal::Quit => rustix::process::Signal::QUIT,
             ProcessSignal::Terminate => rustix::process::Signal::TERM,
             ProcessSignal::Kill => rustix::process::Signal::KILL,
         };
