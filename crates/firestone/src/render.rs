@@ -7,7 +7,7 @@ use std::{
 use firestone_core::{
     DoctorCheckId, DoctorReport, DoctorStatus, ErrorInfo, ErrorKind, Event, EventSink,
     FirestoneError, Level, LogsResult, MachineStatus, MachineSummary, MachineView, RemoveResult,
-    SshConfigResult, StartResult, StopResult, Unit,
+    SshConfigResult, StartResult, StopResult, Unit, VersionResult,
 };
 
 use unicode_width::UnicodeWidthChar;
@@ -438,6 +438,11 @@ where
             "images-pull" => self.render_image_pull_result(&payload),
             "images-rm" => self.render_image_remove_result(&payload),
             "images-prune" => self.render_image_prune_result(&payload),
+            "version" => {
+                let result: VersionResult = serde_json::from_value(payload)
+                    .map_err(|error| invalid_result_payload("version", error))?;
+                self.render_version_result(&result)
+            }
             "doctor" => {
                 let report: DoctorReport = serde_json::from_value(payload)
                     .map_err(|error| invalid_result_payload("doctor", error))?;
@@ -446,6 +451,55 @@ where
             _ if payload.is_null() => Ok(()),
             _ => self.render_other_result(payload),
         }
+    }
+
+    fn render_version_result(&mut self, result: &VersionResult) -> Result<(), FirestoneError> {
+        write_line(
+            &mut self.stdout,
+            format_args!("firestone {}", result.version),
+        )?;
+        write_line(
+            &mut self.stdout,
+            format_args!("release: {}", result.identity.release),
+        )?;
+        write_line(
+            &mut self.stdout,
+            format_args!(
+                "git commit: {}",
+                result
+                    .identity
+                    .git_commit
+                    .as_deref()
+                    .unwrap_or("not embedded")
+            ),
+        )?;
+        write_line(
+            &mut self.stdout,
+            format_args!("architecture: {}", result.architecture),
+        )?;
+        write_line(&mut self.stdout, format_args!("dependencies:"))?;
+        for (name, dependency) in &result.dependencies {
+            write_line(
+                &mut self.stdout,
+                format_args!(
+                    "  {name}: {} (sha256 {})",
+                    dependency.version, dependency.sha256
+                ),
+            )?;
+        }
+        write_line(&mut self.stdout, format_args!("paths:"))?;
+        write_line(
+            &mut self.stdout,
+            format_args!("  config: {}", result.paths.config),
+        )?;
+        write_line(
+            &mut self.stdout,
+            format_args!("  data: {}", result.paths.data),
+        )?;
+        write_line(
+            &mut self.stdout,
+            format_args!("  runtime: {}", result.paths.runtime),
+        )
     }
 
     fn render_image_pull_result(
@@ -1222,7 +1276,7 @@ mod tests {
             message: "checking cache".to_owned(),
         })?;
         renderer.emit(Event::Result {
-            action: "version".to_owned(),
+            action: "probe".to_owned(),
             payload: json!("0.1.0"),
         })?;
 
@@ -1286,7 +1340,7 @@ mod tests {
             },
         })?;
         renderer.emit(Event::Result {
-            action: "version".to_owned(),
+            action: "probe".to_owned(),
             payload: json!("0.1.0"),
         })?;
 

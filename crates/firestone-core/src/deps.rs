@@ -96,17 +96,18 @@ impl DependencyManifest {
         self.manifest_version
     }
 
-    /// Returns every pinned dependency version in deterministic name order.
-    #[must_use]
-    pub fn versions(&self) -> BTreeMap<String, String> {
+    /// Resolves every binary dependency for one architecture in name order.
+    pub fn artifacts(
+        &self,
+        architecture: &str,
+    ) -> Result<BTreeMap<String, DependencyArtifact>, FirestoneError> {
         self.dependencies
-            .iter()
-            .map(|(name, entry)| (name.clone(), entry.version.clone()))
+            .keys()
+            .map(|name| {
+                self.artifact(name, architecture)
+                    .map(|artifact| (name.clone(), artifact))
+            })
             .collect()
-    }
-
-    pub fn version(&self, dependency: &str) -> Result<&str, FirestoneError> {
-        self.entry(dependency).map(|entry| entry.version.as_str())
     }
 
     /// Resolves and validates one binary artifact for the requested architecture.

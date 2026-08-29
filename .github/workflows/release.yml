@@ -1,0 +1,143 @@
+name: Linux release artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - release/**
+    paths:
+      - .github/workflows/release.yml
+      - build/firestone/**
+      - crates/**
+      - Cargo.lock
+      - Cargo.toml
+      - deps.toml
+      - scripts/build-release.sh
+      - scripts/pin-deps.sh
+      - scripts/tests/test-build-release.sh
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - build/firestone/**
+      - crates/**
+      - Cargo.lock
+      - Cargo.toml
+      - deps.toml
+      - scripts/build-release.sh
+      - scripts/pin-deps.sh
+      - scripts/tests/test-build-release.sh
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  recipe-tests:
+    name: Release recipe tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Test checksum and toolchain failures
+        run: scripts/tests/test-build-release.sh
+
+  dependency-checksums:
+    name: Re-verify pinned dependency checksums
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Download and verify both architecture pin sets
+        run: scripts/pin-deps.sh verify --arch all
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs:
+      - recipe-tests
+      - dependency-checksums
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Build from clean inputs
+        run: >-
+          scripts/build-release.sh
+          --target "${{ matrix.target }}"
+          --output-dir "$RUNNER_TEMP/run-1"
+
+      - name: Build x86_64 a second time
+        if: matrix.arch == 'x86_64'
+        run: >-
+          scripts/build-release.sh
+          --target "${{ matrix.target }}"
+          --output-dir "$RUNNER_TEMP/run-2"
+
+      - name: Require byte-identical x86_64 output
+        if: matrix.arch == 'x86_64'
+        env:
+          ARTIFACT: firestone-v0.1.0-x86_64-unknown-linux-musl
+        run: |
+          set -euo pipefail
+          cmp "$RUNNER_TEMP/run-1/$ARTIFACT" "$RUNNER_TEMP/run-2/$ARTIFACT"
+          cmp "$RUNNER_TEMP/run-1/SHA256SUMS" "$RUNNER_TEMP/run-2/SHA256SUMS"
+          (cd "$RUNNER_TEMP/run-1" && sha256sum -c SHA256SUMS)
+          (cd "$RUNNER_TEMP/run-2" && sha256sum -c SHA256SUMS)
+
+      - name: Smoke x86_64 version, completions, and help
+        if: matrix.arch == 'x86_64'
+        env:
+          ARTIFACT: firestone-v0.1.0-x86_64-unknown-linux-musl
+        run: |
+          set -euo pipefail
+          binary="$RUNNER_TEMP/run-1/$ARTIFACT"
+          test "$($binary --version)" = 'firestone 0.1.0'
+          home="$RUNNER_TEMP/smoke-home"
+          install -d -m 0700 "$home"
+          version_output=$(FIRESTONE_HOME="$home" "$binary" version)
+          case "$version_output" in
+            *"git commit: $GITHUB_SHA"*"architecture: x86_64"*) ;;
+            *) printf '%s\n' "$version_output" >&2; exit 1 ;;
+          esac
+          json_output=$(FIRESTONE_HOME="$home" "$binary" --json version)
+          case "$json_output" in
+            *"\"architecture\":\"x86_64\""*"\"git_commit\":\"$GITHUB_SHA\""*) ;;
+            *) printf '%s\n' "$json_output" >&2; exit 1 ;;
+          esac
+          for shell in bash elvish fish powershell zsh; do
+            output="$RUNNER_TEMP/completions.$shell"
+            "$binary" completions "$shell" >"$output"
+            test -s "$output"
+            if grep -Eq '_shim|_vsock-proxy' "$output"; then
+              printf 'hidden command leaked into %s completions\n' "$shell" >&2
+              exit 1
+            fi
+          done
+          "$binary" --help >"$RUNNER_TEMP/firestone.help"
+          grep -q 'completions' "$RUNNER_TEMP/firestone.help"
+          grep -q 'version' "$RUNNER_TEMP/firestone.help"
+
+      - name: Upload x86_64 release candidate
+        if: matrix.arch == 'x86_64'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: firestone-v0.1.0-x86_64-unknown-linux-musl
+          path: |
+            ${{ runner.temp }}/run-1/firestone-v0.1.0-x86_64-unknown-linux-musl
+            ${{ runner.temp }}/run-1/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14

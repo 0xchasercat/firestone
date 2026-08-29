@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 axum.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 firestone-core = { path = "../firestone-core" }
 futures-util.workspace = true
 hyper.workspace = true

@@ -1,0 +1,608 @@
+
+using namespace System.Management.Automation
+using namespace System.Management.Automation.Language
+
+Register-ArgumentCompleter -Native -CommandName 'firestone' -ScriptBlock {
+    param($wordToComplete, $commandAst, $cursorPosition)
+
+    $commandElements = $commandAst.CommandElements
+    $command = @(
+        'firestone'
+        for ($i = 1; $i -lt $commandElements.Count; $i++) {
+            $element = $commandElements[$i]
+            if ($element -isnot [StringConstantExpressionAst] -or
+                $element.StringConstantType -ne [StringConstantType]::BareWord -or
+                $element.Value.StartsWith('-') -or
+                $element.Value -eq $wordToComplete) {
+                break
+        }
+        $element.Value
+    }) -join ';'
+
+    $completions = @(switch ($command) {
+        'firestone' {
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('-V', '-V ', [CompletionResultType]::ParameterName, 'Print version')
+            [CompletionResult]::new('--version', '--version', [CompletionResultType]::ParameterName, 'Print version')
+            [CompletionResult]::new('run', 'run', [CompletionResultType]::ParameterValue, 'Create or reuse a machine, start it, and open an SSH shell')
+            [CompletionResult]::new('create', 'create', [CompletionResultType]::ParameterValue, 'Create a machine definition without booting it')
+            [CompletionResult]::new('start', 'start', [CompletionResultType]::ParameterValue, 'Start a machine and wait for SSH readiness')
+            [CompletionResult]::new('stop', 'stop', [CompletionResultType]::ParameterValue, 'Stop a machine')
+            [CompletionResult]::new('restart', 'restart', [CompletionResultType]::ParameterValue, 'Stop and start a machine')
+            [CompletionResult]::new('rm', 'rm', [CompletionResultType]::ParameterValue, 'Stop and remove one or more machines')
+            [CompletionResult]::new('ls', 'ls', [CompletionResultType]::ParameterValue, 'List machines')
+            [CompletionResult]::new('list', 'list', [CompletionResultType]::ParameterValue, 'List machines')
+            [CompletionResult]::new('show', 'show', [CompletionResultType]::ParameterValue, 'Show a machine''s specification and runtime state')
+            [CompletionResult]::new('edit', 'edit', [CompletionResultType]::ParameterValue, 'Edit and validate a machine''s firestone.toml')
+            [CompletionResult]::new('shell', 'shell', [CompletionResultType]::ParameterValue, 'Open SSH over the machine''s private vsock transport')
+            [CompletionResult]::new('ssh', 'ssh', [CompletionResultType]::ParameterValue, 'Open SSH over the machine''s private vsock transport')
+            [CompletionResult]::new('ssh-config', 'ssh-config', [CompletionResultType]::ParameterValue, 'Print an OpenSSH Host block for the machine')
+            [CompletionResult]::new('console', 'console', [CompletionResultType]::ParameterValue, 'Attach to the machine''s hvc0 console')
+            [CompletionResult]::new('logs', 'logs', [CompletionResultType]::ParameterValue, 'Print a bounded machine log')
+            [CompletionResult]::new('images', 'images', [CompletionResultType]::ParameterValue, 'Manage the owned image store')
+            [CompletionResult]::new('doctor', 'doctor', [CompletionResultType]::ParameterValue, 'Check host requirements and optional safe repairs')
+            [CompletionResult]::new('completions', 'completions', [CompletionResultType]::ParameterValue, 'Generate a shell completion script on stdout')
+            [CompletionResult]::new('version', 'version', [CompletionResultType]::ParameterValue, 'Print Firestone, pinned dependency, and resolved path versions')
+            [CompletionResult]::new('serve', 'serve', [CompletionResultType]::ParameterValue, 'Run the stateless REST API over a private Unix socket')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'firestone;run' {
+            [CompletionResult]::new('--name', '--name', [CompletionResultType]::ParameterName, 'Name a machine created from an image reference')
+            [CompletionResult]::new('--arch', '--arch', [CompletionResultType]::ParameterName, 'arch')
+            [CompletionResult]::new('--cpus', '--cpus', [CompletionResultType]::ParameterName, 'cpus')
+            [CompletionResult]::new('--memory', '--memory', [CompletionResultType]::ParameterName, 'memory')
+            [CompletionResult]::new('--disk', '--disk', [CompletionResultType]::ParameterName, 'disk')
+            [CompletionResult]::new('--user', '--user', [CompletionResultType]::ParameterName, 'user')
+            [CompletionResult]::new('--net', '--net', [CompletionResultType]::ParameterName, 'net')
+            [CompletionResult]::new('-p', '-p', [CompletionResultType]::ParameterName, 'p')
+            [CompletionResult]::new('--forward', '--forward', [CompletionResultType]::ParameterName, 'forward')
+            [CompletionResult]::new('--tap', '--tap', [CompletionResultType]::ParameterName, 'tap')
+            [CompletionResult]::new('--network-mac', '--network-mac', [CompletionResultType]::ParameterName, 'network-mac')
+            [CompletionResult]::new('--mount', '--mount', [CompletionResultType]::ParameterName, 'mount')
+            [CompletionResult]::new('--user-data', '--user-data', [CompletionResultType]::ParameterName, 'user-data')
+            [CompletionResult]::new('--cloud-init-network-config', '--cloud-init-network-config', [CompletionResultType]::ParameterName, 'cloud-init-network-config')
+            [CompletionResult]::new('--ssh-key', '--ssh-key', [CompletionResultType]::ParameterName, 'ssh-key')
+            [CompletionResult]::new('--vmm-binary', '--vmm-binary', [CompletionResultType]::ParameterName, 'vmm-binary')
+            [CompletionResult]::new('--vmm-firmware', '--vmm-firmware', [CompletionResultType]::ParameterName, 'vmm-firmware')
+            [CompletionResult]::new('--vmm-arg', '--vmm-arg', [CompletionResultType]::ParameterName, 'vmm-arg')
+            [CompletionResult]::new('--vmm-config', '--vmm-config', [CompletionResultType]::ParameterName, 'vmm-config')
+            [CompletionResult]::new('--clear', '--clear', [CompletionResultType]::ParameterName, 'clear')
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--rm', '--rm', [CompletionResultType]::ParameterName, 'Remove a machine created by this invocation after SSH exits')
+            [CompletionResult]::new('--no-provisioning', '--no-provisioning', [CompletionResultType]::ParameterName, 'no-provisioning')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;create' {
+            [CompletionResult]::new('--image', '--image', [CompletionResultType]::ParameterName, 'Supply IMAGE as a flag. A sole positional value is then NAME')
+            [CompletionResult]::new('-f', '-f', [CompletionResultType]::ParameterName, 'Layer an existing machine specification below command-line flags')
+            [CompletionResult]::new('--file', '--file', [CompletionResultType]::ParameterName, 'Layer an existing machine specification below command-line flags')
+            [CompletionResult]::new('--arch', '--arch', [CompletionResultType]::ParameterName, 'arch')
+            [CompletionResult]::new('--cpus', '--cpus', [CompletionResultType]::ParameterName, 'cpus')
+            [CompletionResult]::new('--memory', '--memory', [CompletionResultType]::ParameterName, 'memory')
+            [CompletionResult]::new('--disk', '--disk', [CompletionResultType]::ParameterName, 'disk')
+            [CompletionResult]::new('--user', '--user', [CompletionResultType]::ParameterName, 'user')
+            [CompletionResult]::new('--net', '--net', [CompletionResultType]::ParameterName, 'net')
+            [CompletionResult]::new('-p', '-p', [CompletionResultType]::ParameterName, 'p')
+            [CompletionResult]::new('--forward', '--forward', [CompletionResultType]::ParameterName, 'forward')
+            [CompletionResult]::new('--tap', '--tap', [CompletionResultType]::ParameterName, 'tap')
+            [CompletionResult]::new('--network-mac', '--network-mac', [CompletionResultType]::ParameterName, 'network-mac')
+            [CompletionResult]::new('--mount', '--mount', [CompletionResultType]::ParameterName, 'mount')
+            [CompletionResult]::new('--user-data', '--user-data', [CompletionResultType]::ParameterName, 'user-data')
+            [CompletionResult]::new('--cloud-init-network-config', '--cloud-init-network-config', [CompletionResultType]::ParameterName, 'cloud-init-network-config')
+            [CompletionResult]::new('--ssh-key', '--ssh-key', [CompletionResultType]::ParameterName, 'ssh-key')
+            [CompletionResult]::new('--vmm-binary', '--vmm-binary', [CompletionResultType]::ParameterName, 'vmm-binary')
+            [CompletionResult]::new('--vmm-firmware', '--vmm-firmware', [CompletionResultType]::ParameterName, 'vmm-firmware')
+            [CompletionResult]::new('--vmm-arg', '--vmm-arg', [CompletionResultType]::ParameterName, 'vmm-arg')
+            [CompletionResult]::new('--vmm-config', '--vmm-config', [CompletionResultType]::ParameterName, 'vmm-config')
+            [CompletionResult]::new('--clear', '--clear', [CompletionResultType]::ParameterName, 'clear')
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--edit', '--edit', [CompletionResultType]::ParameterName, 'Open the generated specification in the configured editor')
+            [CompletionResult]::new('--no-provisioning', '--no-provisioning', [CompletionResultType]::ParameterName, 'no-provisioning')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;start' {
+            [CompletionResult]::new('--timeout', '--timeout', [CompletionResultType]::ParameterName, 'Override the configured start deadline')
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--no-wait', '--no-wait', [CompletionResultType]::ParameterName, 'Return immediately after the VMM reaches persisted running state')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;stop' {
+            [CompletionResult]::new('--timeout', '--timeout', [CompletionResultType]::ParameterName, 'Override the configured graceful-stop deadline')
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--force', '--force', [CompletionResultType]::ParameterName, 'Skip the guest power button and kill the VMM')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;restart' {
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;rm' {
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--force', '--force', [CompletionResultType]::ParameterName, 'Approve removal of running machines')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;ls' {
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;list' {
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;show' {
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--vmconfig', '--vmconfig', [CompletionResultType]::ParameterName, 'Include the generated cloud-hypervisor configuration')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;edit' {
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;shell' {
+            [CompletionResult]::new('--user', '--user', [CompletionResultType]::ParameterName, 'Select the guest login user')
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;ssh' {
+            [CompletionResult]::new('--user', '--user', [CompletionResultType]::ParameterName, 'Select the guest login user')
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;ssh-config' {
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;console' {
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;logs' {
+            [CompletionResult]::new('--source', '--source', [CompletionResultType]::ParameterName, 'Select an owned machine log')
+            [CompletionResult]::new('-n', '-n', [CompletionResultType]::ParameterName, 'Print the last LINES lines before following')
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('-f', '-f', [CompletionResultType]::ParameterName, 'Continue printing appended log data until interrupted')
+            [CompletionResult]::new('--follow', '--follow', [CompletionResultType]::ParameterName, 'Continue printing appended log data until interrupted')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;images' {
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('ls', 'ls', [CompletionResultType]::ParameterValue, 'List stored images')
+            [CompletionResult]::new('pull', 'pull', [CompletionResultType]::ParameterValue, 'Pull and verify one image')
+            [CompletionResult]::new('inspect', 'inspect', [CompletionResultType]::ParameterValue, 'Verify and inspect one stored image')
+            [CompletionResult]::new('rm', 'rm', [CompletionResultType]::ParameterValue, 'Remove one stored image')
+            [CompletionResult]::new('prune', 'prune', [CompletionResultType]::ParameterValue, 'Remove all unreferenced images')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'firestone;images;ls' {
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;images;pull' {
+            [CompletionResult]::new('--sha256', '--sha256', [CompletionResultType]::ParameterName, 'Verify a direct HTTPS URL with this SHA-256 digest')
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;images;inspect' {
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;images;rm' {
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--force', '--force', [CompletionResultType]::ParameterName, 'Approve removal while a machine still references the image')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;images;prune' {
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;images;help' {
+            [CompletionResult]::new('ls', 'ls', [CompletionResultType]::ParameterValue, 'List stored images')
+            [CompletionResult]::new('pull', 'pull', [CompletionResultType]::ParameterValue, 'Pull and verify one image')
+            [CompletionResult]::new('inspect', 'inspect', [CompletionResultType]::ParameterValue, 'Verify and inspect one stored image')
+            [CompletionResult]::new('rm', 'rm', [CompletionResultType]::ParameterValue, 'Remove one stored image')
+            [CompletionResult]::new('prune', 'prune', [CompletionResultType]::ParameterValue, 'Remove all unreferenced images')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'firestone;images;help;ls' {
+            break
+        }
+        'firestone;images;help;pull' {
+            break
+        }
+        'firestone;images;help;inspect' {
+            break
+        }
+        'firestone;images;help;rm' {
+            break
+        }
+        'firestone;images;help;prune' {
+            break
+        }
+        'firestone;images;help;help' {
+            break
+        }
+        'firestone;doctor' {
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--fix', '--fix', [CompletionResultType]::ParameterName, 'Perform only the safe unprivileged repairs')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;completions' {
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;version' {
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;serve' {
+            [CompletionResult]::new('--listen', '--listen', [CompletionResultType]::ParameterName, 'Listen at a Unix socket inside Firestone''s private runtime directory')
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;help' {
+            [CompletionResult]::new('run', 'run', [CompletionResultType]::ParameterValue, 'Create or reuse a machine, start it, and open an SSH shell')
+            [CompletionResult]::new('create', 'create', [CompletionResultType]::ParameterValue, 'Create a machine definition without booting it')
+            [CompletionResult]::new('start', 'start', [CompletionResultType]::ParameterValue, 'Start a machine and wait for SSH readiness')
+            [CompletionResult]::new('stop', 'stop', [CompletionResultType]::ParameterValue, 'Stop a machine')
+            [CompletionResult]::new('restart', 'restart', [CompletionResultType]::ParameterValue, 'Stop and start a machine')
+            [CompletionResult]::new('rm', 'rm', [CompletionResultType]::ParameterValue, 'Stop and remove one or more machines')
+            [CompletionResult]::new('ls', 'ls', [CompletionResultType]::ParameterValue, 'List machines')
+            [CompletionResult]::new('show', 'show', [CompletionResultType]::ParameterValue, 'Show a machine''s specification and runtime state')
+            [CompletionResult]::new('edit', 'edit', [CompletionResultType]::ParameterValue, 'Edit and validate a machine''s firestone.toml')
+            [CompletionResult]::new('shell', 'shell', [CompletionResultType]::ParameterValue, 'Open SSH over the machine''s private vsock transport')
+            [CompletionResult]::new('ssh-config', 'ssh-config', [CompletionResultType]::ParameterValue, 'Print an OpenSSH Host block for the machine')
+            [CompletionResult]::new('console', 'console', [CompletionResultType]::ParameterValue, 'Attach to the machine''s hvc0 console')
+            [CompletionResult]::new('logs', 'logs', [CompletionResultType]::ParameterValue, 'Print a bounded machine log')
+            [CompletionResult]::new('images', 'images', [CompletionResultType]::ParameterValue, 'Manage the owned image store')
+            [CompletionResult]::new('doctor', 'doctor', [CompletionResultType]::ParameterValue, 'Check host requirements and optional safe repairs')
+            [CompletionResult]::new('completions', 'completions', [CompletionResultType]::ParameterValue, 'Generate a shell completion script on stdout')
+            [CompletionResult]::new('version', 'version', [CompletionResultType]::ParameterValue, 'Print Firestone, pinned dependency, and resolved path versions')
+            [CompletionResult]::new('serve', 'serve', [CompletionResultType]::ParameterValue, 'Run the stateless REST API over a private Unix socket')
+            [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
+            break
+        }
+        'firestone;help;run' {
+            break
+        }
+        'firestone;help;create' {
+            break
+        }
+        'firestone;help;start' {
+            break
+        }
+        'firestone;help;stop' {
+            break
+        }
+        'firestone;help;restart' {
+            break
+        }
+        'firestone;help;rm' {
+            break
+        }
+        'firestone;help;ls' {
+            break
+        }
+        'firestone;help;show' {
+            break
+        }
+        'firestone;help;edit' {
+            break
+        }
+        'firestone;help;shell' {
+            break
+        }
+        'firestone;help;ssh-config' {
+            break
+        }
+        'firestone;help;console' {
+            break
+        }
+        'firestone;help;logs' {
+            break
+        }
+        'firestone;help;images' {
+            [CompletionResult]::new('ls', 'ls', [CompletionResultType]::ParameterValue, 'List stored images')
+            [CompletionResult]::new('pull', 'pull', [CompletionResultType]::ParameterValue, 'Pull and verify one image')
+            [CompletionResult]::new('inspect', 'inspect', [CompletionResultType]::ParameterValue, 'Verify and inspect one stored image')
+            [CompletionResult]::new('rm', 'rm', [CompletionResultType]::ParameterValue, 'Remove one stored image')
+            [CompletionResult]::new('prune', 'prune', [CompletionResultType]::ParameterValue, 'Remove all unreferenced images')
+            break
+        }
+        'firestone;help;images;ls' {
+            break
+        }
+        'firestone;help;images;pull' {
+            break
+        }
+        'firestone;help;images;inspect' {
+            break
+        }
+        'firestone;help;images;rm' {
+            break
+        }
+        'firestone;help;images;prune' {
+            break
+        }
+        'firestone;help;doctor' {
+            break
+        }
+        'firestone;help;completions' {
+            break
+        }
+        'firestone;help;version' {
+            break
+        }
+        'firestone;help;serve' {
+            break
+        }
+        'firestone;help;help' {
+            break
+        }
+    })
+
+    $completions.Where{ $_.CompletionText -like "$wordToComplete*" } |
+        Sort-Object -Property ListItemText
+}

@@ -21,10 +21,10 @@ use firestone_core::{
     MachineSpecPatch, MachineState, MachineStatus, MachineSummary, MachineView, Paths,
     ReadinessOptions, RealValidationHost, RemoveResult, ShimClient, ShimTimeouts, SpecResult,
     SpecWarningPayload, StartResult, StateImage, StateStore, StateVersion, StopResult, Supervision,
-    ValidationContext, VersionPaths, VersionResult, atomic, cancel_prepared,
-    launch_prepared_cancellable, prepare_start, read_reconciled_machine_state_live,
-    read_reconciled_machine_state_live_locked, run_doctor, stop_unsupervised,
-    validate_machine_spec, wait_for_ssh_ready,
+    ValidationContext, VersionDependency, VersionIdentity, VersionPaths, VersionResult, atomic,
+    cancel_prepared, launch_prepared_cancellable, prepare_start,
+    read_reconciled_machine_state_live, read_reconciled_machine_state_live_locked, run_doctor,
+    stop_unsupervised, validate_machine_spec, wait_for_ssh_ready,
 };
 
 const SPEC_TEMPLATE: &str = include_str!("../../../templates/firestone.toml");
@@ -698,13 +698,35 @@ impl LocalDispatcher {
     }
 
     fn version(&self, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
-        let manifest = DependencyManifest::bundled()?;
+        let architecture = Arch::current().map_err(|message| {
+            FirestoneError::new(ErrorKind::Dependency, message)
+                .with_hint("run Firestone on an x86_64 or aarch64 host")
+        })?;
+        let dependencies = DependencyManifest::bundled()?
+            .artifacts(architecture.as_str())?
+            .into_iter()
+            .map(|(name, artifact)| {
+                (
+                    name,
+                    VersionDependency {
+                        version: artifact.version,
+                        sha256: artifact.sha256,
+                    },
+                )
+            })
+            .collect();
+        let version = env!("CARGO_PKG_VERSION").to_owned();
         emit_result(
             events,
             "version",
             &VersionResult {
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-                deps: manifest.versions(),
+                identity: VersionIdentity {
+                    release: format!("v{version}"),
+                    git_commit: embedded_git_commit()?,
+                },
+                version,
+                architecture: architecture.to_string(),
+                dependencies,
                 paths: VersionPaths {
                     config: self.paths.config_dir().display().to_string(),
                     data: self.paths.data_dir().display().to_string(),
@@ -1542,6 +1564,24 @@ impl Dispatcher for LocalDispatcher {
     }
 }
 
+fn embedded_git_commit() -> Result<Option<String>, FirestoneError> {
+    let Some(commit) = option_env!("FIRESTONE_GIT_COMMIT") else {
+        return Ok(None);
+    };
+    let valid = commit.len() == 40
+        && commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if !valid {
+        return Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            "the embedded Firestone git commit is invalid",
+        )
+        .with_hint("build with FIRESTONE_GIT_COMMIT set to the full lowercase 40-hex revision"));
+    }
+    Ok(Some(commit.to_owned()))
+}
+
 fn pinned_image_reference(state: &MachineState) -> Option<&str> {
     if state.image.id.is_some() && state.image.sha256.is_some() {
         Some(state.image.r#ref.as_str())
@@ -2181,10 +2221,10 @@ mod tests {
     };
 
     use firestone_core::{
-        Action, Catalog, Dispatcher, ErrorKind, Event, EventSink, FirestoneError, GlobalConfig,
-        ImageRef, LogSource, MachineLock, MachineSpec, MachineSpecPatch, MachineStatus,
-        NetworkSpecPatch, PathInputs, Paths, RealValidationHost, StateStore, Supervision,
-        ValidationContext,
+        Action, Arch, Catalog, Dispatcher, ErrorKind, Event, EventSink, FirestoneError,
+        GlobalConfig, ImageRef, LogSource, MachineLock, MachineSpec, MachineSpecPatch,
+        MachineStatus, NetworkSpecPatch, PathInputs, Paths, RealValidationHost, StateStore,
+        Supervision, ValidationContext, VersionResult,
     };
 
     use super::{
@@ -2340,19 +2380,35 @@ esac
             [Event::Result { action, payload }] if action == "version" => payload,
             _ => return Err("version did not emit exactly one Result".into()),
         };
-        assert_eq!(payload["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(payload["deps"]["cloud-hypervisor"], "v53.0");
-        assert_eq!(payload["deps"]["virtiofsd"], "v1.14.0");
+        let result = serde_json::from_value::<VersionResult>(payload.clone())?;
+        let architecture = Arch::current().map_err(std::io::Error::other)?;
+        assert_eq!(result.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(result.identity.release, "v0.1.0");
         assert_eq!(
-            payload["paths"]["config"],
+            result.identity.git_commit.as_deref(),
+            option_env!("FIRESTONE_GIT_COMMIT")
+        );
+        assert_eq!(result.architecture, architecture.as_str());
+        assert_eq!(result.dependencies.len(), 4);
+        let cloud_hypervisor = result
+            .dependencies
+            .get("cloud-hypervisor")
+            .ok_or("cloud-hypervisor version pin is missing")?;
+        assert_eq!(cloud_hypervisor.version, "v53.0");
+        assert_eq!(
+            cloud_hypervisor.sha256,
+            match architecture {
+                Arch::X86_64 => "448af3d4e59b22c2987f7df94c213ad40fb53a10d437e42b5ee6c4fce7c29ecc",
+                Arch::Aarch64 => "f192b510eea1c710cbc439d716bb0573c223fc463dbe3e6523788a2b7ef62850",
+            }
+        );
+        assert_eq!(
+            result.paths.config,
             paths.config_dir().display().to_string()
         );
+        assert_eq!(result.paths.data, paths.data_dir().display().to_string());
         assert_eq!(
-            payload["paths"]["data"],
-            paths.data_dir().display().to_string()
-        );
-        assert_eq!(
-            payload["paths"]["runtime"],
+            result.paths.runtime,
             paths.runtime_dir().display().to_string()
         );
         Ok(())

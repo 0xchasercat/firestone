@@ -63,8 +63,8 @@ pub use paths::{PathInputs, Paths};
 pub use readiness::{ReadinessOptions, wait_for_ssh_ready};
 pub use result::{
     LogsResult, MachineRecord, MachineSummary, MachineView, RemoveResult, RunResult, ShellResult,
-    SpecResult, SpecWarningPayload, SshConfigResult, StartResult, StopResult, VersionPaths,
-    VersionResult,
+    SpecResult, SpecWarningPayload, SshConfigResult, StartResult, StopResult, VersionDependency,
+    VersionIdentity, VersionPaths, VersionResult,
 };
 pub use shim::{
     PreparedStart, ShimClient, ShimPids, ShimStatus, ShimTimeouts, cancel_prepared,
