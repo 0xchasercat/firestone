@@ -115,7 +115,7 @@ jobs:
           esac
           json_output=$(FIRESTONE_HOME="$home" "$binary" --json version)
           case "$json_output" in
-            *"\"git_commit\":\"$GITHUB_SHA\""*"\"architecture\":\"x86_64\""*) ;;
+            *"\"architecture\":\"x86_64\""*"\"git_commit\":\"$GITHUB_SHA\""*) ;;
             *) printf '%s\n' "$json_output" >&2; exit 1 ;;
           esac
           for shell in bash elvish fish powershell zsh; do
