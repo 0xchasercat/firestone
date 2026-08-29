@@ -511,6 +511,12 @@ where
                 .run(Action::Doctor { fix: arguments.fix }, renderer)
                 .await
         }
+        Command::Version => {
+            let dispatcher =
+                LocalDispatcher::new(paths, GlobalConfig::default(), Catalog::built_in()?)
+                    .with_source_base(source_base);
+            dispatcher.run(Action::Version, renderer).await
+        }
         Command::Serve(arguments) => {
             if yes {
                 return Err(FirestoneError::new(

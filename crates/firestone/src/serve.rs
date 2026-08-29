@@ -600,6 +600,9 @@ impl BoundSocket {
                 source,
             )
         })?;
+        // Unix bind starts from mode 0777, so 0177 publishes the socket as 0600.
+        // Restore 0077 before request handlers create private directories.
+        let _ = umask(Mode::from_bits_truncate(0o077));
         let stat = runtime.stat(&socket_name)?.ok_or_else(|| {
             FirestoneError::new(
                 ErrorKind::Generic,

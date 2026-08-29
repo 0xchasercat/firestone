@@ -99,6 +99,9 @@ pub enum Command {
     /// Check host requirements and optional safe repairs.
     Doctor(DoctorArgs),
 
+    /// Print Firestone, pinned dependency, and resolved path versions.
+    Version,
+
     /// Run the stateless REST API over a private Unix socket.
     Serve(ServeArgs),
 

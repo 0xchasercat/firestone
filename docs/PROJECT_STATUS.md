@@ -42,7 +42,7 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 | M3-05 | M3 Linux KVM integration | `agent/m3-integration` | [draft #25](https://github.com/0xchasercat/firestone/pull/25) | blocked | M3-01 through M3-04 | Harness/static gates pass; E2E 3, 4, 8 and verify 7, 8, 14, 16 await a reachable KVM host; verify 10 and 15 remain resolved |
 | M4-01 | Axum REST router, routes, streaming, and error mapping | `agent/m4-api` | [#26](https://github.com/0xchasercat/firestone/pull/26) | complete | M3-04 | Every SPEC route projects shared actions/results, NDJSON framing and limits are exact, handler tests pass with a mocked Dispatcher, and local stable/1.85 plus final-head Ubuntu x86_64 CI are green |
 | M4-02 | Serve CLI and HTTP runtime integration | `agent/m4-serve` | [#27](https://github.com/0xchasercat/firestone/pull/27) | complete | M4-01 | Unix-only mode-0600 listener, secure stale/conflict handling, identity-safe cleanup, concurrent requests, bounded signal drain, and real CLI/curl smoke pass; final Ubuntu CI is green |
-| M4-03 | M4 REST equivalence and E2E integration | `agent/m4-integration` | pending | ready | M4-01, M4-02 | E2E 9 passes and REST Result payloads are byte-equal to CLI --json for the same actions |
+| M4-03 | M4 REST equivalence and E2E integration | `agent/m4-integration` | [draft #28](https://github.com/0xchasercat/firestone/pull/28) | blocked | M4-01, M4-02 | Real CLI and Unix-serve no-KVM equivalence, streaming, 204, locking, disconnect, and restart tests pass; the secure E2E 9 harness is ready. E2E 9 remains open because bounded SSH attempts at 2026-08-29T19:38:22Z and 19:38:38Z both timed out on `172.203.242.136:22` after 10.06 seconds; no KVM result is claimed. |
 
 ## Merge order
 
