@@ -3,6 +3,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
     os::unix::net::{UnixListener, UnixStream},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, ExitCode, Stdio},
 };
@@ -29,6 +30,11 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = env::args().collect::<Vec<_>>();
+    if arguments.iter().any(|argument| argument == "--foreground")
+        || arguments.get(1).is_some_and(|argument| argument == "--socket-path")
+    {
+        return run_fake_sidecar(&arguments);
+    }
     if matches!(
         arguments.get(1).map(String::as_str),
         Some("convert" | "create" | "info")
@@ -77,6 +83,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let pty = FakePty::open()?;
     let _ = fs::remove_file(&options.api_socket);
+    let mut sidecar_connections = Vec::new();
     let listener = UnixListener::bind(&options.api_socket)?;
     for connection in listener.incoming() {
         let mut stream = connection?;
@@ -107,6 +114,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "/api/v1/vm.create" => {
                 fs::write(&options.body, &request.body)?;
+                sidecar_connections.extend(connect_sidecars(&request.body)?);
                 start_vsock(&request.body)?;
                 if let Some(console) = &options.console_log {
                     fs::write(console, b"current boot\n")?;
@@ -168,6 +176,133 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+fn option_value(arguments: &[String], option: &str) -> Option<PathBuf> {
+    arguments
+        .windows(2)
+        .find(|pair| pair[0] == option)
+        .map(|pair| PathBuf::from(&pair[1]))
+}
+
+fn fake_sidecar_name(socket: &Path, passt: bool) -> Result<String, Box<dyn std::error::Error>> {
+    if passt {
+        return Ok("passt".to_owned());
+    }
+    let file = socket
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or("fake virtiofsd socket has no UTF-8 file name")?;
+    let index = file
+        .strip_prefix("fs")
+        .and_then(|value| value.strip_suffix(".sock"))
+        .ok_or("fake virtiofsd socket does not use fsN.sock")?;
+    Ok(format!("virtiofsd-{index}"))
+}
+
+fn run_fake_sidecar(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let passt = arguments.iter().any(|argument| argument == "--foreground");
+    let socket = option_value(arguments, if passt { "--socket" } else { "--socket-path" })
+        .ok_or("fake sidecar has no socket option")?;
+    let name = fake_sidecar_name(&socket, passt)?;
+    if passt
+        && arguments
+            .get(arguments.len().saturating_sub(2)..)
+            != Some(["--repair-path".to_owned(), "none".to_owned()].as_slice())
+    {
+        return Err("passt repair-path pair is not final".into());
+    }
+    let mut environment = env::vars_os()
+        .map(|(key, _)| key.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    environment.sort();
+    if let Some(record) = env::var_os("FIRESTONE_FAKE_SIDECAR_RECORD") {
+        append(
+            Path::new(&record),
+            format!(
+                "launch {name} pid={} argv={:?} env={environment:?}\n",
+                std::process::id(),
+                &arguments[1..]
+            )
+            .as_bytes(),
+        )?;
+    }
+    if env::var("FIRESTONE_FAKE_SIDECAR_FAIL").as_deref() == Ok(name.as_str()) {
+        return Err(format!("injected {name} failure before readiness").into());
+    }
+    if env::var("FIRESTONE_FAKE_SIDECAR_NEVER_READY").as_deref() == Ok(name.as_str()) {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        return Ok(());
+    }
+
+    let _ = fs::remove_file(&socket);
+    let pid_file = (!passt).then(|| PathBuf::from(format!("{}.pid", socket.display())));
+    if let Some(pid_file) = pid_file.as_ref() {
+        let _ = fs::remove_file(pid_file);
+    }
+    if env::var("FIRESTONE_FAKE_SIDECAR_BAD_READY").as_deref() == Ok(name.as_str()) {
+        fs::write(&socket, b"not a socket")?;
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o700))?;
+        if let Some(pid_file) = pid_file.as_ref() {
+            fs::write(pid_file, format!("{}\n", std::process::id()))?;
+            fs::set_permissions(pid_file, fs::Permissions::from_mode(0o600))?;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        return Ok(());
+    }
+    let listener = UnixListener::bind(&socket)?;
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o700))?;
+    if let Some(pid_file) = pid_file.as_ref() {
+        fs::write(pid_file, format!("{}\n", std::process::id()))?;
+        fs::set_permissions(pid_file, fs::Permissions::from_mode(0o600))?;
+    }
+    eprintln!("fake {name} ready");
+    if env::var("FIRESTONE_FAKE_SIDECAR_EXIT_AFTER_READY").as_deref() == Ok(name.as_str()) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        return Err(format!("injected {name} exit after readiness").into());
+    }
+
+    let (mut stream, _) = listener.accept()?;
+    if let Some(record) = env::var_os("FIRESTONE_FAKE_SIDECAR_RECORD") {
+        append(Path::new(&record), format!("connect {name}\n").as_bytes())?;
+    }
+    if env::var("FIRESTONE_FAKE_SIDECAR_EXIT_AFTER_CONNECT").as_deref() == Ok(name.as_str()) {
+        return Err(format!("injected {name} exit after VMM connection").into());
+    }
+    let mut buffer = [0_u8; 4096];
+    while stream.read(&mut buffer)? != 0 {}
+    Ok(())
+}
+
+fn json_string_values(text: &str, marker: &str) -> Vec<PathBuf> {
+    let mut values = Vec::new();
+    let mut remaining = text;
+    while let Some(start) = remaining.find(marker) {
+        let tail = &remaining[start + marker.len()..];
+        let Some(end) = tail.find('"') else {
+            break;
+        };
+        values.push(PathBuf::from(&tail[..end]));
+        remaining = &tail[end + 1..];
+    }
+    values
+}
+
+fn connect_sidecars(config: &[u8]) -> Result<Vec<UnixStream>, Box<dyn std::error::Error>> {
+    let text = std::str::from_utf8(config)?;
+    let mut paths = json_string_values(text, "\"vhost_socket\":\"");
+    if let Some(fs_start) = text.find("\"fs\":[") {
+        let fs_tail = &text[fs_start..];
+        let fs_end = fs_tail.find("],\"memory\"").unwrap_or(fs_tail.len());
+        paths.extend(json_string_values(
+            &fs_tail[..fs_end],
+            "\"socket\":\"",
+        ));
+    }
+    paths
+        .into_iter()
+        .map(|path| UnixStream::connect(&path).map_err(Into::into))
+        .collect()
+}
+
 fn start_vsock(config: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
     let config = std::str::from_utf8(config)?;
     let Some(vsock) = config.find("\"vsock\"") else {

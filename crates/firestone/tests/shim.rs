@@ -115,7 +115,7 @@ impl Fixture {
             extra_args.push(descendant_pid.to_string_lossy().into_owned());
         }
         let plan = json!({
-            "version": 1,
+            "version": 2,
             "name": NAME,
             "vmm_binary": vmm_binary,
             "vmm_binary_sha256": sha256_file(&vmm_binary)?,
@@ -127,6 +127,8 @@ impl Fixture {
             "control_io_timeout_ms": 150,
             "launch_request_timeout_ms": 5000,
             "launch_overall_timeout_ms": launch_overall_timeout_ms,
+            "network": {"mode": "none"},
+            "filesystems": [],
         });
         atomic::write_json_with_mode(&paths.machine_shim_plan(NAME)?, &plan, 0o600)?;
 
@@ -233,6 +235,10 @@ impl Fixture {
 
 #[test]
 fn start_preparation_orders_image_overlay_seed_vmconfig_and_plan() -> TestResult<()> {
+    fs::set_permissions(
+        env!("CARGO_BIN_EXE_firestone"),
+        fs::Permissions::from_mode(0o755),
+    )?;
     let root = tempfile::tempdir()?;
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))?;
     let fake = shared_fake_vmm()?;

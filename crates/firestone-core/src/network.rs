@@ -13,6 +13,7 @@ use std::{
 };
 
 use nix::sys::socket::UnixAddr;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     Cmd, ErrorKind, FirestoneError, MacAddr, NetMode, NetworkSpec, Paths, PortForward, Protocol,
@@ -88,6 +89,36 @@ pub enum NetworkPlan {
     Passt(Box<PasstPlan>),
     Tap(TapPlan),
 }
+/// Exact cross-process form of a prepared network plan.
+///
+/// The CLI prepares this while holding the machine lock. The shim restores the
+/// same command and device paths instead of rebuilding them from mutable spec
+/// or host state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum NetworkPlanSnapshot {
+    None,
+    Passt {
+        program: PathBuf,
+        args: Vec<OsString>,
+        socket: PathBuf,
+        socket_uid: u32,
+        socket_mode: u32,
+        log: PathBuf,
+        log_uid: u32,
+        log_mode: u32,
+        readiness_timeout_ms: u64,
+        readiness_poll_interval_ms: u64,
+        forwards: Vec<PortForward>,
+        mac: MacAddr,
+    },
+    Tap {
+        name: String,
+        mac: MacAddr,
+        ip: Option<IpAddr>,
+        mask: Option<IpAddr>,
+    },
+}
 
 impl NetworkPlan {
     #[must_use]
@@ -106,6 +137,111 @@ impl NetworkPlan {
             Self::None | Self::Tap(_) => &[],
         }
     }
+
+    pub(crate) fn snapshot(&self) -> Result<NetworkPlanSnapshot, FirestoneError> {
+        match self {
+            Self::None => Ok(NetworkPlanSnapshot::None),
+            Self::Passt(plan) => Ok(NetworkPlanSnapshot::Passt {
+                program: PathBuf::from(plan.command.program()),
+                args: plan.command.arguments().map(OsStr::to_os_string).collect(),
+                socket: plan.socket.path.clone(),
+                socket_uid: plan.socket.uid,
+                socket_mode: plan.socket.mode,
+                log: plan.log.path.clone(),
+                log_uid: plan.log.uid,
+                log_mode: plan.log.mode,
+                readiness_timeout_ms: duration_millis(
+                    plan.readiness.timeout,
+                    "passt readiness timeout",
+                )?,
+                readiness_poll_interval_ms: duration_millis(
+                    plan.readiness.poll_interval,
+                    "passt readiness poll interval",
+                )?,
+                forwards: plan.forwards.clone(),
+                mac: plan.mac,
+            }),
+            Self::Tap(plan) => Ok(NetworkPlanSnapshot::Tap {
+                name: plan.name.clone(),
+                mac: plan.mac,
+                ip: plan.ip,
+                mask: plan.mask,
+            }),
+        }
+    }
+
+    pub(crate) fn from_snapshot(snapshot: NetworkPlanSnapshot) -> Result<Self, FirestoneError> {
+        match snapshot {
+            NetworkPlanSnapshot::None => Ok(Self::None),
+            NetworkPlanSnapshot::Passt {
+                program,
+                args,
+                socket,
+                socket_uid,
+                socket_mode,
+                log,
+                log_uid,
+                log_mode,
+                readiness_timeout_ms,
+                readiness_poll_interval_ms,
+                forwards,
+                mac,
+            } => {
+                let socket = OwnedPathExpectation {
+                    path: socket,
+                    uid: socket_uid,
+                    mode: socket_mode,
+                };
+                let log = OwnedPathExpectation {
+                    path: log,
+                    uid: log_uid,
+                    mode: log_mode,
+                };
+                let readiness = SocketReadinessPlan::new(
+                    socket.clone(),
+                    Duration::from_millis(readiness_timeout_ms),
+                    Duration::from_millis(readiness_poll_interval_ms),
+                )?;
+                let command = Cmd::new(program.as_os_str())
+                    .args(args)
+                    .cwd("/")
+                    .stdin_null()
+                    .stdout_append(&log.path)
+                    .stderr_append(&log.path)
+                    .error_kind(ErrorKind::Dependency)
+                    .reduced_environment();
+                Ok(Self::Passt(Box::new(PasstPlan {
+                    command,
+                    socket,
+                    log,
+                    readiness,
+                    forwards,
+                    mac,
+                })))
+            }
+            NetworkPlanSnapshot::Tap {
+                name,
+                mac,
+                ip,
+                mask,
+            } => Ok(Self::Tap(TapPlan {
+                name,
+                mac,
+                ownership: TapOwnership::ExistingUserOwned,
+                ip,
+                mask,
+            })),
+        }
+    }
+}
+
+fn duration_millis(duration: Duration, label: &str) -> Result<u64, FirestoneError> {
+    u64::try_from(duration.as_millis()).map_err(|_| {
+        FirestoneError::new(
+            ErrorKind::Usage,
+            format!("{label} cannot be represented in the launch plan"),
+        )
+    })
 }
 
 /// One current-user path and the exact node mode expected at launch.

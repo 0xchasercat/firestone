@@ -23,7 +23,7 @@ use firestone_core::{
     SpecWarningPayload, StartResult, StateImage, StateStore, StateVersion, StopResult, Supervision,
     ValidationContext, atomic, cancel_prepared, launch_prepared_cancellable, prepare_start,
     read_reconciled_machine_state_live, read_reconciled_machine_state_live_locked, run_doctor,
-    stop_unsupervised, validate_m1_start_scope, wait_for_ssh_ready,
+    stop_unsupervised, wait_for_ssh_ready,
 };
 
 const SPEC_TEMPLATE: &str = include_str!("../../../templates/firestone.toml");
@@ -763,7 +763,6 @@ impl LocalDispatcher {
         let live = self.read_live_state_locked(name, &lock)?;
         ensure_startable(name, &live.state)?;
         let spec = self.load_machine_spec(name, &live.state)?;
-        validate_m1_start_scope(&spec)?;
 
         let image_store = self.image_store()?;
         let manifest = DependencyManifest::bundled()?;
@@ -791,6 +790,8 @@ impl LocalDispatcher {
             events,
             timeouts,
         )?;
+        let effective_forwards = prepared.forwards().to_vec();
+        let effective_mounts = prepared.mounts().to_vec();
         let first_boot = prepared.seed_rewritten();
         let effective_timeout = prepared.timeout();
         if self.start_cancellation.load(Ordering::Relaxed) {
@@ -848,17 +849,8 @@ impl LocalDispatcher {
             name: name.to_owned(),
             status: MachineStatus::Running,
             elapsed_ms: elapsed_millis(started.elapsed()),
-            forwards: spec
-                .network
-                .forward
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            mounts: spec
-                .mounts
-                .iter()
-                .map(|mount| format!("{} -> {}", mount.host.display(), mount.guest.display()))
-                .collect(),
+            forwards: effective_forwards,
+            mounts: effective_mounts,
         })
     }
 
@@ -2208,48 +2200,6 @@ esac
                 .read()?
                 .status,
             MachineStatus::Created
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn start_deferred_network_scope_fails_before_side_effects()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (directory, dispatcher, paths) = fixture()?;
-        let program = fake_qemu(directory.path())?;
-        let dispatcher = dispatcher.with_programs(program.clone(), program);
-        create_machine(&dispatcher, "deferred-net", MachineSpec::default()).await?;
-        let mut events = Vec::new();
-
-        let error = dispatcher
-            .run(
-                Action::Start {
-                    name: "deferred-net".to_owned(),
-                    wait: true,
-                    timeout: Duration::from_secs(1),
-                },
-                &mut events,
-            )
-            .await
-            .err()
-            .ok_or("start unexpectedly accepted M3 networking")?;
-
-        assert_eq!(error.kind(), ErrorKind::InvalidSpec);
-        assert_eq!(
-            error.hint(),
-            Some("set network.mode to none until M3 networking is available")
-        );
-        assert_eq!(
-            StateStore::new(paths.machine_state("deferred-net")?)
-                .read()?
-                .status,
-            MachineStatus::Created
-        );
-        assert!(!paths.machine_vmconfig("deferred-net")?.exists());
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, Event::Result { .. }))
         );
         Ok(())
     }

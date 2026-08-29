@@ -9,8 +9,8 @@ use serde_json::{Map, Value};
 
 use crate::{
     Arch, CatalogFirmware, DependencyManifest, ErrorKind, FirestoneError, Firmware, MacAddr,
-    MachineSpec, MachineState, MountSpec, NetMode, NetworkPlan, Paths, VirtiofsPlan, atomic,
-    virtiofs::{VIRTIOFS_NUM_QUEUES, VIRTIOFS_QUEUE_SIZE, validated_vm_fs_identity},
+    MachineSpec, MachineState, NetworkPlan, Paths, VirtiofsPlan, atomic,
+    virtiofs::{VIRTIOFS_NUM_QUEUES, VIRTIOFS_QUEUE_SIZE},
 };
 
 /// Inputs already resolved by image and state preparation before VMM creation.
@@ -19,6 +19,8 @@ pub struct VmConfigInput<'a> {
     pub name: &'a str,
     pub spec: &'a MachineSpec,
     pub state: &'a MachineState,
+    pub network: &'a NetworkPlan,
+    pub filesystems: &'a [VirtiofsPlan],
     pub architecture: Arch,
     pub catalog_firmware: Option<CatalogFirmware>,
 }
@@ -173,21 +175,6 @@ impl FsConfig {
             queue_size: VIRTIOFS_QUEUE_SIZE,
         }
     }
-
-    fn from_mount(
-        paths: &Paths,
-        name: &str,
-        index: usize,
-        mount: &MountSpec,
-    ) -> Result<Self, FirestoneError> {
-        let (tag, socket) = validated_vm_fs_identity(paths, name, index, mount)?;
-        Ok(Self {
-            tag,
-            socket,
-            num_queues: VIRTIOFS_NUM_QUEUES,
-            queue_size: VIRTIOFS_QUEUE_SIZE,
-        })
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -304,39 +291,7 @@ fn base_vm_config(
     input: VmConfigInput<'_>,
     payload: PayloadConfig,
 ) -> Result<VmConfig, FirestoneError> {
-    let net = match input.spec.network.mode {
-        NetMode::Passt => Some(vec![NetConfig {
-            tap: None,
-            mac: state_mac(input)?,
-            ip: None,
-            mask: None,
-            vhost_user: Some(true),
-            vhost_socket: Some(utf8_path(
-                &paths.machine_net_socket(input.name)?,
-                "passt vhost-user socket",
-            )?),
-            vhost_mode: Some(VhostMode::Client),
-        }]),
-        NetMode::Tap => {
-            let tap = input.spec.network.tap.clone().ok_or_else(|| {
-                FirestoneError::new(
-                    ErrorKind::InvalidSpec,
-                    "network.tap is required when network.mode is tap",
-                )
-                .with_hint("set network.tap to a user-owned TAP interface")
-            })?;
-            Some(vec![NetConfig {
-                tap: Some(tap),
-                mac: state_mac(input)?,
-                vhost_user: None,
-                vhost_socket: None,
-                ip: None,
-                mask: None,
-                vhost_mode: None,
-            }])
-        }
-        NetMode::None => None,
-    };
+    let net = NetConfig::from_plan(input.network)?;
 
     if input.state.cid != 3 {
         return Err(FirestoneError::new(
@@ -349,18 +304,10 @@ fn base_vm_config(
         .with_hint("persist vsock CID 3 before building VmConfig"));
     }
 
-    let fs = if input.spec.mounts.is_empty() {
+    let fs = if input.filesystems.is_empty() {
         None
     } else {
-        Some(
-            input
-                .spec
-                .mounts
-                .iter()
-                .enumerate()
-                .map(|(index, mount)| FsConfig::from_mount(paths, input.name, index, mount))
-                .collect::<Result<Vec<_>, FirestoneError>>()?,
-        )
+        Some(input.filesystems.iter().map(FsConfig::from_plan).collect())
     };
 
     let vcpus = u32::from(input.spec.cpus);
@@ -405,28 +352,6 @@ fn base_vm_config(
             src: PathBuf::from("/dev/urandom"),
         },
     })
-}
-
-fn state_mac(input: VmConfigInput<'_>) -> Result<MacAddr, FirestoneError> {
-    let value = input.state.mac.as_deref().ok_or_else(|| {
-        FirestoneError::new(
-            ErrorKind::InvalidSpec,
-            format!("machine `{}` has no persisted MAC address", input.name),
-        )
-        .with_hint("assign and persist the machine MAC address before building VmConfig")
-    })?;
-    let mac = value.parse::<MacAddr>().map_err(|source| {
-        FirestoneError::new(
-            ErrorKind::InvalidSpec,
-            format!(
-                "machine `{}` has invalid persisted MAC address `{value}`",
-                input.name
-            ),
-        )
-        .with_hint("persist a MAC address such as 52:54:00:9a:1f:c3")
-        .with_source(source)
-    })?;
-    Ok(mac)
 }
 
 fn utf8_path(path: &Path, field: &str) -> Result<String, FirestoneError> {
@@ -600,10 +525,10 @@ fn validate_required_invariants(
     let Some(object) = candidate.as_object() else {
         return Err(required_overlay_error("<root>"));
     };
-    if input.spec.network.mode == NetMode::None && object.contains_key("net") {
+    if matches!(input.network, NetworkPlan::None) && object.contains_key("net") {
         return Err(required_overlay_error("net"));
     }
-    if input.spec.mounts.is_empty() && object.contains_key("fs") {
+    if input.filesystems.is_empty() && object.contains_key("fs") {
         return Err(required_overlay_error("fs"));
     }
 
@@ -633,19 +558,19 @@ fn validate_required_defaults(
         require_false_or_absent(candidate, path)?;
     }
 
-    match input.spec.network.mode {
-        NetMode::Passt => {
+    match input.network {
+        NetworkPlan::Passt(_) => {
             for path in ["/net/0/tap", "/net/0/ip", "/net/0/mask"] {
                 require_absent(candidate, path)?;
             }
         }
-        NetMode::Tap => {
+        NetworkPlan::Tap(_) => {
             require_false_or_absent(candidate, "/net/0/vhost_user")?;
             for path in ["/net/0/ip", "/net/0/mask", "/net/0/vhost_socket"] {
                 require_absent(candidate, path)?;
             }
         }
-        NetMode::None => {}
+        NetworkPlan::None => {}
     }
     Ok(())
 }
@@ -775,10 +700,42 @@ mod tests {
     use crate::{
         Arch, CatalogFirmware, DependencyManifest, ErrorKind, Firmware, MachineSpec, MachineState,
         MachineStatus, MountSpec, NetMode, NetworkPlan, NetworkPlanOptions, NetworkSpec,
-        PathInputs, Paths, StateImage, StateVersion, TapHost, prepare_network,
+        PathInputs, Paths, StateImage, StateVersion, TapHost, VirtiofsPlan, VirtiofsSandbox,
+        prepare_network, prepare_virtiofs_plans,
     };
     use serde_json::{Value, json};
     use tempfile::TempDir;
+
+    static NO_NETWORK: NetworkPlan = NetworkPlan::None;
+    static NO_FILESYSTEMS: [VirtiofsPlan; 0] = [];
+    struct ReadyTapHost;
+
+    impl TapHost for ReadyTapHost {
+        fn tap_device_is_tap(&self, _name: &str) -> io::Result<bool> {
+            Ok(true)
+        }
+
+        fn tun_is_accessible(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn network_plan(
+        paths: &Paths,
+        spec: &NetworkSpec,
+    ) -> Result<NetworkPlan, crate::FirestoneError> {
+        prepare_network(NetworkPlanOptions::new(
+            paths,
+            "demo",
+            spec,
+            "52:54:00:9a:1f:c3".parse().map_err(|source| {
+                crate::FirestoneError::new(ErrorKind::InvalidSpec, "invalid fixture MAC")
+                    .with_source(source)
+            })?,
+            OsStr::new("passt"),
+            &ReadyTapHost,
+        ))
+    }
 
     struct Fixture {
         _temp: TempDir,
@@ -828,8 +785,8 @@ mod tests {
     }
 
     #[test]
-    fn base_vmconfig_default_matches_v53_golden_mapping() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn base_vmconfig_without_sidecars_matches_v53_golden_mapping()
+    -> Result<(), Box<dyn std::error::Error>> {
         let paths = paths_for_root(PathBuf::from("/firestone"))?;
         let spec = MachineSpec::default();
         let state = state(&paths)?;
@@ -861,12 +818,6 @@ mod tests {
                         "image_type": "Raw"
                     }
                 ],
-                "net": [{
-                    "vhost_user": true,
-                    "vhost_socket": "/firestone/run/demo/net.sock",
-                    "vhost_mode": "Client",
-                    "mac": "52:54:00:9a:1f:c3"
-                }],
                 "vsock": {"cid": 3, "socket": "/firestone/run/demo/vsock.sock"},
                 "serial": {
                     "mode": "File",
@@ -1047,10 +998,18 @@ mod tests {
         let state = state(&fixture.paths)?;
 
         let passt_spec = MachineSpec::default();
+        let passt_plan = network_plan(&fixture.paths, &passt_spec.network)?;
         let passt = canonical_vm_config(
             &fixture.paths,
             &fixture.manifest,
-            input(&passt_spec, &state, Arch::X86_64, None),
+            input_with_plans(
+                &passt_spec,
+                &state,
+                &passt_plan,
+                &NO_FILESYSTEMS,
+                Arch::X86_64,
+                None,
+            ),
         )?;
         assert_eq!(
             passt.as_value().pointer("/net/0/vhost_user"),
@@ -1064,10 +1023,18 @@ mod tests {
         let mut tap_spec = MachineSpec::default();
         tap_spec.network.mode = NetMode::Tap;
         tap_spec.network.tap = Some("tap0".to_owned());
+        let tap_plan = network_plan(&fixture.paths, &tap_spec.network)?;
         let tap = canonical_vm_config(
             &fixture.paths,
             &fixture.manifest,
-            input(&tap_spec, &state, Arch::X86_64, None),
+            input_with_plans(
+                &tap_spec,
+                &state,
+                &tap_plan,
+                &NO_FILESYSTEMS,
+                Arch::X86_64,
+                None,
+            ),
         )?;
         assert_eq!(
             tap.as_value().get("net"),
@@ -1078,12 +1045,20 @@ mod tests {
 
         let mut none_spec = MachineSpec::default();
         none_spec.network.mode = NetMode::None;
+        let none_plan = network_plan(&fixture.paths, &none_spec.network)?;
         let mut none_state = state.clone();
         none_state.mac = None;
         let none = canonical_vm_config(
             &fixture.paths,
             &fixture.manifest,
-            input(&none_spec, &none_state, Arch::X86_64, None),
+            input_with_plans(
+                &none_spec,
+                &none_state,
+                &none_plan,
+                &NO_FILESYSTEMS,
+                Arch::X86_64,
+                None,
+            ),
         )?;
         assert!(none.as_value().get("net").is_none());
         Ok(())
@@ -1182,16 +1157,26 @@ mod tests {
     fn mounts_map_to_required_v53_fs_entries() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::new()?;
         fixture.install("rust-hypervisor-firmware", Arch::X86_64)?;
+        let virtiofsd = fixture.install("virtiofsd", Arch::X86_64)?;
+        fs::set_permissions(&virtiofsd, fs::Permissions::from_mode(0o755))?;
+        let first_host = fixture._temp.path().join("host-a");
+        let second_host = fixture._temp.path().join("host-b");
+        fs::create_dir(&first_host)?;
+        fs::create_dir(&second_host)?;
+        fs::set_permissions(&first_host, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(&second_host, fs::Permissions::from_mode(0o700))?;
+        let first_host = fs::canonicalize(first_host)?;
+        let second_host = fs::canonicalize(second_host)?;
         let spec = MachineSpec {
             mounts: vec![
                 MountSpec {
-                    host: PathBuf::from("/host/a"),
+                    host: first_host,
                     guest: PathBuf::from("/guest/a"),
                     readonly: false,
                     tag: None,
                 },
                 MountSpec {
-                    host: PathBuf::from("/host/b"),
+                    host: second_host,
                     guest: PathBuf::from("/guest/b"),
                     readonly: true,
                     tag: Some("source".to_owned()),
@@ -1199,12 +1184,20 @@ mod tests {
             ],
             ..MachineSpec::default()
         };
+        let filesystems = prepare_virtiofs_plans(
+            &fixture.paths,
+            &fixture.manifest,
+            "demo",
+            Arch::X86_64,
+            &spec.mounts,
+            VirtiofsSandbox::None,
+        )?;
         let state = state(&fixture.paths)?;
 
         let config = canonical_vm_config(
             &fixture.paths,
             &fixture.manifest,
-            input(&spec, &state, Arch::X86_64, None),
+            input_with_plans(&spec, &state, &NO_NETWORK, &filesystems, Arch::X86_64, None),
         )?;
 
         assert_eq!(
@@ -1278,6 +1271,7 @@ mod tests {
         let fixture = Fixture::new()?;
         fixture.install("rust-hypervisor-firmware", Arch::X86_64)?;
         let state = state(&fixture.paths)?;
+        let passt_plan = network_plan(&fixture.paths, &NetworkSpec::default())?;
 
         for (overlay, field) in [
             (json!({"memory": {"shared": false}}), "memory.shared"),
@@ -1345,7 +1339,14 @@ mod tests {
             let error = canonical_vm_config(
                 &fixture.paths,
                 &fixture.manifest,
-                input(&spec, &state, Arch::X86_64, None),
+                input_with_plans(
+                    &spec,
+                    &state,
+                    &passt_plan,
+                    &NO_FILESYSTEMS,
+                    Arch::X86_64,
+                    None,
+                ),
             )
             .err()
             .ok_or("required overlay change should fail")?;
@@ -1569,32 +1570,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn missing_state_mac_returns_actionable_invalid_spec_error()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let fixture = Fixture::new()?;
-        fixture.install("rust-hypervisor-firmware", Arch::X86_64)?;
-        let spec = MachineSpec::default();
-        let mut state = state(&fixture.paths)?;
-        state.mac = None;
-
-        let error = canonical_vm_config(
-            &fixture.paths,
-            &fixture.manifest,
-            input(&spec, &state, Arch::X86_64, None),
-        )
-        .err()
-        .ok_or("missing MAC should fail")?;
-
-        assert_eq!(error.kind(), ErrorKind::InvalidSpec);
-        assert!(error.message().contains("no persisted MAC address"));
-        assert_eq!(
-            error.hint(),
-            Some("assign and persist the machine MAC address before building VmConfig")
-        );
-        Ok(())
-    }
-
     fn paths_for_root(root: PathBuf) -> Result<Paths, crate::FirestoneError> {
         Paths::from_inputs(&PathInputs {
             current_dir: root.clone(),
@@ -1643,6 +1618,26 @@ mod tests {
             name: "demo",
             spec,
             state,
+            network: &NO_NETWORK,
+            filesystems: &NO_FILESYSTEMS,
+            architecture,
+            catalog_firmware,
+        }
+    }
+    fn input_with_plans<'a>(
+        spec: &'a MachineSpec,
+        state: &'a MachineState,
+        network: &'a NetworkPlan,
+        filesystems: &'a [VirtiofsPlan],
+        architecture: Arch,
+        catalog_firmware: Option<CatalogFirmware>,
+    ) -> VmConfigInput<'a> {
+        VmConfigInput {
+            name: "demo",
+            spec,
+            state,
+            network,
+            filesystems,
             architecture,
             catalog_firmware,
         }
