@@ -34,7 +34,7 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 | M2-01 | SSH identity, host-key trust, and vsock proxy transport | `agent/m2-transport` | [#17](https://github.com/0xchasercat/firestone/pull/17) | complete | M1 | Exact SSH/vsock transport contracts, key permissions, trust rotation, bounded handshake, cancellation, and binary relay pass without KVM |
 | M2-02 | Guest SSH units and cloud-init integration | `agent/m2-guest` | [#18](https://github.com/0xchasercat/firestone/pull/18) | complete | M1 | Typed deterministic guest units activate key-only root/default-user SSH, coexist with native systemd vsock, preserve first-boot hvc0 rescue, and KVM verify 11 and 17 pass |
 | M2-03 | Readiness, shell, ssh-config, console, and run CLI | `agent/m2-cli` | [#19](https://github.com/0xchasercat/firestone/pull/19) | complete | M2-01, M2-02 | Shared actions, deterministic output, interactive exec, no-wait behavior, and readiness transitions pass |
-| M2-04 | M2 Linux KVM integration | `agent/m2-integration` | pending | review | M2-01 through M2-03 | E2E 2 and 10 pass; empty-home run reaches a root prompt; verify 11, 13, and 17 close |
+| M2-04 | M2 Linux KVM integration | `agent/m2-integration` | [#20](https://github.com/0xchasercat/firestone/pull/20) | review | M2-01 through M2-03 | E2E 2 and 10 pass; empty-home run reaches a root prompt; verify 11, 13, and 17 close |
 
 ## Merge order
 
