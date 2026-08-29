@@ -261,7 +261,7 @@ fn proxy_command(
     let executable = shell_word(current_executable.as_os_str(), "firestone executable")?;
     let name = shell_word(OsStr::new(name), "machine name")?;
     Ok(format!(
-        "FIRESTONE_CONFIG_DIR={config} FIRESTONE_DATA_DIR={data} FIRESTONE_RUNTIME_DIR={runtime} {executable} _vsock-proxy {name} 22"
+        "env FIRESTONE_CONFIG_DIR={config} FIRESTONE_DATA_DIR={data} FIRESTONE_RUNTIME_DIR={runtime} {executable} _vsock-proxy {name} 22"
     ))
 }
 
@@ -1349,9 +1349,7 @@ where
     let _download_thread = thread::Builder::new()
         .name("firestone-vsock-download".to_owned())
         .spawn(move || {
-            let result = io::copy(&mut download, &mut output)
-                .and_then(|_| output.flush())
-                .map(|_| ());
+            let result = copy_and_flush(&mut download, &mut output);
             let _ = download_sender.send(RelayCompletion {
                 direction: RelayDirection::SocketToOutput,
                 result,
@@ -1404,6 +1402,17 @@ where
     }
 }
 
+fn copy_and_flush<R: Read, W: Write>(input: &mut R, output: &mut W) -> io::Result<()> {
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            return output.flush();
+        }
+        output.write_all(&buffer[..read])?;
+        output.flush()?;
+    }
+}
 fn relay_closed(source: &io::Error) -> bool {
     matches!(
         source.kind(),
@@ -1887,6 +1896,40 @@ exit 23"#,
         Ok(())
     }
 
+    #[test]
+    fn proxy_command_survives_openssh_exec_prefix() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let executable = fixture.root.join("bin with space/firestone");
+        let executable_directory = executable.parent().ok_or("missing executable parent")?;
+        fs::create_dir_all(executable_directory)?;
+        let record = fixture.root.join("proxy-record");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nset -eu\nprintf '%s\n' \"$FIRESTONE_CONFIG_DIR\" \"$FIRESTONE_DATA_DIR\" \"$FIRESTONE_RUNTIME_DIR\" \"$@\" > {}\n",
+                quoted(&record)
+            ),
+        )?;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))?;
+
+        let proxy = super::proxy_command(&fixture.paths, &executable, "demo")?;
+        let expanded = proxy.replace("%%", "%");
+        let output = crate::Cmd::new("sh")
+            .arg("-c")
+            .arg(format!("exec {expanded}"))
+            .output()?;
+        assert!(output.success(), "{}", output.stderr_lossy());
+        assert_eq!(
+            fs::read_to_string(record)?,
+            format!(
+                "{}\n{}\n{}\n_vsock-proxy\ndemo\n22\n",
+                fixture.paths.config_dir().display(),
+                fixture.paths.data_dir().display(),
+                fixture.paths.runtime_dir().display(),
+            )
+        );
+        Ok(())
+    }
     #[test]
     fn readiness_plan_adds_batch_mode_without_tty() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::new()?;
