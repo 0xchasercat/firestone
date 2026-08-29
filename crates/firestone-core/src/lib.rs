@@ -22,6 +22,7 @@ pub mod shim;
 pub mod spec;
 pub mod ssh;
 pub mod state;
+pub mod virtiofs;
 pub mod vmm;
 pub mod vmm_api;
 
@@ -91,7 +92,14 @@ pub use state::{
     StateVersion, Supervision, VmmPingProbe, observe_liveness, reconcile, reconciled_state,
     verify_shim_identity,
 };
+pub use virtiofs::{
+    DEFAULT_VIRTIOFS_READINESS_POLL_INTERVAL, DEFAULT_VIRTIOFS_READINESS_TIMEOUT,
+    MAX_VIRTIOFS_MOUNTS, VHOST_USER_SOCKET_MAX_BYTES, VIRTIOFS_NUM_QUEUES, VIRTIOFS_PATH_MAX_BYTES,
+    VIRTIOFS_QUEUE_SIZE, VIRTIOFS_TAG_MAX_BYTES, VirtiofsCancellationPolicy, VirtiofsPlan,
+    VirtiofsReadinessPlan, VirtiofsSandbox, prepare_virtiofs_plans,
+    prepare_virtiofs_plans_with_readiness,
+};
 pub use vmm::{
-    CanonicalVmConfig, NetConfig, VmConfigInput, canonical_vm_config, publish_vm_config,
+    CanonicalVmConfig, FsConfig, NetConfig, VmConfigInput, canonical_vm_config, publish_vm_config,
 };
 pub use vmm_api::{VmInfo, VmState, VmmApi, VmmApiLivenessProbe, VmmPingResponse};

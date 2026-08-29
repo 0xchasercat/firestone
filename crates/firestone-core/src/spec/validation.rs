@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     fs::{self, File, OpenOptions},
     io,
     path::{Path, PathBuf},
@@ -589,34 +588,14 @@ fn validate_mounts(
     spec: &MachineSpec,
     context: &ValidationContext<'_>,
 ) -> Result<(), FirestoneError> {
-    let mut tags = HashSet::new();
+    crate::virtiofs::validate_mount_spec_layout(&spec.mounts)?;
     for (index, mount) in spec.mounts.iter().enumerate() {
         let host_key = format!("mount[{index}].host");
-        let guest_key = format!("mount[{index}].guest");
-        let tag_key = format!("mount[{index}].tag");
         if !host_path_exists(context.host, &host_key, &mount.host)? {
             return Err(invalid(
                 &host_key,
                 format!("mount source '{}' does not exist", mount.host.display()),
                 "correct the host path or create it before starting the machine",
-            ));
-        }
-        if !mount.guest.is_absolute() {
-            return Err(invalid(
-                &guest_key,
-                format!(
-                    "guest mount path '{}' is not absolute",
-                    mount.guest.display()
-                ),
-                "use an absolute guest path such as '/work'",
-            ));
-        }
-        let tag = mount.effective_tag(index);
-        if !tags.insert(tag.clone()) {
-            return Err(invalid(
-                &tag_key,
-                format!("mount tag '{tag}' is used more than once"),
-                "set a unique tag for each mount or omit tags to use share0, share1, and so on",
             ));
         }
     }
