@@ -1,5 +1,6 @@
 use std::{
     fs,
+    net::IpAddr,
     path::{Path, PathBuf},
 };
 
@@ -8,7 +9,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     Arch, CatalogFirmware, DependencyManifest, ErrorKind, FirestoneError, Firmware, MacAddr,
-    MachineSpec, MachineState, NetMode, Paths, atomic,
+    MachineSpec, MachineState, NetMode, NetworkPlan, Paths, atomic,
 };
 
 /// Inputs already resolved by image and state preparation before VMM creation.
@@ -107,16 +108,48 @@ enum ImageType {
 }
 
 #[derive(Debug, Serialize)]
-struct NetConfig {
+pub struct NetConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     tap: Option<String>,
     mac: MacAddr,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ip: Option<IpAddr>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mask: Option<IpAddr>,
     #[serde(skip_serializing_if = "Option::is_none")]
     vhost_user: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     vhost_socket: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     vhost_mode: Option<VhostMode>,
+}
+impl NetConfig {
+    /// Maps a validated M3 network plan to the exact Cloud Hypervisor v53
+    /// NetConfig fields. The vhost client role depends on verify item 14;
+    /// TAP ip and mask absence depends on verify item 8.
+    pub fn from_plan(plan: &NetworkPlan) -> Result<Option<Vec<Self>>, FirestoneError> {
+        Ok(match plan {
+            NetworkPlan::None => None,
+            NetworkPlan::Passt(plan) => Some(vec![Self {
+                tap: None,
+                mac: plan.mac(),
+                ip: None,
+                mask: None,
+                vhost_user: Some(true),
+                vhost_socket: Some(utf8_path(plan.socket().path(), "passt vhost-user socket")?),
+                vhost_mode: Some(VhostMode::Client),
+            }]),
+            NetworkPlan::Tap(plan) => Some(vec![Self {
+                tap: Some(plan.name().to_owned()),
+                mac: plan.mac(),
+                ip: plan.ip(),
+                mask: plan.mask(),
+                vhost_user: None,
+                vhost_socket: None,
+                vhost_mode: None,
+            }]),
+        })
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -245,6 +278,8 @@ fn base_vm_config(
         NetMode::Passt => Some(vec![NetConfig {
             tap: None,
             mac: state_mac(input)?,
+            ip: None,
+            mask: None,
             vhost_user: Some(true),
             vhost_socket: Some(utf8_path(
                 &paths.machine_net_socket(input.name)?,
@@ -265,6 +300,8 @@ fn base_vm_config(
                 mac: state_mac(input)?,
                 vhost_user: None,
                 vhost_socket: None,
+                ip: None,
+                mask: None,
                 vhost_mode: None,
             }])
         }
@@ -702,23 +739,23 @@ fn sort_json(value: &mut Value) {
 mod tests {
     use std::{
         collections::BTreeMap,
-        fs,
+        ffi::OsStr,
+        fs, io,
         os::unix::fs::{PermissionsExt, symlink},
         path::PathBuf,
     };
 
-    use serde_json::{Value, json};
-    use tempfile::TempDir;
-
+    use super::{
+        NetConfig, PayloadConfig, VmConfigInput, apply_merge_patch, base_vm_config,
+        canonical_vm_config, publish_vm_config,
+    };
     use crate::{
         Arch, CatalogFirmware, DependencyManifest, ErrorKind, Firmware, MachineSpec, MachineState,
-        MachineStatus, MountSpec, NetMode, PathInputs, Paths, StateImage, StateVersion,
+        MachineStatus, MountSpec, NetMode, NetworkPlan, NetworkPlanOptions, NetworkSpec,
+        PathInputs, Paths, StateImage, StateVersion, TapHost, prepare_network,
     };
-
-    use super::{
-        PayloadConfig, VmConfigInput, apply_merge_patch, base_vm_config, canonical_vm_config,
-        publish_vm_config,
-    };
+    use serde_json::{Value, json};
+    use tempfile::TempDir;
 
     struct Fixture {
         _temp: TempDir,
@@ -732,14 +769,18 @@ mod tests {
             let root = fs::canonicalize(temp.path())?;
             let paths = paths_for_root(root.clone())?;
             let machine_dir = paths.machine_dir("demo")?;
+            let runtime_dir = paths.machine_runtime_dir("demo")?;
             let bin_dir = paths.bin_dir();
             fs::create_dir_all(&machine_dir)?;
+            fs::create_dir_all(&runtime_dir)?;
             fs::create_dir_all(&bin_dir)?;
             for directory in [
                 root,
                 paths.data_dir().to_path_buf(),
                 paths.machines_dir(),
                 machine_dir,
+                paths.runtime_dir().to_path_buf(),
+                runtime_dir,
                 bin_dir,
             ] {
                 fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
@@ -1025,6 +1066,95 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn network_plans_map_to_exact_v53_json_goldens() -> Result<(), Box<dyn std::error::Error>> {
+        #[derive(serde::Serialize)]
+        struct NetworkFragment {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            net: Option<Vec<NetConfig>>,
+        }
+
+        struct ReadyTapHost;
+        impl TapHost for ReadyTapHost {
+            fn tap_device_is_tap(&self, _name: &str) -> io::Result<bool> {
+                Ok(true)
+            }
+
+            fn tun_is_accessible(&self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let fixture = Fixture::new()?;
+        let host = ReadyTapHost;
+        let mac = "52:54:00:9a:1f:c3".parse()?;
+
+        let passt_spec = NetworkSpec::default();
+        let passt = prepare_network(NetworkPlanOptions::new(
+            &fixture.paths,
+            "demo",
+            &passt_spec,
+            mac,
+            OsStr::new("passt"),
+            &host,
+        ))?;
+        assert!(matches!(&passt, NetworkPlan::Passt(_)));
+        assert_eq!(
+            serde_json::to_value(NetworkFragment {
+                net: NetConfig::from_plan(&passt)?,
+            })?,
+            json!({
+                "net": [{
+                    "mac": "52:54:00:9a:1f:c3",
+                    "vhost_user": true,
+                    "vhost_socket": fixture.paths.machine_net_socket("demo")?,
+                    "vhost_mode": "Client"
+                }]
+            })
+        );
+
+        let tap_spec = NetworkSpec {
+            mode: NetMode::Tap,
+            tap: Some("tap0".to_owned()),
+            ..NetworkSpec::default()
+        };
+        let tap = prepare_network(NetworkPlanOptions::new(
+            &fixture.paths,
+            "demo",
+            &tap_spec,
+            mac,
+            OsStr::new("passt"),
+            &host,
+        ))?;
+        assert!(matches!(&tap, NetworkPlan::Tap(_)));
+        assert_eq!(
+            serde_json::to_value(NetworkFragment {
+                net: NetConfig::from_plan(&tap)?,
+            })?,
+            json!({"net": [{"tap": "tap0", "mac": "52:54:00:9a:1f:c3"}]})
+        );
+
+        let none_spec = NetworkSpec {
+            mode: NetMode::None,
+            ..NetworkSpec::default()
+        };
+        let none = prepare_network(NetworkPlanOptions::new(
+            &fixture.paths,
+            "demo",
+            &none_spec,
+            mac,
+            OsStr::new("passt"),
+            &host,
+        ))?;
+        assert!(matches!(&none, NetworkPlan::None));
+        assert_eq!(
+            serde_json::to_value(NetworkFragment {
+                net: NetConfig::from_plan(&none)?,
+            })?,
+            json!({})
+        );
+        Ok(())
+    }
     #[test]
     fn mounts_map_to_required_v53_fs_entries() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::new()?;

@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
-    ffi::OsString,
+    env,
+    ffi::{OsStr, OsString},
     fs::{File, OpenOptions},
     io::{Read, Write},
     os::unix::{
@@ -158,6 +159,39 @@ impl Cmd {
             interactive_stdout_to_stderr: false,
         }
     }
+    #[must_use]
+    pub fn program(&self) -> &OsStr {
+        &self.program
+    }
+
+    pub fn arguments(&self) -> impl ExactSizeIterator<Item = &OsStr> {
+        self.args.iter().map(|argument| argument.value.as_os_str())
+    }
+
+    #[must_use]
+    pub const fn clears_environment(&self) -> bool {
+        self.clear_env
+    }
+
+    #[must_use]
+    pub const fn environment(&self) -> &BTreeMap<OsString, OsString> {
+        &self.env
+    }
+
+    #[must_use]
+    pub fn working_directory(&self) -> Option<&Path> {
+        self.cwd.as_deref()
+    }
+
+    #[must_use]
+    pub fn stdout_append_path(&self) -> Option<&Path> {
+        self.stdout_append.as_deref()
+    }
+
+    #[must_use]
+    pub fn stderr_append_path(&self) -> Option<&Path> {
+        self.stderr_append.as_deref()
+    }
 
     #[must_use]
     pub fn arg(mut self, value: impl Into<OsString>) -> Self {
@@ -200,6 +234,29 @@ impl Cmd {
     #[must_use]
     pub fn env_clear(mut self) -> Self {
         self.clear_env = true;
+        self
+    }
+    /// Clears the inherited environment, then copies only the process context
+    /// allowed for Firestone children.
+    #[must_use]
+    pub fn reduced_environment(mut self) -> Self {
+        self = self.env_clear();
+        for key in [
+            "PATH",
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_RUNTIME_DIR",
+        ] {
+            if let Some(value) = env::var_os(key).filter(|value| !value.is_empty()) {
+                self = self.env(key, value);
+            }
+        }
+        for (key, value) in env::vars_os() {
+            if key.to_string_lossy().starts_with("FIRESTONE_") {
+                self = self.env(key, value);
+            }
+        }
         self
     }
 

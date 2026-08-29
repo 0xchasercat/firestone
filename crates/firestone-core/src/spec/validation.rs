@@ -582,36 +582,7 @@ fn validate_network(
             "set network.tap to a user-owned interface such as 'tap0'",
         )
     })?;
-    if tap.is_empty() || tap.contains('/') || matches!(tap, "." | "..") {
-        return Err(invalid(
-            "network.tap",
-            format!("tap interface name '{tap}' is invalid"),
-            "use an interface name such as 'tap0', without path separators",
-        ));
-    }
-    let exists = context.host.tap_device_is_tap(tap).map_err(|error| {
-        dependency_with_source(
-            "network.tap",
-            format!("cannot inspect TAP interface '{tap}'"),
-            "check that /sys/class/net is mounted and readable",
-            error,
-        )
-    })?;
-    if !exists {
-        return Err(invalid(
-            "network.tap",
-            format!("interface '{tap}' does not exist or is not a TAP device"),
-            format!("create a user-owned tap named '{tap}' or choose network.mode = 'passt'"),
-        ));
-    }
-    context.host.tun_is_accessible().map_err(|error| {
-        dependency_with_source(
-            "network.tap",
-            "/dev/net/tun is not accessible for tap mode",
-            "grant this user read/write access to /dev/net/tun or choose network.mode = 'passt'",
-            error,
-        )
-    })
+    crate::network::validate_tap(tap, context.host)
 }
 
 fn validate_mounts(
@@ -954,20 +925,6 @@ fn invalid_with_source(
     source: impl std::error::Error + Send + Sync + 'static,
 ) -> FirestoneError {
     invalid(key, message, hint).with_source(source)
-}
-
-fn dependency_with_source(
-    key: &str,
-    message: impl Into<String>,
-    hint: impl Into<String>,
-    source: impl std::error::Error + Send + Sync + 'static,
-) -> FirestoneError {
-    FirestoneError::new(
-        ErrorKind::Dependency,
-        format!("cannot validate '{key}': {}", message.into()),
-    )
-    .with_hint(hint)
-    .with_source(source)
 }
 
 #[cfg(test)]

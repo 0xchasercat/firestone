@@ -14,6 +14,7 @@ pub mod error;
 pub mod event;
 pub mod image;
 pub mod lock;
+pub mod network;
 pub mod paths;
 pub mod readiness;
 pub mod result;
@@ -51,6 +52,12 @@ pub use image::{
     PreparedMachineImage, PulledImage, ResolvedImageSource, StoredImage,
 };
 pub use lock::MachineLock;
+pub use network::{
+    DEFAULT_NETWORK_READINESS_POLL_INTERVAL, DEFAULT_NETWORK_READINESS_TIMEOUT, NetworkPlan,
+    NetworkPlanOptions, OwnedPathExpectation, PINNED_PASST_VERSION, PasstPlan,
+    ReadinessCancellation, SocketReadiness, SocketReadinessPlan, TapHost, TapOwnership, TapPlan,
+    passt_forward_argument, prepare_network, validate_tap,
+};
 pub use paths::{PathInputs, Paths};
 pub use readiness::{ReadinessOptions, wait_for_ssh_ready};
 pub use result::{
@@ -84,5 +91,7 @@ pub use state::{
     StateVersion, Supervision, VmmPingProbe, observe_liveness, reconcile, reconciled_state,
     verify_shim_identity,
 };
-pub use vmm::{CanonicalVmConfig, VmConfigInput, canonical_vm_config, publish_vm_config};
+pub use vmm::{
+    CanonicalVmConfig, NetConfig, VmConfigInput, canonical_vm_config, publish_vm_config,
+};
 pub use vmm_api::{VmInfo, VmState, VmmApi, VmmApiLivenessProbe, VmmPingResponse};
