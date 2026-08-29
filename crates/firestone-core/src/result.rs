@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{LogSource, MachineSpec, MachineState, MachineStatus, SpecWarning, Supervision};
@@ -110,6 +112,22 @@ impl From<&SpecWarning> for SpecWarningPayload {
 pub struct SpecResult {
     pub spec: MachineSpec,
     pub warnings: Vec<SpecWarningPayload>,
+}
+
+/// Process and dependency versions returned by the REST version route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionResult {
+    pub version: String,
+    pub deps: BTreeMap<String, String>,
+    pub paths: VersionPaths,
+}
+
+/// Resolved process-wide roots exposed by the REST version route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionPaths {
+    pub config: String,
+    pub data: String,
+    pub runtime: String,
 }
 
 #[cfg(test)]

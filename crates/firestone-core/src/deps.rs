@@ -96,6 +96,15 @@ impl DependencyManifest {
         self.manifest_version
     }
 
+    /// Returns every pinned dependency version in deterministic name order.
+    #[must_use]
+    pub fn versions(&self) -> BTreeMap<String, String> {
+        self.dependencies
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.version.clone()))
+            .collect()
+    }
+
     pub fn version(&self, dependency: &str) -> Result<&str, FirestoneError> {
         self.entry(dependency).map(|entry| entry.version.as_str())
     }

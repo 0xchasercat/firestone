@@ -1,3 +1,4 @@
+pub mod api;
 mod cli;
 mod render;
 mod store;
@@ -5,9 +6,7 @@ mod store;
 use std::{
     env,
     ffi::{OsStr, OsString},
-    fs,
-    future::Future,
-    io,
+    fs, io,
     io::IsTerminal,
     os::unix::process::ExitStatusExt,
     path::Path,
@@ -16,7 +15,6 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    task::{Context, Poll, Wake, Waker},
     thread,
     time::Duration,
 };
@@ -24,9 +22,9 @@ use std::{
 use clap::{Parser, error::ErrorKind as ClapErrorKind};
 use firestone_core::{
     Action, Catalog, Dispatcher, ErrorKind, Event, EventSink, FirestoneError, GlobalConfig,
-    ImageRef, Level, MachineSpec, MachineSpecPatch, MachineStatus, PathInputs, Paths,
-    ProcessSignal, RawTerminal, RealValidationHost, RunResult, ShellResult, SshConfigResult,
-    ValidationContext, console_plan, relay_console, shell_ssh_plan, ssh_config_plan,
+    ImageRef, MachineSpec, MachineSpecPatch, MachineStatus, PathInputs, Paths, ProcessSignal,
+    RawTerminal, RealValidationHost, RunResult, ShellResult, SshConfigResult, ValidationContext,
+    block_on, console_plan, relay_console, shell_ssh_plan, ssh_config_plan,
 };
 
 use crate::{
@@ -97,30 +95,6 @@ fn main() -> ExitCode {
     let result = block_on(run(cli, &mut renderer));
     ExitCode::from(finish_command(result, &mut renderer))
 }
-struct ThreadWake(thread::Thread);
-
-impl Wake for ThreadWake {
-    fn wake(self: Arc<Self>) {
-        self.0.unpark();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.0.unpark();
-    }
-}
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let waker = Waker::from(Arc::new(ThreadWake(thread::current())));
-    let mut context = Context::from_waker(&waker);
-    let mut future = std::pin::pin!(future);
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(output) => return output,
-            Poll::Pending => thread::park(),
-        }
-    }
-}
-
 fn hidden_shim_name(arguments: &[std::ffi::OsString]) -> Option<&str> {
     if arguments.len() != 3
         || arguments.get(1).map(OsString::as_os_str) != Some(OsStr::new("_shim"))
@@ -328,12 +302,6 @@ where
             let edit = request.edit;
             let (name, loaded) =
                 load_create_spec(request, &inputs.current_dir, &paths, &global, &catalog)?;
-            for warning in &loaded.warnings {
-                renderer.emit(Event::Log {
-                    level: Level::Warn,
-                    message: format!("{}: {}", warning.key, warning.message),
-                })?;
-            }
             let dispatcher =
                 LocalDispatcher::new(paths, global, catalog).with_source_base(source_base);
             if edit {
@@ -613,7 +581,7 @@ where
     let has_spec_flags = forbidden_patch != MachineSpecPatch::default();
 
     let exact_machine = dispatcher.find_terminal_machine(&target)?;
-    let (name, machine, create_spec, warnings) = if let Some(machine) = exact_machine {
+    let (name, machine, create_spec) = if let Some(machine) = exact_machine {
         if requested_name.is_some() || has_spec_flags {
             return Err(FirestoneError::new(
                 ErrorKind::Usage,
@@ -625,7 +593,7 @@ where
                 "use firestone edit {target} to change its specification"
             )));
         }
-        (target, Some(machine), None, Vec::new())
+        (target, Some(machine), None)
     } else {
         let image = ImageRef::new(target.clone());
         let name = match requested_name {
@@ -669,18 +637,11 @@ where
                         "use firestone edit {name} to change its specification"
                     )));
                 }
-                (name, Some(machine), None, Vec::new())
+                (name, Some(machine), None)
             }
-            None => (name, None, Some(loaded.spec), loaded.warnings),
+            None => (name, None, Some(loaded.spec)),
         }
     };
-
-    for warning in warnings {
-        renderer.emit(Event::Log {
-            level: Level::Warn,
-            message: format!("{}: {}", warning.key, warning.message),
-        })?;
-    }
 
     let created = create_spec.is_some();
     let mut machine = match (machine, create_spec) {

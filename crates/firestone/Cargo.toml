@@ -6,8 +6,11 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+axum.workspace = true
 clap.workspace = true
 firestone-core = { path = "../firestone-core" }
+hyper.workspace = true
+hyperlocal.workspace = true
 jiff.workspace = true
 nix.workspace = true
 serde.workspace = true
@@ -15,13 +18,17 @@ serde_json.workspace = true
 shlex.workspace = true
 signal-hook.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 fs2.workspace = true
-sha2.workspace = true
-wait-timeout.workspace = true
+http-body-util.workspace = true
 nix.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tower.workspace = true
+wait-timeout.workspace = true
+
 [lints]
 workspace = true

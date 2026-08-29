@@ -694,7 +694,7 @@ fn write_safe_text<W: Write>(writer: &mut W, value: &str) -> io::Result<()> {
     }
     Ok(())
 }
-fn write_safe_output<W: Write>(writer: &mut W, value: &str) -> io::Result<()> {
+pub(crate) fn write_safe_output<W: Write>(writer: &mut W, value: &str) -> io::Result<()> {
     let mut encoded = [0_u8; 4];
     for character in value.chars() {
         if character == '\n' {
