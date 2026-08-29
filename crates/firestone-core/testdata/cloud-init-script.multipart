@@ -1,0 +1,10 @@
+Content-Type: multipart/mixed; boundary="===============firestone=="
+MIME-Version: 1.0
+
+--===============firestone==
+Content-Type: text/x-shellscript; charset="utf-8"
+Content-Disposition: attachment; filename="user-script.sh"
+
+#!/bin/sh
+printf "%s\n" "snowman ☃: # literal"
+--===============firestone==--

@@ -1,14 +1,18 @@
 use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
-    io::{self, Read},
+    io,
     path::{Path, PathBuf},
 };
 
 use ssh_key::PublicKey;
 
 use super::{Arch, ByteSize, MachineSpec, NetMode};
-use crate::{Catalog, ErrorKind, FirestoneError, Paths};
+use crate::{
+    Catalog, ErrorKind, FirestoneError, Paths,
+    bounded::{self, BoundedReadError},
+    cloudinit::{MAX_NETWORK_CONFIG_BYTES, MAX_SSH_KEY_FILE_BYTES, MAX_USER_DATA_BYTES},
+};
 
 /// A non-fatal spec issue surfaced consistently by each interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,7 +32,7 @@ pub trait ValidationHost: Send + Sync {
     fn path_is_file(&self, path: &Path) -> io::Result<bool>;
     fn canonicalize_regular_nofollow(&self, path: &Path) -> io::Result<PathBuf>;
     fn path_is_executable(&self, path: &Path) -> io::Result<bool>;
-    fn read_regular_file(&self, path: &Path) -> io::Result<Vec<u8>>;
+    fn read_regular_file(&self, path: &Path, limit: u64) -> io::Result<Vec<u8>>;
     fn tap_device_is_tap(&self, name: &str) -> io::Result<bool>;
     fn tun_is_accessible(&self) -> io::Result<()>;
 }
@@ -95,14 +99,16 @@ impl ValidationHost for RealValidationHost {
             Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
         }
     }
-    fn read_regular_file(&self, path: &Path) -> io::Result<Vec<u8>> {
+    fn read_regular_file(&self, path: &Path, limit: u64) -> io::Result<Vec<u8>> {
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
 
-            options.custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits());
+            options.custom_flags(
+                nix::fcntl::OFlag::O_NONBLOCK.bits() | nix::fcntl::OFlag::O_CLOEXEC.bits(),
+            );
         }
 
         let mut file = options.open(path)?;
@@ -112,10 +118,13 @@ impl ValidationHost for RealValidationHost {
                 format!("'{}' is not a regular file", path.display()),
             ));
         }
-
-        let mut contents = Vec::new();
-        file.read_to_end(&mut contents)?;
-        Ok(contents)
+        bounded::read_to_end(&mut file, limit).map_err(|error| match error {
+            BoundedReadError::Io(error) => error,
+            BoundedReadError::LimitExceeded => io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("'{}' exceeds the read limit", path.display()),
+            ),
+        })
     }
 
     fn tap_device_is_tap(&self, name: &str) -> io::Result<bool> {
@@ -652,15 +661,23 @@ fn validate_cloud_init(
             context.host,
             "cloud_init.user_data",
             path,
-            "correct the path and make the file readable",
+            MAX_USER_DATA_BYTES,
+            "1 MiB",
+            "correct the path and provide UTF-8 user-data of 1 MiB or less",
         )?;
-        let first_line = match contents.split(|byte| *byte == b'\n').next() {
-            Some(line) => match line.strip_suffix(b"\r") {
-                Some(stripped) => stripped,
-                None => line,
-            },
-            None => &[],
-        };
+        std::str::from_utf8(&contents).map_err(|error| {
+            invalid_with_source(
+                "cloud_init.user_data",
+                format!("user-data file '{}' is not UTF-8", path.display()),
+                "save user-data as UTF-8 without changing its cloud-init header",
+                error,
+            )
+        })?;
+        let first_line = contents
+            .split(|byte| *byte == b'\n')
+            .next()
+            .unwrap_or_default();
+        let first_line = first_line.strip_suffix(b"\r").unwrap_or(first_line);
         if first_line != b"#cloud-config" && !first_line.starts_with(b"#!") {
             return Err(invalid(
                 "cloud_init.user_data",
@@ -674,12 +691,22 @@ fn validate_cloud_init(
     }
 
     if let Some(path) = &spec.cloud_init.network_config {
-        read_required_file(
+        let contents = read_required_file(
             context.host,
             "cloud_init.network_config",
             path,
-            "correct the path and make the file readable",
+            MAX_NETWORK_CONFIG_BYTES,
+            "1 MiB",
+            "correct the path and provide UTF-8 network-config of 1 MiB or less",
         )?;
+        std::str::from_utf8(&contents).map_err(|error| {
+            invalid_with_source(
+                "cloud_init.network_config",
+                format!("network-config file '{}' is not UTF-8", path.display()),
+                "save network-config as UTF-8 YAML",
+                error,
+            )
+        })?;
     }
 
     for (index, path) in spec.cloud_init.ssh_keys.iter().enumerate() {
@@ -688,7 +715,9 @@ fn validate_cloud_init(
             context.host,
             &key,
             path,
-            "correct the path and provide an OpenSSH public-key file",
+            MAX_SSH_KEY_FILE_BYTES,
+            "64 KiB",
+            "correct the path and provide an OpenSSH public-key file of 64 KiB or less",
         )?;
         let text = std::str::from_utf8(&contents).map_err(|error| {
             invalid_with_source(
@@ -871,10 +900,12 @@ fn read_required_file(
     host: &dyn ValidationHost,
     key: &str,
     path: &Path,
+    limit: u64,
+    limit_label: &str,
     hint: impl Into<String>,
 ) -> Result<Vec<u8>, FirestoneError> {
     let hint = hint.into();
-    match host.read_regular_file(path) {
+    match host.read_regular_file(path, limit) {
         Ok(contents) => Ok(contents),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Err(invalid_with_source(
             key,
@@ -885,6 +916,12 @@ fn read_required_file(
         Err(error) if error.kind() == io::ErrorKind::InvalidInput => Err(invalid_with_source(
             key,
             format!("'{}' is not a regular file", path.display()),
+            hint,
+            error,
+        )),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => Err(invalid_with_source(
+            key,
+            format!("file '{}' exceeds {limit_label}", path.display()),
             hint,
             error,
         )),
@@ -902,7 +939,6 @@ fn read_required_file(
         )),
     }
 }
-
 fn invalid(key: &str, message: impl Into<String>, hint: impl Into<String>) -> FirestoneError {
     FirestoneError::new(
         ErrorKind::InvalidSpec,
@@ -944,8 +980,8 @@ mod tests {
     };
 
     use super::{
-        RealValidationHost, SpecWarning, ValidationContext, ValidationHost, read_required_file,
-        validate_machine_spec,
+        MAX_USER_DATA_BYTES, RealValidationHost, SpecWarning, ValidationContext, ValidationHost,
+        read_required_file, validate_machine_spec,
     };
     use crate::{
         Arch, ByteSize, Catalog, CloudInitSpecPatch, ErrorKind, Firmware, MachineSpec,
@@ -1040,10 +1076,16 @@ mod tests {
             Ok(self.executable.contains(path))
         }
 
-        fn read_regular_file(&self, path: &Path) -> io::Result<Vec<u8>> {
+        fn read_regular_file(&self, path: &Path, limit: u64) -> io::Result<Vec<u8>> {
             if let Some(contents) = self.files.get(path) {
                 if !self.readable.contains(path) {
                     return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+                }
+                if contents.len() as u64 > limit {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "file exceeds the read limit",
+                    ));
                 }
                 return Ok(contents.clone());
             }
@@ -1778,6 +1820,8 @@ checksum_alg = "sha256"
             &host,
             "cloud_init.user_data",
             directory.path(),
+            MAX_USER_DATA_BYTES,
+            "1 MiB",
             "choose a regular file",
         )
         .expect_err("directory is not a regular file");
@@ -1797,12 +1841,34 @@ checksum_alg = "sha256"
             &host,
             "cloud_init.user_data",
             &path,
+            MAX_USER_DATA_BYTES,
+            "1 MiB",
             "make the file readable",
         )
         .expect_err("unreadable regular file");
 
         assert_invalid_key(&error, "cloud_init.user_data");
         assert!(error.message().contains("not readable"));
+    }
+
+    #[test]
+    fn required_file_over_limit_returns_keyed_error() {
+        let mut host = FakeHost::default();
+        host.add_file("/machines/dev/user-data", b"#cloud-config\n".to_vec());
+        let path = PathBuf::from("/machines/dev/user-data");
+
+        let error = read_required_file(
+            &host,
+            "cloud_init.user_data",
+            &path,
+            4,
+            "4 bytes",
+            "reduce the file",
+        )
+        .expect_err("oversized regular file");
+
+        assert_invalid_key(&error, "cloud_init.user_data");
+        assert!(error.message().contains("exceeds 4 bytes"));
     }
 
     #[cfg(unix)]
@@ -1821,6 +1887,8 @@ checksum_alg = "sha256"
             &host,
             "cloud_init.user_data",
             &path,
+            MAX_USER_DATA_BYTES,
+            "1 MiB",
             "choose a regular file",
         )
         .expect_err("FIFO is not a regular file");
@@ -1838,6 +1906,8 @@ checksum_alg = "sha256"
             &host,
             "cloud_init.user_data",
             Path::new("/dev/null"),
+            MAX_USER_DATA_BYTES,
+            "1 MiB",
             "choose a regular file",
         )
         .expect_err("character device is not a regular file");
@@ -1860,6 +1930,8 @@ checksum_alg = "sha256"
             &host,
             "cloud_init.user_data",
             &link,
+            MAX_USER_DATA_BYTES,
+            "1 MiB",
             "choose a regular file",
         )
         .expect("read symlink target");
