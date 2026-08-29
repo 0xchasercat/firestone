@@ -1,8 +1,8 @@
 use std::{
-    fs::{self, DirBuilder, File},
+    fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Seek, SeekFrom, Write},
-    os::unix::fs::{DirBuilderExt, PermissionsExt},
-    path::Path,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
 };
 
 use fatfs::{
@@ -14,7 +14,9 @@ use sha2::{Digest, Sha256};
 use ssh_key::PublicKey;
 
 use crate::{
-    ErrorKind, FirestoneError, MachineSpec, Paths, atomic, catalog::SshdPath,
+    ErrorKind, FirestoneError, MachineSpec, Paths, atomic,
+    bounded::{self, BoundedReadError},
+    catalog::SshdPath,
     spec::validate_guest_user,
 };
 
@@ -22,6 +24,12 @@ const FIRESTONE_TEMPLATE: &str = include_str!("../../../templates/cloud-init.yam
 const MIME_BOUNDARY: &str = "===============firestone==";
 const VOLUME_LABEL: [u8; 11] = *b"CIDATA     ";
 const VOLUME_ID: u32 = 0x4653_0001;
+const FIRESTONE_PUBLIC_KEY_MODE: u32 = 0o644;
+const MAX_FIRESTONE_PUBLIC_KEY_BYTES: u64 = 16 * 1024;
+pub(crate) const MAX_USER_DATA_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_NETWORK_CONFIG_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_SSH_KEY_FILE_BYTES: u64 = 64 * 1024;
+const MAX_RENDERED_SSH_KEYS_BYTES: usize = 256 * 1024;
 pub const SEED_IMAGE_SIZE: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug)]
@@ -71,6 +79,40 @@ struct TemplateMount {
     readonly: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserDataKind {
+    CloudConfig,
+    ShellScript,
+}
+
+impl UserDataKind {
+    const fn content_type(self) -> &'static str {
+        match self {
+            Self::CloudConfig => "text/cloud-config",
+            Self::ShellScript => "text/x-shellscript",
+        }
+    }
+
+    const fn filename(self) -> &'static str {
+        match self {
+            Self::CloudConfig => "user-cloud-config.yaml",
+            Self::ShellScript => "user-script.sh",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct UserDataPart {
+    kind: UserDataKind,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct ParsedPublicKey {
+    rendered: String,
+    parsed: PublicKey,
+}
+
 /// Renders Firestone-owned cloud-init content with the default guest sshd path.
 pub fn render_cloud_init(
     paths: &Paths,
@@ -115,49 +157,67 @@ fn render_cloud_init_inner(
     firestone_pubkey: &str,
     sshd_path: &SshdPath,
 ) -> Result<RenderedCloudInit, FirestoneError> {
-    paths.machine_dir(name)?;
-    reject_deferred_inputs(spec)?;
+    let machine_dir = paths.machine_dir(name)?;
     validate_guest_user(&spec.user)?;
 
-    let user_data = if spec.cloud_init.provisioning {
-        let firestone_pubkey = validate_supplied_firestone_public_key(firestone_pubkey)?;
-        let user_keys = read_user_public_keys(&spec.cloud_init.ssh_keys)?;
-        let mounts = spec
-            .mounts
-            .iter()
-            .enumerate()
-            .map(|(index, mount)| {
-                let guest = mount.guest.to_str().ok_or_else(|| {
-                    FirestoneError::new(
-                        ErrorKind::InvalidSpec,
-                        format!(
-                            "mount[{index}].guest '{}' is not UTF-8",
-                            mount.guest.display()
-                        ),
-                    )
-                    .with_hint("use a UTF-8 guest mount path")
-                })?;
-                Ok(TemplateMount {
-                    tag: json_string(&mount.effective_tag(index))?,
-                    guest: json_string(guest)?,
-                    readonly: mount.readonly,
-                })
-            })
-            .collect::<Result<Vec<_>, FirestoneError>>()?;
-        let firestone_part = render_firestone_part(
-            name,
-            &spec.user,
-            firestone_pubkey,
-            &user_keys,
-            &mounts,
-            sshd_path,
-        )?;
-        render_multipart(&firestone_part)
+    let user_data = match &spec.cloud_init.user_data {
+        Some(path) => {
+            let path = paths.resolve_input_path(path, &machine_dir, "cloud_init.user_data")?;
+            Some(read_user_data_file(&path)?)
+        }
+        None => None,
+    };
+    let network_config = match &spec.cloud_init.network_config {
+        Some(path) => {
+            let path = paths.resolve_input_path(path, &machine_dir, "cloud_init.network_config")?;
+            Some(read_network_config_file(&path)?)
+        }
+        None => None,
+    };
+    let user_keys = if spec.cloud_init.provisioning {
+        read_user_public_keys(paths, &machine_dir, &spec.cloud_init.ssh_keys)?
     } else {
         Vec::new()
     };
 
-    let instance_id = instance_id(name, &user_data);
+    render_cloud_init_bytes(
+        name,
+        spec,
+        firestone_pubkey,
+        sshd_path,
+        user_data,
+        network_config,
+        user_keys,
+    )
+}
+
+fn render_cloud_init_bytes(
+    name: &str,
+    spec: &MachineSpec,
+    firestone_pubkey: &str,
+    sshd_path: &SshdPath,
+    user_data: Option<UserDataPart>,
+    network_config: Option<Vec<u8>>,
+    user_keys: Vec<ParsedPublicKey>,
+) -> Result<RenderedCloudInit, FirestoneError> {
+    let firestone_part = if spec.cloud_init.provisioning {
+        let firestone_key = validate_supplied_firestone_public_key(firestone_pubkey)?;
+        let user_keys = deduplicate_user_keys(&firestone_key.parsed, user_keys);
+        let mounts = render_template_mounts(spec)?;
+        Some(render_firestone_part(
+            name,
+            &spec.user,
+            &firestone_key.rendered,
+            &user_keys,
+            &mounts,
+            sshd_path,
+        )?)
+    } else {
+        None
+    };
+
+    let rendered_user_data = render_multipart(user_data.as_ref(), firestone_part.as_deref());
+    let instance_id = instance_id(name, &rendered_user_data, network_config.as_deref());
     let meta_data = format!(
         r#"instance-id: {}
 local-hostname: {}
@@ -170,9 +230,33 @@ local-hostname: {}
     Ok(RenderedCloudInit {
         instance_id,
         meta_data,
-        user_data,
-        network_config: None,
+        user_data: rendered_user_data,
+        network_config,
     })
+}
+
+fn render_template_mounts(spec: &MachineSpec) -> Result<Vec<TemplateMount>, FirestoneError> {
+    spec.mounts
+        .iter()
+        .enumerate()
+        .map(|(index, mount)| {
+            let guest = mount.guest.to_str().ok_or_else(|| {
+                FirestoneError::new(
+                    ErrorKind::InvalidSpec,
+                    format!(
+                        "mount[{index}].guest '{}' is not UTF-8",
+                        mount.guest.display()
+                    ),
+                )
+                .with_hint("use a UTF-8 guest mount path")
+            })?;
+            Ok(TemplateMount {
+                tag: json_string(&mount.effective_tag(index))?,
+                guest: json_string(guest)?,
+                readonly: mount.readonly,
+            })
+        })
+        .collect()
 }
 
 /// Renders inspection files and atomically publishes a deterministic CIDATA disk.
@@ -225,48 +309,165 @@ fn publish_rendered_seed(
     Ok(rendered)
 }
 
-fn reject_deferred_inputs(spec: &MachineSpec) -> Result<(), FirestoneError> {
-    if spec.cloud_init.user_data.is_some() {
+fn read_user_data_file(path: &Path) -> Result<UserDataPart, FirestoneError> {
+    let bytes = read_bounded_user_file(
+        path,
+        "cloud_init.user_data",
+        MAX_USER_DATA_BYTES,
+        "1 MiB",
+        "correct the path or reduce the user-data file to 1 MiB or less",
+    )?;
+    parse_user_data(bytes, &format!("file '{}'", path.display()))
+}
+
+fn parse_user_data(bytes: Vec<u8>, source_label: &str) -> Result<UserDataPart, FirestoneError> {
+    std::str::from_utf8(&bytes).map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::InvalidSpec,
+            format!("cloud_init.user_data {source_label} is not UTF-8"),
+        )
+        .with_hint("save user-data as UTF-8 without changing its cloud-init header")
+        .with_source(source)
+    })?;
+    let first_line = bytes
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let first_line = first_line.strip_suffix(b"\r").unwrap_or(first_line);
+    let kind = if first_line == b"#cloud-config" {
+        UserDataKind::CloudConfig
+    } else if first_line.starts_with(b"#!") {
+        UserDataKind::ShellScript
+    } else {
         return Err(FirestoneError::new(
             ErrorKind::InvalidSpec,
-            "cloud_init.user_data is not supported during M1 seed rendering",
+            format!("cloud_init.user_data {source_label} has an unsupported first line"),
         )
-        .with_hint("remove cloud_init.user_data; user-provided multipart data is enabled in M3"));
-    }
-    if spec.cloud_init.network_config.is_some() {
+        .with_hint("start user-data with '#cloud-config' or a '#!' interpreter line"));
+    };
+    Ok(UserDataPart { kind, bytes })
+}
+
+fn read_network_config_file(path: &Path) -> Result<Vec<u8>, FirestoneError> {
+    let bytes = read_bounded_user_file(
+        path,
+        "cloud_init.network_config",
+        MAX_NETWORK_CONFIG_BYTES,
+        "1 MiB",
+        "correct the path or reduce the network-config file to 1 MiB or less",
+    )?;
+    std::str::from_utf8(&bytes).map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::InvalidSpec,
+            format!(
+                "cloud_init.network_config file '{}' is not UTF-8",
+                path.display()
+            ),
+        )
+        .with_hint("save network-config as UTF-8 YAML")
+        .with_source(source)
+    })?;
+    Ok(bytes)
+}
+
+fn read_bounded_user_file(
+    path: &Path,
+    key: &str,
+    limit: u64,
+    limit_label: &str,
+    hint: &'static str,
+) -> Result<Vec<u8>, FirestoneError> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK);
+    let mut file = options.open(path).map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::InvalidSpec,
+            format!("cannot open {key} file '{}'", path.display()),
+        )
+        .with_hint(hint)
+        .with_source(source)
+    })?;
+    let metadata = file.metadata().map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::InvalidSpec,
+            format!("cannot inspect {key} file '{}'", path.display()),
+        )
+        .with_hint(hint)
+        .with_source(source)
+    })?;
+    if !metadata.is_file() {
         return Err(FirestoneError::new(
             ErrorKind::InvalidSpec,
-            "cloud_init.network_config is not supported during M1 seed rendering",
+            format!("{key} path '{}' is not a regular file", path.display()),
         )
-        .with_hint(
-            "remove cloud_init.network_config; its instance-id formula and publication are enabled in M3",
-        ));
+        .with_hint(hint));
     }
-    Ok(())
+    match bounded::read_to_end(&mut file, limit) {
+        Ok(bytes) => Ok(bytes),
+        Err(BoundedReadError::LimitExceeded) => Err(FirestoneError::new(
+            ErrorKind::InvalidSpec,
+            format!("{key} file '{}' exceeds {limit_label}", path.display()),
+        )
+        .with_hint(hint)),
+        Err(BoundedReadError::Io(source)) => Err(FirestoneError::new(
+            ErrorKind::InvalidSpec,
+            format!("cannot read {key} file '{}'", path.display()),
+        )
+        .with_hint(hint)
+        .with_source(source)),
+    }
 }
 
 fn read_firestone_public_key(paths: &Paths) -> Result<String, FirestoneError> {
     let path = paths.ssh_public_key();
     paths.validate_ssh_data_directory()?;
-    let metadata = fs::symlink_metadata(&path).map_err(|source| {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK);
+    let mut file = options.open(&path).map_err(|source| {
         FirestoneError::new(
             ErrorKind::Dependency,
-            format!("cannot read Firestone SSH public key at {}", path.display()),
+            format!("cannot open Firestone SSH public key at {}", path.display()),
         )
         .with_hint("run `firestone doctor --fix` to generate the Firestone SSH key")
         .with_source(source)
     })?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return Err(FirestoneError::new(
-            ErrorKind::Dependency,
-            format!(
-                "Firestone SSH public key {} is not a regular non-symlink file",
-                path.display()
-            ),
-        )
-        .with_hint("run `firestone doctor --fix` to regenerate the Firestone SSH key"));
-    }
-    let keys = read_public_key_file(&path, "Firestone SSH public key", ErrorKind::Dependency)?;
+    paths.validate_owned_data_file_handle(
+        &path,
+        "Firestone SSH public key",
+        FIRESTONE_PUBLIC_KEY_MODE,
+        &file,
+    )?;
+    let bytes = match bounded::read_to_end(&mut file, MAX_FIRESTONE_PUBLIC_KEY_BYTES) {
+        Ok(bytes) => bytes,
+        Err(BoundedReadError::LimitExceeded) => {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "Firestone SSH public key '{}' exceeds 16 KiB",
+                    path.display()
+                ),
+            )
+            .with_hint("run `firestone doctor --fix` to regenerate the Firestone SSH key"));
+        }
+        Err(BoundedReadError::Io(source)) => {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!("cannot read Firestone SSH public key at {}", path.display()),
+            )
+            .with_hint("run `firestone doctor --fix` to regenerate the Firestone SSH key")
+            .with_source(source));
+        }
+    };
+    let mut keys = parse_public_keys(
+        &bytes,
+        &path,
+        "Firestone SSH public key",
+        ErrorKind::Dependency,
+    )?;
     if keys.len() != 1 {
         return Err(FirestoneError::new(
             ErrorKind::Dependency,
@@ -277,7 +478,7 @@ fn read_firestone_public_key(paths: &Paths) -> Result<String, FirestoneError> {
         )
         .with_hint("run `firestone doctor --fix` to regenerate the Firestone SSH key"));
     }
-    keys.into_iter().next().ok_or_else(|| {
+    keys.pop().map(|key| key.rendered).ok_or_else(|| {
         FirestoneError::new(
             ErrorKind::Dependency,
             format!(
@@ -288,51 +489,75 @@ fn read_firestone_public_key(paths: &Paths) -> Result<String, FirestoneError> {
         .with_hint("run `firestone doctor --fix` to regenerate the Firestone SSH key")
     })
 }
-fn validate_supplied_firestone_public_key(value: &str) -> Result<&str, FirestoneError> {
-    let value = value.trim();
-    let valid = !value.is_empty()
-        && value.lines().count() == 1
-        && !value.starts_with('#')
-        && PublicKey::from_openssh(value).is_ok();
-    if !valid {
-        return Err(FirestoneError::new(
-            ErrorKind::InvalidSpec,
-            "supplied Firestone SSH public key must contain exactly one valid OpenSSH key",
-        )
-        .with_hint("supply one OpenSSH public-key line without surrounding content"));
+
+fn validate_supplied_firestone_public_key(value: &str) -> Result<ParsedPublicKey, FirestoneError> {
+    let rendered = value.trim();
+    if rendered.is_empty() || rendered.lines().count() != 1 || rendered.starts_with('#') {
+        return Err(invalid_supplied_firestone_key());
     }
-    Ok(value)
+    let parsed = PublicKey::from_openssh(rendered).map_err(|_| invalid_supplied_firestone_key())?;
+    Ok(ParsedPublicKey {
+        rendered: rendered.to_owned(),
+        parsed,
+    })
 }
 
-fn read_user_public_keys(paths: &[std::path::PathBuf]) -> Result<Vec<String>, FirestoneError> {
+fn invalid_supplied_firestone_key() -> FirestoneError {
+    FirestoneError::new(
+        ErrorKind::InvalidSpec,
+        "supplied Firestone SSH public key must contain exactly one valid OpenSSH key",
+    )
+    .with_hint("supply one OpenSSH public-key line without surrounding content")
+}
+
+fn read_user_public_keys(
+    paths: &Paths,
+    machine_dir: &Path,
+    configured_paths: &[PathBuf],
+) -> Result<Vec<ParsedPublicKey>, FirestoneError> {
+    let mut total_bytes = 0_usize;
     let mut keys = Vec::new();
-    for path in paths {
-        let mut file_keys =
-            read_public_key_file(path, "cloud_init.ssh_keys entry", ErrorKind::InvalidSpec)?;
-        keys.append(&mut file_keys);
+    for (index, configured_path) in configured_paths.iter().enumerate() {
+        let key = format!("cloud_init.ssh_keys[{index}]");
+        let path = paths.resolve_input_path(configured_path, machine_dir, &key)?;
+        let bytes = read_bounded_user_file(
+            &path,
+            &key,
+            MAX_SSH_KEY_FILE_BYTES,
+            "64 KiB",
+            "correct the path or provide an OpenSSH public-key file of 64 KiB or less",
+        )?;
+        total_bytes = total_bytes.checked_add(bytes.len()).ok_or_else(|| {
+            FirestoneError::new(
+                ErrorKind::InvalidSpec,
+                "cloud_init.ssh_keys contents exceed the supported size",
+            )
+            .with_hint("reduce the configured public-key files to 256 KiB in total")
+        })?;
+        if total_bytes > MAX_RENDERED_SSH_KEYS_BYTES {
+            return Err(FirestoneError::new(
+                ErrorKind::InvalidSpec,
+                "cloud_init.ssh_keys contents exceed 256 KiB in total",
+            )
+            .with_hint("reduce the configured public-key files to 256 KiB in total"));
+        }
+        keys.extend(parse_public_keys(
+            &bytes,
+            &path,
+            "cloud_init.ssh_keys entry",
+            ErrorKind::InvalidSpec,
+        )?);
     }
     Ok(keys)
 }
 
-fn read_public_key_file(
+fn parse_public_keys(
+    bytes: &[u8],
     path: &Path,
     description: &str,
     kind: ErrorKind,
-) -> Result<Vec<String>, FirestoneError> {
-    let bytes = fs::read(path).map_err(|source| {
-        let hint = if kind == ErrorKind::Dependency {
-            "run `firestone doctor --fix` to generate the Firestone SSH key"
-        } else {
-            "correct the path or replace it with a readable OpenSSH public-key file"
-        };
-        FirestoneError::new(
-            kind,
-            format!("cannot read {description} at {}", path.display()),
-        )
-        .with_hint(hint)
-        .with_source(source)
-    })?;
-    let text = std::str::from_utf8(&bytes).map_err(|source| {
+) -> Result<Vec<ParsedPublicKey>, FirestoneError> {
+    let text = std::str::from_utf8(bytes).map_err(|source| {
         FirestoneError::new(
             kind,
             format!("{description} at {} is not UTF-8", path.display()),
@@ -347,7 +572,7 @@ fn read_public_key_file(
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
     {
-        PublicKey::from_openssh(line).map_err(|source| {
+        let parsed = PublicKey::from_openssh(line).map_err(|source| {
             FirestoneError::new(
                 kind,
                 format!(
@@ -358,7 +583,10 @@ fn read_public_key_file(
             .with_hint("replace the invalid line with an OpenSSH public key")
             .with_source(source)
         })?;
-        keys.push(line.to_owned());
+        keys.push(ParsedPublicKey {
+            rendered: line.to_owned(),
+            parsed,
+        });
     }
 
     if keys.is_empty() {
@@ -369,6 +597,21 @@ fn read_public_key_file(
         .with_hint("add at least one OpenSSH public key"));
     }
     Ok(keys)
+}
+
+fn deduplicate_user_keys(firestone_key: &PublicKey, keys: Vec<ParsedPublicKey>) -> Vec<String> {
+    let mut unique = Vec::<ParsedPublicKey>::new();
+    for key in keys {
+        if key.parsed.key_data() == firestone_key.key_data()
+            || unique
+                .iter()
+                .any(|existing| existing.parsed.key_data() == key.parsed.key_data())
+        {
+            continue;
+        }
+        unique.push(key);
+    }
+    unique.into_iter().map(|key| key.rendered).collect()
 }
 
 fn render_firestone_part(
@@ -430,21 +673,65 @@ fn template_error(source: minijinja::Error) -> FirestoneError {
     .with_source(source)
 }
 
-fn render_multipart(firestone_part: &[u8]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(firestone_part.len() + 320);
-    bytes.extend_from_slice(
-        format!(
-            "Content-Type: multipart/mixed; boundary=\"{MIME_BOUNDARY}\"\r\nMIME-Version: 1.0\r\n\r\n--{MIME_BOUNDARY}\r\nContent-Type: text/cloud-config; charset=\"utf-8\"\r\nContent-Disposition: attachment; filename=\"firestone-cloud-config.yaml\"\r\n\r\n"
-        )
-        .as_bytes(),
-    );
-    bytes.extend_from_slice(firestone_part);
-    bytes.extend_from_slice(format!("--{MIME_BOUNDARY}--\r\n").as_bytes());
+fn render_multipart(user_part: Option<&UserDataPart>, firestone_part: Option<&[u8]>) -> Vec<u8> {
+    if user_part.is_none() && firestone_part.is_none() {
+        return Vec::new();
+    }
+
+    let body_bytes =
+        user_part.map_or(0, |part| part.bytes.len()) + firestone_part.map_or(0, <[u8]>::len);
+    let mut bytes = Vec::with_capacity(body_bytes.saturating_add(640));
+    bytes.extend_from_slice(b"Content-Type: multipart/mixed; boundary=\"");
+    bytes.extend_from_slice(MIME_BOUNDARY.as_bytes());
+    bytes.extend_from_slice(b"\"\r\nMIME-Version: 1.0\r\n\r\n");
+
+    if let Some(part) = user_part {
+        append_mime_part(
+            &mut bytes,
+            part.kind.content_type(),
+            part.kind.filename(),
+            &part.bytes,
+        );
+    }
+    if let Some(part) = firestone_part {
+        append_mime_part(
+            &mut bytes,
+            "text/cloud-config",
+            "firestone-cloud-config.yaml",
+            part,
+        );
+    }
+    bytes.extend_from_slice(b"--");
+    bytes.extend_from_slice(MIME_BOUNDARY.as_bytes());
+    bytes.extend_from_slice(b"--\r\n");
     bytes
 }
 
-fn instance_id(name: &str, user_data: &[u8]) -> String {
-    let digest = Sha256::digest(user_data);
+fn append_mime_part(bytes: &mut Vec<u8>, content_type: &str, filename: &str, body: &[u8]) {
+    bytes.extend_from_slice(b"--");
+    bytes.extend_from_slice(MIME_BOUNDARY.as_bytes());
+    bytes.extend_from_slice(b"\r\nContent-Type: ");
+    bytes.extend_from_slice(content_type.as_bytes());
+    bytes.extend_from_slice(b"; charset=\"utf-8\"\r\nContent-Disposition: attachment; filename=\"");
+    bytes.extend_from_slice(filename.as_bytes());
+    bytes.extend_from_slice(b"\"\r\n\r\n");
+    bytes.extend_from_slice(body);
+    bytes.extend_from_slice(b"\r\n");
+}
+
+fn instance_id(name: &str, user_data: &[u8], network_config: Option<&[u8]>) -> String {
+    let mut hasher = Sha256::new();
+    match network_config {
+        Some(network_config) => {
+            hasher.update(b"firestone-instance-v1\0");
+            hasher.update((user_data.len() as u64).to_be_bytes());
+            hasher.update(user_data);
+            hasher.update((network_config.len() as u64).to_be_bytes());
+            hasher.update(network_config);
+        }
+        None => hasher.update(user_data),
+    }
+    let digest = hasher.finalize();
     let mut prefix = String::with_capacity(12);
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for byte in &digest[..6] {
@@ -550,7 +837,7 @@ mod tests {
         fs,
         io::{Cursor, Read},
         os::unix::fs::{PermissionsExt, symlink},
-        path::PathBuf,
+        path::{Path, PathBuf},
     };
 
     use fatfs::{FileSystem, FsOptions};
@@ -560,15 +847,22 @@ mod tests {
     use crate::{ErrorKind, MachineSpec, MountSpec, PathInputs, Paths, SshdPath};
 
     use super::{
-        SEED_IMAGE_SIZE, VOLUME_ID, publish_seed, publish_seed_with_sshd_path, render_cloud_init,
-        render_cloud_init_with_guest_ssh,
+        MAX_NETWORK_CONFIG_BYTES, MAX_SSH_KEY_FILE_BYTES, MAX_USER_DATA_BYTES, SEED_IMAGE_SIZE,
+        VOLUME_ID, parse_public_keys, parse_user_data, publish_seed, publish_seed_with_sshd_path,
+        render_cloud_init, render_cloud_init_bytes, render_cloud_init_with_guest_ssh,
     };
 
     const FIRESTONE_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKg0J8YPh7wARkZSlBzFAoJez6gssTQUuPu4Qy3z8T1P firestone@test\n";
     const USER_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN6eVqR0T6lRuT6aGvdMVhZkcNrD1s8g8J3RYfLZBuo5 user@test\n";
+    const SECOND_USER_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN6eVqR0T6lRuT6aGvdMVhZkcNrD1s8g8J3RYfLZBuo4 second@test\n";
+    const USER_CLOUD_CONFIG: &str = "#cloud-config\nhostname: \"user: # wins\"\ndisable_root: true\nssh_authorized_keys:\n  - \"user supplied\"\nwrite_files:\n  - path: /etc/user-wins\n    content: \"snowman ☃: # literal\"\nmounts:\n  - [\"user-tag\", \"/user\", \"virtiofs\", \"ro\", \"0\", \"0\"]\nruncmd:\n  - [sh, -c, \"printf user\"]\n";
+    const SCRIPT_USER_DATA: &str = "#!/bin/sh\nprintf \"%s\\n\" \"snowman ☃: # literal\"";
     const GOLDEN_MULTIPART: &[u8] = include_bytes!("../testdata/cloud-init.multipart");
+    const GOLDEN_USER_MULTIPART: &[u8] = include_bytes!("../testdata/cloud-init-user.multipart");
+    const GOLDEN_SCRIPT_MULTIPART: &[u8] =
+        include_bytes!("../testdata/cloud-init-script.multipart");
     const GOLDEN_SEED_SHA256: &str =
-        "d4ad73c9803e42e2d9f77c42efc907945ec9d0f1f0be633db74b744e59a22fd4";
+        "eddaac95d6ca1cb7ecb174c67788df8d19b06f51dda0ab9c15df72c79f14771d";
 
     struct Fixture {
         _temp: TempDir,
@@ -605,9 +899,35 @@ mod tests {
                 fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
             }
             if with_key {
-                fs::write(paths.ssh_public_key(), FIRESTONE_KEY)?;
+                let public_key = paths.ssh_public_key();
+                fs::write(&public_key, FIRESTONE_KEY)?;
+                fs::set_permissions(&public_key, fs::Permissions::from_mode(0o644))?;
             }
             Ok(Self { _temp: temp, paths })
+        }
+    }
+    fn layered_spec(key_path: PathBuf) -> MachineSpec {
+        MachineSpec {
+            user: "ubuntu".to_owned(),
+            cloud_init: crate::CloudInitSpec {
+                ssh_keys: vec![key_path],
+                ..crate::CloudInitSpec::default()
+            },
+            mounts: vec![
+                MountSpec {
+                    host: PathBuf::from("/host/code"),
+                    guest: PathBuf::from("/work"),
+                    readonly: false,
+                    tag: None,
+                },
+                MountSpec {
+                    host: PathBuf::from("/host/archive"),
+                    guest: PathBuf::from("/archive"),
+                    readonly: true,
+                    tag: Some("archive".to_owned()),
+                },
+            ],
+            ..MachineSpec::default()
         }
     }
 
@@ -633,7 +953,7 @@ mod tests {
     }
 
     #[test]
-    fn multipart_firestone_inputs_matches_golden_bytes() -> Result<(), Box<dyn std::error::Error>> {
+    fn multipart_absent_user_data_matches_golden_bytes() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::new(true)?;
         let user_key = fixture.paths.machine_dir("demo")?.join("user.pub");
         fs::write(&user_key, USER_KEY)?;
@@ -673,7 +993,7 @@ mod tests {
             rendered.user_data.len(),
             GOLDEN_MULTIPART.len()
         );
-        assert_eq!(rendered.instance_id, "iid-demo-390b75d3a7b4");
+        assert_eq!(rendered.instance_id, "iid-demo-77caef92bee2");
         assert_eq!(
             rendered.meta_data,
             format!(
@@ -683,6 +1003,95 @@ mod tests {
             .as_bytes()
         );
         assert!(rendered.network_config.is_none());
+        Ok(())
+    }
+    #[test]
+    fn multipart_inline_cloud_config_matches_golden_bytes() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let spec = layered_spec(PathBuf::from("inline.pub"));
+        let user_keys = parse_public_keys(
+            USER_KEY.as_bytes(),
+            Path::new("inline.pub"),
+            "inline key",
+            ErrorKind::InvalidSpec,
+        )?;
+        let user_data =
+            parse_user_data(USER_CLOUD_CONFIG.as_bytes().to_vec(), "inline cloud-config")?;
+
+        let rendered = render_cloud_init_bytes(
+            "demo",
+            &spec,
+            FIRESTONE_KEY.trim(),
+            &SshdPath::default(),
+            Some(user_data),
+            None,
+            user_keys,
+        )?;
+
+        assert_eq!(rendered.user_data, GOLDEN_USER_MULTIPART);
+        assert_eq!(rendered.instance_id, "iid-demo-331c6c041fc0");
+        Ok(())
+    }
+
+    #[test]
+    fn multipart_relative_path_cloud_config_matches_inline_and_seed_goldens()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(true)?;
+        let machine_dir = fixture.paths.machine_dir("demo")?;
+        fs::write(machine_dir.join("user-data.yaml"), USER_CLOUD_CONFIG)?;
+        fs::write(machine_dir.join("user.pub"), USER_KEY)?;
+        let mut spec = layered_spec(PathBuf::from("user.pub"));
+        spec.cloud_init.user_data = Some(PathBuf::from("user-data.yaml"));
+
+        let rendered = render_cloud_init(&fixture.paths, "demo", &spec)?;
+        let repeated = render_cloud_init(&fixture.paths, "demo", &spec)?;
+        assert_eq!(rendered, repeated);
+        assert_eq!(rendered.user_data, GOLDEN_USER_MULTIPART);
+        assert_eq!(rendered.instance_id, "iid-demo-331c6c041fc0");
+
+        let published = publish_seed(&fixture.paths, "demo", &spec)?;
+        let seed = fs::read(fixture.paths.machine_seed_image("demo")?)?;
+        assert_eq!(published, rendered);
+        assert_eq!(
+            hex_digest(&seed),
+            "5ed7766c9b604f97659c2e4ee3b4a4ad5de143498a40381b42164983f68991b8"
+        );
+        verify_seed_filesystem(&seed, &published)?;
+        Ok(())
+    }
+
+    #[test]
+    fn multipart_user_precedes_firestone_merge_directive() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let user_offset = find_bytes(GOLDEN_USER_MULTIPART, USER_CLOUD_CONFIG.as_bytes())
+            .ok_or("missing user cloud-config")?;
+        let firestone_offset = find_bytes(
+            GOLDEN_USER_MULTIPART,
+            b"#cloud-config\nmerge_how: \"list(append)+dict(recurse_dict,recurse_list,no_replace)+str()\"\n",
+        )
+        .ok_or("missing Firestone merge directive")?;
+
+        assert!(user_offset < firestone_offset);
+        assert!(GOLDEN_USER_MULTIPART.starts_with(
+            b"Content-Type: multipart/mixed; boundary=\"===============firestone==\"\r\nMIME-Version: 1.0\r\n\r\n"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn provisioning_false_shellscript_matches_golden_without_identity_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let machine_dir = fixture.paths.machine_dir("demo")?;
+        fs::write(machine_dir.join("user-script.sh"), SCRIPT_USER_DATA)?;
+        let mut spec = MachineSpec::default();
+        spec.cloud_init.provisioning = false;
+        spec.cloud_init.user_data = Some(PathBuf::from("user-script.sh"));
+
+        let rendered = render_cloud_init(&fixture.paths, "demo", &spec)?;
+
+        assert_eq!(rendered.user_data, GOLDEN_SCRIPT_MULTIPART);
+        assert_eq!(rendered.instance_id, "iid-demo-bb5567ea0d31");
         Ok(())
     }
 
@@ -911,50 +1320,268 @@ mod tests {
     }
 
     #[test]
-    fn configured_user_data_returns_stable_invalid_spec_error()
+    fn network_config_path_publishes_exact_bytes_and_changes_identity()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::new(true)?;
+        let machine_dir = fixture.paths.machine_dir("demo")?;
+        let network_path = machine_dir.join("network.yaml");
+        let first_bytes = b"version: 2\nethernets:\n  eth0:\n    dhcp4: true\n";
+        let second_bytes = b"version: 2\nethernets:\n  eth0:\n    dhcp4: false\n";
+        fs::write(&network_path, first_bytes)?;
+        let without_network = render_cloud_init(&fixture.paths, "demo", &MachineSpec::default())?;
         let mut spec = MachineSpec::default();
-        spec.cloud_init.user_data = Some(PathBuf::from("/tmp/user-data"));
+        spec.cloud_init.network_config = Some(PathBuf::from("network.yaml"));
 
-        let error = render_cloud_init(&fixture.paths, "demo", &spec)
-            .err()
-            .ok_or("configured user data should fail")?;
+        let first = publish_seed(&fixture.paths, "demo", &spec)?;
+        let repeated = render_cloud_init(&fixture.paths, "demo", &spec)?;
+        assert_eq!(first, repeated);
+        assert_eq!(
+            first.network_config.as_deref(),
+            Some(first_bytes.as_slice())
+        );
+        assert_eq!(first.instance_id, "iid-demo-6be2ed98af05");
+        assert_ne!(first.instance_id, without_network.instance_id);
+        assert_eq!(
+            fs::read(fixture.paths.machine_seed_file("demo", "network-config")?)?,
+            first_bytes
+        );
 
-        assert_eq!(error.kind(), ErrorKind::InvalidSpec);
+        fs::write(&network_path, second_bytes)?;
+        let changed = publish_seed(&fixture.paths, "demo", &spec)?;
         assert_eq!(
-            error.message(),
-            "cloud_init.user_data is not supported during M1 seed rendering"
+            changed.network_config.as_deref(),
+            Some(second_bytes.as_slice())
         );
-        assert_eq!(
-            error.hint(),
-            Some("remove cloud_init.user_data; user-provided multipart data is enabled in M3")
-        );
+        assert_eq!(changed.instance_id, "iid-demo-3fb3e38f47a8");
+        assert_ne!(changed.instance_id, first.instance_id);
+        let seed = fs::read(fixture.paths.machine_seed_image("demo")?)?;
+        verify_seed_filesystem(&seed, &changed)?;
         Ok(())
     }
 
     #[test]
-    fn configured_network_config_returns_stable_invalid_spec_error()
+    fn user_data_symlink_to_regular_file_matches_direct_path()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::new(true)?;
+        let machine_dir = fixture.paths.machine_dir("demo")?;
+        let target = machine_dir.join("target.yaml");
+        let link = machine_dir.join("link.yaml");
+        fs::write(&target, USER_CLOUD_CONFIG)?;
+        symlink(&target, &link)?;
         let mut spec = MachineSpec::default();
-        spec.cloud_init.network_config = Some(PathBuf::from("/tmp/network-config"));
+        spec.cloud_init.user_data = Some(PathBuf::from("link.yaml"));
+        let linked = render_cloud_init(&fixture.paths, "demo", &spec)?;
 
-        let error = render_cloud_init(&fixture.paths, "demo", &spec)
+        spec.cloud_init.user_data = Some(PathBuf::from("target.yaml"));
+        let direct = render_cloud_init(&fixture.paths, "demo", &spec)?;
+
+        assert_eq!(linked, direct);
+        fs::write(&target, "#cloud-config\nhostname: changed\n")?;
+        let changed = render_cloud_init(&fixture.paths, "demo", &spec)?;
+        assert_eq!(changed.instance_id, "iid-demo-2aa289e6ac6e");
+        assert_ne!(changed.instance_id, direct.instance_id);
+        Ok(())
+    }
+
+    #[test]
+    fn user_data_size_and_utf8_errors_are_bounded() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(true)?;
+        let machine_dir = fixture.paths.machine_dir("demo")?;
+        let path = machine_dir.join("user-data.yaml");
+        let mut oversized = b"#cloud-config\n".to_vec();
+        oversized.resize(MAX_USER_DATA_BYTES as usize + 1, b'x');
+        fs::write(&path, oversized)?;
+        let mut spec = MachineSpec::default();
+        spec.cloud_init.user_data = Some(PathBuf::from("user-data.yaml"));
+
+        let size_error = render_cloud_init(&fixture.paths, "demo", &spec)
             .err()
-            .ok_or("configured network config should fail")?;
+            .ok_or("oversized user-data should fail")?;
+        assert_eq!(size_error.kind(), ErrorKind::InvalidSpec);
+        assert!(size_error.message().contains("exceeds 1 MiB"));
 
-        assert_eq!(error.kind(), ErrorKind::InvalidSpec);
-        assert_eq!(
-            error.message(),
-            "cloud_init.network_config is not supported during M1 seed rendering"
+        fs::write(&path, b"#cloud-config\nvalue: \xff\n")?;
+        let utf8_error = render_cloud_init(&fixture.paths, "demo", &spec)
+            .err()
+            .ok_or("non-UTF-8 user-data should fail")?;
+        assert_eq!(utf8_error.kind(), ErrorKind::InvalidSpec);
+        assert!(utf8_error.message().contains("is not UTF-8"));
+        Ok(())
+    }
+
+    #[test]
+    fn network_config_size_and_utf8_errors_are_bounded() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(true)?;
+        let machine_dir = fixture.paths.machine_dir("demo")?;
+        let path = machine_dir.join("network.yaml");
+        fs::write(&path, vec![b'x'; MAX_NETWORK_CONFIG_BYTES as usize + 1])?;
+        let mut spec = MachineSpec::default();
+        spec.cloud_init.network_config = Some(PathBuf::from("network.yaml"));
+
+        let size_error = render_cloud_init(&fixture.paths, "demo", &spec)
+            .err()
+            .ok_or("oversized network-config should fail")?;
+        assert_eq!(size_error.kind(), ErrorKind::InvalidSpec);
+        assert!(size_error.message().contains("exceeds 1 MiB"));
+
+        fs::write(&path, b"version: \xff\n")?;
+        let utf8_error = render_cloud_init(&fixture.paths, "demo", &spec)
+            .err()
+            .ok_or("non-UTF-8 network-config should fail")?;
+        assert_eq!(utf8_error.kind(), ErrorKind::InvalidSpec);
+        assert!(utf8_error.message().contains("is not UTF-8"));
+        Ok(())
+    }
+
+    #[test]
+    fn ssh_key_size_and_utf8_errors_are_bounded() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(true)?;
+        let machine_dir = fixture.paths.machine_dir("demo")?;
+        let path = machine_dir.join("user.pub");
+        fs::write(&path, vec![b'x'; MAX_SSH_KEY_FILE_BYTES as usize + 1])?;
+        let mut spec = MachineSpec::default();
+        spec.cloud_init.ssh_keys = vec![PathBuf::from("user.pub")];
+
+        let size_error = render_cloud_init(&fixture.paths, "demo", &spec)
+            .err()
+            .ok_or("oversized public-key file should fail")?;
+        assert_eq!(size_error.kind(), ErrorKind::InvalidSpec);
+        assert!(size_error.message().contains("exceeds 64 KiB"));
+
+        fs::write(&path, b"ssh-ed25519 \xff\n")?;
+        let utf8_error = render_cloud_init(&fixture.paths, "demo", &spec)
+            .err()
+            .ok_or("non-UTF-8 public-key file should fail")?;
+        assert_eq!(utf8_error.kind(), ErrorKind::InvalidSpec);
+        assert!(utf8_error.message().contains("is not UTF-8"));
+        Ok(())
+    }
+
+    #[test]
+    fn ssh_key_deduplication_preserves_first_seen_order_and_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(true)?;
+        let machine_dir = fixture.paths.machine_dir("demo")?;
+        let user_blob = public_key_blob(USER_KEY)?;
+        let second_blob = public_key_blob(SECOND_USER_KEY)?;
+        let firestone_blob = public_key_blob(FIRESTONE_KEY)?;
+        let first_user = format!("ssh-ed25519 {user_blob} user:\" # first\n");
+        let first_second = format!("ssh-ed25519 {second_blob} second first\n");
+        fs::write(
+            machine_dir.join("keys-one.pub"),
+            format!("{first_user}ssh-ed25519 {user_blob} duplicate user\n{first_second}"),
+        )?;
+        fs::write(
+            machine_dir.join("keys-two.pub"),
+            format!(
+                "ssh-ed25519 {second_blob} duplicate second\nssh-ed25519 {firestone_blob} duplicate identity\n"
+            ),
+        )?;
+        let mut spec = MachineSpec::default();
+        spec.cloud_init.ssh_keys =
+            vec![PathBuf::from("keys-one.pub"), PathBuf::from("keys-two.pub")];
+
+        let rendered = render_cloud_init(&fixture.paths, "demo", &spec)?;
+        let text = std::str::from_utf8(&rendered.user_data)?;
+        assert_eq!(text.matches(firestone_blob).count(), 2);
+        assert_eq!(text.matches(user_blob).count(), 2);
+        assert_eq!(text.matches(second_blob).count(), 2);
+        assert!(text.contains("user:\\\" # first"));
+        assert!(!text.contains("duplicate user"));
+        assert!(!text.contains("duplicate second"));
+        assert!(!text.contains("duplicate identity"));
+        assert!(
+            text.find(user_blob).ok_or("missing first user key")?
+                < text.find(second_blob).ok_or("missing second user key")?
         );
+
+        fs::write(
+            machine_dir.join("keys-clean.pub"),
+            format!("{first_user}{first_second}"),
+        )?;
+        spec.cloud_init.ssh_keys = vec![PathBuf::from("keys-clean.pub")];
+        let clean = render_cloud_init(&fixture.paths, "demo", &spec)?;
+        assert_eq!(rendered, clean);
+        assert_eq!(rendered.instance_id, "iid-demo-82b55541fe2b");
+        Ok(())
+    }
+
+    #[test]
+    fn instance_id_tracks_rendered_user_key_user_and_mount_bytes_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(true)?;
+        let machine_dir = fixture.paths.machine_dir("demo")?;
+        fs::write(machine_dir.join("user.pub"), USER_KEY)?;
+
+        let baseline = render_cloud_init(&fixture.paths, "demo", &MachineSpec::default())?;
+        assert_eq!(baseline.instance_id, "iid-demo-dd4f451e0c43");
         assert_eq!(
-            error.hint(),
-            Some(
-                "remove cloud_init.network_config; its instance-id formula and publication are enabled in M3"
-            )
+            render_cloud_init(&fixture.paths, "demo", &MachineSpec::default())?,
+            baseline
         );
+
+        let mut unrelated = MachineSpec {
+            cpus: 7,
+            ..MachineSpec::default()
+        };
+        assert_eq!(
+            render_cloud_init(&fixture.paths, "demo", &unrelated)?.instance_id,
+            baseline.instance_id
+        );
+
+        unrelated.user = "ubuntu".to_owned();
+        let changed_user = render_cloud_init(&fixture.paths, "demo", &unrelated)?;
+        assert_eq!(changed_user.instance_id, "iid-demo-1cdcb9351f3c");
+        assert_ne!(changed_user.instance_id, baseline.instance_id);
+
+        let mut key_spec = MachineSpec::default();
+        key_spec.cloud_init.ssh_keys = vec![PathBuf::from("user.pub")];
+        let changed_key = render_cloud_init(&fixture.paths, "demo", &key_spec)?;
+        assert_eq!(changed_key.instance_id, "iid-demo-9d17ff3299fb");
+        assert_ne!(changed_key.instance_id, baseline.instance_id);
+
+        let mut mount_spec = MachineSpec {
+            mounts: vec![MountSpec {
+                host: PathBuf::from("/host/one"),
+                guest: PathBuf::from("/work: # \\\"snow\\\""),
+                readonly: false,
+                tag: None,
+            }],
+            ..MachineSpec::default()
+        };
+        let changed_mount = render_cloud_init(&fixture.paths, "demo", &mount_spec)?;
+        assert_eq!(changed_mount.instance_id, "iid-demo-fc1e09393a54");
+        assert_ne!(changed_mount.instance_id, baseline.instance_id);
+        assert!(
+            std::str::from_utf8(&changed_mount.user_data)?
+                .contains("[\"share0\", \"/work: # \\\\\\\"snow\\\\\\\"\", \"virtiofs\"")
+        );
+
+        mount_spec.mounts[0].host = PathBuf::from("/host/two");
+        let host_only = render_cloud_init(&fixture.paths, "demo", &mount_spec)?;
+        assert_eq!(host_only.instance_id, changed_mount.instance_id);
+        mount_spec.mounts[0].readonly = true;
+        let readonly = render_cloud_init(&fixture.paths, "demo", &mount_spec)?;
+        assert_ne!(readonly.instance_id, changed_mount.instance_id);
+        Ok(())
+    }
+
+    #[test]
+    fn firestone_public_key_wrong_mode_is_rejected_before_render()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(true)?;
+        fs::set_permissions(
+            fixture.paths.ssh_public_key(),
+            fs::Permissions::from_mode(0o600),
+        )?;
+
+        let error = render_cloud_init(&fixture.paths, "demo", &MachineSpec::default())
+            .err()
+            .ok_or("wrong public-key mode should fail")?;
+
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert!(error.message().contains("mode 0644"));
+        assert!(!fixture.paths.machine_seed_image("demo")?.exists());
         Ok(())
     }
 
@@ -1027,13 +1654,29 @@ mod tests {
         assert!(
             error
                 .message()
-                .contains("cannot read Firestone SSH public key")
+                .contains("cannot open Firestone SSH public key")
         );
         assert_eq!(
             error.hint(),
             Some("run `firestone doctor --fix` to generate the Firestone SSH key")
         );
         Ok(())
+    }
+
+    fn public_key_blob(value: &str) -> Result<&str, Box<dyn std::error::Error>> {
+        value
+            .split_whitespace()
+            .nth(1)
+            .ok_or_else(|| "public-key fixture has no encoded key".into())
+    }
+
+    fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() {
+            return Some(0);
+        }
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
     }
 
     fn hex_digest(bytes: &[u8]) -> String {
@@ -1061,12 +1704,17 @@ mod tests {
             .into_iter()
             .filter(|entry| entry.is_file())
             .collect::<Vec<_>>();
+        let expected_names = if rendered.network_config.is_some() {
+            vec!["meta-data", "user-data", "network-config"]
+        } else {
+            vec!["meta-data", "user-data"]
+        };
         assert_eq!(
             entries
                 .iter()
                 .map(|entry| entry.file_name())
                 .collect::<Vec<_>>(),
-            ["meta-data", "user-data"]
+            expected_names
         );
         for entry in &entries {
             assert_eq!(entry.created(), super::fixed_date_time());
@@ -1080,6 +1728,12 @@ mod tests {
         root.open_file("user-data")?.read_to_end(&mut user_data)?;
         assert_eq!(meta_data, rendered.meta_data);
         assert_eq!(user_data, rendered.user_data);
+        if let Some(expected) = &rendered.network_config {
+            let mut network_config = Vec::new();
+            root.open_file("network-config")?
+                .read_to_end(&mut network_config)?;
+            assert_eq!(&network_config, expected);
+        }
         Ok(())
     }
 }

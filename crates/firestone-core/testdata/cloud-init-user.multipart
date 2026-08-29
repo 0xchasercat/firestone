@@ -3,6 +3,23 @@ MIME-Version: 1.0
 
 --===============firestone==
 Content-Type: text/cloud-config; charset="utf-8"
+Content-Disposition: attachment; filename="user-cloud-config.yaml"
+
+#cloud-config
+hostname: "user: # wins"
+disable_root: true
+ssh_authorized_keys:
+  - "user supplied"
+write_files:
+  - path: /etc/user-wins
+    content: "snowman ☃: # literal"
+mounts:
+  - ["user-tag", "/user", "virtiofs", "ro", "0", "0"]
+runcmd:
+  - [sh, -c, "printf user"]
+
+--===============firestone==
+Content-Type: text/cloud-config; charset="utf-8"
 Content-Disposition: attachment; filename="firestone-cloud-config.yaml"
 
 #cloud-config
