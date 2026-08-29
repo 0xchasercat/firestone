@@ -4,12 +4,12 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 
 ## Current position
 
-- Milestone: M5 Linux MVP implementation; M0 through M2 are complete, M3/M4 code is merged, and their KVM acceptance is externally blocked
-- Baseline: all shared lifecycle, shell, sidecar, REST, Unix serve, and real-process equivalence behavior through M4 is merged and green in Ubuntu CI
+- Milestone: Linux x86_64 MVP implementation complete; final KVM acceptance is externally blocked
+- Baseline: M0-M5 code, PTY UX, REST/serve, catalog, doctor matrix, user guide, completions, and reproducible x86_64 release artifacts are merged and green in Ubuntu CI
 - Linux validation host: `firestone@172.203.242.136`, Ubuntu 24.04 x86_64, `/dev/kvm` present
 - Required local gate: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`
 - Required integration gate: the same commands on the Linux host
-- KVM blocker: the only validation host times out on TCP/22; M3 E2E 3/4/8, M4 E2E 9, and final KVM acceptance remain open with secure gated harnesses merged or staged
+- KVM blocker: the only validation host times out on TCP/22; M3 E2E 3/4/8, M4 E2E 9, catalog E2E 11, and final combined acceptance remain open with secure gated harnesses
 
 ## Work queue
 
@@ -44,9 +44,9 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 | M4-02 | Serve CLI and HTTP runtime integration | `agent/m4-serve` | [#27](https://github.com/0xchasercat/firestone/pull/27) | complete | M4-01 | Unix-only mode-0600 listener, secure stale/conflict handling, identity-safe cleanup, concurrent requests, bounded signal drain, and real CLI/curl smoke pass; final Ubuntu CI is green |
 | M4-03 | M4 REST equivalence and E2E integration | `agent/m4-integration` | [#28](https://github.com/0xchasercat/firestone/pull/28) | blocked | M4-01, M4-02 | Real CLI/Unix-serve equivalence, streaming, 204, locking, disconnect, and restart pass; secure E2E 9 harness is merged, but E2E 9 awaits the unreachable KVM host |
 | M5-01 | CLI progress, timing, output polish, and error hints | `agent/m5-cli-polish` | [#31](https://github.com/0xchasercat/firestone/pull/31) | complete | M4 implementation | Real PTY coverage proves ordered repeated rows, resize-safe updates, timing/rates, color gates, SIGINT cleanup, and exact termios restore; non-TTY, JSON, quiet, and broken-pipe contracts remain deterministic; bounded process/VMM diagnostics retain stable kinds, context, hints, and safe log/body previews; local stable/1.85 and final-head Ubuntu CI pass |
-| M5-02 | Completions, version, and Linux release artifacts | `agent/m5-release` | [#29](https://github.com/0xchasercat/firestone/pull/29) | in review | M4 implementation | All five clap-complete shells have deterministic hidden-free snapshots; `version` shares exact human/JSON identity, architecture, dependency-checksum, and Paths data; pinned native CI builds byte-reproducible static x86_64 artifacts plus SHA256SUMS and gates aarch64 compilation without a runtime claim |
-| M5-03 | Catalog gate, fresh-host doctor matrix, and user guide | `agent/m5-docs-catalog` | [#30](https://github.com/0xchasercat/firestone/pull/30) | blocked | M4 implementation | Dated authoritative x86_64 catalog sources, Ubuntu/Fedora/Arch unprivileged doctor matrices, and the Linux MVP guide pass; E2E 11 and verify 3 await the unreachable KVM host, with aarch64 runtime still deferred |
-| M5-04 | Final Linux x86_64 MVP acceptance | `agent/m5-integration` | pending | blocked | M3-05, M4-03, M5-01 through M5-03 | Full Linux x86_64 E2E and release gates pass; aarch64 runtime, non-Linux authority, and hostile wrappers remain explicitly deferred |
+| M5-02 | Completions, version, and Linux release artifacts | `agent/m5-release` | [#29](https://github.com/0xchasercat/firestone/pull/29) | complete | M4 implementation | Five deterministic hidden-free completions, shared version metadata, reproducible static x86_64 artifacts/SHA256SUMS, and compile-only aarch64 gate pass; no release or aarch64 runtime claim |
+| M5-03 | Catalog gate, fresh-host doctor matrix, and user guide | `agent/m5-docs-catalog` | [#30](https://github.com/0xchasercat/firestone/pull/30) | complete | M4 implementation | Authoritative x86_64 catalog sources, Ubuntu/Fedora/Arch unprivileged doctor matrices, and Linux MVP guide pass; E2E 11/verify 3 remain final KVM gates |
+| M5-04 | Final Linux x86_64 MVP acceptance | `agent/m5-integration` | pending | blocked | M3-05, M4-03, M5-01 through M5-03 | Full Linux x86_64 E2E and release gates await the unreachable KVM host; aarch64 runtime, non-Linux authority, and hostile wrappers remain explicitly deferred |
 
 ## Merge order
 
