@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     ffi::OsString,
@@ -35,7 +36,8 @@ pub const DEFAULT_VIRTIOFS_READINESS_TIMEOUT: Duration = Duration::from_secs(10)
 pub const DEFAULT_VIRTIOFS_READINESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Isolation selected after the user-namespace doctor check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VirtiofsSandbox {
     Namespace,
     None,
@@ -141,6 +143,33 @@ pub struct VirtiofsPlan {
     readiness: VirtiofsReadinessPlan,
     owner_uid: u32,
 }
+/// Exact cross-process form of one prepared virtiofsd plan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VirtiofsPlanSnapshot {
+    index: usize,
+    tag: String,
+    host: PathBuf,
+    guest: PathBuf,
+    readonly: bool,
+    sandbox: VirtiofsSandbox,
+    program: PathBuf,
+    args: Vec<OsString>,
+    socket: PathBuf,
+    pid_file: PathBuf,
+    log: PathBuf,
+    readiness_timeout_ms: u64,
+    readiness_poll_interval_ms: u64,
+    owner_uid: u32,
+}
+fn snapshot_duration_millis(duration: Duration, label: &str) -> Result<u64, FirestoneError> {
+    u64::try_from(duration.as_millis()).map_err(|_| {
+        FirestoneError::new(
+            ErrorKind::Usage,
+            format!("{label} cannot be represented in the launch plan"),
+        )
+    })
+}
 
 impl VirtiofsPlan {
     #[must_use]
@@ -210,6 +239,52 @@ impl VirtiofsPlan {
     #[must_use]
     pub const fn queue_size(&self) -> u16 {
         VIRTIOFS_QUEUE_SIZE
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<VirtiofsPlanSnapshot, FirestoneError> {
+        Ok(VirtiofsPlanSnapshot {
+            index: self.index,
+            tag: self.tag.clone(),
+            host: self.host.clone(),
+            guest: self.guest.clone(),
+            readonly: self.readonly,
+            sandbox: self.sandbox,
+            program: self.program.clone(),
+            args: self.args.clone(),
+            socket: self.socket.clone(),
+            pid_file: self.pid_file.clone(),
+            log: self.log.clone(),
+            readiness_timeout_ms: snapshot_duration_millis(
+                self.readiness.timeout(),
+                "virtiofsd readiness timeout",
+            )?,
+            readiness_poll_interval_ms: snapshot_duration_millis(
+                self.readiness.poll_interval(),
+                "virtiofsd readiness poll interval",
+            )?,
+            owner_uid: self.owner_uid,
+        })
+    }
+
+    pub(crate) fn from_snapshot(snapshot: VirtiofsPlanSnapshot) -> Result<Self, FirestoneError> {
+        Ok(Self {
+            index: snapshot.index,
+            tag: snapshot.tag,
+            host: snapshot.host,
+            guest: snapshot.guest,
+            readonly: snapshot.readonly,
+            sandbox: snapshot.sandbox,
+            program: snapshot.program,
+            args: snapshot.args,
+            socket: snapshot.socket,
+            pid_file: snapshot.pid_file,
+            log: snapshot.log,
+            readiness: VirtiofsReadinessPlan::new(
+                Duration::from_millis(snapshot.readiness_timeout_ms),
+                Duration::from_millis(snapshot.readiness_poll_interval_ms),
+            )?,
+            owner_uid: snapshot.owner_uid,
+        })
     }
 
     /// Builds the shared process wrapper without starting the sidecar.
@@ -309,19 +384,6 @@ impl VirtiofsPlan {
 struct MountShape {
     tag: String,
     guest: PathBuf,
-}
-
-pub(crate) fn validated_vm_fs_identity(
-    paths: &Paths,
-    name: &str,
-    index: usize,
-    mount: &MountSpec,
-) -> Result<(String, PathBuf), FirestoneError> {
-    let tag = mount.effective_tag(index);
-    validate_tag(&tag, index)?;
-    let socket = paths.machine_fs_socket(name, index)?;
-    validate_socket_path(&socket)?;
-    Ok((tag, socket))
 }
 
 /// Validates every mount and builds one sidecar plan in declaration order.

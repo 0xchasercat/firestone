@@ -7,8 +7,9 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+use wait_timeout::ChildExt as _;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -498,5 +499,659 @@ fn lifecycle_cli_smoke_without_kvm() -> TestResult {
         .args(["--json", "rm", "slow", "--force"])
         .output()?;
     assert!(slow_removed.status.success());
+    Ok(())
+}
+
+fn wait_for_state(
+    path: &Path,
+    timeout: Duration,
+    predicate: impl Fn(&serde_json::Value) -> bool,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let state: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+        if predicate(&state) {
+            return Ok(state);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("state predicate timed out: {state}").into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn require_success(output: &Output, action: &str) -> Result<(), Box<dyn Error>> {
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{action} failed with {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into())
+    }
+}
+
+fn event_index(records: &[serde_json::Value], kind: &str, id: &str, occurrence: usize) -> usize {
+    records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| record["type"] == kind && record["id"] == id)
+        .nth(occurrence)
+        .map_or(usize::MAX, |(index, _)| index)
+}
+
+#[test]
+fn m3_sidecars_cli_lifecycle_uses_exact_plans_and_recovers_degradation() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = fs::canonicalize(directory.path())?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(
+        env!("CARGO_BIN_EXE_firestone"),
+        fs::Permissions::from_mode(0o755),
+    )?;
+    let home = root.join("home");
+    let fake = compile_fake_vmm(&root)?;
+    let bin = root.join("bin");
+    fs::create_dir(&bin)?;
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o700))?;
+    for program in ["qemu-img", "passt"] {
+        let path = bin.join(program);
+        fs::copy(&fake, &path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+    }
+    let mut path_entries = vec![bin];
+    if let Some(existing) = env::var_os("PATH") {
+        path_entries.extend(env::split_paths(&existing));
+    }
+    let path = env::join_paths(path_entries)?;
+
+    let source = root.join("m3-base.qcow2");
+    fs::write(&source, b"QFI\xfbM3-CLI")?;
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600))?;
+    let firmware = root.join("firmware.fd");
+    fs::write(&firmware, b"firmware")?;
+    fs::set_permissions(&firmware, fs::Permissions::from_mode(0o600))?;
+    let first_host = root.join("first-host");
+    let second_host = root.join("second-host");
+    fs::create_dir(&first_host)?;
+    fs::create_dir(&second_host)?;
+    fs::set_permissions(&first_host, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(&second_host, fs::Permissions::from_mode(0o700))?;
+    let first_host = fs::canonicalize(first_host)?;
+    let second_host = fs::canonicalize(second_host)?;
+    let user_data = root.join("user-data.sh");
+    fs::write(&user_data, b"#!/bin/sh\nprintf m3\n")?;
+    fs::set_permissions(&user_data, fs::Permissions::from_mode(0o600))?;
+    let network_config = root.join("network.yaml");
+    fs::write(&network_config, b"version: 2\nethernets: {}\n")?;
+    fs::set_permissions(&network_config, fs::Permissions::from_mode(0o600))?;
+    let ssh_key = root.join("id.pub");
+    fs::write(
+        &ssh_key,
+        b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEZzSm9dJz0ZVb1e8WnQwB6sNscXFGHvXcYzM8O5pBsx m3@test\n",
+    )?;
+    fs::set_permissions(&ssh_key, fs::Permissions::from_mode(0o600))?;
+    let sidecar_record = root.join("sidecars.log");
+    let request_record = root.join("requests.log");
+    let body = root.join("body.json");
+    let console = home.join("data/machines/m3/console.log");
+    let _cleanup = MachineCleanup {
+        home: home.clone(),
+        path: path.clone(),
+        names: vec!["m3".to_owned()],
+    };
+
+    let mut create = firestone(&home, &path);
+    create
+        .arg("--json")
+        .arg("create")
+        .arg("m3")
+        .arg(&source)
+        .args(["-p", "18080:80"])
+        .arg("--mount")
+        .arg(format!("{}:/work", first_host.display()))
+        .arg("--mount")
+        .arg(format!("{}:/archive:ro", second_host.display()))
+        .arg("--user-data")
+        .arg(&user_data)
+        .arg("--cloud-init-network-config")
+        .arg(&network_config)
+        .arg("--ssh-key")
+        .arg(&ssh_key)
+        .arg("--no-provisioning")
+        .arg("--vmm-binary")
+        .arg(&fake)
+        .arg("--vmm-firmware")
+        .arg(&firmware);
+    for value in [
+        "--record".to_owned(),
+        request_record.to_string_lossy().into_owned(),
+        "--body".to_owned(),
+        body.to_string_lossy().into_owned(),
+        "--behavior".to_owned(),
+        "normal".to_owned(),
+        "--console-log".to_owned(),
+        console.to_string_lossy().into_owned(),
+    ] {
+        create.arg(format!("--vmm-arg={value}"));
+    }
+    let created = create.output()?;
+    require_success(&created, "create")?;
+
+    let data_bin = home.join("data/bin");
+    fs::create_dir_all(&data_bin)?;
+    fs::set_permissions(&data_bin, fs::Permissions::from_mode(0o700))?;
+    let virtiofsd = data_bin.join("virtiofsd-v1.14.0");
+    fs::copy(&fake, &virtiofsd)?;
+    fs::set_permissions(&virtiofsd, fs::Permissions::from_mode(0o755))?;
+
+    let mut start = firestone(&home, &path);
+    let started = start
+        .args(["--json", "start", "m3", "--no-wait", "--timeout", "15s"])
+        .env("UNSAFE_TEST_ENV", "must-not-leak")
+        .env("FIRESTONE_FAKE_SIDECAR_RECORD", &sidecar_record)
+        .output()?;
+    require_success(&started, "start")?;
+    let start_records = ndjson(&started)?;
+    let net = event_index(&start_records, "StepStart", "net", 0);
+    let fs0 = event_index(&start_records, "StepStart", "fs", 0);
+    let fs1 = event_index(&start_records, "StepStart", "fs", 1);
+    let vmm = event_index(&start_records, "StepStart", "vmm", 0);
+    assert!(net < fs0 && fs0 < fs1 && fs1 < vmm);
+    let start_result = start_records
+        .iter()
+        .find(|record| record["type"] == "Result" && record["action"] == "start")
+        .ok_or("start emitted no Result")?;
+    assert_eq!(
+        start_result["payload"]["forwards"],
+        serde_json::json!(["18080:80"])
+    );
+    assert_eq!(
+        start_result["payload"]["mounts"],
+        serde_json::json!([
+            format!("{} -> /work", first_host.display()),
+            format!("{} -> /archive", second_host.display())
+        ])
+    );
+
+    let state_path = home.join("data/machines/m3/state.json");
+    let running = wait_for_state(&state_path, Duration::from_secs(2), |state| {
+        state["status"] == "running"
+            && state["sidecar_pids"]
+                .as_object()
+                .map_or(0, serde_json::Map::len)
+                == 3
+    })?;
+    let original_instance = running["instance_id"]
+        .as_str()
+        .ok_or("missing instance id")?;
+    let original_pids = running["sidecar_pids"]
+        .as_object()
+        .ok_or("missing sidecar pids")?
+        .clone();
+
+    let vmconfig: serde_json::Value = serde_json::from_slice(&fs::read(&body)?)?;
+    assert_eq!(vmconfig["net"][0]["vhost_user"], true);
+    assert_eq!(vmconfig["fs"].as_array().map(Vec::len), Some(2));
+    assert_eq!(vmconfig["fs"][0]["tag"], "share0");
+    assert_eq!(vmconfig["fs"][1]["tag"], "share1");
+
+    let sidecars = fs::read_to_string(&sidecar_record)?;
+    let lines = sidecars.lines().collect::<Vec<_>>();
+    assert!(!sidecars.contains("UNSAFE_TEST_ENV"));
+    let launch_passt = lines
+        .iter()
+        .position(|line| line.starts_with("launch passt "))
+        .ok_or("passt was not launched")?;
+    let launch_fs0 = lines
+        .iter()
+        .position(|line| line.starts_with("launch virtiofsd-0 "))
+        .ok_or("virtiofsd-0 was not launched")?;
+    let launch_fs1 = lines
+        .iter()
+        .position(|line| line.starts_with("launch virtiofsd-1 "))
+        .ok_or("virtiofsd-1 was not launched")?;
+    let first_connect = lines
+        .iter()
+        .position(|line| line.starts_with("connect "))
+        .ok_or("VMM made no sidecar connection")?;
+    assert!(launch_passt < launch_fs0 && launch_fs0 < launch_fs1 && launch_fs1 < first_connect);
+    assert!(lines[launch_passt].contains("\"--repair-path\", \"none\"]"));
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("connect "))
+            .count(),
+        3
+    );
+
+    for source in ["passt", "virtiofsd-1"] {
+        let logs = firestone(&home, &path)
+            .args(["--json", "logs", "m3", "--source", source, "-n", "20"])
+            .output()?;
+        require_success(&logs, "logs")?;
+        assert!(
+            ndjson(&logs)?.iter().any(|record| {
+                record["type"] == "Output"
+                    && record["data"]
+                        .as_str()
+                        .is_some_and(|data| data.contains("fake") && data.contains("ready"))
+            }),
+            "missing {source} log output"
+        );
+    }
+
+    let passt_pid = original_pids["passt"]
+        .as_u64()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .ok_or("invalid passt pid")?;
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(passt_pid),
+        nix::sys::signal::Signal::SIGKILL,
+    )?;
+    let degraded = wait_for_state(&state_path, Duration::from_secs(2), |state| {
+        state["degraded"].as_array().is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry == "passt exited (signal 9)")
+        })
+    })?;
+    assert_eq!(degraded["status"], "running");
+    assert!(degraded["sidecar_pids"].get("passt").is_none());
+    let listed = firestone(&home, &path).args(["--json", "ls"]).output()?;
+    require_success(&listed, "ls")?;
+    let listed_records = ndjson(&listed)?;
+    let expected_status = if cfg!(target_os = "linux") {
+        "running!"
+    } else {
+        "running! (unsupervised)"
+    };
+    assert_eq!(listed_records[0]["payload"][0]["status"], expected_status);
+    let shown = firestone(&home, &path)
+        .args(["--json", "show", "m3"])
+        .output()?;
+    require_success(&shown, "show")?;
+    assert!(
+        ndjson(&shown)?[0]["payload"]["state"]["degraded"]
+            .as_array()
+            .is_some_and(|entries| entries
+                .iter()
+                .any(|entry| entry == "passt exited (signal 9)"))
+    );
+
+    let known_hosts = home.join("data/machines/m3/known_hosts");
+    fs::write(&known_hosts, b"old-host-key\n")?;
+    fs::set_permissions(&known_hosts, fs::Permissions::from_mode(0o600))?;
+    fs::write(
+        &network_config,
+        b"version: 2\nethernets:\n  eth0:\n    dhcp4: true\n",
+    )?;
+    let restarted = firestone(&home, &path)
+        .args(["--json", "restart", "m3"])
+        .env("FIRESTONE_FAKE_SIDECAR_RECORD", &sidecar_record)
+        .output()?;
+    require_success(&restarted, "restart")?;
+    let restarted_state = wait_for_state(&state_path, Duration::from_secs(2), |state| {
+        state["status"] == "running"
+            && state["sidecar_pids"]
+                .as_object()
+                .map_or(0, serde_json::Map::len)
+                == 3
+    })?;
+    assert!(
+        restarted_state["degraded"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
+    assert_ne!(
+        restarted_state["instance_id"].as_str(),
+        Some(original_instance)
+    );
+    assert!(!known_hosts.exists());
+    let restarted_pids = restarted_state["sidecar_pids"]
+        .as_object()
+        .ok_or("missing restarted pids")?
+        .clone();
+    for (sidecar, old_pid) in &original_pids {
+        if let (Some(old_pid), Some(new_pid)) = (old_pid.as_u64(), restarted_pids[sidecar].as_u64())
+        {
+            assert_ne!(old_pid, new_pid, "{sidecar} was not replaced");
+        }
+    }
+
+    let crashed_vmm = restarted_state["vmm_pid"]
+        .as_u64()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .ok_or("missing restarted VMM pid")?;
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(crashed_vmm),
+        nix::sys::signal::Signal::SIGKILL,
+    )?;
+    let failed_after_vmm_crash = wait_for_state(&state_path, Duration::from_secs(3), |state| {
+        state["status"] == "failed"
+            && state["sidecar_pids"]
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+    })?;
+    assert_eq!(failed_after_vmm_crash["vmm_pid"], serde_json::Value::Null);
+    let runtime_deadline = Instant::now() + Duration::from_secs(2);
+    while home.join("run/m3").exists() && Instant::now() < runtime_deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!home.join("run/m3").exists());
+    for pid in restarted_pids
+        .values()
+        .filter_map(serde_json::Value::as_u64)
+    {
+        let pid = i32::try_from(pid)?;
+        assert!(matches!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH)
+        ));
+    }
+
+    let started_again = firestone(&home, &path)
+        .args(["--json", "start", "m3", "--no-wait", "--timeout", "15s"])
+        .env("FIRESTONE_FAKE_SIDECAR_RECORD", &sidecar_record)
+        .output()?;
+    require_success(&started_again, "start after VMM crash")?;
+    let final_running = wait_for_state(&state_path, Duration::from_secs(2), |state| {
+        state["status"] == "running"
+            && state["sidecar_pids"]
+                .as_object()
+                .map_or(0, serde_json::Map::len)
+                == 3
+    })?;
+    let final_sidecar_pids = final_running["sidecar_pids"]
+        .as_object()
+        .ok_or("missing final sidecar pids")?
+        .clone();
+
+    if cfg!(target_os = "linux") {
+        let shim_pid = final_running["shim_pid"]
+            .as_u64()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .ok_or("missing final shim pid")?;
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(shim_pid),
+            nix::sys::signal::Signal::SIGKILL,
+        )?;
+        thread::sleep(Duration::from_millis(100));
+    }
+    let mut stop = firestone(&home, &path);
+    stop.args(["--json", "stop", "m3", "--timeout", "2s"]);
+    if cfg!(target_os = "linux") {
+        stop.arg("--force");
+    }
+    let stopped = stop.output()?;
+    require_success(&stopped, "stop")?;
+    let stopped_state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path)?)?;
+    assert_eq!(stopped_state["status"], "stopped");
+    assert!(
+        stopped_state["sidecar_pids"]
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
+    );
+    assert!(!home.join("run/m3").exists());
+    if cfg!(target_os = "linux") {
+        for pid in final_sidecar_pids
+            .values()
+            .filter_map(serde_json::Value::as_u64)
+        {
+            let pid = i32::try_from(pid)?;
+            assert!(matches!(
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+                Err(nix::errno::Errno::ESRCH)
+            ));
+        }
+    }
+
+    let removed = firestone(&home, &path)
+        .args(["--json", "rm", "m3", "--force"])
+        .output()?;
+    require_success(&removed, "rm")?;
+    assert!(!home.join("data/machines/m3").exists());
+    Ok(())
+}
+
+fn fake_sidecar_pids(record: &str) -> Vec<i32> {
+    record
+        .lines()
+        .filter_map(|line| line.split(" pid=").nth(1))
+        .filter_map(|tail| tail.split_ascii_whitespace().next())
+        .filter_map(|pid| pid.parse().ok())
+        .collect()
+}
+
+fn assert_processes_gone(record: &str) -> Result<(), Box<dyn Error>> {
+    for pid in fake_sidecar_pids(record) {
+        match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+            Err(nix::errno::Errno::ESRCH) => {}
+            Ok(()) => return Err(format!("sidecar pid {pid} survived rollback").into()),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn m3_sidecar_partial_launch_and_sigint_roll_back_every_process() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = fs::canonicalize(directory.path())?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(
+        env!("CARGO_BIN_EXE_firestone"),
+        fs::Permissions::from_mode(0o755),
+    )?;
+    let home = root.join("home");
+    let fake = compile_fake_vmm(&root)?;
+    let bin = root.join("bin");
+    fs::create_dir(&bin)?;
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o700))?;
+    for program in ["qemu-img", "passt"] {
+        let target = bin.join(program);
+        fs::copy(&fake, &target)?;
+        fs::set_permissions(target, fs::Permissions::from_mode(0o755))?;
+    }
+    let mut path_entries = vec![bin];
+    if let Some(existing) = env::var_os("PATH") {
+        path_entries.extend(env::split_paths(&existing));
+    }
+    let path = env::join_paths(path_entries)?;
+    let source = root.join("base.qcow2");
+    fs::write(&source, b"QFI\xfbM3-ROLLBACK")?;
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600))?;
+    let firmware = root.join("firmware.fd");
+    fs::write(&firmware, b"firmware")?;
+    fs::set_permissions(&firmware, fs::Permissions::from_mode(0o600))?;
+    let first_host = root.join("host-a");
+    let second_host = root.join("host-b");
+    fs::create_dir(&first_host)?;
+    fs::create_dir(&second_host)?;
+    fs::set_permissions(&first_host, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(&second_host, fs::Permissions::from_mode(0o700))?;
+    let first_host = fs::canonicalize(first_host)?;
+    let second_host = fs::canonicalize(second_host)?;
+    let names = vec![
+        "rollback-passt".to_owned(),
+        "rollback-fs0".to_owned(),
+        "rollback-fs1".to_owned(),
+        "rollback-timeout".to_owned(),
+        "rollback-sigint".to_owned(),
+    ];
+    let _cleanup = MachineCleanup {
+        home: home.clone(),
+        path: path.clone(),
+        names: names.clone(),
+    };
+
+    for (index, name) in names.iter().enumerate() {
+        let request_record = root.join(format!("{name}-requests.log"));
+        let body = root.join(format!("{name}-body.json"));
+        let console = home.join("data/machines").join(name).join("console.log");
+        let mut create = firestone(&home, &path);
+        create
+            .arg("--json")
+            .arg("create")
+            .arg(name)
+            .arg(&source)
+            .arg("--mount")
+            .arg(format!("{}:/work", first_host.display()))
+            .arg("--mount")
+            .arg(format!("{}:/archive:ro", second_host.display()))
+            .arg("--no-provisioning")
+            .arg("--vmm-binary")
+            .arg(&fake)
+            .arg("--vmm-firmware")
+            .arg(&firmware);
+        for value in [
+            "--record".to_owned(),
+            request_record.to_string_lossy().into_owned(),
+            "--body".to_owned(),
+            body.to_string_lossy().into_owned(),
+            "--behavior".to_owned(),
+            "normal".to_owned(),
+            "--console-log".to_owned(),
+            console.to_string_lossy().into_owned(),
+        ] {
+            create.arg(format!("--vmm-arg={value}"));
+        }
+        let output = create.output()?;
+        require_success(&output, "rollback create")?;
+        if index == 0 {
+            let data_bin = home.join("data/bin");
+            fs::create_dir_all(&data_bin)?;
+            fs::set_permissions(&data_bin, fs::Permissions::from_mode(0o700))?;
+            let virtiofsd = data_bin.join("virtiofsd-v1.14.0");
+            fs::copy(&fake, &virtiofsd)?;
+            fs::set_permissions(virtiofsd, fs::Permissions::from_mode(0o755))?;
+        }
+    }
+
+    for (name, boundary) in [
+        ("rollback-passt", "passt"),
+        ("rollback-fs0", "virtiofsd-0"),
+        ("rollback-fs1", "virtiofsd-1"),
+    ] {
+        let record = root.join(format!("{name}-sidecars.log"));
+        let failed = firestone(&home, &path)
+            .args(["--json", "start", name, "--no-wait", "--timeout", "15s"])
+            .env("FIRESTONE_FAKE_SIDECAR_RECORD", &record)
+            .env("FIRESTONE_FAKE_SIDECAR_BAD_READY", boundary)
+            .output()?;
+        assert!(!failed.status.success(), "{boundary} unexpectedly started");
+        let state_path = home.join("data/machines").join(name).join("state.json");
+        let state: serde_json::Value = serde_json::from_slice(&fs::read(state_path)?)?;
+        assert_eq!(state["status"], "failed");
+        assert!(
+            state["sidecar_pids"]
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty),
+            "{name} retained sidecars: {state}"
+        );
+        assert!(!home.join("run").join(name).exists());
+        let recorded = fs::read_to_string(record)?;
+        assert_processes_gone(&recorded)?;
+    }
+
+    let cancel_name = "rollback-sigint";
+    let timeout_name = "rollback-timeout";
+    let timeout_record = root.join("timeout-sidecars.log");
+    let timed_out = firestone(&home, &path)
+        .args([
+            "--json",
+            "start",
+            timeout_name,
+            "--no-wait",
+            "--timeout",
+            "20s",
+        ])
+        .env("FIRESTONE_FAKE_SIDECAR_RECORD", &timeout_record)
+        .env("FIRESTONE_FAKE_SIDECAR_NEVER_READY", "passt")
+        .output()?;
+    assert_eq!(timed_out.status.code(), Some(6));
+    let timeout_state_path = home
+        .join("data/machines")
+        .join(timeout_name)
+        .join("state.json");
+    let timeout_state = wait_for_state(&timeout_state_path, Duration::from_secs(5), |state| {
+        state["status"] != "starting"
+            && state["sidecar_pids"]
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+    })?;
+    assert_eq!(timeout_state["status"], "failed");
+    assert!(
+        timeout_state["sidecar_pids"]
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
+    );
+    assert!(!home.join("run").join(timeout_name).exists());
+    let timeout_recorded = fs::read_to_string(&timeout_record).map_err(|error| {
+        format!(
+            "cannot read timeout sidecar record {}: {error}; start stdout: {}; stderr: {}",
+            timeout_record.display(),
+            String::from_utf8_lossy(&timed_out.stdout),
+            String::from_utf8_lossy(&timed_out.stderr)
+        )
+    })?;
+    assert!(timeout_recorded.contains("launch passt "));
+    assert_processes_gone(&timeout_recorded)?;
+
+    let cancel_record = root.join("cancel-sidecars.log");
+    let mut command = firestone(&home, &path);
+    command
+        .args([
+            "--json",
+            "start",
+            cancel_name,
+            "--no-wait",
+            "--timeout",
+            "15s",
+        ])
+        .env("FIRESTONE_FAKE_SIDECAR_RECORD", &cancel_record)
+        .env("FIRESTONE_FAKE_SIDECAR_NEVER_READY", "passt")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let launched_deadline = Instant::now() + Duration::from_secs(5);
+    while !cancel_record.exists() || !fs::read_to_string(&cancel_record)?.contains("launch passt ")
+    {
+        if Instant::now() >= launched_deadline {
+            child.kill()?;
+            let _ = child.wait();
+            return Err("cancelled start did not launch passt".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(child.id())?),
+        nix::sys::signal::Signal::SIGINT,
+    )?;
+    let status = match child.wait_timeout(Duration::from_secs(5))? {
+        Some(status) => status,
+        None => {
+            child.kill()?;
+            let _ = child.wait();
+            return Err("start did not cancel within five seconds".into());
+        }
+    };
+    assert!(!status.success());
+    let cancel_state: serde_json::Value = serde_json::from_slice(&fs::read(
+        home.join("data/machines")
+            .join(cancel_name)
+            .join("state.json"),
+    )?)?;
+    assert_eq!(cancel_state["status"], "created");
+    assert!(
+        cancel_state["sidecar_pids"]
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
+    );
+    assert!(!home.join("run").join(cancel_name).exists());
+    assert_processes_gone(&fs::read_to_string(cancel_record)?)?;
     Ok(())
 }

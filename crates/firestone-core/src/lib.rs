@@ -68,7 +68,7 @@ pub use result::{
 pub use shim::{
     PreparedStart, ShimClient, ShimPids, ShimStatus, ShimTimeouts, cancel_prepared,
     launch_prepared, launch_prepared_cancellable, prepare_start, recover_shim, run_shim,
-    stop_unsupervised, validate_m1_start_scope,
+    stop_unsupervised,
 };
 pub use spec::{
     Arch, ByteSize, CloudInitSpec, CloudInitSpecPatch, ColorMode, Firmware, GlobalConfig,
