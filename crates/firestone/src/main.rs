@@ -1,6 +1,7 @@
 pub mod api;
 mod cli;
 mod render;
+mod serve;
 mod store;
 
 use std::{
@@ -509,6 +510,24 @@ where
             dispatcher
                 .run(Action::Doctor { fix: arguments.fix }, renderer)
                 .await
+        }
+        Command::Serve(arguments) => {
+            if yes {
+                return Err(FirestoneError::new(
+                    ErrorKind::Usage,
+                    "--yes is not valid with firestone serve",
+                )
+                .with_hint("remove --yes; serve never prompts"));
+            }
+            let (global, catalog) = load_user_configuration(&paths)?;
+            let dispatcher = LocalDispatcher::new(paths.clone(), global.clone(), catalog)
+                .with_source_base(source_base);
+            let socket = match arguments.listen {
+                Some(path) if path.is_absolute() => path,
+                Some(path) => paths.runtime_dir().join(path),
+                None => paths.serve_socket(),
+            };
+            serve::run(&paths, &socket, Arc::new(dispatcher), &global)
         }
         Command::VsockProxy(_) => Err(FirestoneError::new(
             ErrorKind::Generic,
