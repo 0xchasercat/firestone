@@ -37,7 +37,7 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 | M2-04 | M2 Linux KVM integration | `agent/m2-integration` | [#20](https://github.com/0xchasercat/firestone/pull/20) | complete | M2-01 through M2-03 | E2E 2 and 10 pass; empty-home run reaches a root prompt; verify 11, 13, and 17 close |
 | M3-01 | Passt, forward grammar, and tap network plans | `agent/m3-network` | pending | ready | M2 | Exact pinned passt/tap commands, socket/config plans, forward validation, and bounded errors pass without KVM |
 | M3-02 | Virtiofsd mount plans and VmConfig mapping | `agent/m3-virtiofs` | pending | ready | M2 | Exact pinned virtiofsd commands, tags, read-only mapping, ownership, and bounded errors pass without KVM |
-| M3-03 | User cloud-init parts, SSH keys, and instance identity | `agent/m3-cloudinit` | pending | ready | M2 | MIME merge, user precedence, key rotation, seed identity, and deterministic goldens pass |
+| M3-03 | User cloud-init parts, SSH keys, and instance identity | `agent/m3-cloudinit` | [#21](https://github.com/0xchasercat/firestone/pull/21) | review | M2 | Canonical user-first MIME, bounded path inputs, key de-duplication/order, network-config publication, exact byte identities, target cloud-init merge evidence, and deterministic seed goldens pass |
 | M3-04 | Network/filesystem sidecars and CLI lifecycle integration | `agent/m3-sidecars` | pending | blocked | M3-01 through M3-03 | Shim launch/stop/recovery integrates passt, tap, virtiofsd, forwards, mounts, and shared CLI contracts |
 | M3-05 | M3 Linux KVM integration | `agent/m3-integration` | pending | blocked | M3-01 through M3-04 | E2E 3, 4, 8 and verify 7, 8, 10, 14, 15, 16 close |
 
