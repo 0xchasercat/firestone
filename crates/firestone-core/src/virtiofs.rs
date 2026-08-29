@@ -1015,6 +1015,7 @@ mod tests {
             fs::create_dir_all(&runtime_dir)?;
             fs::create_dir_all(&bin_dir)?;
             for directory in [
+                root.clone(),
                 paths.data_dir().to_path_buf(),
                 paths.machines_dir(),
                 machine_dir,
