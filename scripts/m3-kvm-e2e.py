@@ -1343,12 +1343,6 @@ def direct_ssh(
 
 
 def verify_cloud_merge(harness: Harness, version: int, metric: int) -> dict[str, Any]:
-    network_probe = (
-        "import json; "
-        "d=json.load(open('/run/cloud-init/network-config.json')); "
-        "v=d['ethernets']['passt0']['dhcp4-overrides']['route-metric']; "
-        "print('network_metric='+str(v))"
-    )
     script = f"""
 set -eu
 cloud-init status --wait --long >/tmp/firestone-cloud-status
@@ -1358,7 +1352,9 @@ cloud-init status --wait --long >/tmp/firestone-cloud-status
 test -f /etc/systemd/system/firestone-sshd.socket
 test "$(systemctl is-active firestone-sshd.socket)" = active
 test "$(systemctl show -p SubState --value firestone-sshd.socket)" = listening
-python3 -c {shlex.quote(network_probe)}
+network_metric=$(ip -4 route show default | awk '{{for (i=1; i<NF; i++) if ($i=="metric") {{print $(i+1); exit}}}}')
+[ "$network_metric" = "{metric}" ]
+printf 'network_metric=%s\n' "$network_metric"
 printf 'hostname=m3-user-v{version}\n'
 printf 'user_write_files=v{version}\n'
 printf 'user_runcmd=v{version}-runcmd\n'
