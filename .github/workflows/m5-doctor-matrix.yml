@@ -1,6 +1,7 @@
 name: M5 catalog, docs, and doctor matrix
 
 on:
+  workflow_dispatch:
   push:
     paths:
       - "README.md"
@@ -10,7 +11,9 @@ on:
       - "crates/firestone-core/src/doctor.rs"
       - "deps.toml"
       - "docs/**"
+      - "scripts/m1-kvm-e2e.py"
       - "scripts/m5-catalog-kvm-e2e.py"
+      - "scripts/m5-linux-mvp-e2e.py"
       - "scripts/m5-doctor-matrix.py"
       - "scripts/validate-catalog-images.py"
       - "scripts/validate-docs.py"
@@ -25,7 +28,9 @@ on:
       - "crates/firestone-core/src/doctor.rs"
       - "deps.toml"
       - "docs/**"
+      - "scripts/m1-kvm-e2e.py"
       - "scripts/m5-catalog-kvm-e2e.py"
+      - "scripts/m5-linux-mvp-e2e.py"
       - "scripts/m5-doctor-matrix.py"
       - "scripts/validate-catalog-images.py"
       - "scripts/validate-docs.py"
