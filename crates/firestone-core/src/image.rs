@@ -1582,6 +1582,7 @@ impl ImageStore {
             full_backing_filename,
             dirty_flag,
             corrupt: format_specific.corrupt,
+            compat: format_specific.compat,
             data_file: format_specific.data_file,
             data_file_raw: format_specific.data_file_raw,
         })
@@ -3250,6 +3251,7 @@ fn image_artifact_from_name(name: &str) -> Result<Option<(String, ImageArtifact)
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Qcow2FormatSpecific {
     corrupt: Option<bool>,
+    compat: Option<String>,
     data_file: Option<String>,
     data_file_raw: Option<bool>,
 }
@@ -3263,6 +3265,7 @@ struct QemuInfo {
     full_backing_filename: Option<String>,
     dirty_flag: Option<bool>,
     corrupt: Option<bool>,
+    compat: Option<String>,
     data_file: Option<String>,
     data_file_raw: Option<bool>,
 }
@@ -3339,6 +3342,7 @@ fn parse_qcow2_format_specific(
     let data_value = serde_json::Value::Object(data.clone());
     Ok(Qcow2FormatSpecific {
         corrupt: optional_qemu_bool(&data_value, "corrupt", path)?,
+        compat: optional_qemu_string(&data_value, "compat", path)?,
         data_file: optional_qemu_string(&data_value, "data-file", path)?,
         data_file_raw: optional_qemu_bool(&data_value, "data-file-raw", path)?,
     })
@@ -3372,7 +3376,14 @@ fn validate_qcow2_structure(label: &str, info: &QemuInfo) -> Result<(), Fireston
             format!("{label} has qemu format '{}'", info.format),
         ));
     }
-    if info.dirty_flag.is_none() || info.corrupt != Some(false) {
+    // qcow2 compat 0.10 has no incompatible-feature bitmap, so qemu-img 8.2
+    // legitimately omits the v3-only corrupt flag while still reporting dirty-flag.
+    let corrupt_field_is_healthy = match info.corrupt {
+        Some(false) => true,
+        None => info.compat.as_deref() == Some("0.10"),
+        Some(true) => false,
+    };
+    if info.dirty_flag.is_none() || !corrupt_field_is_healthy {
         return Err(FirestoneError::new(
             ErrorKind::Dependency,
             format!("{label} omitted health fields or is marked corrupt by qemu-img"),
@@ -4810,6 +4821,7 @@ else:
             full_backing_filename: None,
             dirty_flag: Some(false),
             corrupt: Some(false),
+            compat: Some("1.1".to_owned()),
             data_file: None,
             data_file_raw: None,
         };
@@ -4828,6 +4840,19 @@ else:
             validate_base_info("corrupt", &corrupt)
                 .err()
                 .ok_or("corrupt accepted")?
+                .kind(),
+            ErrorKind::Dependency
+        );
+        let mut legacy = healthy();
+        legacy.compat = Some("0.10".to_owned());
+        legacy.corrupt = None;
+        validate_base_info("legacy", &legacy)?;
+        let mut missing_corrupt = healthy();
+        missing_corrupt.corrupt = None;
+        assert_eq!(
+            validate_base_info("missing-corrupt", &missing_corrupt)
+                .err()
+                .ok_or("missing v3 corrupt flag accepted")?
                 .kind(),
             ErrorKind::Dependency
         );
