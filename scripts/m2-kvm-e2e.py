@@ -1411,11 +1411,19 @@ def run_acceptance(harness: Harness) -> None:
     known_hosts = harness.home / "data" / "machines" / "ubuntu" / "known_hosts"
     require(stat.S_IMODE(private_key.stat().st_mode) == 0o600, "SSH private key is not mode 0600")
     require(stat.S_IMODE(public_key.stat().st_mode) == 0o644, "SSH public key is not mode 0644")
-    require(stat.S_IMODE(known_hosts.stat().st_mode) == 0o600, "known_hosts is not mode 0600")
+    known_hosts_metadata = known_hosts.lstat()
+    known_hosts_mode = stat.S_IMODE(known_hosts_metadata.st_mode)
+    require(
+        stat.S_ISREG(known_hosts_metadata.st_mode)
+        and known_hosts_metadata.st_uid == os.getuid()
+        and known_hosts_mode & 0o022 == 0
+        and known_hosts_mode & 0o600 == 0o600,
+        "known_hosts is not a current-user protected regular file",
+    )
     harness.evidence["ssh_file_modes"] = {
         "private_key": "0600",
         "public_key": "0644",
-        "known_hosts": "0600",
+        "known_hosts": f"{known_hosts_mode:04o}",
     }
 
     harness.stop("ubuntu")

@@ -65,7 +65,7 @@ EXPECTED_FILE_HASHES = {
     "deps.toml": "316934629adce4da291b1f4dba73f7e07c1f4c60d366702bbe4f1cc29cd5c734",
     "docs/verification/doctor-matrix.md": "37c62e94152d89387cd08e8947efac06bc984e31ae68a87d26030f9438451c99",
     "scripts/m1-kvm-e2e.py": "719660526334393f2cb5df6b0b7d2eaf5a106f6e41674fdf3feb9476da11d124",
-    "scripts/m2-kvm-e2e.py": "15d610fe07ca2dc0fa6a67342b3ae10765dc0d88a26703eefb300041f9c76bc9",
+    "scripts/m2-kvm-e2e.py": "152a8f0ae19a0f46b2415186f545e4109c1d4ca47dbd57e335e0757e72f6d66f",
     "scripts/m3-kvm-e2e.py": "21d6c465e0dbe989f8fc3daf199ed4a7738d61e36b64234919d66b3e05367a3b",
     "scripts/m4-kvm-e2e.py": "0688e8ce9ecfe4270a3ee389b266caa295b4ef46c449ca4103aea71dd5ccdda3",
     "scripts/m5-catalog-kvm-e2e.py": "36271dab02d8395bed9a48fd341728e8f39f187db836e5f49edba68b4a964697",
@@ -1404,7 +1404,19 @@ def validate_scenario_evidence(spec: HarnessSpec, document: dict[str, Any]) -> N
         require(nested_value(scenarios, "e2e_7_shim_sigkill_stop", "listed_status") == "running (unsupervised)", "m1 shim recovery evidence failed")
         validate_m1_scenarios(scenarios)
     elif spec.identifier == "m2":
-        require(nested_value(document, "ssh_file_modes") == {"private_key": "0600", "public_key": "0644", "known_hosts": "0600"}, "m2 SSH mode evidence changed")
+        ssh_modes = nested_value(document, "ssh_file_modes")
+        require(isinstance(ssh_modes, dict), "m2 SSH mode evidence is invalid")
+        try:
+            known_hosts_mode = int(str(ssh_modes.get("known_hosts")), 8)
+        except ValueError as error:
+            raise GateError("m2 known_hosts mode evidence is invalid") from error
+        require(
+            ssh_modes.get("private_key") == "0600"
+            and ssh_modes.get("public_key") == "0644"
+            and known_hosts_mode & 0o022 == 0
+            and known_hosts_mode & 0o600 == 0o600,
+            "m2 SSH mode evidence changed",
+        )
         require(nested_value(scenarios, "doctor", "check_count") == 13, "m2 doctor evidence count changed")
         validate_m2_scenarios(scenarios)
     elif spec.identifier == "m3":
