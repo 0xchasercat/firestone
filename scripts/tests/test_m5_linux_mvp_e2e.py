@@ -426,30 +426,44 @@ class FinalLinuxMvpGateTests(unittest.TestCase):
             self.assertEqual(executor.cleanup(), [])
 
     @unittest.skipUnless(sys.platform == "linux", "Linux /proc process-group regression")
-    def test_process_group_cleanup_survives_leader_exit(self) -> None:
+    def test_process_group_cleanup_does_not_signal_reused_group_after_leader_exit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             child_pid_path = root / "child.pid"
             leader_source = root / "leader.py"
             leader_source.write_text(
-                "import pathlib, subprocess, sys\n"
-                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                "import os, pathlib, subprocess, sys\n"
+                "environment = os.environ.copy()\n"
+                "environment['FIRESTONE_HOME'] = sys.argv[1]\n"
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+                "cwd=sys.argv[1], env=environment)\n"
                 f"pathlib.Path({str(child_pid_path)!r}).write_text(str(child.pid))\n",
                 encoding="utf-8",
             )
             leader = subprocess.Popen(
-                [sys.executable, leader_source],
+                [sys.executable, leader_source, root],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
+            leader_start = GATE.process_start_ticks(leader.pid)
+            self.assertIsNotNone(leader_start)
+            leader_identity = GATE.ProcessIdentity(leader.pid, leader_start)
             self.assertEqual(leader.wait(timeout=5), 0)
             child_pid = int(child_pid_path.read_text(encoding="utf-8"))
             child_start = GATE.process_start_ticks(child_pid)
             self.assertIsNotNone(child_start)
             try:
-                self.assertEqual(GATE.terminate_process_group(leader), [])
+                with mock.patch.object(
+                    GATE.os,
+                    "killpg",
+                    side_effect=AssertionError("simulated reused process group was signalled"),
+                ) as killpg:
+                    self.assertEqual(
+                        GATE.terminate_process_group(leader, leader_identity, root), []
+                    )
+                    killpg.assert_not_called()
                 self.assertNotEqual(GATE.process_start_ticks(child_pid), child_start)
             finally:
                 try:

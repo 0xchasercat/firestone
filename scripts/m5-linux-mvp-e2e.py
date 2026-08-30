@@ -1853,47 +1853,50 @@ def terminate_home_processes(home: Path) -> list[str]:
     return errors
 
 
-def process_group_exists(process_group: int) -> bool:
-    try:
-        os.killpg(process_group, 0)
-    except ProcessLookupError:
+def harness_leader_owns_group(
+    process: subprocess.Popen[bytes], identity: ProcessIdentity | None
+) -> bool:
+    if identity is None or identity.pid != process.pid or process.poll() is not None:
         return False
-    except PermissionError:
-        return True
-    return True
+    if not identity_alive(identity):
+        return False
+    try:
+        return os.getpgid(identity.pid) == identity.pid
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
 
 
-def terminate_process_group(process: subprocess.Popen[bytes]) -> list[str]:
+def terminate_process_group(
+    process: subprocess.Popen[bytes], identity: ProcessIdentity | None, home: Path
+) -> list[str]:
     errors: list[str] = []
     process_group = process.pid
-    if not process_group_exists(process_group):
+    if not harness_leader_owns_group(process, identity):
         process.poll()
-        return errors
+        return terminate_home_processes(home)
     try:
         os.killpg(process_group, signal.SIGTERM)
     except ProcessLookupError:
-        process.poll()
-        return errors
+        pass
     except OSError as error:
         errors.append(f"cannot terminate harness process group {process_group}: {error}")
     deadline = time.monotonic() + PROCESS_CLEANUP_GRACE_SECONDS
-    while process_group_exists(process_group) and time.monotonic() < deadline:
-        process.poll()
+    while harness_leader_owns_group(process, identity) and time.monotonic() < deadline:
         time.sleep(0.05)
-    if process_group_exists(process_group):
+    if harness_leader_owns_group(process, identity):
         try:
             os.killpg(process_group, signal.SIGKILL)
         except ProcessLookupError:
             pass
         except OSError as error:
             errors.append(f"cannot kill harness process group {process_group}: {error}")
-    deadline = time.monotonic() + 10
-    while process_group_exists(process_group) and time.monotonic() < deadline:
-        process.poll()
+    deadline = time.monotonic() + HOME_PROCESS_KILL_SECONDS
+    while harness_leader_owns_group(process, identity) and time.monotonic() < deadline:
         time.sleep(0.05)
-    if process_group_exists(process_group):
+    if harness_leader_owns_group(process, identity):
         errors.append(f"harness process group {process_group} survived SIGKILL")
     process.poll()
+    errors.extend(terminate_home_processes(home))
     return errors
 
 
@@ -2028,6 +2031,8 @@ class HarnessExecutor:
         self.repository_root = repository_root
         self.git_dir = git_dir
         self.current_process: subprocess.Popen[bytes] | None = None
+        self.current_process_identity: ProcessIdentity | None = None
+        self.current_home: Path | None = None
         self.homes: dict[str, Path] = {}
         self.m3_snapshot: M3HostSnapshot | None = None
         self.m3_pid: int | None = None
@@ -2106,6 +2111,7 @@ class HarnessExecutor:
         if snapshot is not None:
             self.m3_snapshot = snapshot
         process: subprocess.Popen[bytes] | None = None
+        process_identity: ProcessIdentity | None = None
         failure: str | None = None
         timed_out = False
         cleanup_errors: list[str] = []
@@ -2125,6 +2131,7 @@ class HarnessExecutor:
                 f"(timeout {timeout:.0f}s, aggregate remaining {remaining:.0f}s)",
                 flush=True,
             )
+            self.current_home = home
             process = subprocess.Popen(
                 [sys.executable, source],
                 cwd=self.repository_root,
@@ -2133,6 +2140,15 @@ class HarnessExecutor:
                 start_new_session=True,
             )
             self.current_process = process
+            start_ticks = process_start_ticks(process.pid)
+            if start_ticks is not None:
+                process_identity = ProcessIdentity(process.pid, start_ticks)
+                self.current_process_identity = process_identity
+            else:
+                require(
+                    sys.platform != "linux" or process.poll() is not None,
+                    "cannot capture live harness leader process identity",
+                )
             if snapshot is not None:
                 self.m3_pid = process.pid
             deadline = started + timeout
@@ -2157,9 +2173,11 @@ class HarnessExecutor:
             failure = f"cannot run {spec.identifier}: {error}"
         finally:
             if process is not None:
-                cleanup_errors.extend(terminate_process_group(process))
+                cleanup_errors.extend(terminate_process_group(process, process_identity, home))
                 returncode = process.poll()
             self.current_process = None
+            self.current_process_identity = None
+            self.current_home = None
             harness_removed_home = not home.exists()
             cleanup_errors.extend(self.force_cleanup_home(spec, home))
             if snapshot is not None and process is not None:
@@ -2246,8 +2264,20 @@ class HarnessExecutor:
         self._cleanup_started = True
         errors: list[str] = []
         if self.current_process is not None:
-            errors.extend(terminate_process_group(self.current_process))
+            if self.current_home is not None:
+                errors.extend(
+                    terminate_process_group(
+                        self.current_process,
+                        self.current_process_identity,
+                        self.current_home,
+                    )
+                )
+            else:
+                for home in self.homes.values():
+                    errors.extend(terminate_home_processes(home))
             self.current_process = None
+            self.current_process_identity = None
+            self.current_home = None
         for spec in HARNESSES:
             home = self.homes.get(spec.identifier)
             if home is not None:
