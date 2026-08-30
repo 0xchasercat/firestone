@@ -4,12 +4,12 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 
 ## Current position
 
-- Milestone: Linux x86_64 MVP implementation complete; final KVM acceptance is externally blocked
-- Baseline: M0-M5 code, PTY UX, REST/serve, catalog, doctor matrix, user guide, completions, and reproducible x86_64 release artifacts are merged and green in Ubuntu CI
-- Linux validation host: `firestone@172.203.242.136`, Ubuntu 24.04 x86_64, `/dev/kvm` present
+- Milestone: Linux x86_64 MVP accepted; M0 through M5 are complete
+- Baseline: exact clean main `47daf52` passed E2E 1–11 and resolved verify 1–17 on real x86_64 KVM; PTY UX, REST/serve, five-image catalog, doctor matrix, user guide, completions, and reproducible x86_64 release artifacts are merged
+- Linux validation host: bare-metal `w`, Linux 6.8.0-137-generic x86_64, `/dev/kvm` read/write; temporary acceptance setup was removed and host policy restored
 - Required local gate: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`
-- Required integration gate: the same commands on the Linux host
-- KVM blocker: the only validation host times out on TCP/22; M3 E2E 3/4/8, M4 E2E 9, catalog E2E 11, and final combined acceptance remain open with secure gated harnesses
+- Required integration gate: the same commands plus `scripts/m5-linux-mvp-e2e.py` on a clean Linux x86_64 KVM host
+- Final acceptance: SHA-256 `e29a3fc7d189e29ea7a789783ce585ee4247032aa5be000931964107fd7faff4`; exact-main CI `33335967366`, doctor matrix `33335967251`, and release `33335967353` passed
 
 ## Work queue
 
@@ -45,7 +45,7 @@ This file is the durable handoff for Firestone development. The orchestrator upd
 | M4-03 | M4 REST equivalence and E2E integration | `agent/m4-integration` | [#28](https://github.com/0xchasercat/firestone/pull/28) | complete | M4-01, M4-02 | Exact-main `47daf52` KVM E2E 9 passed real CLI/Unix-serve equivalence, streaming, 204, locking, disconnect, crash-safe stale-socket takeover, restart, and cleanup; `m4.json` SHA-256 is `364223d2be540372ace6cc942a76ff9158baf2965b7b7f03b1cb05756042a322`. |
 | M5-01 | CLI progress, timing, output polish, and error hints | `agent/m5-cli-polish` | [#31](https://github.com/0xchasercat/firestone/pull/31) | complete | M4 implementation | Real PTY coverage proves ordered repeated rows, resize-safe updates, timing/rates, color gates, SIGINT cleanup, and exact termios restore; non-TTY, JSON, quiet, and broken-pipe contracts remain deterministic; bounded process/VMM diagnostics retain stable kinds, context, hints, and safe log/body previews; local stable/1.85 and final-head Ubuntu CI pass |
 | M5-02 | Completions, version, and Linux release artifacts | `agent/m5-release` | [#29](https://github.com/0xchasercat/firestone/pull/29) | complete | M4 implementation | Five deterministic hidden-free completions, shared version metadata, reproducible static x86_64 artifacts/SHA256SUMS, and compile-only aarch64 gate pass; no release or aarch64 runtime claim |
-| M5-03 | Catalog gate, fresh-host doctor matrix, and user guide | `agent/m5-docs-catalog` | [#30](https://github.com/0xchasercat/firestone/pull/30) | complete | M4 implementation | Authoritative x86_64 catalog sources, Ubuntu/Fedora/Arch unprivileged doctor matrices, and Linux MVP guide pass; E2E 11/verify 3 remain final KVM gates |
+| M5-03 | Catalog gate, fresh-host doctor matrix, and user guide | `agent/m5-docs-catalog` | [#30](https://github.com/0xchasercat/firestone/pull/30) | complete | M4 implementation | Authoritative x86_64 catalog sources, Ubuntu/Fedora/Arch unprivileged doctor matrices, Linux MVP guide, and five-image KVM E2E 11/verify 3 pass |
 | M5-04 | Final Linux x86_64 MVP acceptance | `agent/m5-integration` | [#32](https://github.com/0xchasercat/firestone/pull/32), [#44](https://github.com/0xchasercat/firestone/pull/44) | complete | M3-05, M4-03, M5-01 through M5-03 | On Linux 6.8.0-137-generic x86_64 with real KVM, exact clean main `47daf52` passed the sequential M1–M4 and five-image catalog coordinator: E2E 1–11 passed and verify 1–17 resolved. Acceptance SHA-256 is `e29a3fc7d189e29ea7a789783ce585ee4247032aa5be000931964107fd7faff4`; release SHA-256 is `411d26c63e3ea4b0e1aa807165f0f00f08d09ef0fa75726edbb906217bf06505`; exact-main CI `33335967366`, doctor matrix `33335967251`, and release `33335967353` passed. aarch64 runtime, non-Linux authority, and hostile wrappers remain explicitly deferred. |
 
 ## Merge order
@@ -68,8 +68,8 @@ The orchestrator reviews each pull request for spec alignment, public contract d
 |---|---|---|
 | GitHub remote | `git@github.com:0xchasercat/firestone.git`; `main` baseline pushed | All implementation enters through reviewed pull requests |
 | Local macOS toolchain | Rust 1.97.1, Cargo 1.97.0 | Use for fast unit feedback; Linux behavior requires remote validation |
-| Azure Linux host | Reachable; fresh SSH sessions have KVM read/write access; Rust 1.98.0 and M1 build/runtime tools installed | Run every integration candidate and M1 KVM acceptance here before merge |
-| Bare-metal host `w` | Available | Use only for behavior that nested Azure KVM cannot validate |
+| Azure Linux host | Unreachable on TCP/22 during final delivery; prior M1/M2 KVM evidence remains recorded | Restore only if future nested-KVM validation needs this host |
+| Bare-metal host `w` | Final Linux x86_64 MVP acceptance passed; KVM read/write; temporary user, sudoers, TAP, policy changes, images, and test roots cleaned | Use a fresh isolated setup for future KVM release gates |
 
 ## Completed work
 
