@@ -85,35 +85,54 @@ class FinalLinuxMvpGateTests(unittest.TestCase):
                     ]
                 )
 
-    def test_doctor_run_is_bound_to_workflow_head_and_jobs(self) -> None:
+    def test_doctor_attestation_is_bound_to_digest_head_urls_and_jobs(self) -> None:
         commit = "1" * 40
-        run = {
-            "id": 42,
-            "head_repository": {"full_name": "0xchasercat/firestone"},
-            "path": GATE.DOCTOR_WORKFLOW_PATH,
+        run_id = 42
+        run_url = f"https://github.com/0xchasercat/firestone/actions/runs/{run_id}"
+        document = {
+            "schema": 1,
+            "repository": "0xchasercat/firestone",
+            "workflow": GATE.DOCTOR_WORKFLOW_PATH,
+            "run_id": run_id,
+            "run_url": run_url,
             "head_sha": commit,
             "head_branch": "main",
             "status": "completed",
             "conclusion": "success",
-            "html_url": "https://github.com/0xchasercat/firestone/actions/runs/42",
-            "run_attempt": 1,
+            "build_job": {
+                "job_id": 1,
+                "name": GATE.DOCTOR_BUILD_JOB,
+                "status": "completed",
+                "conclusion": "success",
+                "url": f"{run_url}/job/1",
+            },
+            "rows": {
+                distro: {
+                    "job_id": index,
+                    "name": name,
+                    "status": "completed",
+                    "conclusion": "success",
+                    "url": f"{run_url}/job/{index}",
+                }
+                for index, (distro, name) in enumerate(GATE.DOCTOR_JOB_NAMES.items(), start=2)
+            },
         }
-        names = [GATE.DOCTOR_BUILD_JOB, *GATE.DOCTOR_JOB_NAMES.values()]
-        jobs = {
-            "jobs": [
-                {"id": index, "name": name, "status": "completed", "conclusion": "success"}
-                for index, name in enumerate(names, start=1)
-            ]
-        }
-        with mock.patch.object(GATE, "github_api_json", side_effect=[run, jobs]):
-            verified = GATE.verify_doctor_workflow(42, commit)
-        self.assertTrue(verified["verified_via_github_api"])
-        self.assertEqual(set(verified["rows"]), {"ubuntu", "fedora", "arch"})
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary).resolve() / "doctor-attestation.json"
+            payload = (json.dumps(document, sort_keys=True) + "\n").encode()
+            path.write_bytes(payload)
+            os.chmod(path, 0o600)
+            digest = GATE.hashlib.sha256(payload).hexdigest()
+            verified = GATE.verify_doctor_workflow_attestation(path, digest, commit)
+            self.assertTrue(verified["verified_from_prevalidated_manifest"])
+            self.assertEqual(set(verified["rows"]), {"ubuntu", "fedora", "arch"})
 
-        wrong_head = dict(run, head_sha="2" * 40)
-        with mock.patch.object(GATE, "github_api_json", return_value=wrong_head):
+            wrong_head = dict(document, head_sha="2" * 40)
+            wrong_payload = (json.dumps(wrong_head, sort_keys=True) + "\n").encode()
+            path.write_bytes(wrong_payload)
+            wrong_digest = GATE.hashlib.sha256(wrong_payload).hexdigest()
             with self.assertRaisesRegex(GATE.GateError, "accepted main"):
-                GATE.verify_doctor_workflow(42, commit)
+                GATE.verify_doctor_workflow_attestation(path, wrong_digest, commit)
 
     def test_pending_signal_is_observed_while_finalization_is_blocked(self) -> None:
         with mock.patch.object(GATE, "INTERRUPTED_SIGNAL", None):

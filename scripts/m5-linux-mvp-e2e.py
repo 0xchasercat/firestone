@@ -617,83 +617,65 @@ def validate_repository(expected_commit: str) -> dict[str, Any]:
     }
 
 
-def github_api_json(endpoint: str) -> dict[str, Any]:
-    completed = run_small(
-        ["gh", "api", "--method", "GET", endpoint],
-        timeout=30,
+def verify_doctor_workflow_attestation(
+    path: Path,
+    expected_sha256: str,
+    expected_commit: str,
+) -> dict[str, Any]:
+    require(path.is_absolute(), "doctor attestation path must be absolute")
+    require(path.parent.resolve(strict=True) == path.parent, "doctor attestation parent must not contain symlinks")
+    require(SHA256_PATTERN.fullmatch(expected_sha256) is not None, "doctor attestation SHA-256 must be lowercase 64-hex")
+    payload = read_regular_bytes(path, limit=64 * 1024, exact_mode=0o600)
+    actual_sha256 = hashlib.sha256(payload).hexdigest()
+    require(
+        actual_sha256 == expected_sha256,
+        f"doctor attestation SHA-256 is {actual_sha256}, expected {expected_sha256}",
     )
     try:
-        document = json.loads(completed.stdout)
+        document = json.loads(payload)
     except json.JSONDecodeError as error:
-        raise GateError(f"GitHub API returned invalid JSON for {endpoint}") from error
-    require(isinstance(document, dict), f"GitHub API response is not an object for {endpoint}")
-    return document
+        raise GateError("doctor attestation is invalid JSON") from error
+    require(isinstance(document, dict), "doctor attestation is not an object")
+    require(document.get("schema") == 1, "doctor attestation schema changed")
+    require(document.get("repository") == "0xchasercat/firestone", "doctor attestation repository changed")
+    require(document.get("workflow") == DOCTOR_WORKFLOW_PATH, "doctor attestation workflow changed")
+    require(document.get("head_sha") == expected_commit, "doctor attestation did not verify accepted main")
+    require(document.get("head_branch") == "main", "doctor attestation did not verify main")
+    require(document.get("status") == "completed", "doctor attestation run is incomplete")
+    require(document.get("conclusion") == "success", "doctor attestation run failed")
+    run_id = document.get("run_id")
+    require(isinstance(run_id, int) and run_id > 0, "doctor attestation run ID is invalid")
+    run_url = f"https://github.com/0xchasercat/firestone/actions/runs/{run_id}"
+    require(document.get("run_url") == run_url, "doctor attestation run URL changed")
 
+    build = document.get("build_job")
+    require(isinstance(build, dict), "doctor attestation build job is missing")
+    require(build.get("name") == DOCTOR_BUILD_JOB, "doctor attestation build job changed")
+    require(build.get("status") == "completed" and build.get("conclusion") == "success", "doctor attestation build job failed")
+    build_id = build.get("job_id")
+    require(isinstance(build_id, int) and build_id > 0, "doctor attestation build job ID is invalid")
+    require(build.get("url") == f"{run_url}/job/{build_id}", "doctor attestation build job URL changed")
 
-def verify_doctor_workflow(run_id: int, expected_commit: str) -> dict[str, Any]:
-    require(run_id > 0, "doctor workflow run ID must be positive")
-    run = github_api_json(f"repos/0xchasercat/firestone/actions/runs/{run_id}")
-    require(run.get("id") == run_id, "doctor workflow run ID changed")
-    repository = run.get("head_repository")
-    require(
-        isinstance(repository, dict)
-        and repository.get("full_name") == "0xchasercat/firestone",
-        "doctor workflow belongs to another repository",
-    )
-    require(run.get("path") == DOCTOR_WORKFLOW_PATH, "doctor workflow path changed")
-    require(run.get("head_sha") == expected_commit, "doctor workflow did not run at accepted main")
-    require(run.get("head_branch") == "main", "doctor workflow did not run on main")
-    require(run.get("status") == "completed", "doctor workflow is not complete")
-    require(run.get("conclusion") == "success", "doctor workflow did not succeed")
-
-    jobs_document = github_api_json(
-        f"repos/0xchasercat/firestone/actions/runs/{run_id}/jobs?per_page=100"
-    )
-    jobs = jobs_document.get("jobs")
-    require(isinstance(jobs, list), "doctor workflow jobs are missing")
-    expected_names = {DOCTOR_BUILD_JOB, *DOCTOR_JOB_NAMES.values()}
-    by_name: dict[str, dict[str, Any]] = {}
-    for job in jobs:
-        require(isinstance(job, dict), "doctor workflow job is invalid")
-        name = job.get("name")
-        if name in expected_names:
-            require(name not in by_name, f"doctor workflow repeated job {name}")
-            by_name[name] = job
-    require(set(by_name) == expected_names, "doctor workflow job set is incomplete")
-    for name, job in by_name.items():
-        require(job.get("status") == "completed", f"doctor workflow job is incomplete: {name}")
-        require(job.get("conclusion") == "success", f"doctor workflow job failed: {name}")
-        require(isinstance(job.get("id"), int), f"doctor workflow job ID is invalid: {name}")
-
-    rows: dict[str, dict[str, Any]] = {}
+    rows = document.get("rows")
+    require(isinstance(rows, dict) and set(rows) == set(DOCTOR_JOB_NAMES), "doctor attestation row set changed")
     for distro, name in DOCTOR_JOB_NAMES.items():
-        job = by_name[name]
-        rows[distro] = {
-            "job_id": job["id"],
-            "name": name,
-            "status": job["status"],
-            "conclusion": job["conclusion"],
-        }
-    build = by_name[DOCTOR_BUILD_JOB]
-    return {
-        "verified_via_github_api": True,
-        "run_id": run_id,
-        "repository": "0xchasercat/firestone",
-        "workflow": DOCTOR_WORKFLOW_PATH,
-        "head_sha": expected_commit,
-        "head_branch": "main",
-        "status": "completed",
-        "conclusion": "success",
-        "html_url": run.get("html_url"),
-        "run_attempt": run.get("run_attempt"),
-        "build_job": {
-            "job_id": build["id"],
-            "name": DOCTOR_BUILD_JOB,
-            "status": build["status"],
-            "conclusion": build["conclusion"],
-        },
-        "rows": rows,
+        job = rows[distro]
+        require(isinstance(job, dict), f"doctor attestation row is invalid: {distro}")
+        require(job.get("name") == name, f"doctor attestation job name changed: {distro}")
+        require(job.get("status") == "completed" and job.get("conclusion") == "success", f"doctor attestation row failed: {distro}")
+        job_id = job.get("job_id")
+        require(isinstance(job_id, int) and job_id > 0, f"doctor attestation job ID is invalid: {distro}")
+        require(job.get("url") == f"{run_url}/job/{job_id}", f"doctor attestation job URL changed: {distro}")
+
+    result = dict(document)
+    result["verified_from_prevalidated_manifest"] = True
+    result["attestation"] = {
+        "file": path.name,
+        "sha256": actual_sha256,
+        "bytes": len(payload),
+        "mode": "0600",
     }
+    return result
 
 
 
@@ -1510,7 +1492,7 @@ def build_manifest(
 ) -> dict[str, Any]:
     if doctor_run is None:
         doctor_run = {
-            "verified_via_github_api": False,
+            "verified_from_prevalidated_manifest": False,
             "run_id": 33276918451,
             "repository": "0xchasercat/firestone",
             "workflow": DOCTOR_WORKFLOW_PATH,
@@ -2322,10 +2304,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="independently obtained release digest; defaults to FIRESTONE_E2E_RELEASE_SHA256",
     )
     parser.add_argument(
-        "--doctor-run-id",
-        type=int,
-        default=os.environ.get("FIRESTONE_E2E_DOCTOR_RUN_ID"),
-        help="final-head doctor matrix workflow run; defaults to FIRESTONE_E2E_DOCTOR_RUN_ID",
+        "--doctor-attestation",
+        type=Path,
+        default=(
+            Path(os.environ["FIRESTONE_E2E_DOCTOR_ATTESTATION"])
+            if os.environ.get("FIRESTONE_E2E_DOCTOR_ATTESTATION")
+            else None
+        ),
+        help="prevalidated final-head workflow manifest; defaults to FIRESTONE_E2E_DOCTOR_ATTESTATION",
+    )
+    parser.add_argument(
+        "--doctor-attestation-sha256",
+        default=os.environ.get("FIRESTONE_E2E_DOCTOR_ATTESTATION_SHA256"),
+        help="independently supplied manifest digest; defaults to FIRESTONE_E2E_DOCTOR_ATTESTATION_SHA256",
     )
     parser.add_argument(
         "--evidence-dir",
@@ -2350,19 +2341,30 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--expected-release-sha256 or FIRESTONE_E2E_RELEASE_SHA256 is required",
     )
     require(
-        args.doctor_run_id is not None and args.doctor_run_id > 0,
-        "--doctor-run-id or positive FIRESTONE_E2E_DOCTOR_RUN_ID is required",
+        args.doctor_attestation is not None,
+        "--doctor-attestation or FIRESTONE_E2E_DOCTOR_ATTESTATION is required",
+    )
+    require(
+        args.doctor_attestation_sha256 is not None,
+        "--doctor-attestation-sha256 or FIRESTONE_E2E_DOCTOR_ATTESTATION_SHA256 is required",
     )
     require(args.evidence_dir is not None, "--evidence-dir or FIRESTONE_E2E_EVIDENCE_DIR is required")
     args.expected_commit = str(args.expected_commit)
     args.expected_release_sha256 = str(args.expected_release_sha256)
+    args.doctor_attestation_sha256 = str(args.doctor_attestation_sha256)
+    require(
+        SHA256_PATTERN.fullmatch(args.doctor_attestation_sha256) is not None,
+        "doctor attestation SHA-256 must be lowercase 64-hex",
+    )
     require(
         SHA256_PATTERN.fullmatch(args.expected_release_sha256) is not None,
         "expected release SHA-256 must be lowercase 64-hex",
     )
     args.release_artifact = args.release_artifact.expanduser()
+    args.doctor_attestation = args.doctor_attestation.expanduser()
     args.evidence_dir = args.evidence_dir.expanduser()
     require(args.release_artifact.is_absolute(), "release artifact path must be absolute")
+    require(args.doctor_attestation.is_absolute(), "doctor attestation path must be absolute")
     require(args.evidence_dir.is_absolute(), "evidence directory path must be absolute")
     return args
 
@@ -2390,7 +2392,11 @@ def run_gate(args: argparse.Namespace) -> tuple[bool, Path | None, str | None]:
     lock.acquire()
     try:
         repository = validate_repository(args.expected_commit)
-        doctor_run = verify_doctor_workflow(args.doctor_run_id, args.expected_commit)
+        doctor_run = verify_doctor_workflow_attestation(
+            args.doctor_attestation,
+            args.doctor_attestation_sha256,
+            args.expected_commit,
+        )
         require_not_interrupted()
         work_root = prepare_work_root()
         repository_snapshot = prepare_repository_snapshot(work_root, args.expected_commit)
