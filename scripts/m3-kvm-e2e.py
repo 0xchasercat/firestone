@@ -191,6 +191,29 @@ def decode_argv_hex(values: Any, label: str) -> list[str]:
     return result
 
 
+def decode_launch_args(values: Any, label: str) -> list[str]:
+    require(isinstance(values, list), f"{label} args is not a list")
+    result: list[str] = []
+    for value in values:
+        require(
+            isinstance(value, dict) and set(value) == {"Unix"},
+            f"{label} args contains an invalid OsString",
+        )
+        raw = value["Unix"]
+        require(
+            isinstance(raw, list)
+            and all(
+                isinstance(byte, int)
+                and not isinstance(byte, bool)
+                and 0 <= byte <= 255
+                for byte in raw
+            ),
+            f"{label} args contains invalid Unix bytes",
+        )
+        result.append(os.fsdecode(bytes(raw)))
+    return result
+
+
 def status_fields(pid: int) -> dict[str, str]:
     try:
         lines = (Path("/proc") / str(pid) / "status").read_text(
@@ -1125,7 +1148,8 @@ def assert_main_runtime(
         "--repair-path",
         "none",
     ]
-    require(network["args"] == expected_passt_args, f"passt argv changed: {network['args']!r}")
+    actual_passt_args = decode_launch_args(network["args"], "passt")
+    require(actual_passt_args == expected_passt_args, f"passt argv changed: {actual_passt_args!r}")
     require(network["forwards"] == [
         f"127.0.0.1:{tcp_port}:80",
         f"udp:127.0.0.1:{udp_port}:5353",
@@ -1155,7 +1179,8 @@ def assert_main_runtime(
         if readonly:
             expected_args.append("--readonly")
         expected_args.extend(["--log-level", "warn"])
-        require(item["args"] == expected_args, f"virtiofsd-{index} argv changed")
+        actual_args = decode_launch_args(item["args"], f"virtiofsd-{index}")
+        require(actual_args == expected_args, f"virtiofsd-{index} argv changed: {actual_args!r}")
         pid_file = runtime / f"fs{index}.sock.pid"
         require(stat.S_IMODE(pid_file.stat().st_mode) == 0o600, f"virtiofsd-{index} pid mode changed")
     net = vmconfig.get("net")
