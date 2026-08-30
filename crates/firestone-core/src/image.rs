@@ -3423,9 +3423,15 @@ fn validate_overlay_info(
             format!("base image path '{}' is not UTF-8", base.display()),
         )
     })?;
+    // Cloud Hypervisor's qcow2 writer can omit the optional backing-format
+    // extension after a forced stop. The base was independently validated as
+    // qcow2 above, so an absent hint is safe; an explicit different format is not.
     if info.backing_filename.as_deref() != Some(expected)
         || info.full_backing_filename.as_deref() != Some(expected)
-        || info.backing_filename_format.as_deref() != Some("qcow2")
+        || info
+            .backing_filename_format
+            .as_deref()
+            .is_some_and(|format| format != "qcow2")
     {
         return Err(FirestoneError::new(
             ErrorKind::Dependency,
@@ -4848,6 +4854,9 @@ else:
         let mut dirty_overlay = valid_overlay.clone();
         dirty_overlay.dirty_flag = Some(true);
         validate_overlay_info(overlay, base, 4096, &dirty_overlay)?;
+        let mut inferred_backing_format = valid_overlay.clone();
+        inferred_backing_format.backing_filename_format = None;
+        validate_overlay_info(overlay, base, 4096, &inferred_backing_format)?;
         let mut corrupt_overlay = valid_overlay.clone();
         corrupt_overlay.corrupt = Some(true);
         assert!(validate_overlay_info(overlay, base, 4096, &corrupt_overlay).is_err());
