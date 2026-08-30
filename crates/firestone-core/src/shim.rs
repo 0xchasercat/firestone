@@ -3130,6 +3130,61 @@ fn recover_sidecar_processes(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn process_executable_access_denied(pid: u32) -> bool {
+    fs::canonicalize(PathBuf::from("/proc").join(pid.to_string()).join("exe"))
+        .is_err_and(|source| source.kind() == io::ErrorKind::PermissionDenied)
+}
+
+/// Records the immutable spawn identity after a managed sidecar has deliberately
+/// made its procfs executable link unreadable. Recovery still fails closed unless
+/// it can independently verify the live process against this conservative record.
+#[cfg(target_os = "linux")]
+fn launch_bound_sidecar_record(
+    pid: u32,
+    process_group: u32,
+    program: &Path,
+    executable_sha256: &str,
+    launch_argv: &[OsString],
+    launch_binding: &str,
+) -> Result<ProcessRecord, FirestoneError> {
+    let executable = fs::canonicalize(program).map_err(|source| {
+        filesystem_error(
+            ErrorKind::Conflict,
+            format!("cannot resolve sidecar executable {}", program.display()),
+            source,
+        )
+    })?;
+    let metadata = fs::metadata(&executable).map_err(|source| {
+        filesystem_error(
+            ErrorKind::Conflict,
+            format!("cannot inspect sidecar executable {}", executable.display()),
+            source,
+        )
+    })?;
+    let start_time_ticks = process_start_time(pid)?.ok_or_else(|| {
+        FirestoneError::new(
+            ErrorKind::Conflict,
+            format!("sidecar process {pid} disappeared during identity capture"),
+        )
+    })?;
+    let argv_hex = encode_os_argv(launch_argv);
+    Ok(ProcessRecord {
+        pid,
+        process_group,
+        executable,
+        executable_dev: metadata.dev(),
+        executable_ino: metadata.ino(),
+        argv_hex: argv_hex.clone(),
+        launch_artifact: Some(program.to_path_buf()),
+        launch_argv_hex: Some(argv_hex),
+        launch_binding: Some(launch_binding.to_owned()),
+        launch_sha256: Some(executable_sha256.to_owned()),
+        uid: nix::unistd::getuid().as_raw(),
+        start_time_ticks: Some(start_time_ticks),
+    })
+}
+
 fn capture_sidecar_process_record(
     sidecar: &mut OwnedSidecar,
     program: &Path,
@@ -3159,6 +3214,17 @@ fn capture_sidecar_process_record(
                     );
                     let status = sidecar.reap_exited()?;
                     return Err(sidecar.exit_error(status, &context));
+                }
+                #[cfg(target_os = "linux")]
+                if process_executable_access_denied(sidecar.id()) {
+                    return launch_bound_sidecar_record(
+                        sidecar.id(),
+                        sidecar.record.process_group,
+                        program,
+                        executable_sha256,
+                        launch_argv,
+                        launch_binding,
+                    );
                 }
                 if Instant::now() >= deadline {
                     return Err(error);
@@ -7355,7 +7421,7 @@ mod tests {
     };
 
     #[cfg(target_os = "linux")]
-    use super::{ProcessRecord, process_record, verify_linux_process};
+    use super::{ProcessRecord, launch_bound_sidecar_record, process_record, verify_linux_process};
     use super::{authorize_peer, import_custom_vmm};
     use crate::{ErrorKind, FirestoneError, PathInputs, Paths};
     #[cfg(target_os = "linux")]
@@ -7413,6 +7479,35 @@ mod tests {
         };
         let error = require_error(verify_linux_process(&wrong), "changed executable must fail");
         assert_eq!(error.kind(), ErrorKind::Conflict);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launch_bound_sidecar_record_preserves_immutable_spawn_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pid = std::process::id();
+        let group = nix::unistd::getpgid(Some(super::pid_from_u32(pid)?))?;
+        let executable = std::fs::canonicalize(std::env::current_exe()?)?;
+        let argv = std::env::args_os().collect::<Vec<_>>();
+        let record = launch_bound_sidecar_record(
+            pid,
+            u32::try_from(group.as_raw())?,
+            &executable,
+            "immutable-sha256",
+            &argv,
+            "launch-binding",
+        )?;
+
+        assert_eq!(
+            record.launch_artifact.as_deref(),
+            Some(executable.as_path())
+        );
+        assert_eq!(record.launch_sha256.as_deref(), Some("immutable-sha256"));
+        assert_eq!(record.launch_binding.as_deref(), Some("launch-binding"));
+        assert_eq!(record.argv_hex, super::encode_os_argv(&argv));
+        assert_eq!(record.launch_argv_hex.as_ref(), Some(&record.argv_hex));
+        assert!(record.start_time_ticks.is_some());
         Ok(())
     }
 
