@@ -583,8 +583,10 @@ class ConsoleSession:
 
     def wait_for_shell(self, timeout: int = BOOT_TIMEOUT_SECONDS) -> None:
         token = f"__FIRESTONE_READY_{uuid.uuid4().hex}__".encode("ascii")
-        command = b"printf '" + token + b"\n'\n"
-        deadline = time.monotonic() + timeout
+        command = b"\nprintf '" + token + b"\n'\n"
+        started = time.monotonic()
+        deadline = started + timeout
+        fallback_probe_at = started + 60
         next_probe = 0.0
         while self._pop_line_marker(token) is None:
             now = time.monotonic()
@@ -594,7 +596,10 @@ class ConsoleSession:
                 )
             if now >= deadline:
                 raise AcceptanceError("guest console did not reach the root autologin shell")
-            if b"automatic login" in self.buffer and now >= next_probe:
+            shell_visible = b"automatic login" in self.buffer or re.search(
+                rb"root@[^:\r\n]+:[^\r\n]*#\s*", self.buffer
+            ) is not None
+            if (shell_visible or now >= fallback_probe_at) and now >= next_probe:
                 self._sendall(command)
                 next_probe = now + 2.0
             self._receive()
