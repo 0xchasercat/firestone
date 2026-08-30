@@ -66,7 +66,7 @@ EXPECTED_FILE_HASHES = {
     "docs/verification/doctor-matrix.md": "37c62e94152d89387cd08e8947efac06bc984e31ae68a87d26030f9438451c99",
     "scripts/m1-kvm-e2e.py": "719660526334393f2cb5df6b0b7d2eaf5a106f6e41674fdf3feb9476da11d124",
     "scripts/m2-kvm-e2e.py": "152a8f0ae19a0f46b2415186f545e4109c1d4ca47dbd57e335e0757e72f6d66f",
-    "scripts/m3-kvm-e2e.py": "21d6c465e0dbe989f8fc3daf199ed4a7738d61e36b64234919d66b3e05367a3b",
+    "scripts/m3-kvm-e2e.py": "976b4a16001874c7c3be76c03fa2561c5725e8ee7cc3088316b9bc4ab9ab39a7",
     "scripts/m4-kvm-e2e.py": "0688e8ce9ecfe4270a3ee389b266caa295b4ef46c449ca4103aea71dd5ccdda3",
     "scripts/m5-catalog-kvm-e2e.py": "36271dab02d8395bed9a48fd341728e8f39f187db836e5f49edba68b4a964697",
     "scripts/m5-doctor-matrix.py": "90431c0b296106c42b5d04be7a2088f3801653fd45c16234c0789aa86b41b91d",
