@@ -1051,14 +1051,38 @@ def capture_process(
     if label in {"shim", "vmm"}:
         require(int(cap_eff, 16) == 0, f"{label} has effective host capabilities")
     proc_exe = Path("/proc") / str(pid) / "exe"
+    proc_exe_access_error: str | None = None
     try:
         executable_link = os.readlink(proc_exe)
         executable_metadata = proc_exe.stat()
         executable_hash = sha256(proc_exe)
-        cmdline = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+    except PermissionError as error:
+        launch_artifact = record.get("launch_artifact")
+        require(
+            isinstance(launch_artifact, str) and Path(launch_artifact).is_absolute(),
+            f"{label} identity omitted an absolute launch artifact",
+        )
+        artifact = Path(launch_artifact)
+        try:
+            executable_metadata = artifact.stat()
+            executable_hash = sha256(artifact)
+        except OSError as artifact_error:
+            raise AcceptanceError(
+                f"cannot inventory {label} launch artifact: {artifact_error}"
+            ) from artifact_error
+        executable_link = str(artifact)
+        proc_exe_access_error = str(error)
     except OSError as error:
         raise AcceptanceError(f"cannot inventory {label} pid {pid}: {error}") from error
-    require(len(cmdline) <= 1024 * 1024, f"{label} cmdline exceeds 1 MiB")
+    proc_cmdline_access_error: str | None = None
+    try:
+        cmdline: bytes | None = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+    except PermissionError as error:
+        cmdline = None
+        proc_cmdline_access_error = str(error)
+    except OSError as error:
+        raise AcceptanceError(f"cannot inventory {label} pid {pid}: {error}") from error
+    require(cmdline is None or len(cmdline) <= 1024 * 1024, f"{label} cmdline exceeds 1 MiB")
     require(
         executable_metadata.st_dev == record.get("executable_dev")
         and executable_metadata.st_ino == record.get("executable_ino"),
@@ -1082,8 +1106,16 @@ def capture_process(
         "executable_dev": executable_metadata.st_dev,
         "executable_ino": executable_metadata.st_ino,
         "executable_sha256": executable_hash,
-        "cmdline_sha256": bytes_sha256(cmdline),
-        "cmdline_hex": [part.hex() for part in cmdline.rstrip(b"\0").split(b"\0")],
+        "proc_exe_accessible": proc_exe_access_error is None,
+        "proc_exe_access_error": proc_exe_access_error,
+        "cmdline_sha256": bytes_sha256(cmdline) if cmdline is not None else None,
+        "cmdline_hex": (
+            [part.hex() for part in cmdline.rstrip(b"\0").split(b"\0")]
+            if cmdline is not None
+            else None
+        ),
+        "proc_cmdline_accessible": proc_cmdline_access_error is None,
+        "proc_cmdline_access_error": proc_cmdline_access_error,
         "argv_hex": argv_hex,
         "argv": decode_argv_hex(argv_hex, label),
         "launch_artifact": record.get("launch_artifact"),
