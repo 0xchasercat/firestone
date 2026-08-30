@@ -4587,7 +4587,7 @@ fn detect_virtiofs_sandbox() -> VirtiofsSandbox {
         return VirtiofsSandbox::None;
     };
     match Cmd::new(unshare.as_os_str())
-        .args(["-U", "true"])
+        .args(["--user", "--map-root-user", "true"])
         .reduced_environment()
         .stdin_null()
         .timeout(Duration::from_secs(2))

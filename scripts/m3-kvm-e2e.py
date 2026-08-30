@@ -191,6 +191,29 @@ def decode_argv_hex(values: Any, label: str) -> list[str]:
     return result
 
 
+def decode_launch_args(values: Any, label: str) -> list[str]:
+    require(isinstance(values, list), f"{label} args is not a list")
+    result: list[str] = []
+    for value in values:
+        require(
+            isinstance(value, dict) and set(value) == {"Unix"},
+            f"{label} args contains an invalid OsString",
+        )
+        raw = value["Unix"]
+        require(
+            isinstance(raw, list)
+            and all(
+                isinstance(byte, int)
+                and not isinstance(byte, bool)
+                and 0 <= byte <= 255
+                for byte in raw
+            ),
+            f"{label} args contains invalid Unix bytes",
+        )
+        result.append(os.fsdecode(bytes(raw)))
+    return result
+
+
 def status_fields(pid: int) -> dict[str, str]:
     try:
         lines = (Path("/proc") / str(pid) / "status").read_text(
@@ -704,9 +727,10 @@ def configure_timeouts(harness: Harness) -> dict[str, Any]:
 
 
 def setup_user_namespaces(harness: Harness) -> dict[str, Any]:
-    probe = harness.run(["unshare", "-U", "true"], timeout=10, check=False)
+    probe_command = ["unshare", "--user", "--map-root-user", "true"]
+    probe = harness.run(probe_command, timeout=10, check=False)
     result: dict[str, Any] = {
-        "probe_command": ["unshare", "-U", "true"],
+        "probe_command": probe_command,
         "before": {
             "exit_code": probe.returncode,
             "stdout": stream_facts(probe.stdout),
@@ -725,14 +749,14 @@ def setup_user_namespaces(harness: Harness) -> dict[str, Any]:
     result["apparmor_restrict_unprivileged_userns_before"] = before
     require(
         os.environ.get("FIRESTONE_E2E_ALLOW_USERNS_SETUP") == "1",
-        "unshare -U true failed; verify 16 requires rootless user namespaces. On this "
+        "unshare root mapping failed; verify 16 requires rootless user namespaces. On this "
         "disposable test host, set FIRESTONE_E2E_ALLOW_USERNS_SETUP=1 to allow the "
         "harness to temporarily set kernel.apparmor_restrict_unprivileged_userns=0; "
         "the harness records and restores the prior value",
     )
     require(
         before is not None,
-        "unshare -U true failed and the AppArmor user-namespace policy sysctl is absent",
+        "unshare root mapping failed and the AppArmor user-namespace policy sysctl is absent",
     )
     completed = harness.run(
         [
@@ -756,7 +780,7 @@ def setup_user_namespaces(harness: Harness) -> dict[str, Any]:
     result["adjustment_command"] = (
         "sudo -n sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
     )
-    after = harness.run(["unshare", "-U", "true"], timeout=10, check=False)
+    after = harness.run(probe_command, timeout=10, check=False)
     result["after"] = {
         "exit_code": after.returncode,
         "stdout": stream_facts(after.stdout),
@@ -767,7 +791,7 @@ def setup_user_namespaces(harness: Harness) -> dict[str, Any]:
     }
     require(
         after.returncode == 0,
-        "unshare -U true still fails after explicit test-host setup",
+        "unshare root mapping still fails after explicit test-host setup",
     )
     return result
 
@@ -1026,19 +1050,47 @@ def capture_process(
     require(cap_eff is not None, f"{label} status omitted CapEff")
     if label in {"shim", "vmm"}:
         require(int(cap_eff, 16) == 0, f"{label} has effective host capabilities")
+    recorded_executable = record.get("executable")
+    require(
+        isinstance(recorded_executable, str) and Path(recorded_executable).is_absolute(),
+        f"{label} identity omitted an absolute executable",
+    )
     proc_exe = Path("/proc") / str(pid) / "exe"
+    proc_exe_access_error: str | None = None
     try:
         executable_link = os.readlink(proc_exe)
         executable_metadata = proc_exe.stat()
         executable_hash = sha256(proc_exe)
-        cmdline = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+    except PermissionError as error:
+        executable = Path(recorded_executable)
+        try:
+            executable_metadata = executable.stat()
+            executable_hash = sha256(executable)
+        except OSError as executable_error:
+            raise AcceptanceError(
+                f"cannot inventory {label} recorded executable: {executable_error}"
+            ) from executable_error
+        executable_link = str(executable)
+        proc_exe_access_error = str(error)
     except OSError as error:
         raise AcceptanceError(f"cannot inventory {label} pid {pid}: {error}") from error
-    require(len(cmdline) <= 1024 * 1024, f"{label} cmdline exceeds 1 MiB")
+    proc_cmdline_access_error: str | None = None
+    try:
+        cmdline: bytes | None = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+    except PermissionError as error:
+        cmdline = None
+        proc_cmdline_access_error = str(error)
+    except OSError as error:
+        raise AcceptanceError(f"cannot inventory {label} pid {pid}: {error}") from error
+    require(cmdline is None or len(cmdline) <= 1024 * 1024, f"{label} cmdline exceeds 1 MiB")
     require(
         executable_metadata.st_dev == record.get("executable_dev")
         and executable_metadata.st_ino == record.get("executable_ino"),
         f"{label} executable identity disagrees with identity.json",
+    )
+    require(
+        executable_link == recorded_executable,
+        f"{label} executable path disagrees with identity.json",
     )
     process_group = os.getpgid(pid)
     require(
@@ -1058,8 +1110,16 @@ def capture_process(
         "executable_dev": executable_metadata.st_dev,
         "executable_ino": executable_metadata.st_ino,
         "executable_sha256": executable_hash,
-        "cmdline_sha256": bytes_sha256(cmdline),
-        "cmdline_hex": [part.hex() for part in cmdline.rstrip(b"\0").split(b"\0")],
+        "proc_exe_accessible": proc_exe_access_error is None,
+        "proc_exe_access_error": proc_exe_access_error,
+        "cmdline_sha256": bytes_sha256(cmdline) if cmdline is not None else None,
+        "cmdline_hex": (
+            [part.hex() for part in cmdline.rstrip(b"\0").split(b"\0")]
+            if cmdline is not None
+            else None
+        ),
+        "proc_cmdline_accessible": proc_cmdline_access_error is None,
+        "proc_cmdline_access_error": proc_cmdline_access_error,
         "argv_hex": argv_hex,
         "argv": decode_argv_hex(argv_hex, label),
         "launch_artifact": record.get("launch_artifact"),
@@ -1124,7 +1184,8 @@ def assert_main_runtime(
         "--repair-path",
         "none",
     ]
-    require(network["args"] == expected_passt_args, f"passt argv changed: {network['args']!r}")
+    actual_passt_args = decode_launch_args(network["args"], "passt")
+    require(actual_passt_args == expected_passt_args, f"passt argv changed: {actual_passt_args!r}")
     require(network["forwards"] == [
         f"127.0.0.1:{tcp_port}:80",
         f"udp:127.0.0.1:{udp_port}:5353",
@@ -1154,7 +1215,8 @@ def assert_main_runtime(
         if readonly:
             expected_args.append("--readonly")
         expected_args.extend(["--log-level", "warn"])
-        require(item["args"] == expected_args, f"virtiofsd-{index} argv changed")
+        actual_args = decode_launch_args(item["args"], f"virtiofsd-{index}")
+        require(actual_args == expected_args, f"virtiofsd-{index} argv changed: {actual_args!r}")
         pid_file = runtime / f"fs{index}.sock.pid"
         require(stat.S_IMODE(pid_file.stat().st_mode) == 0o600, f"virtiofsd-{index} pid mode changed")
     net = vmconfig.get("net")
@@ -1225,8 +1287,16 @@ def trust_snapshot(harness: Harness, name: str) -> dict[str, Any]:
     path = harness.home / "data" / "machines" / name / "known_hosts"
     value = read_bounded(path, 1024 * 1024)
     require(value, f"{name} known_hosts is empty")
-    require(stat.S_IMODE(path.stat().st_mode) == 0o600, f"{name} known_hosts mode changed")
-    return {"mode": "0600", "bytes": len(value), "sha256": bytes_sha256(value)}
+    metadata = path.lstat()
+    mode = stat.S_IMODE(metadata.st_mode)
+    require(
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == os.getuid()
+        and mode & 0o022 == 0
+        and mode & 0o600 == 0o600,
+        f"{name} known_hosts is not a current-user protected regular file",
+    )
+    return {"mode": f"{mode:04o}", "bytes": len(value), "sha256": bytes_sha256(value)}
 
 
 def direct_ssh(
@@ -1273,12 +1343,6 @@ def direct_ssh(
 
 
 def verify_cloud_merge(harness: Harness, version: int, metric: int) -> dict[str, Any]:
-    network_probe = (
-        "import json; "
-        "d=json.load(open('/run/cloud-init/network-config.json')); "
-        "v=d['ethernets']['passt0']['dhcp4-overrides']['route-metric']; "
-        "print('network_metric='+str(v))"
-    )
     script = f"""
 set -eu
 cloud-init status --wait --long >/tmp/firestone-cloud-status
@@ -1288,7 +1352,9 @@ cloud-init status --wait --long >/tmp/firestone-cloud-status
 test -f /etc/systemd/system/firestone-sshd.socket
 test "$(systemctl is-active firestone-sshd.socket)" = active
 test "$(systemctl show -p SubState --value firestone-sshd.socket)" = listening
-python3 -c {shlex.quote(network_probe)}
+network_metric=$(ip -4 route show default | awk '{{for (i=1; i<NF; i++) if ($i=="metric") {{print $(i+1); exit}}}}')
+[ "$network_metric" = "{metric}" ]
+printf 'network_metric=%s\n' "$network_metric"
 printf 'hostname=m3-user-v{version}\n'
 printf 'user_write_files=v{version}\n'
 printf 'user_runcmd=v{version}-runcmd\n'
