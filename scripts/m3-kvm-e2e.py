@@ -1287,8 +1287,16 @@ def trust_snapshot(harness: Harness, name: str) -> dict[str, Any]:
     path = harness.home / "data" / "machines" / name / "known_hosts"
     value = read_bounded(path, 1024 * 1024)
     require(value, f"{name} known_hosts is empty")
-    require(stat.S_IMODE(path.stat().st_mode) == 0o600, f"{name} known_hosts mode changed")
-    return {"mode": "0600", "bytes": len(value), "sha256": bytes_sha256(value)}
+    metadata = path.lstat()
+    mode = stat.S_IMODE(metadata.st_mode)
+    require(
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == os.getuid()
+        and mode & 0o022 == 0
+        and mode & 0o600 == 0o600,
+        f"{name} known_hosts is not a current-user protected regular file",
+    )
+    return {"mode": f"{mode:04o}", "bytes": len(value), "sha256": bytes_sha256(value)}
 
 
 def direct_ssh(
