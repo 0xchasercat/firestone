@@ -64,7 +64,7 @@ EXPECTED_FILE_HASHES = {
     "catalog/images.toml": "89f3e1827ed143e02da6d90e8c18bc28f273fcaba9cc301db663dac9cc4d3acf",
     "deps.toml": "316934629adce4da291b1f4dba73f7e07c1f4c60d366702bbe4f1cc29cd5c734",
     "docs/verification/doctor-matrix.md": "37c62e94152d89387cd08e8947efac06bc984e31ae68a87d26030f9438451c99",
-    "scripts/m1-kvm-e2e.py": "859dd0a18cf611d1a8bdfd6d0bc363882fe83f9551cd2d5f057f72e044cb7d89",
+    "scripts/m1-kvm-e2e.py": "bd5281b0c287ba5a9fb616ba7f6617e00cc725f2048515c49a1cf5819e8a9638",
     "scripts/m2-kvm-e2e.py": "15d610fe07ca2dc0fa6a67342b3ae10765dc0d88a26703eefb300041f9c76bc9",
     "scripts/m3-kvm-e2e.py": "21d6c465e0dbe989f8fc3daf199ed4a7738d61e36b64234919d66b3e05367a3b",
     "scripts/m4-kvm-e2e.py": "0688e8ce9ecfe4270a3ee389b266caa295b4ef46c449ca4103aea71dd5ccdda3",

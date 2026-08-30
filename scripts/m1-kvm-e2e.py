@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import atexit
 import base64
+import errno
 import hashlib
 import json
 import os
 import platform
+import pty
 import re
 import shlex
 import shutil
@@ -458,21 +460,72 @@ def prepare_fio_disk(harness: Harness) -> tuple[Path, str, str]:
 
 
 class ConsoleSession:
-    def __init__(self, path: Path, timeout: int = BOOT_TIMEOUT_SECONDS) -> None:
-        self.path = path
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-                break
-            except FileNotFoundError:
-                if time.monotonic() >= deadline:
-                    raise AcceptanceError(f"console PTY did not appear: {path}")
-                time.sleep(0.1)
+    def __init__(
+        self,
+        harness: Harness,
+        name: str,
+        timeout: int = BOOT_TIMEOUT_SECONDS,
+    ) -> None:
+        self.harness = harness
+        self.name = name
+        self.fd, slave = pty.openpty()
+        os.set_blocking(self.fd, False)
+        command = [os.fspath(harness.binary), "console", name]
+        rendered = shlex.join(command)
+        harness.commands.append(rendered)
+        print(f"+ {rendered}", flush=True)
+        try:
+            self.process = subprocess.Popen(
+                command,
+                cwd=REPO_ROOT,
+                env=os.environ.copy(),
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
+                start_new_session=True,
+            )
+        except BaseException:
+            os.close(self.fd)
+            os.close(slave)
+            raise
+        os.close(slave)
         self.buffer = bytearray()
+        deadline = time.monotonic() + timeout
+        acknowledgement = f"connected to {name} console".encode()
+        try:
+            while acknowledgement not in self.buffer:
+                if self.process.poll() is not None:
+                    raise AcceptanceError(
+                        f"console client exited {self.process.returncode} before attachment"
+                    )
+                if time.monotonic() >= deadline:
+                    raise AcceptanceError("console client did not attach before the deadline")
+                self._receive()
+        except BaseException:
+            self.close()
+            raise
 
     def close(self) -> None:
-        os.close(self.fd)
+        try:
+            if self.process.poll() is None:
+                try:
+                    self._sendall(bytes([0x1D]))
+                    self.process.wait(timeout=10)
+                except (AcceptanceError, OSError, subprocess.TimeoutExpired):
+                    try:
+                        os.killpg(self.process.pid, signal.SIGTERM)
+                        self.process.wait(timeout=5)
+                    except (ProcessLookupError, subprocess.TimeoutExpired):
+                        try:
+                            os.killpg(self.process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            self.process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            pass
+        finally:
+            os.close(self.fd)
 
     def _sendall(self, data: bytes) -> None:
         remaining = memoryview(data)
@@ -481,9 +534,9 @@ class ConsoleSession:
                 written = os.write(self.fd, remaining)
             except BlockingIOError:
                 _, writable, _ = select.select([], [self.fd], [], 0.2)
-                require(writable, "console PTY remained blocked while writing")
+                require(writable, "console client remained blocked while writing")
                 continue
-            require(written > 0, "console PTY accepted no bytes")
+            require(written > 0, "console client accepted no bytes")
             remaining = remaining[written:]
 
     def _receive(self) -> bool:
@@ -494,6 +547,10 @@ class ConsoleSession:
             block = os.read(self.fd, 65_536)
         except BlockingIOError:
             return False
+        except OSError as error:
+            if error.errno == errno.EIO:
+                return False
+            raise
         if not block:
             return False
         self.buffer.extend(block)
@@ -514,6 +571,10 @@ class ConsoleSession:
             before = self._pop_line_marker(marker)
             if before is not None:
                 return before
+            if self.process.poll() is not None:
+                raise AcceptanceError(
+                    f"console client exited {self.process.returncode} before returning a marker"
+                )
             if time.monotonic() >= deadline:
                 raise AcceptanceError(
                     f"console did not return marker {marker.decode('ascii', errors='replace')!r}"
@@ -522,11 +583,15 @@ class ConsoleSession:
 
     def wait_for_shell(self, timeout: int = BOOT_TIMEOUT_SECONDS) -> None:
         token = f"__FIRESTONE_READY_{uuid.uuid4().hex}__".encode("ascii")
-        command = b"printf '" + token + b"\\n'\n"
+        command = b"printf '" + token + b"\n'\n"
         deadline = time.monotonic() + timeout
         next_probe = 0.0
         while self._pop_line_marker(token) is None:
             now = time.monotonic()
+            if self.process.poll() is not None:
+                raise AcceptanceError(
+                    f"console client exited {self.process.returncode} before the root shell"
+                )
             if now >= deadline:
                 raise AcceptanceError("guest console did not reach the root autologin shell")
             if b"automatic login" in self.buffer and now >= next_probe:
@@ -543,11 +608,11 @@ class ConsoleSession:
         wrapper = (
             b"printf '\n"
             + begin
-            + b"\\n'; printf '%s' '"
+            + b"\n'; printf '%s' '"
             + encoded
             + b"' | base64 -d | /bin/sh; rc=$?; printf '\n"
             + end_prefix
-            + b"%s__\\n' \"$rc\"\n"
+            + b"%s__\n' \"$rc\"\n"
         )
         self._sendall(wrapper)
         self._wait_for_line(begin, 10)
@@ -559,10 +624,13 @@ class ConsoleSession:
                 output = bytes(self.buffer[: match.start()]).replace(b"\r", b"")
                 self.buffer = self.buffer[match.end() :]
                 return int(match.group(1)), output.decode("utf-8", errors="replace").strip()
+            if self.process.poll() is not None:
+                raise AcceptanceError(
+                    f"console client exited {self.process.returncode} during guest command"
+                )
             if time.monotonic() >= deadline:
                 raise AcceptanceError(f"guest command timed out after {timeout}s")
             self._receive()
-
 
 def fio_summary(document: dict[str, Any]) -> dict[str, Any]:
     jobs = document.get("jobs")
@@ -652,17 +720,6 @@ def image_evidence(harness: Harness, name: str) -> dict[str, Any]:
     }
 
 
-def pty_console_path(info: dict[str, Any]) -> Path:
-    config = info.get("config")
-    require(isinstance(config, dict), "vm.info did not return VmConfig")
-    console = config.get("console")
-    require(isinstance(console, dict), "vm.info did not return console configuration")
-    require(console.get("mode") == "Pty", "vm.info did not report a PTY console")
-    path_value = console.get("file")
-    require(isinstance(path_value, str) and path_value, "vm.info did not return the console PTY path")
-    path = Path(path_value)
-    require(path.is_absolute(), "vm.info returned a relative console PTY path")
-    return path
 
 
 def require_default_vmconfig(harness: Harness, name: str) -> dict[str, Any]:
@@ -751,7 +808,7 @@ def run_acceptance(harness: Harness) -> None:
     info = json.loads(info_body)
     require(info.get("state") == "Running", f"vm.info did not report Running: {info!r}")
 
-    console = ConsoleSession(pty_console_path(info))
+    console = ConsoleSession(harness, graceful)
     try:
         console.wait_for_shell()
         cloud_rc, cloud_status = console.run(
@@ -849,10 +906,9 @@ cat /tmp/fio-raw.json
 printf '\nFIO_RAW_END\n'
 umount /mnt/firestone-fio
 """.strip()
-    converted_info_status, converted_info_body = harness.unix_http(converted, "GET", "/api/v1/vm.info")
+    converted_info_status, _ = harness.unix_http(converted, "GET", "/api/v1/vm.info")
     require(converted_info_status == 200, f"converted vm.info returned HTTP {converted_info_status}")
-    converted_info = json.loads(converted_info_body)
-    fio_console = ConsoleSession(pty_console_path(converted_info))
+    fio_console = ConsoleSession(harness, converted)
     try:
         fio_console.wait_for_shell()
         fio_rc, fio_output = fio_console.run(fio_command, timeout=180)
