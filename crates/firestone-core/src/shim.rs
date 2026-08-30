@@ -7421,9 +7421,7 @@ mod tests {
     };
 
     #[cfg(target_os = "linux")]
-    use super::{
-        ProcessRecord, launch_bound_sidecar_record, process_record, verify_linux_process,
-    };
+    use super::{ProcessRecord, launch_bound_sidecar_record, process_record, verify_linux_process};
     use super::{authorize_peer, import_custom_vmm};
     use crate::{ErrorKind, FirestoneError, PathInputs, Paths};
     #[cfg(target_os = "linux")]
@@ -7501,7 +7499,10 @@ mod tests {
             "launch-binding",
         )?;
 
-        assert_eq!(record.launch_artifact.as_deref(), Some(executable.as_path()));
+        assert_eq!(
+            record.launch_artifact.as_deref(),
+            Some(executable.as_path())
+        );
         assert_eq!(record.launch_sha256.as_deref(), Some("immutable-sha256"));
         assert_eq!(record.launch_binding.as_deref(), Some("launch-binding"));
         assert_eq!(record.argv_hex, super::encode_os_argv(&argv));
