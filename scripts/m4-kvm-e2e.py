@@ -446,7 +446,7 @@ class Harness:
         first_body_ms: float | None = None
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(min(5.0, timeout))
-            client.connect(self.socket_path)
+            client.connect(os.fspath(self.socket_path))
             client.sendall(wire)
             while True:
                 remaining = deadline - time.monotonic()
