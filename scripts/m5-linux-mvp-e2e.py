@@ -68,7 +68,7 @@ EXPECTED_FILE_HASHES = {
     "scripts/m2-kvm-e2e.py": "152a8f0ae19a0f46b2415186f545e4109c1d4ca47dbd57e335e0757e72f6d66f",
     "scripts/m3-kvm-e2e.py": "976b4a16001874c7c3be76c03fa2561c5725e8ee7cc3088316b9bc4ab9ab39a7",
     "scripts/m4-kvm-e2e.py": "16a14771c0c0e6916d49554f0ed1af24b8fa8ef7e9c28ad9351e587e86c3a99e",
-    "scripts/m5-catalog-kvm-e2e.py": "36271dab02d8395bed9a48fd341728e8f39f187db836e5f49edba68b4a964697",
+    "scripts/m5-catalog-kvm-e2e.py": "500e414ab16e08b25e592d049491e6c51e3240ce1569dc1207f8efdbc27d833b",
     "scripts/m5-doctor-matrix.py": "90431c0b296106c42b5d04be7a2088f3801653fd45c16234c0789aa86b41b91d",
 }
 
