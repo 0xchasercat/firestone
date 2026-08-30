@@ -455,6 +455,30 @@ def image_evidence(
     }
 
 
+def doctor_evidence(harness: Harness) -> dict[str, Any]:
+    _, doctor_fix = harness.json_command(
+        "doctor",
+        "--fix",
+        action="doctor",
+        timeout=DOCTOR_TIMEOUT_SECONDS,
+    )
+    _, doctor = harness.json_command("doctor", action="doctor")
+    fix_checks = doctor_fix.get("checks")
+    checks = doctor.get("checks")
+    require(
+        isinstance(fix_checks, list) and len(fix_checks) == 13,
+        "doctor --fix did not return 13 checks",
+    )
+    require(isinstance(checks, list) and len(checks) == 13, "doctor did not return 13 checks")
+    failures = [check for check in checks if check.get("status") == "fail"]
+    require(not failures, f"doctor failed before E2E 11: {failures!r}")
+    return {
+        "fix_check_count": len(fix_checks),
+        "check_count": len(checks),
+        "failures": [],
+    }
+
+
 def run_acceptance(harness: Harness) -> None:
     require(sys.platform == "linux", "E2E 11 requires Linux")
     require(platform.machine() == "x86_64", "E2E 11 requires x86_64")
@@ -486,22 +510,7 @@ def run_acceptance(harness: Harness) -> None:
         "sshd_path": "/usr/sbin/sshd",
     }
 
-    doctor_fix, _ = harness.json_command(
-        "doctor",
-        "--fix",
-        action="doctor",
-        timeout=DOCTOR_TIMEOUT_SECONDS,
-    )
-    _, doctor = harness.json_command("doctor", action="doctor")
-    checks = doctor.get("checks")
-    require(isinstance(checks, list) and len(checks) == 13, "doctor did not return 13 checks")
-    failures = [check for check in checks if check.get("status") == "fail"]
-    require(not failures, f"doctor failed before E2E 11: {failures!r}")
-    harness.evidence["doctor"] = {
-        "fix_check_count": len(doctor_fix.get("checks", [])),
-        "check_count": len(checks),
-        "failures": [],
-    }
+    harness.evidence["doctor"] = doctor_evidence(harness)
     harness.evidence["artifacts"] = installed_artifacts(harness)
 
     for reference in MATRIX_REFERENCES:
