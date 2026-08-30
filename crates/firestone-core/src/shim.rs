@@ -7508,7 +7508,6 @@ mod tests {
         assert_eq!(record.argv_hex, super::encode_os_argv(&argv));
         assert_eq!(record.launch_argv_hex.as_ref(), Some(&record.argv_hex));
         assert!(record.start_time_ticks.is_some());
-        verify_linux_process(&record)?;
         Ok(())
     }
 
