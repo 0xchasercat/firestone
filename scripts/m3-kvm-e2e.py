@@ -704,9 +704,10 @@ def configure_timeouts(harness: Harness) -> dict[str, Any]:
 
 
 def setup_user_namespaces(harness: Harness) -> dict[str, Any]:
-    probe = harness.run(["unshare", "-U", "true"], timeout=10, check=False)
+    probe_command = ["unshare", "--user", "--map-root-user", "true"]
+    probe = harness.run(probe_command, timeout=10, check=False)
     result: dict[str, Any] = {
-        "probe_command": ["unshare", "-U", "true"],
+        "probe_command": probe_command,
         "before": {
             "exit_code": probe.returncode,
             "stdout": stream_facts(probe.stdout),
@@ -725,14 +726,14 @@ def setup_user_namespaces(harness: Harness) -> dict[str, Any]:
     result["apparmor_restrict_unprivileged_userns_before"] = before
     require(
         os.environ.get("FIRESTONE_E2E_ALLOW_USERNS_SETUP") == "1",
-        "unshare -U true failed; verify 16 requires rootless user namespaces. On this "
+        "unshare root mapping failed; verify 16 requires rootless user namespaces. On this "
         "disposable test host, set FIRESTONE_E2E_ALLOW_USERNS_SETUP=1 to allow the "
         "harness to temporarily set kernel.apparmor_restrict_unprivileged_userns=0; "
         "the harness records and restores the prior value",
     )
     require(
         before is not None,
-        "unshare -U true failed and the AppArmor user-namespace policy sysctl is absent",
+        "unshare root mapping failed and the AppArmor user-namespace policy sysctl is absent",
     )
     completed = harness.run(
         [
@@ -756,7 +757,7 @@ def setup_user_namespaces(harness: Harness) -> dict[str, Any]:
     result["adjustment_command"] = (
         "sudo -n sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
     )
-    after = harness.run(["unshare", "-U", "true"], timeout=10, check=False)
+    after = harness.run(probe_command, timeout=10, check=False)
     result["after"] = {
         "exit_code": after.returncode,
         "stdout": stream_facts(after.stdout),
@@ -767,7 +768,7 @@ def setup_user_namespaces(harness: Harness) -> dict[str, Any]:
     }
     require(
         after.returncode == 0,
-        "unshare -U true still fails after explicit test-host setup",
+        "unshare root mapping still fails after explicit test-host setup",
     )
     return result
 

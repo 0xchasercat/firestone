@@ -952,7 +952,7 @@ fn check_user_namespaces(context: &DoctorContext) -> DoctorCheck {
         .with_hint("virtiofsd will run with --sandbox none");
     };
     let output = match Cmd::new(unshare)
-        .args(["-U", "true"])
+        .args(["--user", "--map-root-user", "true"])
         .stdin_null()
         .timeout(DOCTOR_PROBE_TIMEOUT)
         .error_kind(ErrorKind::Dependency)
@@ -973,7 +973,7 @@ fn check_user_namespaces(context: &DoctorContext) -> DoctorCheck {
             DoctorCheckId::UserNamespaces,
             DoctorStatus::Ok,
             format!(
-                "user namespaces are enabled; unshare -U true succeeded (maximum {})",
+                "user namespaces are enabled; root mapping succeeded (maximum {})",
                 max_namespaces.unwrap_or_default()
             ),
         )
@@ -982,7 +982,7 @@ fn check_user_namespaces(context: &DoctorContext) -> DoctorCheck {
             "cannot read user.max_user_namespaces".to_owned()
         } else {
             format!(
-                "unshare -U true failed: {}",
+                "unshare --user --map-root-user true failed: {}",
                 command_failure_reason(&output)
             )
         };
@@ -3020,6 +3020,13 @@ mod tests {
 
         fs::write(&fixture.context.user_namespace_sysctl, "1024\n")?;
         let unshare = PathBuf::from(&fixture.context.search_path).join("unshare");
+        write_executable(
+            &unshare,
+            "test \"$1\" = --user && test \"$2\" = --map-root-user && test \"$3\" = true",
+        )?;
+        let mapped = check_user_namespaces(&fixture.context);
+        assert_eq!(mapped.status, DoctorStatus::Ok);
+
         write_executable(&unshare, "printf denied >&2; exit 1")?;
         let denied = check_user_namespaces(&fixture.context);
         assert_eq!(denied.status, DoctorStatus::Warn);
