@@ -1050,6 +1050,11 @@ def capture_process(
     require(cap_eff is not None, f"{label} status omitted CapEff")
     if label in {"shim", "vmm"}:
         require(int(cap_eff, 16) == 0, f"{label} has effective host capabilities")
+    recorded_executable = record.get("executable")
+    require(
+        isinstance(recorded_executable, str) and Path(recorded_executable).is_absolute(),
+        f"{label} identity omitted an absolute executable",
+    )
     proc_exe = Path("/proc") / str(pid) / "exe"
     proc_exe_access_error: str | None = None
     try:
@@ -1057,20 +1062,15 @@ def capture_process(
         executable_metadata = proc_exe.stat()
         executable_hash = sha256(proc_exe)
     except PermissionError as error:
-        launch_artifact = record.get("launch_artifact")
-        require(
-            isinstance(launch_artifact, str) and Path(launch_artifact).is_absolute(),
-            f"{label} identity omitted an absolute launch artifact",
-        )
-        artifact = Path(launch_artifact)
+        executable = Path(recorded_executable)
         try:
-            executable_metadata = artifact.stat()
-            executable_hash = sha256(artifact)
-        except OSError as artifact_error:
+            executable_metadata = executable.stat()
+            executable_hash = sha256(executable)
+        except OSError as executable_error:
             raise AcceptanceError(
-                f"cannot inventory {label} launch artifact: {artifact_error}"
-            ) from artifact_error
-        executable_link = str(artifact)
+                f"cannot inventory {label} recorded executable: {executable_error}"
+            ) from executable_error
+        executable_link = str(executable)
         proc_exe_access_error = str(error)
     except OSError as error:
         raise AcceptanceError(f"cannot inventory {label} pid {pid}: {error}") from error
@@ -1087,6 +1087,10 @@ def capture_process(
         executable_metadata.st_dev == record.get("executable_dev")
         and executable_metadata.st_ino == record.get("executable_ino"),
         f"{label} executable identity disagrees with identity.json",
+    )
+    require(
+        executable_link == recorded_executable,
+        f"{label} executable path disagrees with identity.json",
     )
     process_group = os.getpgid(pid)
     require(
