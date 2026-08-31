@@ -78,17 +78,35 @@ jobs:
             --log-file "$smoke/passt.log" \
             --tcp-ports none \
             --udp-ports none \
-            --repair-path none &
+            --repair-path none 2>"$smoke/passt.stderr" &
           pid=$!
           trap 'kill "$pid" 2>/dev/null || :; wait "$pid" 2>/dev/null || :' EXIT
+          ready=false
           for _ in $(seq 1 100); do
-            test ! -S "$smoke/net.sock" || break
-            kill -0 "$pid"
+            if test -S "$smoke/net.sock"; then
+              ready=true
+              break
+            fi
+            kill -0 "$pid" 2>/dev/null || break
             sleep 0.05
           done
-          test -S "$smoke/net.sock"
-          kill "$pid"
-          wait "$pid" 2>/dev/null || :
+          if [[ $ready == true ]]; then
+            kill "$pid"
+            wait "$pid" 2>/dev/null || :
+            test -s "$smoke/passt.log"
+          else
+            if kill -0 "$pid" 2>/dev/null; then
+              kill "$pid"
+              wait "$pid" 2>/dev/null || :
+              echo 'passt did not create its socket within 5 seconds' >&2
+              exit 1
+            fi
+            status=0
+            wait "$pid" || status=$?
+            test "$status" -ne 0
+            grep -Eq "Couldn't create user namespace|Failed to detach isolating namespaces" \
+              "$smoke/passt.stderr"
+            cat "$smoke/passt.stderr"
+          fi
           trap - EXIT
-          test -s "$smoke/passt.log"
           cat "$output/helpers.build-info"
