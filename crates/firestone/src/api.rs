@@ -16,7 +16,7 @@ use axum::{
     },
     middleware::{self, Next},
     response::Response,
-    routing::{delete, get, post},
+    routing::{MethodRouter, delete, get, post},
 };
 use firestone_core::{
     Action, Dispatcher, ErrorInfo, ErrorKind, Event, EventSink, FirestoneError, GlobalConfig,
@@ -63,6 +63,85 @@ struct ApiState {
     config: RestConfig,
 }
 
+struct RestRoute {
+    path: &'static str,
+    #[cfg(test)]
+    authored_methods: &'static [&'static str],
+    method_router: fn() -> MethodRouter<ApiState>,
+}
+
+#[cfg(test)]
+macro_rules! rest_method_name {
+    (get) => {
+        "GET"
+    };
+    (post) => {
+        "POST"
+    };
+    (put) => {
+        "PUT"
+    };
+    (patch) => {
+        "PATCH"
+    };
+    (delete) => {
+        "DELETE"
+    };
+    (head) => {
+        "HEAD"
+    };
+    (options) => {
+        "OPTIONS"
+    };
+    (trace) => {
+        "TRACE"
+    };
+}
+
+macro_rules! define_rest_routes {
+    ($(
+        $path:literal => $first_method:ident($first_handler:path)
+            $(.$method:ident($handler:path))*;
+    )+) => {
+        const REST_ROUTES: &[RestRoute] = &[
+            $(
+                RestRoute {
+                    path: $path,
+                    #[cfg(test)]
+                    authored_methods: &[
+                        rest_method_name!($first_method)
+                        $(, rest_method_name!($method))*
+                    ],
+                    method_router: || {
+                        $first_method($first_handler)
+                            $(.$method($handler))*
+                    },
+                },
+            )+
+        ];
+    };
+}
+
+define_rest_routes! {
+    "/v1/version" => get(version);
+    "/v1/doctor" => get(doctor);
+    "/v1/machines" => get(machines).post(create_machine);
+    "/v1/catalog" => get(catalog);
+    "/v1/machines/{name}" => get(machine)
+        .put(set_machine_spec)
+        .patch(patch_machine_spec)
+        .delete(remove_machine);
+    "/v1/machines/{name}/start" => post(start_machine);
+    "/v1/machines/{name}/stop" => post(stop_machine);
+    "/v1/machines/{name}/restart" => post(restart_machine);
+    "/v1/machines/{name}/logs" => get(machine_logs);
+    "/v1/machines/{name}/vmconfig" => get(machine_vmconfig);
+    "/v1/images" => get(images);
+    "/v1/images/pull" => post(pull_image);
+    "/v1/images/prune" => post(prune_images);
+    "/v1/images/{id}" => delete(remove_image);
+}
+
 /// Builds the complete v1 REST router over the shared action dispatcher.
 pub fn router(dispatcher: Arc<dyn Dispatcher>, config: &GlobalConfig) -> Router {
     let state = ApiState {
@@ -70,27 +149,11 @@ pub fn router(dispatcher: Arc<dyn Dispatcher>, config: &GlobalConfig) -> Router 
         config: RestConfig::from(config),
     };
 
-    Router::new()
-        .route("/v1/version", get(version))
-        .route("/v1/doctor", get(doctor))
-        .route("/v1/machines", get(machines).post(create_machine))
-        .route("/v1/catalog", get(catalog))
-        .route(
-            "/v1/machines/{name}",
-            get(machine)
-                .put(set_machine_spec)
-                .patch(patch_machine_spec)
-                .delete(remove_machine),
-        )
-        .route("/v1/machines/{name}/start", post(start_machine))
-        .route("/v1/machines/{name}/stop", post(stop_machine))
-        .route("/v1/machines/{name}/restart", post(restart_machine))
-        .route("/v1/machines/{name}/logs", get(machine_logs))
-        .route("/v1/machines/{name}/vmconfig", get(machine_vmconfig))
-        .route("/v1/images", get(images))
-        .route("/v1/images/pull", post(pull_image))
-        .route("/v1/images/prune", post(prune_images))
-        .route("/v1/images/{id}", delete(remove_image))
+    REST_ROUTES
+        .iter()
+        .fold(Router::new(), |router, route| {
+            router.route(route.path, (route.method_router)())
+        })
         .fallback(not_found)
         .method_not_allowed_fallback(not_found)
         .with_state(state)

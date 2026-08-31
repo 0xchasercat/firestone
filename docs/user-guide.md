@@ -309,6 +309,7 @@ Cloud-init contents and private SSH keys are never written to process logs. A us
 ## REST over a Unix socket
 
 `serve` is optional and stateless. It projects the same actions and locks as the CLI. The default listener is `$XDG_RUNTIME_DIR/firestone/serve.sock`, or `/tmp/firestone-<uid>/serve.sock` when the runtime fallback is active.
+The complete static contract is [`openapi.json`](openapi.json). It is an OpenAPI 3.1 JSON document covering request and response shapes, the default NDJSON streams, `Accept: application/json` aggregation, error statuses, limits, and Unix-socket transport. Firestone does not serve the document as an API endpoint.
 
 Start the server and locate its socket:
 
