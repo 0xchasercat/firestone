@@ -28,7 +28,11 @@ bash -n "$repository_root/scripts/build-helpers.sh" \
     "$repository_root/scripts/fetch-helper-inputs.sh" \
     "$repository_root/scripts/pin-deps.sh"
 sh -n "$recipe_root/build-in-container.sh"
-
+if (unset HOST_UID HOST_GID; sh "$recipe_root/build-in-container.sh") \
+    >"$temporary_dir/missing-owner.stdout" 2>"$temporary_dir/missing-owner.stderr"; then
+    fail 'container build accepted missing host ownership'
+fi
+grep -F 'HOST_UID must be numeric' "$temporary_dir/missing-owner.stderr" >/dev/null
 # shellcheck disable=SC1091 # This test checks the committed pin file.
 source "$recipe_root/versions.env"
 [[ $(sha256_file "$recipe_root/packages.lock") == "$PACKAGES_LOCK_SHA256" ]] ||
@@ -228,6 +232,8 @@ FIRESTONE_HELPER_RECIPE_ROOT="$fixture_recipe" \
 [[ $(grep -c '^run ' "$FAKE_DOCKER_LOG") -eq 2 ]]
 [[ $(grep -c -- '--network none' "$FAKE_DOCKER_LOG") -eq 2 ]]
 [[ $(grep -c -- '--pull never' "$FAKE_DOCKER_LOG") -eq 2 ]]
+[[ $(grep -c -- '--env HOST_UID=' "$FAKE_DOCKER_LOG") -eq 2 ]]
+[[ $(grep -c -- '--env HOST_GID=' "$FAKE_DOCKER_LOG") -eq 2 ]]
 [[ -x $test_root/output/passt && -x $test_root/output/qemu-img ]]
 
 : >"$FAKE_DOCKER_LOG"

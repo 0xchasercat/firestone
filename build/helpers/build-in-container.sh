@@ -7,6 +7,14 @@ fail() {
     exit 1
 }
 
+case "${HOST_UID:-}" in '' | *[!0-9]*) fail 'HOST_UID must be numeric' ;; esac
+case "${HOST_GID:-}" in '' | *[!0-9]*) fail 'HOST_GID must be numeric' ;; esac
+
+restore_mount_ownership() {
+    chown -R "$HOST_UID:$HOST_GID" /work /output
+}
+trap restore_mount_ownership 0 1 2 15
+
 sha256_file() {
     sha256sum "$1" | awk '{print $1}'
 }

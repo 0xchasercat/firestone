@@ -146,6 +146,10 @@ shopt -u nullglob dotglob
 verify_lock_files "$recipe_root/packages.lock" "$input_dir/packages"
 verify_lock_files "$recipe_root/sources.lock" "$input_dir/sources"
 
+host_uid=$(id -u)
+host_gid=$(id -g)
+readonly host_uid host_gid
+
 temporary_dir=$(mktemp -d "${TMPDIR:-/tmp}/firestone-helper-build.XXXXXX")
 cleanup() {
     rm -rf "$temporary_dir"
@@ -163,7 +167,7 @@ for run in 1 2; do
         --network none \
         --security-opt no-new-privileges \
         --tmpfs /tmp:rw,nosuid,nodev,noexec,mode=1777 \
-        --env "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" \
+        --env "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" --env "HOST_UID=$host_uid" --env "HOST_GID=$host_gid" \
         --mount "type=bind,src=$repository_root,dst=/source,readonly" \
         --mount "type=bind,src=$input_dir,dst=/inputs,readonly" \
         --mount "type=bind,src=$work_dir,dst=/work" \
