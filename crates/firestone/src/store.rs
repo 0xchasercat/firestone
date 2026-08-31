@@ -207,13 +207,7 @@ impl LocalDispatcher {
         let editor = env::var_os("VISUAL")
             .filter(|value| !value.is_empty())
             .or_else(|| env::var_os("EDITOR").filter(|value| !value.is_empty()))
-            .ok_or_else(|| {
-                FirestoneError::new(
-                    ErrorKind::Dependency,
-                    "cannot edit the machine spec because VISUAL and EDITOR are unset",
-                )
-                .with_hint("set VISUAL or EDITOR to an editor executable and retry")
-            })?;
+            .unwrap_or_else(|| OsString::from("nano"));
         let (editor_program, editor_args) = parse_editor_command(editor)?;
         loop {
             Cmd::new(&editor_program)
