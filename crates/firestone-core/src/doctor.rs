@@ -1652,11 +1652,11 @@ fn passt_userns_probe(context: &DoctorContext) -> PasstUsernsProbe {
 }
 
 fn passt_probe_diagnostics(mut stderr: String, log: &Path) -> String {
-    if let Ok(contents) = read_tail_text(log, PASST_USERNS_STDERR_BYTES as u64)
-        && !contents.trim().is_empty()
-    {
-        stderr.push_str("; passt log: ");
-        stderr.push_str(&bounded_text(&contents));
+    if let Ok(contents) = read_tail_text(log, PASST_USERNS_STDERR_BYTES as u64) {
+        if !contents.trim().is_empty() {
+            stderr.push_str("; passt log: ");
+            stderr.push_str(&bounded_text(&contents));
+        }
     }
     stderr
 }

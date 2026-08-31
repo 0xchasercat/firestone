@@ -390,21 +390,21 @@ fn verify_installed(
     let metadata = file.metadata().map_err(|source| {
         artifact_io_error(identity, "inspect installed file", destination, source)
     })?;
-    if let Some(expected_length) = identity.expected_length
-        && metadata.len() != expected_length
-    {
-        return Err(FirestoneError::new(
-            ErrorKind::Checksum,
-            format!(
-                "{} '{}' at {} has length {}; expected {}",
-                identity.origin.adjective(),
-                identity.dependency,
-                destination.display(),
-                metadata.len(),
-                expected_length
-            ),
-        )
-        .with_hint(identity.origin.mismatch_hint()));
+    if let Some(expected_length) = identity.expected_length {
+        if metadata.len() != expected_length {
+            return Err(FirestoneError::new(
+                ErrorKind::Checksum,
+                format!(
+                    "{} '{}' at {} has length {}; expected {}",
+                    identity.origin.adjective(),
+                    identity.dependency,
+                    destination.display(),
+                    metadata.len(),
+                    expected_length
+                ),
+            )
+            .with_hint(identity.origin.mismatch_hint()));
+        }
     }
     let actual = sha256_reader(&mut file).map_err(|source| {
         artifact_io_error(identity, "hash installed file", destination, source)
