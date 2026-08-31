@@ -42,7 +42,7 @@ firestone doctor --fix
 firestone doctor
 ```
 
-`doctor --fix` creates Firestone-owned directories, materializes the embedded helpers, downloads and checksum-verifies the pinned Cloud Hypervisor, firmware, and `virtiofsd` binaries, and generates Firestone's SSH key. It never changes a sysctl, KVM permissions, or machines. When Ubuntu AppArmor blocks passt's mandatory user namespace, an interactive run first prints the exact root-owned helper/profile commands and asks for confirmation. `--yes` and `--json` never authorize elevation; non-interactive runs print the commands without invoking them.
+`doctor --fix` creates Firestone-owned directories, materializes the embedded Cloud Hypervisor, passt, and qemu-img executables, downloads and checksum-verifies the pinned firmware and `virtiofsd` binaries, and generates Firestone's SSH key. It never changes a sysctl, KVM permissions, or machines. When Ubuntu AppArmor blocks passt's mandatory user namespace, an interactive run first prints the exact root-owned helper/profile commands and asks for confirmation. `--yes` and `--json` never authorize elevation; non-interactive runs only print the administrator commands.
 
 Each check is `ok`, `warn`, or `fail`. A failed report exits with status 5. Warnings do not block VM use.
 

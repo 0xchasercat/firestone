@@ -82,7 +82,7 @@ fn verify_helpers(manifest_path: &Path, input_dir: &Path) -> Vec<VerifiedHelper>
     let manifest = toml::from_str::<Manifest>(manifest_text)
         .unwrap_or_else(|error| panic!("cannot parse {}: {error}", manifest_path.display()));
 
-    ["passt", "qemu-img"]
+    ["cloud-hypervisor", "passt", "qemu-img"]
         .into_iter()
         .map(|dependency| {
             let entry = manifest
@@ -122,18 +122,21 @@ fn verify_helpers(manifest_path: &Path, input_dir: &Path) -> Vec<VerifiedHelper>
 
 fn write_generated(path: &Path, helpers: &[VerifiedHelper]) {
     let mut generated = String::from(
-        "const BUILD_EMBEDDED_PASST: Option<EmbeddedHelper> = None;\n\
+        "const BUILD_EMBEDDED_CLOUD_HYPERVISOR: Option<EmbeddedHelper> = None;\n\
+         const BUILD_EMBEDDED_PASST: Option<EmbeddedHelper> = None;\n\
          const BUILD_EMBEDDED_QEMU_IMG: Option<EmbeddedHelper> = None;\n",
     );
     if !helpers.is_empty() {
         generated.clear();
         for helper in helpers {
             let constant = match helper.dependency.as_str() {
+                "cloud-hypervisor" => "BUILD_EMBEDDED_CLOUD_HYPERVISOR",
                 "passt" => "BUILD_EMBEDDED_PASST",
                 "qemu-img" => "BUILD_EMBEDDED_QEMU_IMG",
                 other => panic!("unsupported embedded helper {other}"),
             };
             let kind = match helper.dependency.as_str() {
+                "cloud-hypervisor" => "InternalHelper::CloudHypervisor",
                 "passt" => "InternalHelper::Passt",
                 "qemu-img" => "InternalHelper::QemuImg",
                 _ => unreachable!(),

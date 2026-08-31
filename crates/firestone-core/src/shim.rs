@@ -4712,7 +4712,8 @@ fn resolve_vmm_binary(
     }
 
     let artifact = manifest.artifact("cloud-hypervisor", architecture.as_str())?;
-    let binary = paths.binary_file(&artifact.install_name)?;
+    let binary = materialize_embedded_helper(paths, InternalHelper::CloudHypervisor)?
+        .unwrap_or(paths.binary_file(&artifact.install_name)?);
     paths.validate_bin_data_directory()?;
     paths.validate_owned_data_file(&binary, "cloud-hypervisor binary", 0o755, false)?;
     validate_executable(&binary, Some(paths.uid()))?;
@@ -7439,8 +7440,10 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     use super::{ProcessRecord, launch_bound_sidecar_record, process_record, verify_linux_process};
-    use super::{authorize_peer, import_custom_vmm};
-    use crate::{ErrorKind, FirestoneError, PathInputs, Paths};
+    use super::{authorize_peer, import_custom_vmm, resolve_vmm_binary};
+    use crate::{
+        Arch, DependencyManifest, ErrorKind, FirestoneError, MachineSpec, PathInputs, Paths,
+    };
     #[cfg(target_os = "linux")]
     use std::path::PathBuf;
 
@@ -7548,10 +7551,14 @@ exec /bin/true \"$@\"
 ",
         )?;
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
-        let (published, digest) = import_custom_vmm(&paths, "vm", &script)?;
+        let mut spec = MachineSpec::default();
+        spec.vmm.binary = Some(script.clone());
+        let manifest = DependencyManifest::bundled()?;
+        let (published, digest) = resolve_vmm_binary(&paths, &manifest, Arch::X86_64, "vm", &spec)?;
         assert_eq!(published, paths.machine_vmm_executable("vm")?);
         assert_eq!(fs::read(&published)?, fs::read(&script)?);
         assert_eq!(digest, super::sha256_hex(&fs::read(&published)?));
+        assert!(!paths.bin_dir().exists());
 
         let link = root.path().join("vmm-link");
         symlink(&script, &link)?;

@@ -797,6 +797,16 @@ fn check_vendored(context: &DoctorContext) -> DoctorCheck {
     let mut installed = Vec::new();
     let mut hint = None;
     for dependency in VENDORED_DEPENDENCIES {
+        if dependency == "cloud-hypervisor" {
+            if let Some(helper) = embedded_helper(InternalHelper::CloudHypervisor) {
+                installed.push(format!(
+                    "{} {} (embedded)",
+                    helper.kind().dependency(),
+                    helper.version()
+                ));
+                continue;
+            }
+        }
         match context.manifest.artifact(dependency, &context.architecture) {
             Ok(artifact) => match artifact_state(&context.paths.bin_dir(), &artifact) {
                 Ok(()) => installed.push(format!("{} {}", artifact.dependency, artifact.version)),

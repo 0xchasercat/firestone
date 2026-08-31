@@ -21,6 +21,7 @@ const LOCK_MODE: u32 = 0o600;
 /// A helper executable carried inside a standalone Firestone release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InternalHelper {
+    CloudHypervisor,
     Passt,
     QemuImg,
 }
@@ -29,6 +30,7 @@ impl InternalHelper {
     #[must_use]
     pub const fn dependency(self) -> &'static str {
         match self {
+            Self::CloudHypervisor => "cloud-hypervisor",
             Self::Passt => "passt",
             Self::QemuImg => "qemu-img",
         }
@@ -99,6 +101,7 @@ include!(concat!(env!("OUT_DIR"), "/embedded_helpers.rs"));
 #[must_use]
 pub const fn embedded_helper(kind: InternalHelper) -> Option<EmbeddedHelper> {
     match kind {
+        InternalHelper::CloudHypervisor => BUILD_EMBEDDED_CLOUD_HYPERVISOR,
         InternalHelper::Passt => BUILD_EMBEDDED_PASST,
         InternalHelper::QemuImg => BUILD_EMBEDDED_QEMU_IMG,
     }
@@ -381,6 +384,20 @@ mod tests {
         "306c6ca7407560340797866e077e053627ad409277d1b9da58106fce4cf717cb",
         TEST_BYTES,
     );
+
+    #[test]
+    fn internal_helper_names_cover_embedded_vmm_and_sidecars() {
+        assert_eq!(
+            InternalHelper::CloudHypervisor.dependency(),
+            "cloud-hypervisor"
+        );
+        assert_eq!(
+            InternalHelper::CloudHypervisor.system_program(),
+            "cloud-hypervisor"
+        );
+        assert_eq!(InternalHelper::Passt.dependency(), "passt");
+        assert_eq!(InternalHelper::QemuImg.dependency(), "qemu-img");
+    }
 
     #[test]
     fn materialize_absent_helper_publishes_exact_executable()
