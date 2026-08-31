@@ -1,0 +1,16 @@
+7e2280d5f403dfa89f6a65da9e5c317b6aa39253097009573bb864329d66bbd5  aports-gcc-fbf60319.tar.gz  https://gitlab.alpinelinux.org/api/v4/projects/alpine%2Faports/repository/archive.tar.gz?sha=fbf60319be3bbaf6dd32ef55cc6fb7189e05c266&path=main/gcc
+512952ccdb2d3d535497f1a708bbf3c9c95e7cee77d734676c97ae4917acceba  aports-gettext-215a2643.tar.gz  https://gitlab.alpinelinux.org/api/v4/projects/alpine%2Faports/repository/archive.tar.gz?sha=215a26431d1b09c56cb2a9ffe10175feb9518fd8&path=main/gettext
+c59acc35946504b216b06a9669c3c7dcbfb45435de57c13330dc07709f8e6333  aports-glib-9a0d606d.tar.gz  https://gitlab.alpinelinux.org/api/v4/projects/alpine%2Faports/repository/archive.tar.gz?sha=9a0d606dfb2af556b9b96a9e8bb511b2bd0ddbed&path=main/glib
+fbee5e2dbb229c4beb419fc227b6071479ab30de4b0756178cde52acf3e3e4dc  aports-musl-1546f29a.tar.gz  https://gitlab.alpinelinux.org/api/v4/projects/alpine%2Faports/repository/archive.tar.gz?sha=1546f29a1fd233db15464ce000b6247ed71b31e7&path=main/musl
+5a4e6b4a587162fe8d1e51965364db5c521cee0c7789c4561a7c4e0268fd5beb  aports-pcre2-a22c8c27.tar.gz  https://gitlab.alpinelinux.org/api/v4/projects/alpine%2Faports/repository/archive.tar.gz?sha=a22c8c27a78e00ea7cf03e09c6033a6336ee22a2&path=main/pcre2
+d2144a7fcc74ae9fa1c4252b127314616a0202100a418278f862183f10f39290  aports-zlib-0276ab73.tar.gz  https://gitlab.alpinelinux.org/api/v4/projects/alpine%2Faports/repository/archive.tar.gz?sha=0276ab73299b3fd158361983f2f4ba573e0f7526&path=main/zlib
+a7b39bc69cbf9e25826c5a60ab26477001f7c08d85cec04bc0e29cabed6f3cc9  gcc-14.2.0.tar.xz  https://distfiles.alpinelinux.org/distfiles/v3.22/gcc-14.2.0.tar.xz
+6164ec7aa61653ac9cdfb41d5c2344563b21f707da1562712e48715f1d2052a6  gettext-0.24.1.tar.xz  https://distfiles.alpinelinux.org/distfiles/v3.22/gettext-0.24.1.tar.xz
+8a9ea10943c36fc117e253f80c91e477b673525ae45762942858aef57631bb90  glib-2.84.4.tar.xz  https://distfiles.alpinelinux.org/distfiles/v3.22/glib-2.84.4.tar.xz
+0f5a4c1908424bf26bc41e9361168c363685080fbdb87a196c891c8401ca2f09  gobject-introspection-1.82.0.tar.xz  https://distfiles.alpinelinux.org/distfiles/v3.22/gobject-introspection-1.82.0.tar.xz
+a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4  musl-1.2.5.tar.gz  https://distfiles.alpinelinux.org/distfiles/v3.22/musl-1.2.5.tar.gz
+ef64f1fca70aac621c5f4535ad5c0717cc0bccb75a3d19eed1538e3fb81b4da1  passt-a1e48a02ff3550eb7875a7df6726086e9b3a1213.tar.xz  https://passt.top/passt/snapshot/passt-a1e48a02ff3550eb7875a7df6726086e9b3a1213.tar.xz
+15fbc5aba6beee0b17aecb04602ae39432393aba1ebd8e39b7cabf7db883299f  pcre2-10.46.tar.bz2  https://distfiles.alpinelinux.org/distfiles/v3.22/pcre2-10.46.tar.bz2
+847346c1b82c1a54b2c38f6edbd85549edeb17430b7d4d3da12620e2962bc4f3  qemu-8.2.2.tar.xz  https://download.qemu.org/qemu-8.2.2.tar.xz
+4b3848575572cc3584bad4afd67e50470d52232c71efba3de4faaead83f45eb6  qemu-8.2.2.tar.xz.sig  https://download.qemu.org/qemu-8.2.2.tar.xz.sig
+bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16  zlib-1.3.2.tar.gz  https://distfiles.alpinelinux.org/distfiles/v3.22/zlib-1.3.2.tar.gz

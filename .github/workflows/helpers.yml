@@ -1,0 +1,94 @@
+name: Static helper reproducibility
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/helpers.yml
+      - build/helpers/**
+      - deps.toml
+      - scripts/build-helpers.sh
+      - scripts/fetch-helper-inputs.sh
+      - scripts/pin-deps.sh
+  pull_request:
+    paths:
+      - .github/workflows/helpers.yml
+      - build/helpers/**
+      - deps.toml
+      - scripts/build-helpers.sh
+      - scripts/fetch-helper-inputs.sh
+      - scripts/pin-deps.sh
+
+permissions:
+  contents: read
+
+jobs:
+  recipe-tests:
+    name: Helper recipe tests and lint
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Check shell syntax
+        run: |
+          bash -n scripts/build-helpers.sh scripts/fetch-helper-inputs.sh scripts/pin-deps.sh
+          sh -n build/helpers/build-in-container.sh
+      - name: Lint shell recipes
+        run: >-
+          shellcheck
+          scripts/build-helpers.sh
+          scripts/fetch-helper-inputs.sh
+          scripts/pin-deps.sh
+          build/helpers/build-in-container.sh
+      - name: Run helper recipe tests
+        run: build/helpers/tests/test-build-scripts.sh
+
+  build:
+    name: Native x86_64 static helpers
+    needs: recipe-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Fetch and verify immutable inputs
+        run: scripts/fetch-helper-inputs.sh --output-dir "$RUNNER_TEMP/helper-inputs"
+      - name: Build twice without network
+        run: >-
+          scripts/build-helpers.sh
+          --input-dir "$RUNNER_TEMP/helper-inputs"
+          --output-dir "$RUNNER_TEMP/helper-output"
+      - name: Check output checksums and host argv
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/helper-output"
+          (cd "$output" && sha256sum -c SHA256SUMS)
+          test "$("$output/passt" --version 2>/dev/null | sed -n '1p')" = \
+            'passt 2025_02_17.a1e48a0'
+          test "$("$output/qemu-img" --version | sed -n '1p')" = \
+            'qemu-img version 8.2.2'
+
+          smoke="$RUNNER_TEMP/passt-smoke"
+          mkdir "$smoke"
+          "$output/passt" \
+            --foreground \
+            --one-off \
+            --vhost-user \
+            --socket "$smoke/net.sock" \
+            --log-file "$smoke/passt.log" \
+            --tcp-ports none \
+            --udp-ports none \
+            --repair-path none &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || :; wait "$pid" 2>/dev/null || :' EXIT
+          for _ in $(seq 1 100); do
+            test ! -S "$smoke/net.sock" || break
+            kill -0 "$pid"
+            sleep 0.05
+          done
+          test -S "$smoke/net.sock"
+          kill "$pid"
+          wait "$pid" 2>/dev/null || :
+          trap - EXIT
+          test -s "$smoke/passt.log"
+          cat "$output/helpers.build-info"

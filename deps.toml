@@ -76,3 +76,32 @@ sha256 = "e45bd62e346eca87857279d5680782e80148379fbca524a648089f642ac001d2"
 asset = "virtiofsd-v1.14.0.tar.gz"
 url = "https://gitlab.com/virtio-fs/virtiofsd/-/archive/v1.14.0/virtiofsd-v1.14.0.tar.gz"
 sha256 = "52b66e449ca583b4f050a2bff327ff812211a2c349b4130279fcfc6a64540f04"
+
+# Source pins for the unpublished x86_64 static helper build.
+[helper.passt]
+version = "2025_02_17.a1e48a0"
+commit = "a1e48a02ff3550eb7875a7df6726086e9b3a1213"
+architecture = "x86_64"
+license = "GPL-2.0-or-later AND BSD-3-Clause"
+
+[helper.passt.source]
+asset = "passt-a1e48a02ff3550eb7875a7df6726086e9b3a1213.tar.xz"
+url = "https://passt.top/passt/snapshot/passt-a1e48a02ff3550eb7875a7df6726086e9b3a1213.tar.xz"
+sha256 = "ef64f1fca70aac621c5f4535ad5c0717cc0bccb75a3d19eed1538e3fb81b4da1"
+
+[helper.qemu-img]
+version = "8.2.2"
+commit = "11aa0b1ff115b86160c4d37e7c37e6a6b13b77ea"
+architecture = "x86_64"
+license = "GPL-2.0-or-later"
+signing_fingerprint = "CEACC9E15534EBABB82D3FA03353C9CEF108B584"
+
+[helper.qemu-img.source]
+asset = "qemu-8.2.2.tar.xz"
+url = "https://download.qemu.org/qemu-8.2.2.tar.xz"
+sha256 = "847346c1b82c1a54b2c38f6edbd85549edeb17430b7d4d3da12620e2962bc4f3"
+
+[helper.qemu-img.signature]
+asset = "qemu-8.2.2.tar.xz.sig"
+url = "https://download.qemu.org/qemu-8.2.2.tar.xz.sig"
+sha256 = "4b3848575572cc3584bad4afd67e50470d52232c71efba3de4faaead83f45eb6"
