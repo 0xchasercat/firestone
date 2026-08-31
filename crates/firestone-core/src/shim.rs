@@ -58,7 +58,7 @@ use crate::{
     embedded_helper, ensure_ssh_identity, invalidate_known_hosts_for_seed,
     materialize_embedded_helper, network::NetworkPlanSnapshot, prepare_network,
     prepare_virtiofs_plans_with_readiness, publish_seed_with_sshd_path, publish_vm_config,
-    resolve_verified_apparmor_passt, virtiofs::VirtiofsPlanSnapshot,
+    resolve_verified_apparmor_passt, virtiofs::VirtiofsPlanSnapshot, vmm::selected_pinned_firmware,
 };
 
 const PLAN_VERSION: u32 = 2;
@@ -1032,6 +1032,14 @@ pub fn prepare_start(
             elapsed_ms: 0,
         })?;
 
+        if let Some(firmware) = selected_pinned_firmware(
+            manifest,
+            &spec.vmm.firmware,
+            architecture,
+            prepared_image.image.firmware,
+        )? {
+            image_store.ensure_pinned_artifact(&firmware)?;
+        }
         let config = publish_vm_config(
             paths,
             manifest,

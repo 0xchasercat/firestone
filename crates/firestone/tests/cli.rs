@@ -221,6 +221,71 @@ fn create_edit_editor_writes_stdout_emits_one_result_and_publishes_atomically() 
     Ok(())
 }
 
+#[test]
+fn edit_without_editor_environment_uses_nano_from_path() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = fs::canonicalize(directory.path())?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    let home = root.join("home");
+
+    let created = Command::new(env!("CARGO_BIN_EXE_firestone"))
+        .arg("--json")
+        .arg("--home")
+        .arg(&home)
+        .args(["create", "demo", "ubuntu:24.04"])
+        .output()?;
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    let bin = root.join("bin");
+    fs::create_dir(&bin)?;
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o700))?;
+    let nano = bin.join("nano");
+    fs::write(
+        &nano,
+        br##"#!/bin/sh
+set -eu
+[ "$#" -eq 1 ] || exit 9
+case "$1" in
+  *.toml.edit) ;;
+  *) exit 10 ;;
+esac
+printf '\n# edited by fallback nano\n' >> "$1"
+printf 'nano-fallback\n'
+"##,
+    )?;
+    fs::set_permissions(&nano, fs::Permissions::from_mode(0o700))?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_firestone"))
+        .arg("--json")
+        .arg("--home")
+        .arg(&home)
+        .args(["edit", "demo"])
+        .env_remove("VISUAL")
+        .env_remove("EDITOR")
+        .env("PATH", &bin)
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("nano-fallback"));
+    let records = ndjson(&output)?;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["type"], "Result");
+    assert_eq!(records[0]["action"], "edit");
+
+    let spec = home.join("data/machines/demo/firestone.toml");
+    assert!(fs::read_to_string(&spec)?.contains("# edited by fallback nano"));
+    assert!(!spec.with_extension("toml.edit").exists());
+    Ok(())
+}
+
 fn firestone(home: &Path, path: &OsString) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_firestone"));
     command.arg("--home").arg(home).env("PATH", path);
@@ -787,6 +852,18 @@ fn create_tty_runs_wizard_with_effective_defaults() -> TestResult {
     assert!(stderr.contains("Memory [2G]: "));
     assert!(stderr.contains("Disk [20G]: "));
     assert!(stderr.contains("Network [passt]: "));
+    let plain_stderr = console::strip_ansi_codes(&stderr);
+    assert!(
+        plain_stderr.contains(concat!(
+            "\r\n  debian:12 (bookworm)\r\n",
+            "  debian:13 (trixie)\r\n",
+            "  fedora:44\r\n",
+            "  ubuntu:22.04 (jammy)\r\n",
+            "> ubuntu:24.04 (noble)\r\n",
+            "  [Custom URL or local path...]\r\n",
+        )),
+        "image menu did not start each item at column zero: {plain_stderr:?}"
+    );
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("  Name: wizard\n"));
     assert!(stdout.contains("  Image: ubuntu:24.04\n"));
