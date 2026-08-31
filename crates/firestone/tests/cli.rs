@@ -787,6 +787,18 @@ fn create_tty_runs_wizard_with_effective_defaults() -> TestResult {
     assert!(stderr.contains("Memory [2G]: "));
     assert!(stderr.contains("Disk [20G]: "));
     assert!(stderr.contains("Network [passt]: "));
+    let plain_stderr = console::strip_ansi_codes(&stderr);
+    assert!(
+        plain_stderr.contains(concat!(
+            "\r\n  debian:12 (bookworm)\r\n",
+            "  debian:13 (trixie)\r\n",
+            "  fedora:44\r\n",
+            "  ubuntu:22.04 (jammy)\r\n",
+            "> ubuntu:24.04 (noble)\r\n",
+            "  [Custom URL or local path...]\r\n",
+        )),
+        "image menu did not start each item at column zero: {plain_stderr:?}"
+    );
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("  Name: wizard\n"));
     assert!(stdout.contains("  Image: ubuntu:24.04\n"));

@@ -2,6 +2,14 @@ name: Linux release artifacts
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Release version (MAJOR.MINOR.PATCH, no leading "v"). Bumps
+          Cargo.toml/Cargo.lock/versions.env, commits, tags, builds, and
+          publishes a GitHub Release. Leave empty to just build, as CI does.
+        type: string
+        default: ''
   push:
     branches:
       - main
@@ -35,29 +43,117 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  version:
+    name: Resolve and tag release version
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      commit: ${{ steps.resolve.outputs.commit }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Resolve version, bump, and tag
+        id: resolve
+        env:
+          REQUESTED_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
+        run: |
+          set -euo pipefail
+
+          # shellcheck disable=SC1091
+          source build/firestone/versions.env
+          current_version=$FIRESTONE_VERSION
+
+          if [[ -z $REQUESTED_VERSION ]]; then
+            echo "version=$current_version" >>"$GITHUB_OUTPUT"
+            echo "tag=v$current_version" >>"$GITHUB_OUTPUT"
+            echo "commit=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          [[ $REQUESTED_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+            { printf 'requested version %s must be MAJOR.MINOR.PATCH\n' "$REQUESTED_VERSION" >&2; exit 1; }
+          tag="v$REQUESTED_VERSION"
+
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null ||
+             git ls-remote --exit-code --tags origin "$tag" >/dev/null 2>&1
+          then
+            printf 'tag %s already exists; refusing to move a published release tag\n' "$tag" >&2
+            exit 1
+          fi
+
+          if [[ $REQUESTED_VERSION == "$current_version" ]]; then
+            commit=$(git rev-parse HEAD)
+          else
+            sed -i "s/^version = \"$current_version\"\$/version = \"$REQUESTED_VERSION\"/" Cargo.toml
+            grep -q "^version = \"$REQUESTED_VERSION\"\$" Cargo.toml ||
+              { echo 'failed to bump Cargo.toml version' >&2; exit 1; }
+
+            for pkg in firestone firestone-core; do
+              awk -v pkg="$pkg" -v old="$current_version" -v new="$REQUESTED_VERSION" '
+                $0 == "name = \"" pkg "\"" { in_pkg = 1 }
+                in_pkg && $0 == "version = \"" old "\"" { $0 = "version = \"" new "\""; in_pkg = 0 }
+                { print }
+              ' Cargo.lock >Cargo.lock.new
+              mv Cargo.lock.new Cargo.lock
+            done
+            lock_sha=$(sha256sum Cargo.lock | awk '{print $1}')
+
+            sed -i \
+              -e "s/^FIRESTONE_VERSION=.*/FIRESTONE_VERSION=$REQUESTED_VERSION/" \
+              -e "s/^CARGO_LOCK_SHA256=.*/CARGO_LOCK_SHA256=$lock_sha/" \
+              build/firestone/versions.env
+
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add Cargo.toml Cargo.lock build/firestone/versions.env
+            git commit -m "release: $tag [skip ci]"
+            git push origin "HEAD:${GITHUB_REF}"
+            commit=$(git rev-parse HEAD)
+          fi
+
+          git tag "$tag" "$commit"
+          git push origin "refs/tags/$tag"
+
+          echo "version=$REQUESTED_VERSION" >>"$GITHUB_OUTPUT"
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+          echo "commit=$commit" >>"$GITHUB_OUTPUT"
+
   recipe-tests:
     name: Release recipe tests
+    needs: version
     runs-on: ubuntu-24.04
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.version.outputs.commit }}
       - name: Test checksum and toolchain failures
         run: scripts/tests/test-build-release.sh
 
   dependency-checksums:
     name: Re-verify pinned dependency checksums
+    needs: version
     runs-on: ubuntu-24.04
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.version.outputs.commit }}
       - name: Download and verify both architecture pin sets
         run: scripts/pin-deps.sh verify --arch all
 
   build:
     name: Build ${{ matrix.target }}
     needs:
+      - version
       - recipe-tests
       - dependency-checksums
+    env:
+      ARTIFACT: firestone-${{ needs.version.outputs.tag }}-x86_64-unknown-linux-musl
     strategy:
       fail-fast: false
       matrix:
@@ -73,6 +169,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.version.outputs.commit }}
 
       - name: Build from clean inputs
         run: >-
@@ -89,8 +187,6 @@ jobs:
 
       - name: Require byte-identical x86_64 output
         if: matrix.arch == 'x86_64'
-        env:
-          ARTIFACT: firestone-v0.1.0-x86_64-unknown-linux-musl
         run: |
           set -euo pipefail
           cmp "$RUNNER_TEMP/run-1/$ARTIFACT" "$RUNNER_TEMP/run-2/$ARTIFACT"
@@ -101,23 +197,24 @@ jobs:
       - name: Smoke x86_64 version, embedded VMM, completions, and help
         if: matrix.arch == 'x86_64'
         env:
-          ARTIFACT: firestone-v0.1.0-x86_64-unknown-linux-musl
           CLOUD_HYPERVISOR_INSTALL_NAME: cloud-hypervisor-v53.0
           CLOUD_HYPERVISOR_SHA256: 448af3d4e59b22c2987f7df94c213ad40fb53a10d437e42b5ee6c4fce7c29ecc
+          FIRESTONE_VERSION: ${{ needs.version.outputs.version }}
+          BUILT_COMMIT: ${{ needs.version.outputs.commit }}
         run: |
           set -euo pipefail
           binary="$RUNNER_TEMP/run-1/$ARTIFACT"
-          test "$($binary --version)" = 'firestone 0.1.0'
+          test "$($binary --version)" = "firestone $FIRESTONE_VERSION"
           home="$RUNNER_TEMP/smoke-home"
           install -d -m 0700 "$home"
           version_output=$(FIRESTONE_HOME="$home" "$binary" version)
           case "$version_output" in
-            *"git commit: $GITHUB_SHA"*"architecture: x86_64"*) ;;
+            *"git commit: $BUILT_COMMIT"*"architecture: x86_64"*) ;;
             *) printf '%s\n' "$version_output" >&2; exit 1 ;;
           esac
           json_output=$(FIRESTONE_HOME="$home" "$binary" --json version)
           case "$json_output" in
-            *"\"architecture\":\"x86_64\""*"\"git_commit\":\"$GITHUB_SHA\""*) ;;
+            *"\"architecture\":\"x86_64\""*"\"git_commit\":\"$BUILT_COMMIT\""*) ;;
             *) printf '%s\n' "$json_output" >&2; exit 1 ;;
           esac
           set +e
@@ -150,9 +247,38 @@ jobs:
         if: matrix.arch == 'x86_64'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: firestone-v0.1.0-x86_64-unknown-linux-musl
+          name: ${{ env.ARTIFACT }}
           path: |
-            ${{ runner.temp }}/run-1/firestone-v0.1.0-x86_64-unknown-linux-musl
+            ${{ runner.temp }}/run-1/${{ env.ARTIFACT }}
             ${{ runner.temp }}/run-1/SHA256SUMS
           if-no-files-found: error
           retention-days: 14
+
+  publish-release:
+    name: Publish GitHub Release
+    needs:
+      - version
+      - build
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.version != '' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      ARTIFACT: firestone-${{ needs.version.outputs.tag }}-x86_64-unknown-linux-musl
+    steps:
+      - name: Download x86_64 release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: release-assets
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" release-assets/* \
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --generate-notes
