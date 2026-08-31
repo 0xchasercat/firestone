@@ -9,7 +9,7 @@ a7b39bc69cbf9e25826c5a60ab26477001f7c08d85cec04bc0e29cabed6f3cc9  gcc-14.2.0.tar
 8a9ea10943c36fc117e253f80c91e477b673525ae45762942858aef57631bb90  glib-2.84.4.tar.xz  https://distfiles.alpinelinux.org/distfiles/v3.22/glib-2.84.4.tar.xz
 0f5a4c1908424bf26bc41e9361168c363685080fbdb87a196c891c8401ca2f09  gobject-introspection-1.82.0.tar.xz  https://distfiles.alpinelinux.org/distfiles/v3.22/gobject-introspection-1.82.0.tar.xz
 a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4  musl-1.2.5.tar.gz  https://distfiles.alpinelinux.org/distfiles/v3.22/musl-1.2.5.tar.gz
-ef64f1fca70aac621c5f4535ad5c0717cc0bccb75a3d19eed1538e3fb81b4da1  passt-a1e48a02ff3550eb7875a7df6726086e9b3a1213.tar.xz  https://passt.top/passt/snapshot/passt-a1e48a02ff3550eb7875a7df6726086e9b3a1213.tar.xz
+ef64f1fca70aac621c5f4535ad5c0717cc0bccb75a3d19eed1538e3fb81b4da1  passt-a1e48a02ff3550eb7875a7df6726086e9b3a1213.tar.xz  https://github.com/0xchasercat/firestone/releases/download/helpers-v0.1.0-firestone.1/passt-a1e48a02ff3550eb7875a7df6726086e9b3a1213.tar.xz
 15fbc5aba6beee0b17aecb04602ae39432393aba1ebd8e39b7cabf7db883299f  pcre2-10.46.tar.bz2  https://distfiles.alpinelinux.org/distfiles/v3.22/pcre2-10.46.tar.bz2
 847346c1b82c1a54b2c38f6edbd85549edeb17430b7d4d3da12620e2962bc4f3  qemu-8.2.2.tar.xz  https://download.qemu.org/qemu-8.2.2.tar.xz
 4b3848575572cc3584bad4afd67e50470d52232c71efba3de4faaead83f45eb6  qemu-8.2.2.tar.xz.sig  https://download.qemu.org/qemu-8.2.2.tar.xz.sig

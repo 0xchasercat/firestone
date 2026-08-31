@@ -59,7 +59,7 @@ check_lock() {
 
 check_lock "$recipe_root/packages.lock" 91
 check_lock "$recipe_root/sources.lock" 16
-grep -F "$PASST_SOURCE_SHA256  $PASST_SOURCE_ASSET  https://passt.top/" "$recipe_root/sources.lock" >/dev/null
+grep -F "$PASST_SOURCE_SHA256  $PASST_SOURCE_ASSET  https://github.com/0xchasercat/firestone/releases/download/helpers-v0.1.0-firestone.1/" "$recipe_root/sources.lock" >/dev/null
 grep -F "$QEMU_SOURCE_SHA256  $QEMU_SOURCE_ASSET  https://download.qemu.org/" "$recipe_root/sources.lock" >/dev/null
 if grep -R -E '(^|[[:space:]])git (clone|checkout|fetch)' \
     "$repository_root/scripts/build-helpers.sh" \

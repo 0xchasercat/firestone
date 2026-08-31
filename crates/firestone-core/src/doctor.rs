@@ -566,7 +566,7 @@ fn inspect(
     for check in &mut checks {
         if let Some(failure) = fix_failures.get(&check.id) {
             check.status = DoctorStatus::Fail;
-            check.reason = format!("fix failed: {}", failure.reason);
+            check.reason = format!("{}; fix failed: {}", check.reason, failure.reason);
             if failure.fix.is_some() {
                 check.fix.clone_from(&failure.fix);
             }

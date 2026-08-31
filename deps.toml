@@ -128,7 +128,7 @@ license = "GPL-2.0-or-later AND BSD-3-Clause"
 
 [helper.passt.source]
 asset = "passt-a1e48a02ff3550eb7875a7df6726086e9b3a1213.tar.xz"
-url = "https://passt.top/passt/snapshot/passt-a1e48a02ff3550eb7875a7df6726086e9b3a1213.tar.xz"
+url = "https://github.com/0xchasercat/firestone/releases/download/helpers-v0.1.0-firestone.1/passt-a1e48a02ff3550eb7875a7df6726086e9b3a1213.tar.xz"
 sha256 = "ef64f1fca70aac621c5f4535ad5c0717cc0bccb75a3d19eed1538e3fb81b4da1"
 
 [helper.qemu-img]
