@@ -36,7 +36,7 @@ download() {
 
     [[ $url == https://* ]] || fail "download URL is not HTTPS: $url"
     printf 'download %s\n' "$url" >&2
-    curl \
+    if ! curl \
         --fail \
         --location \
         --proto '=https' \
@@ -48,10 +48,33 @@ download() {
         --connect-timeout 20 \
         --output "$output" \
         "$url"
+    then
+        rm -f -- "$output"
+        fail "download failed: $url"
+    fi
     actual_sha=$(sha256_file "$output")
     [[ $actual_sha == "$expected_sha" ]] ||
         fail "$url checksum mismatch: expected $expected_sha, got $actual_sha"
 }
+manifest_value() {
+    local section=$1
+    local key=$2
+    local manifest=$3
+
+    awk -v wanted_section="[$section]" -v wanted_key="$key" '
+        $0 == wanted_section { in_section = 1; next }
+        in_section && /^\[/ { exit }
+        in_section && $0 ~ "^[[:space:]]*" wanted_key "[[:space:]]*=" {
+            value = $0
+            sub("^[[:space:]]*" wanted_key "[[:space:]]*=[[:space:]]*", "", value)
+            sub(/[[:space:]]*#.*/, "", value)
+            gsub(/^"|"$/, "", value)
+            print value
+            exit
+        }
+    ' "$manifest"
+}
+
 
 cleanup() {
     if [[ -n ${work_dir:-} && -d $work_dir && $work_dir != / ]]; then
@@ -118,6 +141,26 @@ esac
 [[ $musl_headers_url == https://* ]] || fail 'musl headers URL must be HTTPS'
 [[ $musl_headers_sha =~ ^[0-9a-f]{64}$ ]] || fail 'musl headers checksum must be lowercase SHA-256'
 readonly musl_headers_url musl_headers_sha
+deps_manifest="$repository_root/deps.toml"
+helper_docker_env=()
+if [[ $target_arch == x86_64 ]]; then
+    passt_asset=$(manifest_value dependency.passt.x86_64 asset "$deps_manifest")
+    passt_url=$(manifest_value dependency.passt.x86_64 url "$deps_manifest")
+    passt_sha=$(manifest_value dependency.passt.x86_64 sha256 "$deps_manifest")
+    qemu_img_asset=$(manifest_value dependency.qemu-img.x86_64 asset "$deps_manifest")
+    qemu_img_url=$(manifest_value dependency.qemu-img.x86_64 url "$deps_manifest")
+    qemu_img_sha=$(manifest_value dependency.qemu-img.x86_64 sha256 "$deps_manifest")
+    for value in "$passt_asset" "$qemu_img_asset"; do
+        [[ -n $value && $value != */* ]] || fail "invalid embedded helper asset name '$value'"
+    done
+    for value in "$passt_sha" "$qemu_img_sha"; do
+        [[ $value =~ ^[0-9a-f]{64}$ ]] || fail "invalid embedded helper checksum '$value'"
+    done
+    helper_docker_env=(
+        --env FIRESTONE_EMBEDDED_HELPERS_DIR=/work/inputs
+        --env FIRESTONE_REQUIRE_EMBEDDED_HELPERS=1
+    )
+fi
 
 host_arch=$(uname -m)
 case "$host_arch" in
@@ -153,6 +196,10 @@ readonly work_dir
 trap cleanup EXIT
 mkdir -p "$work_dir/cargo-home" "$work_dir/home" "$work_dir/inputs" "$work_dir/target"
 download "$musl_headers_url" "$musl_headers_sha" "$work_dir/inputs/musl-dev.apk"
+if [[ $target_arch == x86_64 ]]; then
+    download "$passt_url" "$passt_sha" "$work_dir/inputs/$passt_asset"
+    download "$qemu_img_url" "$qemu_img_sha" "$work_dir/inputs/$qemu_img_asset"
+fi
 
 docker pull "$RUST_IMAGE"
 docker run \
@@ -167,6 +214,7 @@ docker run \
     --env FIRESTONE_GIT_COMMIT="$git_commit" \
     --env HOME=/work/home \
     --env SOURCE_DATE_EPOCH="$source_date_epoch" \
+    "${helper_docker_env[@]}" \
     --mount "type=bind,src=$repository_root,dst=/source,readonly" \
     --mount "type=bind,src=$work_dir,dst=/work" \
     --mount "type=bind,src=$output_dir,dst=/output" \

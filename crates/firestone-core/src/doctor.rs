@@ -5,24 +5,39 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::{
+    Cmd, DependencyArtifact, DependencyManifest, ErrorKind, FirestoneError, InternalHelper,
+    MachineLock, Paths, ReconcileRewrite, StateStore, VmmApiLivenessProbe, VmmPingProbe,
+    embedded_helper, observe_liveness, reconcile, reconciled_state,
+};
 use reqwest::{Url, blocking::Client, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::Builder as TempBuilder;
 
-use crate::{
-    Cmd, DependencyArtifact, DependencyManifest, ErrorKind, FirestoneError, MachineLock, Paths,
-    ReconcileRewrite, StateStore, VmmApiLivenessProbe, VmmPingProbe, observe_liveness, reconcile,
-    reconciled_state,
-};
-
 const MINIMUM_FREE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MAX_DEPENDENCY_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 const DOCTOR_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MINIMUM_PASST_DATE: u32 = 20_250_217;
+const PASST_USERNS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const PASST_USERNS_STDERR_BYTES: usize = 16 * 1024;
+const AUDIT_TAIL_BYTES: u64 = 128 * 1024;
+const PASST_USERNS_FAILURE: &str = "Couldn't create user namespace";
+const PASST_LATER_ISOLATION_FAILURE: &str = "Failed to detach isolating namespaces";
+pub const APPARMOR_PASST_PROFILE_NAME: &str = "firestone-passt-2025_02_17.a1e48a0";
+pub const APPARMOR_PASST_EXECUTABLE: &str = "/usr/libexec/firestone/passt-2025_02_17.a1e48a0";
+pub const APPARMOR_PASST_PROFILE: &str = "/etc/apparmor.d/firestone-passt-2025_02_17.a1e48a0";
+const APPARMOR_PASST_PROFILE_CONTENT: &str = concat!(
+    "abi <abi/4.0>,\n",
+    "include <tunables/global>\n\n",
+    "profile firestone-passt-2025_02_17.a1e48a0 ",
+    "/usr/libexec/firestone/passt-2025_02_17.a1e48a0 flags=(unconfined) {\n",
+    "  userns,\n",
+    "}\n",
+);
 const REQUIRED_PASST_FLAGS: [&str; 6] = [
     "--foreground",
     "--one-off",
@@ -144,6 +159,94 @@ struct StaleStateFailure {
     reason: String,
 }
 
+/// Controls the mutations allowed during one doctor run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DoctorOptions {
+    fix: bool,
+    elevation_confirmed: bool,
+}
+
+impl DoctorOptions {
+    #[must_use]
+    pub const fn inspect() -> Self {
+        Self {
+            fix: false,
+            elevation_confirmed: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn fix(elevation_confirmed: bool) -> Self {
+        Self {
+            fix: true,
+            elevation_confirmed,
+        }
+    }
+}
+
+/// Exact extracted passt bytes offered to the AppArmor installer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedPasstHelper {
+    path: PathBuf,
+    artifact: DependencyArtifact,
+}
+
+impl ExtractedPasstHelper {
+    pub fn new(path: PathBuf, artifact: DependencyArtifact) -> Result<Self, FirestoneError> {
+        if !path.is_absolute() {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                "the extracted passt helper path is not absolute",
+            )
+            .with_hint("materialize the embedded helper through a resolved Paths location"));
+        }
+        if artifact.dependency != "passt" || artifact.version != crate::PINNED_PASST_VERSION {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "extracted passt helper identity {} {} does not match passt {}",
+                    artifact.dependency,
+                    artifact.version,
+                    crate::PINNED_PASST_VERSION
+                ),
+            )
+            .with_hint(
+                "extract the exact passt artifact selected by DependencyManifest::embedded_passt",
+            ));
+        }
+        Ok(Self { path, artifact })
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub const fn artifact(&self) -> &DependencyArtifact {
+        &self.artifact
+    }
+}
+
+/// A literal root-owned passt copy whose profile and bytes were verified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedPasst {
+    executable: PathBuf,
+    profile_name: &'static str,
+}
+
+impl VerifiedPasst {
+    #[must_use]
+    pub fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    #[must_use]
+    pub const fn profile_name(&self) -> &'static str {
+        self.profile_name
+    }
+}
+
 /// Resolved Firestone paths and injectable host facts used by doctor.
 #[derive(Debug, Clone)]
 pub struct DoctorContext {
@@ -153,6 +256,18 @@ pub struct DoctorContext {
     pub kvm_device: PathBuf,
     pub nested_parameters: Vec<PathBuf>,
     pub user_namespace_sysctl: PathBuf,
+    pub unprivileged_userns_clone_sysctl: PathBuf,
+    pub apparmor_enabled: PathBuf,
+    pub apparmor_restrict_userns: PathBuf,
+    pub self_status: PathBuf,
+    pub self_cgroup: PathBuf,
+    pub container_markers: Vec<PathBuf>,
+    pub audit_logs: Vec<PathBuf>,
+    pub apparmor_passt_executable: PathBuf,
+    pub apparmor_passt_profile: PathBuf,
+    pub apparmor_loaded_profiles: PathBuf,
+    pub extracted_passt: Option<ExtractedPasstHelper>,
+    pub expected_root_uid: u32,
     pub os_release: PathBuf,
     pub group_file: PathBuf,
     pub search_path: OsString,
@@ -172,6 +287,9 @@ impl DoctorContext {
         hostname: impl Into<String>,
         reconciled_at: impl Into<String>,
     ) -> Self {
+        let apparmor_passt_executable = paths.apparmor_passt_executable();
+        let apparmor_passt_profile = paths.apparmor_passt_profile();
+        let apparmor_loaded_profiles = paths.apparmor_loaded_profiles();
         Self {
             paths,
             operating_system: std::env::consts::OS.to_owned(),
@@ -182,6 +300,30 @@ impl DoctorContext {
                 PathBuf::from("/sys/module/kvm_amd/parameters/nested"),
             ],
             user_namespace_sysctl: PathBuf::from("/proc/sys/user/max_user_namespaces"),
+            unprivileged_userns_clone_sysctl: PathBuf::from(
+                "/proc/sys/kernel/unprivileged_userns_clone",
+            ),
+            apparmor_enabled: PathBuf::from("/sys/module/apparmor/parameters/enabled"),
+            apparmor_restrict_userns: PathBuf::from(
+                "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
+            ),
+            self_status: PathBuf::from("/proc/self/status"),
+            self_cgroup: PathBuf::from("/proc/self/cgroup"),
+            container_markers: vec![
+                PathBuf::from("/.dockerenv"),
+                PathBuf::from("/run/.containerenv"),
+                PathBuf::from("/run/systemd/container"),
+            ],
+            audit_logs: vec![
+                PathBuf::from("/var/log/audit/audit.log"),
+                PathBuf::from("/var/log/kern.log"),
+                PathBuf::from("/var/log/syslog"),
+            ],
+            apparmor_passt_executable,
+            apparmor_passt_profile,
+            apparmor_loaded_profiles,
+            extracted_passt: None,
+            expected_root_uid: 0,
             os_release: PathBuf::from("/etc/os-release"),
             group_file: PathBuf::from("/etc/group"),
             search_path: std::env::var_os("PATH").unwrap_or_default(),
@@ -193,6 +335,13 @@ impl DoctorContext {
         }
     }
 
+    /// Supplies exact bytes materialized by the embedded-helper extraction layer.
+    #[must_use]
+    pub fn with_extracted_passt(mut self, helper: ExtractedPasstHelper) -> Self {
+        self.extracted_passt = Some(helper);
+        self
+    }
+
     /// The product threshold from SPEC 17.3, exposed for explicit contexts.
     #[must_use]
     pub const fn default_minimum_data_free_bytes() -> u64 {
@@ -200,33 +349,50 @@ impl DoctorContext {
     }
 }
 
-/// Runs all checks and optionally applies only the unprivileged fixes allowed by
-/// SPEC 17.3. Every successful fix is checked again before the report is built.
-pub fn run_doctor(context: &DoctorContext, fix: bool) -> Result<DoctorReport, FirestoneError> {
-    if !fix {
+/// Runs all checks and applies requested fixes. Root changes require a separate
+/// interactive confirmation represented by DoctorOptions.
+pub fn run_doctor(
+    context: &DoctorContext,
+    options: DoctorOptions,
+) -> Result<DoctorReport, FirestoneError> {
+    if !options.fix {
         let stale_state = reconcile_machine_states(context, &VMM_PING_PROBE);
         return Ok(inspect(context, &BTreeMap::new(), &stale_state));
     }
 
     match HttpsDownloader::new() {
-        Ok(downloader) => Ok(run_doctor_with(context, true, &downloader)),
+        Ok(downloader) => Ok(run_doctor_with_options(context, options, &downloader)),
         Err(error) => {
             let downloader = FailedDownloader {
                 reason: firestone_error_reason(&error),
                 hint: error.hint().map(str::to_owned),
             };
-            Ok(run_doctor_with(context, true, &downloader))
+            Ok(run_doctor_with_options(context, options, &downloader))
         }
     }
 }
 
+#[cfg(test)]
 fn run_doctor_with(
     context: &DoctorContext,
     fix: bool,
     fetcher: &dyn ArtifactFetcher,
 ) -> DoctorReport {
-    let failures = if fix {
-        perform_fixes(context, fetcher)
+    let options = if fix {
+        DoctorOptions::fix(false)
+    } else {
+        DoctorOptions::inspect()
+    };
+    run_doctor_with_options(context, options, fetcher)
+}
+
+fn run_doctor_with_options(
+    context: &DoctorContext,
+    options: DoctorOptions,
+    fetcher: &dyn ArtifactFetcher,
+) -> DoctorReport {
+    let failures = if options.fix {
+        perform_fixes(context, fetcher, options.elevation_confirmed)
     } else {
         BTreeMap::new()
     };
@@ -244,6 +410,7 @@ const VMM_PING_PROBE: VmmApiLivenessProbe = VmmApiLivenessProbe::new(DOCTOR_PROB
 #[derive(Debug, Clone)]
 struct FixFailure {
     reason: String,
+    fix: Option<String>,
     hint: Option<String>,
 }
 
@@ -251,6 +418,7 @@ impl From<FirestoneError> for FixFailure {
     fn from(error: FirestoneError) -> Self {
         Self {
             reason: firestone_error_reason(&error),
+            fix: None,
             hint: error.hint().map(str::to_owned),
         }
     }
@@ -259,7 +427,6 @@ impl From<FirestoneError> for FixFailure {
 trait ArtifactFetcher {
     fn fetch(&self, url: &Url, output: &mut dyn Write) -> Result<(), FirestoneError>;
 }
-
 struct FailedDownloader {
     reason: String,
     hint: Option<String>,
@@ -388,13 +555,7 @@ fn inspect(
         check_vendored(context),
         check_virtiofsd(context),
         check_passt(context),
-        check_program(
-            context,
-            DoctorCheckId::QemuImg,
-            "qemu-img",
-            Package::QemuImg,
-            "qemu-img is available",
-        ),
+        check_qemu_img(context),
         check_ssh(context),
         check_user_namespaces(context),
         check_ssh_key(context),
@@ -405,7 +566,10 @@ fn inspect(
     for check in &mut checks {
         if let Some(failure) = fix_failures.get(&check.id) {
             check.status = DoctorStatus::Fail;
-            check.reason = format!("fix failed: {}", failure.reason);
+            check.reason = format!("{}; fix failed: {}", check.reason, failure.reason);
+            if failure.fix.is_some() {
+                check.fix.clone_from(&failure.fix);
+            }
             if failure.hint.is_some() {
                 check.hint.clone_from(&failure.hint);
             }
@@ -708,8 +872,20 @@ fn check_virtiofsd(context: &DoctorContext) -> DoctorCheck {
 /// resolve runtime interoperability with Cloud Hypervisor; the M3 network test
 /// remains the verify-14 gate.
 fn check_passt(context: &DoctorContext) -> DoctorCheck {
-    let Some(program) = find_on_path("passt", &context.search_path) else {
-        return missing_passt_check(context);
+    let program = match selected_passt(context) {
+        Ok(Some((program, _))) => program,
+        Ok(None) => return missing_passt_check(context),
+        Err(error) => {
+            let mut check = DoctorCheck::new(
+                DoctorCheckId::Passt,
+                DoctorStatus::Fail,
+                firestone_error_reason(&error),
+            );
+            if let Some(hint) = error.hint() {
+                check = check.with_hint(hint);
+            }
+            return check;
+        }
     };
     let version_output = match Cmd::new(&program)
         .arg("--version")
@@ -848,6 +1024,26 @@ fn check_passt(context: &DoctorContext) -> DoctorCheck {
     )
 }
 
+fn check_qemu_img(context: &DoctorContext) -> DoctorCheck {
+    if let Some(helper) = embedded_helper(InternalHelper::QemuImg) {
+        return DoctorCheck::new(
+            DoctorCheckId::QemuImg,
+            DoctorStatus::Ok,
+            format!(
+                "embedded qemu-img {} is included with verified release bytes",
+                helper.version()
+            ),
+        );
+    }
+    check_program(
+        context,
+        DoctorCheckId::QemuImg,
+        "qemu-img",
+        Package::QemuImg,
+        "qemu-img is available",
+    )
+}
+
 fn check_program(
     context: &DoctorContext,
     id: DoctorCheckId,
@@ -929,66 +1125,734 @@ fn probe_ssh_tool(
     Ok(())
 }
 
-/// Checks the host prerequisite for virtiofsd's `[verify 16]` namespace sandbox.
-fn check_user_namespaces(context: &DoctorContext) -> DoctorCheck {
-    let max_namespaces = match fs::read_to_string(&context.user_namespace_sysctl) {
-        Ok(value) => value.trim().parse::<u64>().ok(),
-        Err(_) => None,
-    };
-    if max_namespaces == Some(0) {
-        return DoctorCheck::new(
-            DoctorCheckId::UserNamespaces,
-            DoctorStatus::Warn,
-            "user namespaces are disabled by user.max_user_namespaces=0",
-        )
-        .with_hint("virtiofsd will run with --sandbox none");
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NumericFact {
+    Value(u64),
+    Missing,
+    Unreadable,
+    Invalid,
+}
+
+impl NumericFact {
+    fn detail(&self, name: &str, optional: bool) -> String {
+        match self {
+            Self::Value(value) => format!("{name}={value}"),
+            Self::Missing if optional => format!("{name}=not exposed"),
+            Self::Missing => format!("{name}=missing"),
+            Self::Unreadable => format!("{name}=unreadable"),
+            Self::Invalid => format!("{name}=invalid"),
+        }
     }
-    let Some(unshare) = find_on_path("unshare", &context.search_path) else {
-        return DoctorCheck::new(
-            DoctorCheckId::UserNamespaces,
-            DoctorStatus::Warn,
-            "cannot prove user namespace support because unshare is not installed",
+
+    fn is_zero(&self) -> bool {
+        matches!(self, Self::Value(0))
+    }
+
+    fn is_one(&self) -> bool {
+        matches!(self, Self::Value(1))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AppArmorState {
+    Enabled,
+    Disabled,
+    Missing,
+    Unreadable,
+    Invalid,
+}
+
+impl AppArmorState {
+    fn detail(&self) -> &'static str {
+        match self {
+            Self::Enabled => "apparmor=enabled",
+            Self::Disabled => "apparmor=disabled",
+            Self::Missing => "apparmor=not exposed",
+            Self::Unreadable => "apparmor=unreadable",
+            Self::Invalid => "apparmor=invalid",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelfPolicyState {
+    seccomp: Option<u64>,
+    no_new_privs: Option<u64>,
+    container: String,
+}
+
+impl SelfPolicyState {
+    fn detail(&self) -> String {
+        format!(
+            "self_seccomp={}; self_no_new_privs={}; container={}",
+            self.seccomp
+                .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+            self.no_new_privs
+                .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+            self.container
         )
-        .with_hint("virtiofsd will run with --sandbox none");
-    };
-    let output = match Cmd::new(unshare)
-        .args(["--user", "--map-root-user", "true"])
-        .stdin_null()
-        .timeout(DOCTOR_PROBE_TIMEOUT)
-        .error_kind(ErrorKind::Dependency)
-        .output()
-    {
-        Ok(output) => output,
-        Err(error) => {
-            return DoctorCheck::new(
-                DoctorCheckId::UserNamespaces,
-                DoctorStatus::Warn,
-                firestone_error_reason(&error),
+    }
+
+    fn has_restricting_context(&self) -> bool {
+        self.seccomp.is_some_and(|value| value > 0) || self.container != "not detected"
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PasstUsernsProbe {
+    Available(String),
+    Denied { pid: Option<u32>, stderr: String },
+    Inconclusive(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuditEvidence {
+    Correlated(PathBuf),
+    ReadableWithoutMatch,
+    Unreadable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UserNamespaceDiagnosis {
+    status: DoctorStatus,
+    reason: String,
+    apparmor_remediation: bool,
+    hint: String,
+}
+
+/// Returns the versioned root copy only after its bytes, profile, ownership,
+/// protected parent directories, and loaded policy have all been verified.
+pub fn resolve_verified_apparmor_passt(
+    paths: &Paths,
+    artifact: &DependencyArtifact,
+) -> Result<Option<VerifiedPasst>, FirestoneError> {
+    resolve_verified_apparmor_passt_at(
+        &paths.apparmor_passt_executable(),
+        &paths.apparmor_passt_profile(),
+        &paths.apparmor_loaded_profiles(),
+        artifact,
+        0,
+    )
+}
+
+fn resolve_verified_apparmor_passt_at(
+    executable: &Path,
+    profile: &Path,
+    loaded_profiles: &Path,
+    artifact: &DependencyArtifact,
+    expected_root_uid: u32,
+) -> Result<Option<VerifiedPasst>, FirestoneError> {
+    if artifact.dependency != "passt" || artifact.version != crate::PINNED_PASST_VERSION {
+        return Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            "cannot verify an AppArmor passt copy against a different dependency identity",
+        )
+        .with_hint("resolve the exact embedded x86_64 passt artifact first"));
+    }
+
+    let executable_metadata = match fs::symlink_metadata(executable) {
+        Ok(metadata) => Some(metadata),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+        Err(source) => {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "cannot inspect AppArmor passt target {}",
+                    executable.display()
+                ),
             )
-            .with_hint("virtiofsd will run with --sandbox none");
+            .with_source(source));
         }
     };
-    if output.success() && max_namespaces.is_some_and(|value| value > 0) {
-        DoctorCheck::new(
-            DoctorCheckId::UserNamespaces,
-            DoctorStatus::Ok,
+    let profile_metadata = match fs::symlink_metadata(profile) {
+        Ok(metadata) => Some(metadata),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+        Err(source) => {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "cannot inspect AppArmor passt profile {}",
+                    profile.display()
+                ),
+            )
+            .with_source(source));
+        }
+    };
+    let (executable_metadata, profile_metadata) = match (executable_metadata, profile_metadata) {
+        (None, None) => return Ok(None),
+        (Some(executable_metadata), Some(profile_metadata)) => {
+            (executable_metadata, profile_metadata)
+        }
+        _ => {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                "the AppArmor passt installation is incomplete",
+            )
+            .with_hint("rerun firestone doctor --fix from an interactive terminal"));
+        }
+    };
+    verify_root_owned_file(
+        executable,
+        &executable_metadata,
+        expected_root_uid,
+        true,
+        "AppArmor passt executable",
+    )?;
+    verify_root_owned_file(
+        profile,
+        &profile_metadata,
+        expected_root_uid,
+        false,
+        "AppArmor passt profile",
+    )?;
+    verify_root_owned_parent(executable, expected_root_uid)?;
+    verify_root_owned_parent(profile, expected_root_uid)?;
+
+    let actual_hash = hash_file(executable, "AppArmor passt executable")?;
+    if actual_hash != artifact.sha256 {
+        return Err(FirestoneError::new(
+            ErrorKind::Checksum,
             format!(
-                "user namespaces are enabled; root mapping succeeded (maximum {})",
-                max_namespaces.unwrap_or_default()
+                "AppArmor passt target {} has SHA-256 {actual_hash}, expected {}",
+                executable.display(),
+                artifact.sha256
             ),
         )
-    } else {
-        let reason = if max_namespaces.is_none() {
-            "cannot read user.max_user_namespaces".to_owned()
-        } else {
-            format!(
-                "unshare --user --map-root-user true failed: {}",
-                command_failure_reason(&output)
-            )
-        };
-        DoctorCheck::new(DoctorCheckId::UserNamespaces, DoctorStatus::Warn, reason)
-            .with_hint("virtiofsd will run with --sandbox none")
+        .with_hint("do not run the mismatched root copy; reinstall the exact embedded bytes"));
     }
+    let profile_bytes = fs::read(profile).map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::Dependency,
+            format!("cannot read AppArmor passt profile {}", profile.display()),
+        )
+        .with_source(source)
+    })?;
+    if profile_bytes != APPARMOR_PASST_PROFILE_CONTENT.as_bytes() {
+        return Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!(
+                "AppArmor passt profile {} has unexpected content",
+                profile.display()
+            ),
+        )
+        .with_hint("replace it with the literal Firestone profile through doctor --fix"));
+    }
+    let loaded = fs::read_to_string(loaded_profiles).map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::Dependency,
+            format!(
+                "cannot confirm loaded AppArmor profiles through {}",
+                loaded_profiles.display()
+            ),
+        )
+        .with_source(source)
+    })?;
+    let profile_loaded = loaded.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next() == Some(APPARMOR_PASST_PROFILE_NAME)
+            && fields.any(|field| field == "(unconfined)")
+    });
+    if !profile_loaded {
+        return Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!("AppArmor profile {APPARMOR_PASST_PROFILE_NAME} is not loaded"),
+        )
+        .with_hint(format!("sudo apparmor_parser -r {}", profile.display())));
+    }
+
+    Ok(Some(VerifiedPasst {
+        executable: executable.to_path_buf(),
+        profile_name: APPARMOR_PASST_PROFILE_NAME,
+    }))
+}
+
+fn verify_root_owned_file(
+    path: &Path,
+    metadata: &fs::Metadata,
+    expected_root_uid: u32,
+    executable: bool,
+    label: &str,
+) -> Result<(), FirestoneError> {
+    let mode = metadata.permissions().mode() & 0o7777;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != expected_root_uid
+        || mode & 0o022 != 0
+        || (executable && mode & 0o111 == 0)
+    {
+        return Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!(
+                "{label} {} is not a root-owned, non-writable regular file with the required execute mode (uid {}, mode {mode:04o})",
+                path.display(),
+                metadata.uid()
+            ),
+        )
+        .with_hint("remove the unsafe installation and rerun firestone doctor --fix"));
+    }
+    Ok(())
+}
+
+fn verify_root_owned_parent(path: &Path, expected_root_uid: u32) -> Result<(), FirestoneError> {
+    let Some(parent) = path.parent() else {
+        return Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!(
+                "AppArmor attachment {} has no parent directory",
+                path.display()
+            ),
+        ));
+    };
+    let metadata = fs::symlink_metadata(parent).map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::Dependency,
+            format!("cannot inspect protected parent {}", parent.display()),
+        )
+        .with_source(source)
+    })?;
+    let mode = metadata.permissions().mode() & 0o7777;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != expected_root_uid
+        || mode & 0o022 != 0
+    {
+        return Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!(
+                "AppArmor attachment parent {} is not a root-owned, non-writable directory (uid {}, mode {mode:04o})",
+                parent.display(),
+                metadata.uid()
+            ),
+        )
+        .with_hint("use the literal protected /usr/libexec/firestone installation path"));
+    }
+    Ok(())
+}
+
+fn hash_file(path: &Path, label: &str) -> Result<String, FirestoneError> {
+    let mut file = File::open(path).map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::Dependency,
+            format!("cannot open {label} {} for hashing", path.display()),
+        )
+        .with_source(source)
+    })?;
+    sha256_reader(&mut file).map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::Dependency,
+            format!("cannot hash {label} {}", path.display()),
+        )
+        .with_source(source)
+    })
+}
+
+fn read_numeric_fact(path: &Path) -> NumericFact {
+    match fs::read_to_string(path) {
+        Ok(value) => value
+            .trim()
+            .parse::<u64>()
+            .map_or(NumericFact::Invalid, NumericFact::Value),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => NumericFact::Missing,
+        Err(_) => NumericFact::Unreadable,
+    }
+}
+
+fn read_apparmor_state(path: &Path) -> AppArmorState {
+    match fs::read_to_string(path) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" | "1" => AppArmorState::Enabled,
+            "n" | "no" | "0" => AppArmorState::Disabled,
+            _ => AppArmorState::Invalid,
+        },
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => AppArmorState::Missing,
+        Err(_) => AppArmorState::Unreadable,
+    }
+}
+
+fn read_self_policy(context: &DoctorContext) -> SelfPolicyState {
+    let status = fs::read_to_string(&context.self_status).ok();
+    let status_value = |name: &str| {
+        status.as_deref().and_then(|contents| {
+            contents
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        })
+    };
+    SelfPolicyState {
+        seccomp: status_value("Seccomp:"),
+        no_new_privs: status_value("NoNewPrivs:"),
+        container: detect_container(context),
+    }
+}
+
+fn detect_container(context: &DoctorContext) -> String {
+    for marker in &context.container_markers {
+        match fs::read_to_string(marker) {
+            Ok(value) if !value.trim().is_empty() => return value.trim().to_owned(),
+            Ok(_) | Err(_)
+                if marker.file_name() == Some(OsStr::new(".dockerenv")) && marker.exists() =>
+            {
+                return "docker".to_owned();
+            }
+            Ok(_) | Err(_)
+                if marker.file_name() == Some(OsStr::new(".containerenv")) && marker.exists() =>
+            {
+                return "podman".to_owned();
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    let Ok(cgroup) = fs::read_to_string(&context.self_cgroup) else {
+        return "unknown".to_owned();
+    };
+    let lower = cgroup.to_ascii_lowercase();
+    for (needle, label) in [
+        ("kubepods", "kubernetes"),
+        ("docker", "docker"),
+        ("containerd", "containerd"),
+        ("libpod", "podman"),
+        ("lxc", "lxc"),
+    ] {
+        if lower.contains(needle) {
+            return label.to_owned();
+        }
+    }
+    "not detected".to_owned()
+}
+fn selected_passt(context: &DoctorContext) -> Result<Option<(PathBuf, bool)>, FirestoneError> {
+    if let Ok(artifact) = context.manifest.embedded_passt(&context.architecture) {
+        if let Some(verified) = resolve_verified_apparmor_passt_at(
+            &context.apparmor_passt_executable,
+            &context.apparmor_passt_profile,
+            &context.apparmor_loaded_profiles,
+            &artifact,
+            context.expected_root_uid,
+        )? {
+            return Ok(Some((verified.executable, true)));
+        }
+        let installed = context.paths.bin_dir().join(&artifact.install_name);
+        if artifact_state(&context.paths.bin_dir(), &artifact).is_ok() {
+            return Ok(Some((installed, true)));
+        }
+    }
+    let Some(program) = find_on_path("passt", &context.search_path) else {
+        return Ok(None);
+    };
+    let exact = Cmd::new(&program)
+        .arg("--version")
+        .stdin_null()
+        .timeout(DOCTOR_PROBE_TIMEOUT)
+        .capture_limit(PASST_USERNS_STDERR_BYTES)
+        .error_kind(ErrorKind::Dependency)
+        .output()
+        .ok()
+        .and_then(|output| {
+            parse_passt_version(&format!(
+                "{}\n{}",
+                output.stdout_lossy(),
+                output.stderr_lossy()
+            ))
+        })
+        .is_some_and(|version| version.raw == crate::PINNED_PASST_VERSION);
+    Ok(Some((program, exact)))
+}
+
+fn passt_userns_probe(context: &DoctorContext) -> PasstUsernsProbe {
+    let (program, exact_pinned) = match selected_passt(context) {
+        Ok(Some(selected)) => selected,
+        Ok(None) => {
+            return PasstUsernsProbe::Inconclusive(
+                "passt is unavailable, so its mandatory userns stage was not tested".to_owned(),
+            );
+        }
+        Err(error) => {
+            return PasstUsernsProbe::Inconclusive(firestone_error_reason(&error));
+        }
+    };
+    let probe_dir = match TempBuilder::new()
+        .prefix(".firestone-passt-userns-")
+        .tempdir_in(context.paths.runtime_dir())
+    {
+        Ok(directory) => directory,
+        Err(source) => {
+            return PasstUsernsProbe::Inconclusive(format!(
+                "cannot create the bounded passt probe directory: {source}"
+            ));
+        }
+    };
+    let socket = probe_dir.path().join("net.sock");
+    let output = Cmd::new(program)
+        .args(["--foreground", "--one-off", "--socket-path"])
+        .arg(socket.as_os_str())
+        .args(["--tcp-ports", "none", "--udp-ports", "none"])
+        .stdin_null()
+        .timeout(PASST_USERNS_PROBE_TIMEOUT)
+        .capture_limit(PASST_USERNS_STDERR_BYTES)
+        .error_kind(ErrorKind::Dependency)
+        .output();
+    match output {
+        Ok(output) => {
+            let stderr = bounded_stderr(&output);
+            if stderr.contains(PASST_USERNS_FAILURE) {
+                PasstUsernsProbe::Denied {
+                    pid: Some(output.pid()),
+                    stderr,
+                }
+            } else if stderr.contains(PASST_LATER_ISOLATION_FAILURE) {
+                PasstUsernsProbe::Available(format!(
+                    "passt pid {} reached the later namespace-detach stage after userns creation",
+                    output.pid()
+                ))
+            } else {
+                PasstUsernsProbe::Inconclusive(format!(
+                    "passt exited before a recognized userns stage: {stderr}"
+                ))
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::Timeout => {
+            let detail = error.message();
+            if detail.contains(PASST_USERNS_FAILURE) {
+                PasstUsernsProbe::Denied {
+                    pid: None,
+                    stderr: bounded_text(detail),
+                }
+            } else if detail.contains(PASST_LATER_ISOLATION_FAILURE) {
+                PasstUsernsProbe::Available(
+                    "passt reached the later namespace-detach stage after userns creation"
+                        .to_owned(),
+                )
+            } else if exact_pinned {
+                PasstUsernsProbe::Available(format!(
+                    "pinned passt remained active for {} ms after its synchronous userns stage",
+                    PASST_USERNS_PROBE_TIMEOUT.as_millis()
+                ))
+            } else {
+                PasstUsernsProbe::Inconclusive(
+                    "a non-pinned passt stayed active, but its startup ordering is not authoritative"
+                        .to_owned(),
+                )
+            }
+        }
+        Err(error) => PasstUsernsProbe::Inconclusive(format!(
+            "cannot run the bounded passt userns probe: {}",
+            firestone_error_reason(&error)
+        )),
+    }
+}
+
+fn bounded_stderr(output: &crate::CmdOutput) -> String {
+    let mut stderr = bounded_text(&output.stderr_lossy());
+    if output.stderr_truncated() {
+        stderr.push_str(" [stderr truncated at 16384 bytes]");
+    }
+    stderr
+}
+
+fn bounded_text(value: &str) -> String {
+    let text = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        "<empty>".to_owned()
+    } else {
+        text
+    }
+}
+
+fn correlated_audit_evidence(
+    context: &DoctorContext,
+    pid: Option<u32>,
+    started: u64,
+) -> AuditEvidence {
+    let Some(pid) = pid else {
+        return AuditEvidence::Unreadable;
+    };
+    let mut readable = false;
+    for path in &context.audit_logs {
+        let Ok(contents) = read_tail_text(path, AUDIT_TAIL_BYTES) else {
+            continue;
+        };
+        readable = true;
+        if contents.lines().any(|line| {
+            line.contains(r#"apparmor="DENIED""#)
+                && line.contains(r#"operation="userns_create""#)
+                && audit_has_pid(line, pid)
+                && audit_is_recent(line, started)
+        }) {
+            return AuditEvidence::Correlated(path.clone());
+        }
+    }
+    if readable {
+        AuditEvidence::ReadableWithoutMatch
+    } else {
+        AuditEvidence::Unreadable
+    }
+}
+
+fn audit_has_pid(line: &str, pid: u32) -> bool {
+    let field = format!("pid={pid}");
+    line.match_indices(&field).any(|(index, _)| {
+        line.as_bytes()
+            .get(index + field.len())
+            .is_none_or(|byte| byte.is_ascii_whitespace())
+    })
+}
+
+fn audit_is_recent(line: &str, started: u64) -> bool {
+    let Some(after) = line.split("audit(").nth(1) else {
+        return true;
+    };
+    let Some(seconds) = after.split(['.', ':']).next() else {
+        return true;
+    };
+    seconds
+        .parse::<u64>()
+        .map_or(true, |seconds| seconds >= started.saturating_sub(2))
+}
+
+fn read_tail_text(path: &Path, maximum: u64) -> Result<String, std::io::Error> {
+    let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    if length > maximum {
+        file.seek(SeekFrom::Start(length - maximum))?;
+    }
+    let mut bytes = Vec::with_capacity(length.min(maximum) as usize);
+    let mut limited = file.take(maximum);
+    limited.read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn diagnose_user_namespaces(context: &DoctorContext) -> UserNamespaceDiagnosis {
+    let max = read_numeric_fact(&context.user_namespace_sysctl);
+    let clone = read_numeric_fact(&context.unprivileged_userns_clone_sysctl);
+    let apparmor = read_apparmor_state(&context.apparmor_enabled);
+    let restrict = read_numeric_fact(&context.apparmor_restrict_userns);
+    let self_policy = read_self_policy(context);
+    let probe_started = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    let probe = passt_userns_probe(context);
+    let facts = format!(
+        "{}; {}; {}; {}; {}",
+        max.detail("max_user_namespaces", false),
+        clone.detail("unprivileged_userns_clone", true),
+        apparmor.detail(),
+        restrict.detail("restrict_unprivileged_userns", true),
+        self_policy.detail()
+    );
+    let qemu_note = "qemu-img does not require user namespaces";
+
+    if max.is_zero() {
+        return UserNamespaceDiagnosis {
+            status: DoctorStatus::Fail,
+            reason: format!(
+                "confirmed userns denial: max_user_namespaces=0; {facts}; {qemu_note}"
+            ),
+            apparmor_remediation: false,
+            hint: "Firestone never changes namespace sysctls; ask the host administrator to review user.max_user_namespaces before running passt".to_owned(),
+        };
+    }
+    if clone.is_zero() {
+        return UserNamespaceDiagnosis {
+            status: DoctorStatus::Fail,
+            reason: format!(
+                "confirmed userns denial: unprivileged_userns_clone=0; {facts}; {qemu_note}"
+            ),
+            apparmor_remediation: false,
+            hint: "Firestone never changes namespace sysctls; ask the host administrator to review kernel.unprivileged_userns_clone before running passt".to_owned(),
+        };
+    }
+
+    match probe {
+        PasstUsernsProbe::Available(evidence) => UserNamespaceDiagnosis {
+            status: DoctorStatus::Ok,
+            reason: format!(
+                "passt userns creation confirmed: {evidence}; {facts}; {qemu_note}"
+            ),
+            apparmor_remediation: false,
+            hint: "passt can use its mandatory user namespace stage".to_owned(),
+        },
+        PasstUsernsProbe::Denied { pid, stderr } => {
+            let audit = correlated_audit_evidence(context, pid, probe_started);
+            let apparmor_consistent = apparmor == AppArmorState::Enabled && restrict.is_one();
+            match audit {
+                AuditEvidence::Correlated(path) => UserNamespaceDiagnosis {
+                    status: DoctorStatus::Fail,
+                    reason: format!(
+                        "confirmed AppArmor userns denial: correlated passt pid audit record in {}; passt stderr: {stderr}; {facts}; {qemu_note}",
+                        path.display()
+                    ),
+                    apparmor_remediation: true,
+                    hint: format!(
+                        "doctor --fix can install exact embedded bytes at {APPARMOR_PASST_EXECUTABLE} and attach only {APPARMOR_PASST_PROFILE_NAME}; it never changes sysctls"
+                    ),
+                },
+                AuditEvidence::ReadableWithoutMatch | AuditEvidence::Unreadable
+                    if apparmor_consistent =>
+                {
+                    let audit_detail = if matches!(audit, AuditEvidence::Unreadable) {
+                        "audit evidence was not readable"
+                    } else {
+                        "readable audit evidence had no correlated denial"
+                    };
+                    UserNamespaceDiagnosis {
+                        status: DoctorStatus::Fail,
+                        reason: format!(
+                            "passt userns denial is consistent with AppArmor but not confirmed: {audit_detail}; passt stderr: {stderr}; {facts}; {qemu_note}"
+                        ),
+                        apparmor_remediation: true,
+                        hint: format!(
+                            "doctor --fix can install a literal profile for {APPARMOR_PASST_EXECUTABLE}; it never grants userns to a user-writable wildcard or changes sysctls"
+                        ),
+                    }
+                }
+                AuditEvidence::ReadableWithoutMatch | AuditEvidence::Unreadable
+                    if self_policy.has_restricting_context() =>
+                {
+                    UserNamespaceDiagnosis {
+                        status: DoctorStatus::Fail,
+                        reason: format!(
+                            "passt confirmed userns creation failed; container or seccomp policy is consistent with the denial, but the cause is not confirmed; passt stderr: {stderr}; {facts}; {qemu_note}"
+                        ),
+                        apparmor_remediation: false,
+                        hint: "inspect the outer container seccomp and namespace policy; Firestone does not weaken it or change sysctls".to_owned(),
+                    }
+                }
+                AuditEvidence::ReadableWithoutMatch | AuditEvidence::Unreadable => {
+                    UserNamespaceDiagnosis {
+                        status: DoctorStatus::Fail,
+                        reason: format!(
+                            "passt confirmed userns creation failed, but the denying policy is not confirmed; passt stderr: {stderr}; {facts}; {qemu_note}"
+                        ),
+                        apparmor_remediation: false,
+                        hint: "inspect host userns policy and readable audit logs; a generic unshare result is not authoritative for passt".to_owned(),
+                    }
+                }
+            }
+        }
+        PasstUsernsProbe::Inconclusive(detail) => UserNamespaceDiagnosis {
+            status: DoctorStatus::Warn,
+            reason: format!(
+                "passt userns result is inconclusive: {detail}; {facts}; {qemu_note}"
+            ),
+            apparmor_remediation: false,
+            hint: "repair or install the pinned passt helper and retry; generic unshare alone is not proof".to_owned(),
+        },
+    }
+}
+
+/// Checks passt's mandatory first user namespace stage and reports policy facts.
+fn check_user_namespaces(context: &DoctorContext) -> DoctorCheck {
+    let diagnosis = diagnose_user_namespaces(context);
+    let mut check = DoctorCheck::new(
+        DoctorCheckId::UserNamespaces,
+        diagnosis.status,
+        diagnosis.reason,
+    )
+    .with_hint(diagnosis.hint);
+    if diagnosis.apparmor_remediation {
+        check = check.with_fix("firestone doctor --fix");
+    }
+    check
 }
 
 fn check_ssh_key(context: &DoctorContext) -> DoctorCheck {
@@ -1397,6 +2261,7 @@ fn read_reconciled_machine_state_with(
 fn perform_fixes(
     context: &DoctorContext,
     fetcher: &dyn ArtifactFetcher,
+    elevation_confirmed: bool,
 ) -> BTreeMap<DoctorCheckId, FixFailure> {
     let mut failures = BTreeMap::new();
 
@@ -1460,9 +2325,361 @@ fn perform_fixes(
         }
     }
 
+    let userns = diagnose_user_namespaces(context);
+    if userns.apparmor_remediation {
+        if let Err(failure) = fix_apparmor_passt(context, elevation_confirmed) {
+            record_fix_failure_value(&mut failures, DoctorCheckId::UserNamespaces, failure);
+        }
+    }
     failures
 }
 
+#[derive(Debug, Clone)]
+enum ElevationProvider {
+    Direct,
+    Sudo(PathBuf),
+    Pkexec(PathBuf),
+}
+
+fn fix_apparmor_passt(
+    context: &DoctorContext,
+    elevation_confirmed: bool,
+) -> Result<(), FixFailure> {
+    if context.operating_system != "linux" || context.architecture != "x86_64" {
+        return Err(FixFailure {
+            reason: "AppArmor passt repair is available only on Linux x86_64".to_owned(),
+            fix: None,
+            hint: Some("use the supported Linux x86_64 runtime".to_owned()),
+        });
+    }
+    let helper = context.extracted_passt.as_ref().ok_or_else(|| FixFailure {
+        reason: "embedded passt helper extraction has not provided installable bytes".to_owned(),
+        fix: None,
+        hint: Some(
+            "extract DependencyManifest::embedded_passt through the helper runtime and supply ExtractedPasstHelper before retrying"
+                .to_owned(),
+        ),
+    })?;
+    let manifest_artifact = context
+        .manifest
+        .embedded_passt(&context.architecture)
+        .map_err(FixFailure::from)?;
+    if helper.artifact != manifest_artifact {
+        return Err(FixFailure {
+            reason: "extracted passt bytes do not match the bundled dependency manifest identity"
+                .to_owned(),
+            fix: None,
+            hint: Some(
+                "discard the extraction and materialize the bundled passt payload again".to_owned(),
+            ),
+        });
+    }
+    verify_extracted_passt(context, helper).map_err(FixFailure::from)?;
+    stage_apparmor_profile(context).map_err(FixFailure::from)?;
+    let manual = manual_apparmor_commands(context, helper.path()).map_err(FixFailure::from)?;
+    if !elevation_confirmed {
+        return Err(FixFailure {
+            reason: "AppArmor repair elevation was not explicitly confirmed in an interactive TTY"
+                .to_owned(),
+            fix: Some(manual),
+            hint: Some(
+                "run the exact commands manually, or rerun firestone doctor --fix in an interactive TTY; no sysctl will be changed"
+                    .to_owned(),
+            ),
+        });
+    }
+
+    let install = find_on_path("install", &context.search_path).ok_or_else(|| FixFailure {
+        reason: "install is unavailable for the AppArmor repair".to_owned(),
+        fix: Some(manual.clone()),
+        hint: Some("install GNU coreutils and retry from an interactive TTY".to_owned()),
+    })?;
+    let parser =
+        find_on_path("apparmor_parser", &context.search_path).ok_or_else(|| FixFailure {
+            reason: "apparmor_parser is unavailable for the AppArmor repair".to_owned(),
+            fix: Some(manual.clone()),
+            hint: Some(
+                "install the AppArmor userspace tools and retry from an interactive TTY".to_owned(),
+            ),
+        })?;
+    let elevation = select_elevation(context).ok_or_else(|| FixFailure {
+        reason: "sudo and pkexec are unavailable for the confirmed AppArmor repair".to_owned(),
+        fix: Some(manual.clone()),
+        hint: Some("run the exact root commands manually".to_owned()),
+    })?;
+    let executable_parent =
+        context
+            .apparmor_passt_executable
+            .parent()
+            .ok_or_else(|| FixFailure {
+                reason: "the AppArmor passt target has no parent directory".to_owned(),
+                fix: Some(manual.clone()),
+                hint: None,
+            })?;
+
+    run_elevated(
+        &elevation,
+        &install,
+        &[
+            OsString::from("-d"),
+            OsString::from("-o"),
+            OsString::from("root"),
+            OsString::from("-g"),
+            OsString::from("root"),
+            OsString::from("-m"),
+            OsString::from("0755"),
+            OsString::from("--"),
+            executable_parent.as_os_str().to_owned(),
+        ],
+    )
+    .map_err(FixFailure::from)?;
+    run_elevated(
+        &elevation,
+        &install,
+        &[
+            OsString::from("-o"),
+            OsString::from("root"),
+            OsString::from("-g"),
+            OsString::from("root"),
+            OsString::from("-m"),
+            OsString::from("0755"),
+            OsString::from("--"),
+            helper.path().as_os_str().to_owned(),
+            context.apparmor_passt_executable.as_os_str().to_owned(),
+        ],
+    )
+    .map_err(FixFailure::from)?;
+    run_elevated(
+        &elevation,
+        &install,
+        &[
+            OsString::from("-o"),
+            OsString::from("root"),
+            OsString::from("-g"),
+            OsString::from("root"),
+            OsString::from("-m"),
+            OsString::from("0644"),
+            OsString::from("--"),
+            context
+                .paths
+                .apparmor_passt_staged_profile()
+                .into_os_string(),
+            context.apparmor_passt_profile.as_os_str().to_owned(),
+        ],
+    )
+    .map_err(FixFailure::from)?;
+    run_elevated(
+        &elevation,
+        &parser,
+        &[
+            OsString::from("-r"),
+            context.apparmor_passt_profile.as_os_str().to_owned(),
+        ],
+    )
+    .map_err(FixFailure::from)?;
+
+    match resolve_verified_apparmor_passt_at(
+        &context.apparmor_passt_executable,
+        &context.apparmor_passt_profile,
+        &context.apparmor_loaded_profiles,
+        helper.artifact(),
+        context.expected_root_uid,
+    )
+    .map_err(FixFailure::from)?
+    {
+        Some(_) => Ok(()),
+        None => Err(FixFailure {
+            reason: "the AppArmor passt installation was not present after install completed"
+                .to_owned(),
+            fix: Some(manual),
+            hint: Some("inspect the privileged command output and retry".to_owned()),
+        }),
+    }
+}
+
+fn verify_extracted_passt(
+    context: &DoctorContext,
+    helper: &ExtractedPasstHelper,
+) -> Result<(), FirestoneError> {
+    let metadata = fs::symlink_metadata(helper.path()).map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::Dependency,
+            format!(
+                "cannot inspect extracted passt bytes at {}",
+                helper.path().display()
+            ),
+        )
+        .with_source(source)
+    })?;
+    let mode = metadata.permissions().mode() & 0o7777;
+    let owned =
+        metadata.uid() == context.paths.uid() || metadata.uid() == context.expected_root_uid;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || !owned
+        || mode & 0o022 != 0
+        || mode & 0o111 == 0
+    {
+        return Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!(
+                "extracted passt {} is not an owned, non-writable executable regular file (uid {}, mode {mode:04o})",
+                helper.path().display(),
+                metadata.uid()
+            ),
+        )
+        .with_hint("discard the unsafe extraction and materialize the embedded bytes again"));
+    }
+    let actual = hash_file(helper.path(), "extracted passt helper")?;
+    if actual != helper.artifact().sha256 {
+        return Err(FirestoneError::new(
+            ErrorKind::Checksum,
+            format!(
+                "extracted passt helper has SHA-256 {actual}, expected {}",
+                helper.artifact().sha256
+            ),
+        )
+        .with_hint("discard the extraction; never elevate mismatched helper bytes"));
+    }
+    Ok(())
+}
+
+fn stage_apparmor_profile(context: &DoctorContext) -> Result<(), FirestoneError> {
+    let directory = context.paths.apparmor_staging_dir();
+    create_firestone_dir(&context.paths, &directory, "AppArmor staging directory")?;
+    let profile = context.paths.apparmor_passt_staged_profile();
+    crate::atomic::write_with_mode(&profile, APPARMOR_PASST_PROFILE_CONTENT.as_bytes(), 0o600)?;
+    let metadata = fs::symlink_metadata(&profile).map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::Dependency,
+            format!(
+                "cannot verify staged AppArmor profile {}",
+                profile.display()
+            ),
+        )
+        .with_source(source)
+    })?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != context.paths.uid()
+        || metadata.permissions().mode() & 0o7777 != 0o600
+    {
+        return Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!("staged AppArmor profile {} is unsafe", profile.display()),
+        )
+        .with_hint("repair the Firestone data directory and retry"));
+    }
+    Ok(())
+}
+
+fn manual_apparmor_commands(
+    context: &DoctorContext,
+    helper: &Path,
+) -> Result<String, FirestoneError> {
+    let executable_parent = context
+        .apparmor_passt_executable
+        .parent()
+        .ok_or_else(|| FirestoneError::new(ErrorKind::Dependency, "invalid passt target path"))?;
+    let staged_profile = context.paths.apparmor_passt_staged_profile();
+    Ok([
+        format!(
+            "sudo install -d -o root -g root -m 0755 -- {}",
+            shell_quote_path(executable_parent)?
+        ),
+        format!(
+            "sudo install -o root -g root -m 0755 -- {} {}",
+            shell_quote_path(helper)?,
+            shell_quote_path(&context.apparmor_passt_executable)?
+        ),
+        format!(
+            "sudo install -o root -g root -m 0644 -- {} {}",
+            shell_quote_path(&staged_profile)?,
+            shell_quote_path(&context.apparmor_passt_profile)?
+        ),
+        format!(
+            "sudo apparmor_parser -r {}",
+            shell_quote_path(&context.apparmor_passt_profile)?
+        ),
+    ]
+    .join(" && "))
+}
+
+fn shell_quote_path(path: &Path) -> Result<String, FirestoneError> {
+    let value = path.to_str().ok_or_else(|| {
+        FirestoneError::new(
+            ErrorKind::Dependency,
+            format!(
+                "cannot render a manual command for non-UTF-8 path {}",
+                path.display()
+            ),
+        )
+        .with_hint("use a UTF-8 Firestone data path for privileged AppArmor repair")
+    })?;
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push(char::from(39));
+    for character in value.chars() {
+        if character == char::from(39) {
+            quoted.push_str(r#"'"'"'"#);
+        } else {
+            quoted.push(character);
+        }
+    }
+    quoted.push(char::from(39));
+    Ok(quoted)
+}
+
+fn select_elevation(context: &DoctorContext) -> Option<ElevationProvider> {
+    if context.paths.uid() == 0 {
+        Some(ElevationProvider::Direct)
+    } else if let Some(sudo) = find_on_path("sudo", &context.search_path) {
+        Some(ElevationProvider::Sudo(sudo))
+    } else {
+        find_on_path("pkexec", &context.search_path).map(ElevationProvider::Pkexec)
+    }
+}
+
+fn run_elevated(
+    elevation: &ElevationProvider,
+    program: &Path,
+    arguments: &[OsString],
+) -> Result<(), FirestoneError> {
+    let command = match elevation {
+        ElevationProvider::Direct => Cmd::new(program.as_os_str().to_owned()),
+        ElevationProvider::Sudo(sudo) => Cmd::new(sudo.as_os_str().to_owned())
+            .arg("--")
+            .arg(program.as_os_str().to_owned()),
+        ElevationProvider::Pkexec(pkexec) => {
+            Cmd::new(pkexec.as_os_str().to_owned()).arg(program.as_os_str().to_owned())
+        }
+    };
+    command
+        .args(arguments.iter().cloned())
+        .stdin_inherit()
+        .interactive_stdout_to_stderr()
+        .error_kind(ErrorKind::Dependency)
+        .run_interactive()
+}
+
+fn record_fix_failure_value(
+    failures: &mut BTreeMap<DoctorCheckId, FixFailure>,
+    check_id: DoctorCheckId,
+    next: FixFailure,
+) {
+    failures
+        .entry(check_id)
+        .and_modify(|failure| {
+            failure.reason.push_str("; ");
+            failure.reason.push_str(&next.reason);
+            if failure.fix.is_none() {
+                failure.fix.clone_from(&next.fix);
+            }
+            if failure.hint.is_none() {
+                failure.hint.clone_from(&next.hint);
+            }
+        })
+        .or_insert(next);
+}
 fn record_directory_fix(
     paths: &Paths,
     failures: &mut BTreeMap<DoctorCheckId, FixFailure>,
@@ -1508,17 +2725,7 @@ fn record_fix_failure(
     check_id: DoctorCheckId,
     error: FirestoneError,
 ) {
-    let next = FixFailure::from(error);
-    failures
-        .entry(check_id)
-        .and_modify(|failure| {
-            failure.reason.push_str("; ");
-            failure.reason.push_str(&next.reason);
-            if failure.hint.is_none() {
-                failure.hint.clone_from(&next.hint);
-            }
-        })
-        .or_insert(next);
+    record_fix_failure_value(failures, check_id, FixFailure::from(error));
 }
 
 fn dependency_install_io_hint(directory: &Path) -> String {
@@ -2030,14 +3237,15 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ArtifactFetcher, CHECK_IDS, DoctorCheck, DoctorCheckId, DoctorContext, DoctorReport,
-        DoctorStatus, MAX_DEPENDENCY_ARTIFACT_BYTES, MINIMUM_PASST_DATE, Package, artifact_state,
+        APPARMOR_PASST_PROFILE_CONTENT, ArtifactFetcher, CHECK_IDS, DoctorCheck, DoctorCheckId,
+        DoctorContext, DoctorOptions, DoctorReport, DoctorStatus, ExtractedPasstHelper,
+        MAX_DEPENDENCY_ARTIFACT_BYTES, MINIMUM_PASST_DATE, Package, artifact_state,
         check_architecture, check_kvm, check_passt, check_user_namespaces,
         content_length_exceeds_limit, copy_bounded, create_firestone_dir, distro_family,
         firestone_error_reason, generate_ssh_key, hash_dependency_download, install_artifact,
         install_command, parse_passt_version, read_reconciled_machine_state_with,
         reconcile_machine_state, redirect_rejection, require_https, run_doctor_with,
-        sync_directory,
+        run_doctor_with_options, sync_directory,
     };
     use crate::{
         DependencyArtifact, DependencyManifest, ErrorKind, ExitReason, FirestoneError, LastExit,
@@ -2172,6 +3380,51 @@ mod tests {
             fs::write(&nested, "Y\n")?;
             let sysctl = root.join("max_user_namespaces");
             fs::write(&sysctl, "1024\n")?;
+            let clone_sysctl = root.join("unprivileged_userns_clone");
+            fs::write(
+                &clone_sysctl,
+                "1
+",
+            )?;
+            let apparmor_enabled = root.join("apparmor-enabled");
+            fs::write(
+                &apparmor_enabled,
+                "N
+",
+            )?;
+            let apparmor_restrict = root.join("apparmor-restrict-userns");
+            fs::write(
+                &apparmor_restrict,
+                "0
+",
+            )?;
+            let self_status = root.join("self-status");
+            fs::write(
+                &self_status,
+                "NoNewPrivs:	0
+Seccomp:	0
+",
+            )?;
+            let self_cgroup = root.join("self-cgroup");
+            fs::write(
+                &self_cgroup,
+                "0::/
+",
+            )?;
+            let audit_log = root.join("audit.log");
+            fs::write(&audit_log, "")?;
+            let system_root = root.join("system");
+            let apparmor_passt_dir = system_root.join("usr/libexec/firestone");
+            let apparmor_profile_dir = system_root.join("etc/apparmor.d");
+            fs::create_dir_all(&apparmor_passt_dir)?;
+            fs::create_dir_all(&apparmor_profile_dir)?;
+            fs::set_permissions(&apparmor_passt_dir, fs::Permissions::from_mode(0o700))?;
+            fs::set_permissions(&apparmor_profile_dir, fs::Permissions::from_mode(0o700))?;
+            let apparmor_passt_executable = apparmor_passt_dir.join("passt-2025_02_17.a1e48a0");
+            let apparmor_passt_profile =
+                apparmor_profile_dir.join("firestone-passt-2025_02_17.a1e48a0");
+            let apparmor_loaded_profiles = root.join("loaded-apparmor-profiles");
+            fs::write(&apparmor_loaded_profiles, "")?;
             let os_release = root.join("os-release");
             fs::write(&os_release, "ID=ubuntu\nID_LIKE=debian\n")?;
 
@@ -2182,7 +3435,10 @@ mod tests {
             )?;
             write_executable(
                 &fake_bin.join("passt"),
-                "case \"$1\" in --version) printf 'passt 2025_02_17.a1e48a0\\n' ;; --help) printf '%s\\n' '--foreground --one-off --vhost-user --socket-path --repair-path --log-file' ;; --tcp-ports) exit 0 ;; *) exit 2 ;; esac",
+                r#"case "$1" in --version) printf 'passt 2025_02_17.a1e48a0
+' ;; --help) printf '%s
+' '--foreground --one-off --vhost-user --socket-path --repair-path --log-file' ;; --tcp-ports) exit 0 ;; --foreground) printf 'Failed to detach isolating namespaces: Operation not permitted
+' >&2; exit 1 ;; *) exit 2 ;; esac"#,
             )?;
             write_executable(&fake_bin.join("qemu-img"), "printf 'qemu-img fixture\\n'")?;
             write_executable(&fake_bin.join("ssh"), "printf 'OpenSSH fixture\\n' >&2")?;
@@ -2213,6 +3469,22 @@ mod tests {
                 kvm_device,
                 nested_parameters: vec![nested],
                 user_namespace_sysctl: sysctl,
+                unprivileged_userns_clone_sysctl: clone_sysctl,
+                apparmor_enabled,
+                apparmor_restrict_userns: apparmor_restrict,
+                self_status,
+                self_cgroup,
+                container_markers: vec![
+                    root.join(".dockerenv"),
+                    root.join(".containerenv"),
+                    root.join("systemd-container"),
+                ],
+                audit_logs: vec![audit_log],
+                apparmor_passt_executable,
+                apparmor_passt_profile,
+                apparmor_loaded_profiles,
+                extracted_passt: None,
+                expected_root_uid: fs::metadata(root)?.uid(),
                 os_release,
                 group_file,
                 search_path: OsString::from(fake_bin),
@@ -2276,6 +3548,22 @@ mod tests {
                 b"cloud-hypervisor-edk2".to_vec(),
             ),
             ("https://example.invalid/virtiofsd", b"virtiofsd".to_vec()),
+            (
+                "https://example.invalid/passt",
+                br#"#!/bin/sh
+case "$1" in
+  --version) printf 'passt 2025_02_17.a1e48a0
+' ;;
+  --help) printf '%s
+' '--foreground --one-off --vhost-user --socket-path --repair-path --log-file' ;;
+  --tcp-ports) exit 0 ;;
+  --foreground) printf "Failed to detach isolating namespaces: Operation not permitted
+" >&2; exit 1 ;;
+  *) exit 2 ;;
+esac
+"#
+                .to_vec(),
+            ),
         ]
         .into_iter()
         .map(|(url, payload)| (url.to_owned(), payload))
@@ -2310,6 +3598,12 @@ mod tests {
                 "virtiofsd-v1.14.0",
                 "https://example.invalid/virtiofsd",
             ),
+            (
+                "passt",
+                crate::PINNED_PASST_VERSION,
+                "passt-2025_02_17.a1e48a0",
+                "https://example.invalid/passt",
+            ),
         ];
         let mut input = "manifest_version = 1\n".to_owned();
         for (dependency, version, install_name, url) in entries {
@@ -2331,6 +3625,56 @@ mod tests {
     fn write_executable(path: &Path, body: &str) -> Result<(), std::io::Error> {
         fs::write(path, format!("#!/bin/sh\n{body}\n"))?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+    }
+    fn configure_apparmor_passt_denial(
+        fixture: &Fixture,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        fs::write(
+            &fixture.context.apparmor_enabled,
+            "Y
+",
+        )?;
+        fs::write(
+            &fixture.context.apparmor_restrict_userns,
+            "1
+",
+        )?;
+        let passt = PathBuf::from(&fixture.context.search_path).join("passt");
+        write_executable(
+            &passt,
+            r#"if [ "$1" = "--version" ]; then
+  printf 'passt 2025_02_17.a1e48a0
+'
+elif [ "$1" = "--help" ]; then
+  printf '%s
+' '--foreground --one-off --vhost-user --socket-path --repair-path --log-file'
+elif [ "$1" = "--tcp-ports" ]; then
+  exit 0
+elif [ "$1" = "--foreground" ]; then
+  printf "Couldn't create user namespace: Permission denied
+" >&2
+  exit 1
+else
+  exit 2
+fi"#,
+        )?;
+        Ok(())
+    }
+
+    fn provide_extracted_passt(
+        fixture: &mut Fixture,
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let artifact = fixture.context.manifest.embedded_passt("x86_64")?;
+        let payload = fixture
+            .payloads
+            .get(&artifact.url)
+            .ok_or("fixture passt payload missing")?;
+        let source = fixture.context.paths.bin_dir().join("extracted-passt");
+        fs::write(&source, payload)?;
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755))?;
+        fixture.context.extracted_passt =
+            Some(ExtractedPasstHelper::new(source.clone(), artifact)?);
+        Ok(source)
     }
 
     fn check(report: &DoctorReport, id: DoctorCheckId) -> &DoctorCheck {
@@ -3007,33 +4351,363 @@ mod tests {
     }
 
     #[test]
-    fn user_namespaces_zero_or_failed_unshare_warns_with_sandbox_fallback()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn userns_sysctls_are_diagnosed_without_mutation() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::healthy()?;
-        fs::write(&fixture.context.user_namespace_sysctl, "0\n")?;
-        let zero = check_user_namespaces(&fixture.context);
-        assert_eq!(zero.status, DoctorStatus::Warn);
+        fs::write(
+            &fixture.context.user_namespace_sysctl,
+            "0
+",
+        )?;
+        let max_zero = check_user_namespaces(&fixture.context);
+        assert_eq!(max_zero.status, DoctorStatus::Fail);
+        assert!(max_zero.reason.contains("max_user_namespaces=0"));
         assert!(
-            zero.hint
-                .is_some_and(|hint| hint.contains("--sandbox none"))
+            max_zero
+                .reason
+                .contains("qemu-img does not require user namespaces")
+        );
+        assert!(
+            max_zero
+                .hint
+                .is_some_and(|hint| hint.contains("never changes"))
         );
 
-        fs::write(&fixture.context.user_namespace_sysctl, "1024\n")?;
-        let unshare = PathBuf::from(&fixture.context.search_path).join("unshare");
-        write_executable(
-            &unshare,
-            "test \"$1\" = --user && test \"$2\" = --map-root-user && test \"$3\" = true",
+        fs::write(
+            &fixture.context.user_namespace_sysctl,
+            "1024
+",
         )?;
-        let mapped = check_user_namespaces(&fixture.context);
-        assert_eq!(mapped.status, DoctorStatus::Ok);
-
-        write_executable(&unshare, "printf denied >&2; exit 1")?;
-        let denied = check_user_namespaces(&fixture.context);
-        assert_eq!(denied.status, DoctorStatus::Warn);
-        assert!(denied.reason.contains("denied"));
+        fs::write(
+            &fixture.context.unprivileged_userns_clone_sysctl,
+            "0
+",
+        )?;
+        let clone_zero = check_user_namespaces(&fixture.context);
+        assert_eq!(clone_zero.status, DoctorStatus::Fail);
+        assert!(clone_zero.reason.contains("unprivileged_userns_clone=0"));
         Ok(())
     }
 
+    #[test]
+    fn passt_later_isolation_failure_proves_userns_succeeded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::healthy()?;
+        let unshare = PathBuf::from(&fixture.context.search_path).join("unshare");
+        write_executable(&unshare, "printf generic-unshare-failed >&2; exit 77")?;
+
+        let check = check_user_namespaces(&fixture.context);
+
+        assert_eq!(check.status, DoctorStatus::Ok);
+        assert!(check.reason.contains("later namespace-detach stage"));
+        assert!(check.reason.contains("self_seccomp=0"));
+        Ok(())
+    }
+
+    #[test]
+    fn passt_first_stage_failure_is_only_consistent_with_apparmor_without_audit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::healthy()?;
+        fs::write(
+            &fixture.context.apparmor_enabled,
+            "Y
+",
+        )?;
+        fs::write(
+            &fixture.context.apparmor_restrict_userns,
+            "1
+",
+        )?;
+        let passt = PathBuf::from(&fixture.context.search_path).join("passt");
+        write_executable(
+            &passt,
+            r#"case "$1" in --version) printf 'passt 2025_02_17.a1e48a0
+' ;; --help) printf '%s
+' '--foreground --one-off --vhost-user --socket-path --repair-path --log-file' ;; --tcp-ports) exit 0 ;; --foreground) printf "Couldn't create user namespace: Permission denied
+" >&2; exit 1 ;; *) exit 2 ;; esac"#,
+        )?;
+
+        let check = check_user_namespaces(&fixture.context);
+
+        assert_eq!(check.status, DoctorStatus::Fail);
+        assert!(
+            check
+                .reason
+                .contains("consistent with AppArmor but not confirmed")
+        );
+        assert_eq!(check.fix.as_deref(), Some("firestone doctor --fix"));
+        Ok(())
+    }
+
+    #[test]
+    fn passt_userns_stderr_is_bounded_and_marks_truncation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::healthy()?;
+        fs::write(
+            &fixture.context.apparmor_enabled,
+            "Y
+",
+        )?;
+        fs::write(
+            &fixture.context.apparmor_restrict_userns,
+            "1
+",
+        )?;
+        let passt = PathBuf::from(&fixture.context.search_path).join("passt");
+        write_executable(
+            &passt,
+            r#"if [ "$1" = "--version" ]; then
+  printf 'passt 2025_02_17.a1e48a0
+'
+elif [ "$1" = "--help" ]; then
+  printf '%s
+' '--foreground --one-off --vhost-user --socket-path --repair-path --log-file'
+elif [ "$1" = "--tcp-ports" ]; then
+  exit 0
+elif [ "$1" = "--foreground" ]; then
+  index=0
+  while [ "$index" -lt 20000 ]; do printf x >&2; index=$((index + 1)); done
+  printf "Couldn't create user namespace: Permission denied
+" >&2
+  exit 1
+fi"#,
+        )?;
+
+        let check = check_user_namespaces(&fixture.context);
+
+        assert_eq!(check.status, DoctorStatus::Fail);
+        assert!(check.reason.contains("stderr truncated at 16384 bytes"));
+        assert!(check.reason.len() < super::PASST_USERNS_STDERR_BYTES + 2_048);
+        Ok(())
+    }
+    #[test]
+    fn correlated_passt_pid_audit_record_confirms_apparmor_denial()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::healthy()?;
+        fs::write(
+            &fixture.context.apparmor_enabled,
+            "Y
+",
+        )?;
+        fs::write(
+            &fixture.context.apparmor_restrict_userns,
+            "1
+",
+        )?;
+        let passt = PathBuf::from(&fixture.context.search_path).join("passt");
+        let audit = &fixture.context.audit_logs[0];
+        write_executable(
+            &passt,
+            &format!(
+                r#"case "$1" in --version) printf 'passt 2025_02_17.a1e48a0
+' ;; --help) printf '%s
+' '--foreground --one-off --vhost-user --socket-path --repair-path --log-file' ;; --tcp-ports) exit 0 ;; --foreground) printf 'apparmor="DENIED" operation="userns_create" pid=%s comm="passt"
+' "$$" > '{}'; printf "Couldn't create user namespace: Permission denied
+" >&2; exit 1 ;; *) exit 2 ;; esac"#,
+                audit.display()
+            ),
+        )?;
+
+        let check = check_user_namespaces(&fixture.context);
+
+        assert_eq!(check.status, DoctorStatus::Fail);
+        assert!(check.reason.contains("confirmed AppArmor userns denial"));
+        assert!(check.reason.contains(&audit.display().to_string()));
+        Ok(())
+    }
+    #[test]
+    fn verified_passt_requires_exact_bytes_root_identity_and_loaded_literal_profile()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut fixture = Fixture::healthy()?;
+        let source = provide_extracted_passt(&mut fixture)?;
+        let artifact = fixture.context.manifest.embedded_passt("x86_64")?;
+        fs::write(
+            &fixture.context.apparmor_passt_executable,
+            fs::read(source)?,
+        )?;
+        fs::set_permissions(
+            &fixture.context.apparmor_passt_executable,
+            fs::Permissions::from_mode(0o755),
+        )?;
+        fs::write(
+            &fixture.context.apparmor_passt_profile,
+            APPARMOR_PASST_PROFILE_CONTENT,
+        )?;
+        fs::set_permissions(
+            &fixture.context.apparmor_passt_profile,
+            fs::Permissions::from_mode(0o644),
+        )?;
+        fs::write(
+            &fixture.context.apparmor_loaded_profiles,
+            format!(
+                "{} (unconfined)
+",
+                super::APPARMOR_PASST_PROFILE_NAME
+            ),
+        )?;
+
+        let verified = super::resolve_verified_apparmor_passt_at(
+            &fixture.context.apparmor_passt_executable,
+            &fixture.context.apparmor_passt_profile,
+            &fixture.context.apparmor_loaded_profiles,
+            &artifact,
+            fixture.context.expected_root_uid,
+        )?
+        .ok_or("verified passt was not resolved")?;
+        assert_eq!(
+            verified.executable(),
+            fixture.context.apparmor_passt_executable
+        );
+        assert_eq!(verified.profile_name(), super::APPARMOR_PASST_PROFILE_NAME);
+        assert!(
+            APPARMOR_PASST_PROFILE_CONTENT
+                .starts_with("abi <abi/4.0>,\ninclude <tunables/global>\n\n")
+        );
+        assert!(APPARMOR_PASST_PROFILE_CONTENT.contains(super::APPARMOR_PASST_EXECUTABLE));
+        assert!(!APPARMOR_PASST_PROFILE_CONTENT.contains('*'));
+        let path_passt = PathBuf::from(&fixture.context.search_path).join("passt");
+        fs::remove_file(path_passt)?;
+        let passt_check = check_passt(&fixture.context);
+        assert_eq!(passt_check.status, DoctorStatus::Ok, "{passt_check:#?}");
+        assert!(passt_check.reason.contains(crate::PINNED_PASST_VERSION));
+
+        fs::set_permissions(
+            &fixture.context.apparmor_passt_executable,
+            fs::Permissions::from_mode(0o777),
+        )?;
+        let error = super::resolve_verified_apparmor_passt_at(
+            &fixture.context.apparmor_passt_executable,
+            &fixture.context.apparmor_passt_profile,
+            &fixture.context.apparmor_loaded_profiles,
+            &artifact,
+            fixture.context.expected_root_uid,
+        )
+        .err()
+        .ok_or("world-writable passt target unexpectedly verified")?;
+        assert!(error.message().contains("non-writable regular file"));
+        Ok(())
+    }
+    #[test]
+    fn noninteractive_apparmor_fix_refuses_elevation_with_exact_commands()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut fixture = Fixture::healthy()?;
+        configure_apparmor_passt_denial(&fixture)?;
+        let source = provide_extracted_passt(&mut fixture)?;
+        let before_max = fs::read(&fixture.context.user_namespace_sysctl)?;
+        let fetcher = FakeFetcher::new(fixture.payloads.clone());
+
+        let report = run_doctor_with_options(&fixture.context, DoctorOptions::fix(false), &fetcher);
+
+        let userns = check(&report, DoctorCheckId::UserNamespaces);
+        assert_eq!(userns.status, DoctorStatus::Fail);
+        assert!(
+            userns
+                .reason
+                .contains("elevation was not explicitly confirmed")
+        );
+        let commands = userns
+            .fix
+            .as_deref()
+            .ok_or("manual AppArmor commands were not rendered")?;
+        for required in [
+            "sudo install -d -o root -g root -m 0755",
+            "sudo install -o root -g root -m 0755",
+            "sudo install -o root -g root -m 0644",
+            "sudo apparmor_parser -r",
+            &source.display().to_string(),
+        ] {
+            assert!(
+                commands.contains(required),
+                "missing {required:?} in {commands:?}"
+            );
+        }
+        assert_eq!(
+            fs::read(fixture.context.paths.apparmor_passt_staged_profile())?,
+            APPARMOR_PASST_PROFILE_CONTENT.as_bytes()
+        );
+        assert!(!fixture.privileged_marker.exists());
+        assert_eq!(
+            fs::read(&fixture.context.user_namespace_sysctl)?,
+            before_max
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn confirmed_apparmor_fix_routes_fake_privileged_commands_and_rechecks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut fixture = Fixture::healthy()?;
+        configure_apparmor_passt_denial(&fixture)?;
+        let source = provide_extracted_passt(&mut fixture)?;
+        let artifact = fixture.context.manifest.embedded_passt("x86_64")?;
+        let fake_bin = PathBuf::from(&fixture.context.search_path);
+        let marker = &fixture.privileged_marker;
+        write_executable(
+            &fake_bin.join("sudo"),
+            &format!(
+                r#"printf 'sudo %s
+' "$*" >> '{}'
+if [ "$1" = "--" ]; then shift; fi
+exec "$@""#,
+                marker.display()
+            ),
+        )?;
+        write_executable(
+            &fake_bin.join("install"),
+            &format!(
+                r#"printf 'install %s
+' "$*" >> '{}'
+last=
+previous=
+for argument in "$@"; do previous=$last; last=$argument; done
+case " $* " in
+  *" -d "*) mkdir -p "$last"; chmod 0755 "$last" ;;
+  *" -m 0755 "*) cp "$previous" "$last"; chmod 0755 "$last" ;;
+  *) cp "$previous" "$last"; chmod 0644 "$last" ;;
+esac"#,
+                marker.display()
+            ),
+        )?;
+        write_executable(
+            &fake_bin.join("apparmor_parser"),
+            &format!(
+                r#"printf 'apparmor_parser %s
+' "$*" >> '{}'
+printf '{} (unconfined)
+' > '{}'"#,
+                marker.display(),
+                super::APPARMOR_PASST_PROFILE_NAME,
+                fixture.context.apparmor_loaded_profiles.display()
+            ),
+        )?;
+        let before_max = fs::read(&fixture.context.user_namespace_sysctl)?;
+        let fetcher = FakeFetcher::new(fixture.payloads.clone());
+
+        let report = run_doctor_with_options(&fixture.context, DoctorOptions::fix(true), &fetcher);
+
+        let userns = check(&report, DoctorCheckId::UserNamespaces);
+        assert_eq!(userns.status, DoctorStatus::Ok, "{userns:#?}");
+        assert!(userns.reason.contains("userns creation confirmed"));
+        assert_eq!(
+            fs::read(&fixture.context.apparmor_passt_executable)?,
+            fs::read(source)?
+        );
+        assert_eq!(
+            super::hash_file(&fixture.context.apparmor_passt_executable, "test")?,
+            artifact.sha256
+        );
+        let target = fs::metadata(&fixture.context.apparmor_passt_executable)?;
+        assert_eq!(target.uid(), fixture.context.expected_root_uid);
+        assert_eq!(target.permissions().mode() & 0o022, 0);
+        let invocations = fs::read_to_string(marker)?;
+        assert!(invocations.contains("install -d"));
+        assert!(invocations.contains("apparmor_parser -r"));
+        assert_eq!(
+            fs::read(&fixture.context.user_namespace_sysctl)?,
+            before_max
+        );
+        Ok(())
+    }
     #[test]
     fn kvm_open_failure_reports_detected_device_group_command()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -3076,7 +4750,7 @@ mod tests {
             fs::Permissions::from_mode(0o777),
         )?;
 
-        let report = super::run_doctor(&fixture.context, false)?;
+        let report = super::run_doctor(&fixture.context, DoctorOptions::inspect())?;
 
         assert_eq!(report.checks.len(), 13);
         assert_eq!(

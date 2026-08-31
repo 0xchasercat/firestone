@@ -179,7 +179,10 @@ async fn non_stream_routes_project_exact_actions_statuses_and_payloads() -> Test
             uri: "/v1/doctor",
             body: None,
             result_action: "doctor",
-            expected_action: Action::Doctor { fix: false },
+            expected_action: Action::Doctor {
+                fix: false,
+                elevation_confirmed: false,
+            },
             status: StatusCode::OK,
         },
         Case {

@@ -168,7 +168,10 @@ async fn version(State(state): State<ApiState>) -> Response {
 async fn doctor(State(state): State<ApiState>) -> Response {
     payload_response(
         &state,
-        Action::Doctor { fix: false },
+        Action::Doctor {
+            fix: false,
+            elevation_confirmed: false,
+        },
         "doctor",
         StatusCode::OK,
     )

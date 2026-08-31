@@ -76,3 +76,74 @@ sha256 = "e45bd62e346eca87857279d5680782e80148379fbca524a648089f642ac001d2"
 asset = "virtiofsd-v1.14.0.tar.gz"
 url = "https://gitlab.com/virtio-fs/virtiofsd/-/archive/v1.14.0/virtiofsd-v1.14.0.tar.gz"
 sha256 = "52b66e449ca583b4f050a2bff327ff812211a2c349b4130279fcfc6a64540f04"
+
+# Firestone-owned helpers are embedded only in the accepted x86_64 standalone release.
+[dependency.passt]
+version = "2025_02_17.a1e48a0"
+commit = "a1e48a02ff3550eb7875a7df6726086e9b3a1213"
+release_url = "https://github.com/0xchasercat/firestone/releases/tag/helpers-v0.1.0-firestone.1"
+availability = "binary"
+architectures = ["x86_64"]
+license = "GPL-2.0-or-later AND BSD-3-Clause"
+
+[dependency.passt.x86_64]
+asset = "passt-2025_02_17.a1e48a0-x86_64-unknown-linux-musl"
+install_name = "passt-2025_02_17.a1e48a0"
+url = "https://github.com/0xchasercat/firestone/releases/download/helpers-v0.1.0-firestone.1/passt-2025_02_17.a1e48a0-x86_64-unknown-linux-musl"
+sha256 = "40e59201765c60a0a5bbd0f2caae1aae3fd8f9a9a0628a835159fb2f17ff7025"
+
+[dependency.qemu-img]
+version = "8.2.2"
+commit = "11aa0b1ff115b86160c4d37e7c37e6a6b13b77ea"
+release_url = "https://github.com/0xchasercat/firestone/releases/tag/helpers-v0.1.0-firestone.1"
+availability = "binary"
+architectures = ["x86_64"]
+license = "GPL-2.0-or-later"
+
+[dependency.qemu-img.x86_64]
+asset = "qemu-img-8.2.2-x86_64-unknown-linux-musl"
+install_name = "qemu-img-8.2.2"
+url = "https://github.com/0xchasercat/firestone/releases/download/helpers-v0.1.0-firestone.1/qemu-img-8.2.2-x86_64-unknown-linux-musl"
+sha256 = "30bff329fe1001635cafcfebddc68a1c824d25110c66f968b428c4cf4785d75d"
+
+[helper.release]
+tag = "helpers-v0.1.0-firestone.1"
+
+[helper.release.corresponding-source]
+asset = "firestone-static-helpers-v0.1.0-corresponding-source.tar"
+url = "https://github.com/0xchasercat/firestone/releases/download/helpers-v0.1.0-firestone.1/firestone-static-helpers-v0.1.0-corresponding-source.tar"
+sha256 = "e0195a3ea6c7448e6de07e829347dee2e49eb86f9ff529b49e852ea8a1a38fac"
+
+[helper.release.build-info]
+asset = "firestone-static-helpers-v0.1.0-build-info.txt"
+url = "https://github.com/0xchasercat/firestone/releases/download/helpers-v0.1.0-firestone.1/firestone-static-helpers-v0.1.0-build-info.txt"
+sha256 = "b41cd535071ada9e28700db85800dfc5bf979d1826b0b58f0ab97e0f7ed8097f"
+
+# Exact upstream source pins consumed by the x86_64 static helper build.
+[helper.passt]
+version = "2025_02_17.a1e48a0"
+commit = "a1e48a02ff3550eb7875a7df6726086e9b3a1213"
+architecture = "x86_64"
+license = "GPL-2.0-or-later AND BSD-3-Clause"
+
+[helper.passt.source]
+asset = "passt-a1e48a02ff3550eb7875a7df6726086e9b3a1213.tar.xz"
+url = "https://github.com/0xchasercat/firestone/releases/download/helpers-v0.1.0-firestone.1/passt-a1e48a02ff3550eb7875a7df6726086e9b3a1213.tar.xz"
+sha256 = "ef64f1fca70aac621c5f4535ad5c0717cc0bccb75a3d19eed1538e3fb81b4da1"
+
+[helper.qemu-img]
+version = "8.2.2"
+commit = "11aa0b1ff115b86160c4d37e7c37e6a6b13b77ea"
+architecture = "x86_64"
+license = "GPL-2.0-or-later"
+signing_fingerprint = "CEACC9E15534EBABB82D3FA03353C9CEF108B584"
+
+[helper.qemu-img.source]
+asset = "qemu-8.2.2.tar.xz"
+url = "https://download.qemu.org/qemu-8.2.2.tar.xz"
+sha256 = "847346c1b82c1a54b2c38f6edbd85549edeb17430b7d4d3da12620e2962bc4f3"
+
+[helper.qemu-img.signature]
+asset = "qemu-8.2.2.tar.xz.sig"
+url = "https://download.qemu.org/qemu-8.2.2.tar.xz.sig"
+sha256 = "4b3848575572cc3584bad4afd67e50470d52232c71efba3de4faaead83f45eb6"

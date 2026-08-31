@@ -6,55 +6,35 @@ The MVP does not provide aarch64 runtime support, non-Linux host support, non-Li
 
 ## Install and build
 
-You need Linux x86_64, hardware virtualization, a kernel KVM driver, at least 5 GB free in Firestone's data filesystem, OpenSSH, `qemu-img`, and a recent `passt`. Rust 1.85 or newer is required to build from source.
+You need Linux x86_64, hardware virtualization, a kernel KVM driver, at least 5 GB free in Firestone's data filesystem, and OpenSSH. The published x86_64 musl executable already carries the pinned static passt and qemu-img helpers; no passt or QEMU package is required. Rust 1.85 or newer is required only when building from source.
 
-Build and install the binary in your user account:
+Install the published standalone executable in your user account, make sure `$HOME/.local/bin` is on `PATH`, then check its identity:
 
 ```sh
-rustup toolchain install stable
-cargo build --locked --release --package firestone
-install -Dm0755 target/release/firestone "$HOME/.local/bin/firestone"
+install -Dm0755 firestone-v0.1.0-x86_64-unknown-linux-musl "$HOME/.local/bin/firestone"
 firestone version
 ```
 
-Make sure `$HOME/.local/bin` is on `PATH` before opening a new shell.
+The version report identifies the embedded passt `2025_02_17.a1e48a0` and qemu-img `8.2.2` payload hashes. Firestone verifies those bytes again before first-use materialization under its private data directory.
 
-Install the system packages for your distribution. The package names below were checked in fresh x86_64 containers and are recorded in the [fresh-host doctor matrix](verification/doctor-matrix.md). Containers do not provide KVM and were not used as boot evidence.
+A normal `cargo build` is a development build and retains PATH fallback for helper development. Use `scripts/build-release.sh --target x86_64-unknown-linux-musl` for the strict standalone build; it refuses missing or mismatched helper inputs.
 
-Ubuntu 24.04 provides `qemu-img` and OpenSSH under these package names:
-
-```sh
-sudo apt-get update
-sudo apt-get install -y build-essential ca-certificates git openssh-client qemu-utils util-linux
-```
-
-Ubuntu 24.04's `passt` package is `2024_02_20`, older than Firestone's `2025_02_17.a1e48a0` minimum. Build the exact minimum from the upstream HTTPS repository instead:
+OpenSSH remains a host tool. Install only its client package when it is missing:
 
 ```sh
-passt_work=$(mktemp -d)
-trap 'rm -rf -- "$passt_work"' EXIT
-git clone --depth 1 --branch 2025_02_17.a1e48a0 https://passt.top/passt "$passt_work/passt"
-test "$(git -C "$passt_work/passt" rev-parse HEAD)" = a1e48a02ff3550eb7875a7df6726086e9b3a1213
-make -C "$passt_work/passt" passt
-sudo install -m0755 "$passt_work/passt/passt" /usr/local/bin/passt
-passt --version
-```
+# Ubuntu 24.04
+sudo apt-get install openssh-client
 
-Fedora 44 carries a new enough `passt`:
+# Fedora 44
+sudo dnf install openssh-clients
 
-```sh
-sudo dnf install passt qemu-img openssh-clients util-linux
-```
-
-Arch Linux carries a new enough `passt`:
-
-```sh
-sudo pacman -S passt qemu-img openssh util-linux
+# Arch Linux
+sudo pacman -S openssh
 ```
 
 ## Run doctor first
 
-Run the read-only check, then allow Firestone to perform its unprivileged repairs:
+Run the read-only check, then let Firestone apply the repairs you approve:
 
 ```sh
 firestone doctor
@@ -62,7 +42,7 @@ firestone doctor --fix
 firestone doctor
 ```
 
-`doctor --fix` creates Firestone-owned directories, downloads and checksum-verifies the pinned Cloud Hypervisor, firmware, and `virtiofsd` binaries, and generates Firestone's SSH key. It does not run `sudo`, install distribution packages, change KVM permissions, enable kernel features, change sysctls, or delete machines.
+`doctor --fix` creates Firestone-owned directories, materializes the embedded helpers, downloads and checksum-verifies the pinned Cloud Hypervisor, firmware, and `virtiofsd` binaries, and generates Firestone's SSH key. It never changes a sysctl, KVM permissions, or machines. When Ubuntu AppArmor blocks passt's mandatory user namespace, an interactive run first prints the exact root-owned helper/profile commands and asks for confirmation. `--yes` and `--json` never authorize elevation; non-interactive runs print the commands without invoking them.
 
 Each check is `ok`, `warn`, or `fail`. A failed report exits with status 5. Warnings do not block VM use.
 
@@ -72,11 +52,11 @@ Each check is `ok`, `warn`, or `fail`. A failed report exits with status 5. Warn
 | `/dev/kvm` missing | Enable virtualization in firmware and load `kvm_intel` or `kvm_amd`. A VM or CI host may also need nested virtualization enabled. |
 | `/dev/kvm` permission denied | Run the exact group command printed by doctor, normally `sudo usermod -aG kvm $USER`, then log out and back in. Doctor reads the device's real group name. |
 | Runtime directory | Set `XDG_RUNTIME_DIR` to a user-owned mode-0700 directory. Without it, Firestone uses `/tmp/firestone-<uid>` and warns. `doctor --fix` creates the fallback safely. |
-| Vendored binaries or Firestone SSH key | Run `firestone doctor --fix`. |
-| `passt` | Use the package command printed for Fedora or Arch. On Ubuntu 24.04, use the pinned source build above because the distro package is too old. |
-| `qemu-img` | Install `qemu-utils` on Ubuntu, `qemu-img` on Fedora, or `qemu-img` on Arch. |
+| Vendored binaries, embedded helpers, or Firestone SSH key | Run `firestone doctor --fix`. Embedded helper corruption is refused rather than overwritten. |
+| `passt` | The standalone binary includes the exact helper. If AppArmor restricts unprivileged user namespaces, review the literal `/usr/libexec/firestone/passt-2025_02_17.a1e48a0` profile commands printed by doctor. Firestone never grants `userns,` to `~/.local/share/firestone/bin/*` or another user-writable wildcard. |
+| `qemu-img` | The standalone binary includes qemu-img 8.2.2 and materializes it on first image operation or `doctor --fix`. It does not need user namespaces. |
 | OpenSSH | Install `openssh-client` on Ubuntu, `openssh-clients` on Fedora, or `openssh` on Arch. |
-| User namespaces | If `unshare -U true` is denied, Firestone warns and runs `virtiofsd` with `--sandbox none`. Whether to enable unprivileged user namespaces is a host security policy decision. |
+| User namespaces | Doctor distinguishes disabled kernel namespaces, container seccomp, confirmed AppArmor audit evidence, and failures merely consistent with AppArmor. A passt mandatory-stage denial is a failure. A virtiofsd-only denial warns and uses `--sandbox none`. |
 | Free space | Free space on the filesystem containing the data directory before pulling images. The warning threshold is 5 GB. |
 | Stale state | Doctor and ordinary reads reconcile state against live processes and sockets. Repair the named path or lock error if reconciliation itself fails. |
 
@@ -109,6 +89,9 @@ Create without booting:
 ```sh
 firestone create dev ubuntu --cpus 4 --memory 4G --disk 40G
 ```
+On a terminal, `create` opens a guided image, name, CPU, memory, disk, and network flow. Supplied arguments become the shown defaults. Pass `--yes` to skip the wizard; `--json` and non-terminal invocations are always deterministic and non-interactive.
+
+After publication, human output prints the effective image/resources/network, forwards, mounts, exact `firestone.toml` path, and ready-to-run `firestone edit NAME` and `firestone start NAME` commands. `firestone create --help` lists every equivalent configuration flag.
 
 Start, inspect, and enter the machine:
 

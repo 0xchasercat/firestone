@@ -52,6 +52,7 @@ enum CmdStdin {
 #[derive(Debug)]
 pub struct CmdOutput {
     program: OsString,
+    pid: u32,
     status: ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
@@ -60,6 +61,11 @@ pub struct CmdOutput {
 }
 
 impl CmdOutput {
+    /// Process identifier assigned to the command that produced this output.
+    #[must_use]
+    pub const fn pid(&self) -> u32 {
+        self.pid
+    }
     #[must_use]
     pub fn success(&self) -> bool {
         self.status.success()
@@ -414,7 +420,8 @@ impl Cmd {
 
         let mut child = spawn_with_busy_retry(&mut command, deadline)
             .map_err(|source| command_start_error(self.error_kind, &self.program, source))?;
-        let process_group = child.id();
+        let pid = child.id();
+        let process_group = pid;
         let Some(stdout) = child.stdout.take() else {
             let _ = kill_process_group(process_group);
             let _ = child.wait();
@@ -571,6 +578,7 @@ impl Cmd {
 
         let output = CmdOutput {
             program: self.program.clone(),
+            pid,
             status,
             stdout: stdout.bytes,
             stderr: stderr.bytes,
@@ -1616,6 +1624,7 @@ mod tests {
             .stderr_log(&log)
             .run()?;
 
+        assert_ne!(output.pid(), 0);
         let stdout = output.stdout_lossy();
         assert!(stdout.starts_with("set\n"));
         assert!(stdout.contains(&dir.path().display().to_string()));

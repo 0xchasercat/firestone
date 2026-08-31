@@ -21,7 +21,10 @@ pub struct DependencyArtifact {
 impl DependencyArtifact {
     #[must_use]
     pub fn executable(&self) -> bool {
-        matches!(self.dependency.as_str(), "cloud-hypervisor" | "virtiofsd")
+        matches!(
+            self.dependency.as_str(),
+            "cloud-hypervisor" | "virtiofsd" | "passt" | "qemu-img"
+        )
     }
 
     #[must_use]
@@ -49,8 +52,18 @@ struct DependencyEntry {
     availability: String,
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    architectures: Option<Vec<String>>,
     #[serde(default, flatten)]
     fields: BTreeMap<String, toml::Value>,
+}
+
+impl DependencyEntry {
+    fn supports_architecture(&self, architecture: &str) -> bool {
+        self.architectures
+            .as_ref()
+            .is_none_or(|architectures| architectures.iter().any(|value| value == architecture))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -101,13 +114,13 @@ impl DependencyManifest {
         &self,
         architecture: &str,
     ) -> Result<BTreeMap<String, DependencyArtifact>, FirestoneError> {
-        self.dependencies
-            .keys()
-            .map(|name| {
-                self.artifact(name, architecture)
-                    .map(|artifact| (name.clone(), artifact))
-            })
-            .collect()
+        let mut artifacts = BTreeMap::new();
+        for (name, entry) in &self.dependencies {
+            if entry.supports_architecture(architecture) {
+                artifacts.insert(name.clone(), self.artifact(name, architecture)?);
+            }
+        }
+        Ok(artifacts)
     }
 
     /// Resolves and validates one binary artifact for the requested architecture.
@@ -121,6 +134,16 @@ impl DependencyManifest {
         architecture: &str,
     ) -> Result<DependencyArtifact, FirestoneError> {
         let entry = self.entry(dependency)?;
+        if !entry.supports_architecture(architecture) {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "dependency `{dependency}` {} is outside its {architecture} runtime scope",
+                    entry.version
+                ),
+            )
+            .with_hint("use a release target listed in the dependency architectures field"));
+        }
         match entry.availability.as_str() {
             "binary" => {}
             "source-only" => {
@@ -181,6 +204,41 @@ impl DependencyManifest {
         })
     }
 
+    /// Resolves the embedded x86_64 passt payload used by the targeted
+    /// AppArmor installation path.
+    pub fn embedded_passt(&self, architecture: &str) -> Result<DependencyArtifact, FirestoneError> {
+        if architecture != "x86_64" {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "the embedded passt helper is unavailable for {architecture}; its runtime scope is x86_64"
+                ),
+            )
+            .with_hint("run Firestone on Linux x86_64 for AppArmor passt remediation"));
+        }
+        let artifact = self.artifact("passt", architecture).map_err(|error| {
+            FirestoneError::new(
+                ErrorKind::Dependency,
+                "embedded passt helper metadata is unavailable",
+            )
+            .with_hint(
+                "provide the pinned x86_64 passt payload and extraction result before AppArmor repair",
+            )
+            .with_source(error)
+        })?;
+        if artifact.version != crate::PINNED_PASST_VERSION {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "embedded passt helper version {} does not match pinned {}",
+                    artifact.version,
+                    crate::PINNED_PASST_VERSION
+                ),
+            )
+            .with_hint("regenerate the embedded helper manifest from the pinned passt source"));
+        }
+        Ok(artifact)
+    }
     fn entry(&self, dependency: &str) -> Result<&DependencyEntry, FirestoneError> {
         self.dependencies.get(dependency).ok_or_else(|| {
             FirestoneError::new(
@@ -358,6 +416,93 @@ availability = "sometimes"
             Ok(_) => return Err(std::io::Error::other("availability should fail").into()),
         };
         assert!(error.message().contains("unsupported availability"));
+        Ok(())
+    }
+    #[test]
+    fn artifacts_architecture_scope_omits_unsupported_runtime_payloads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = DependencyManifest::parse(&format!(
+            r#"
+manifest_version = 1
+[dependency.portable]
+version = "1"
+availability = "binary"
+[dependency.portable.x86_64]
+asset = "portable-x86"
+install_name = "portable"
+url = "https://example.invalid/portable-x86"
+sha256 = "{HASH}"
+[dependency.portable.aarch64]
+asset = "portable-arm"
+install_name = "portable"
+url = "https://example.invalid/portable-arm"
+sha256 = "{HASH}"
+[dependency.x86-only]
+version = "1"
+availability = "binary"
+architectures = ["x86_64"]
+[dependency.x86-only.x86_64]
+asset = "x86-only"
+install_name = "x86-only"
+url = "https://example.invalid/x86-only"
+sha256 = "{HASH}"
+"#
+        ))?;
+
+        assert_eq!(
+            manifest
+                .artifacts("x86_64")?
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["portable".to_owned(), "x86-only".to_owned()]
+        );
+        assert_eq!(
+            manifest
+                .artifacts("aarch64")?
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["portable".to_owned()]
+        );
+        let error = manifest
+            .artifact("x86-only", "aarch64")
+            .err()
+            .ok_or("aarch64 unexpectedly resolved the x86-only artifact")?;
+        assert!(
+            error
+                .message()
+                .contains("outside its aarch64 runtime scope")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn embedded_passt_requires_exact_x86_64_pinned_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = DependencyManifest::parse(&format!(
+            r#"
+manifest_version = 1
+[dependency.passt]
+version = "2025_02_17.a1e48a0"
+availability = "binary"
+[dependency.passt.x86_64]
+asset = "passt"
+install_name = "passt-2025_02_17.a1e48a0"
+url = "https://example.invalid/passt"
+sha256 = "{HASH}"
+"#
+        ))?;
+
+        let passt = manifest.embedded_passt("x86_64")?;
+        assert_eq!(passt.dependency, "passt");
+        assert!(passt.executable());
+        assert_eq!(passt.expected_mode(), 0o755);
+        let error = manifest
+            .embedded_passt("aarch64")
+            .err()
+            .ok_or("aarch64 embedded passt unexpectedly resolved")?;
+        assert!(error.message().contains("runtime scope is x86_64"));
         Ok(())
     }
 }

@@ -3,7 +3,7 @@ use std::{
     error::Error,
     ffi::OsString,
     fs,
-    io::Read,
+    io::{Read, Write},
     os::{fd::AsFd as _, unix::fs::PermissionsExt},
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, ExitStatus, Output, Stdio},
@@ -300,6 +300,7 @@ struct PtyOutput {
 struct PtyCommand {
     child: Option<Child>,
     terminal: Option<fs::File>,
+    input: Option<fs::File>,
     original_termios: nix::sys::termios::Termios,
     stdout: Option<ChildStdout>,
     reader: Option<thread::JoinHandle<std::io::Result<Vec<u8>>>>,
@@ -308,10 +309,29 @@ struct PtyCommand {
 
 impl PtyCommand {
     fn spawn(
+        command: Command,
+        rows: u16,
+        columns: u16,
+        term: &str,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::spawn_with_stdin(command, rows, columns, term, false)
+    }
+
+    fn spawn_interactive(
+        command: Command,
+        rows: u16,
+        columns: u16,
+        term: &str,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::spawn_with_stdin(command, rows, columns, term, true)
+    }
+
+    fn spawn_with_stdin(
         mut command: Command,
         rows: u16,
         columns: u16,
         term: &str,
+        interactive: bool,
     ) -> Result<Self, Box<dyn Error>> {
         let size = Winsize {
             ws_row: rows,
@@ -322,10 +342,19 @@ impl PtyCommand {
         let opened = openpty(Some(&size), None)?;
         let mut master = fs::File::from(opened.master);
         let terminal = fs::File::from(opened.slave);
+        let input = if interactive {
+            Some(master.try_clone()?)
+        } else {
+            None
+        };
         let original_termios = nix::sys::termios::tcgetattr(&terminal)?;
+        command.env("TERM", term);
+        if interactive {
+            command.stdin(Stdio::from(terminal.try_clone()?));
+        } else {
+            command.stdin(Stdio::null());
+        }
         command
-            .env("TERM", term)
-            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(terminal.try_clone()?));
         let mut child = command.spawn()?;
@@ -371,11 +400,22 @@ impl PtyCommand {
         Ok(Self {
             child: Some(child),
             terminal: Some(terminal),
+            input,
             original_termios,
             stdout: Some(stdout),
             reader: Some(reader),
             reader_done,
         })
+    }
+
+    fn write_input(&mut self, value: &[u8]) -> Result<(), Box<dyn Error>> {
+        let input = self
+            .input
+            .as_mut()
+            .ok_or("PTY command has no interactive input")?;
+        input.write_all(value)?;
+        input.flush()?;
+        Ok(())
     }
 
     fn resize(&self, rows: u16, columns: u16) -> Result<(), Box<dyn Error>> {
@@ -494,6 +534,251 @@ fn terminal_modes_equal(
         && left.control_flags == right.control_flags
         && left.local_flags == right.local_flags
         && left.control_chars == right.control_chars
+}
+
+#[test]
+fn create_non_tty_renders_effective_summary_without_prompting() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = fs::canonicalize(directory.path())?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    let home = root.join("home");
+    let share = root.join("share");
+    fs::create_dir(&share)?;
+    let mount = format!("{}:/work:ro", share.display());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_firestone"))
+        .args(["--home"])
+        .arg(&home)
+        .args([
+            "create",
+            "dev",
+            "ubuntu",
+            "--cpus",
+            "1",
+            "--memory",
+            "4G",
+            "--disk",
+            "30G",
+            "--net",
+            "passt",
+            "--forward",
+            "8080:80",
+            "--mount",
+        ])
+        .arg(&mount)
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected = format!(
+        "Created machine\n  Name: dev\n  Image: ubuntu:24.04\n  CPUs: 1\n  Memory: 4G\n  Disk: 30G\n  Network: passt\n  Forwards:\n    8080:80\n  Mounts:\n    {} -> /work (read-only, tag share0)\n  Config: {}\nEdit: firestone edit dev\nStart: firestone start dev\n",
+        share.display(),
+        home.join("data/machines/dev/firestone.toml").display(),
+    );
+    assert_eq!(String::from_utf8(output.stdout)?, expected);
+    assert!(!String::from_utf8(output.stderr)?.contains("Create a machine"));
+    Ok(())
+}
+
+#[test]
+fn create_non_tty_without_image_preserves_usage_error() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let home = directory.path().join("home");
+    let output = Command::new(env!("CARGO_BIN_EXE_firestone"))
+        .args(["--home"])
+        .arg(&home)
+        .arg("create")
+        .output()?;
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("image is required"));
+    assert!(!stderr.contains("Create a machine"));
+    Ok(())
+}
+
+#[test]
+fn create_json_preserves_machine_record_payload() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = fs::canonicalize(directory.path())?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    let home = root.join("home");
+    let output = Command::new(env!("CARGO_BIN_EXE_firestone"))
+        .args(["--json", "--home"])
+        .arg(&home)
+        .args(["create", "json-dev", "ubuntu", "--cpus", "1"])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let records = ndjson(&output)?;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["type"], "Result");
+    assert_eq!(records[0]["action"], "create");
+    assert_eq!(records[0]["payload"]["name"], "json-dev");
+    assert_eq!(records[0]["payload"]["spec"]["image"], "ubuntu:24.04");
+    assert_eq!(records[0]["payload"]["spec"]["cpus"], 1);
+    assert!(!String::from_utf8(output.stdout)?.contains("Created machine"));
+    Ok(())
+}
+
+#[test]
+fn create_quiet_keeps_final_result_and_hides_feedback() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = fs::canonicalize(directory.path())?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    let home = root.join("home");
+    let output = Command::new(env!("CARGO_BIN_EXE_firestone"))
+        .args(["--quiet", "--home"])
+        .arg(&home)
+        .args(["create", "quiet-dev", "ubuntu"])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.starts_with("Created machine\n  Name: quiet-dev\n"));
+    assert!(stdout.contains("Start: firestone start quiet-dev\n"));
+    Ok(())
+}
+
+#[test]
+fn create_help_explains_wizard_and_spec_options() -> TestResult {
+    let output = Command::new(env!("CARGO_BIN_EXE_firestone"))
+        .args(["create", "--help"])
+        .output()?;
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let help = String::from_utf8(output.stdout)?;
+    assert!(help.contains("On a terminal, create prompts for the image"));
+    assert!(help.contains("--yes"));
+    assert!(help.contains("Set the number of virtual CPUs"));
+    assert!(help.contains("Forward a host port or range to the guest"));
+    assert!(help.contains("Merge a JSON object into the generated VMM configuration"));
+    Ok(())
+}
+
+#[test]
+fn create_tty_runs_wizard_with_effective_defaults() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = fs::canonicalize(directory.path())?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    let home = root.join("home");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_firestone"));
+    command.args(["--home"]).arg(&home).arg("create");
+
+    let mut process = PtyCommand::spawn_interactive(command, 24, 100, "xterm-256color")?;
+    process.write_input(b"ubuntu\nwizard\n1\n4G\n30G\nnone\n")?;
+    let output = process.finish(Duration::from_secs(15))?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.terminal_restored);
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("Create a machine. Press Enter to keep a shown value"));
+    assert!(stderr.contains("Image: "));
+    assert!(stderr.contains("Name [ubuntu]: "));
+    assert!(stderr.contains("CPUs [2]: "));
+    assert!(stderr.contains("Memory [2G]: "));
+    assert!(stderr.contains("Disk [20G]: "));
+    assert!(stderr.contains("Network [passt]: "));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("  Name: wizard\n"));
+    assert!(stdout.contains("  Image: ubuntu:24.04\n"));
+    assert!(stdout.contains("  CPUs: 1\n"));
+    assert!(stdout.contains("  Memory: 4G\n"));
+    assert!(stdout.contains("  Disk: 30G\n"));
+    assert!(stdout.contains("  Network: none\n"));
+    assert!(home.join("data/machines/wizard/firestone.toml").is_file());
+    Ok(())
+}
+
+#[test]
+fn create_tty_yes_bypasses_wizard() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = fs::canonicalize(directory.path())?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    let home = root.join("home");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_firestone"));
+    command
+        .args(["--yes", "--home"])
+        .arg(&home)
+        .args(["create", "yes-dev", "ubuntu"]);
+
+    let process = PtyCommand::spawn_interactive(command, 24, 100, "xterm-256color")?;
+    let output = process.finish(Duration::from_secs(15))?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.terminal_restored);
+    assert!(String::from_utf8(output.stderr)?.is_empty());
+    assert!(String::from_utf8(output.stdout)?.contains("  Name: yes-dev\n"));
+    Ok(())
+}
+
+#[test]
+fn create_tty_cancel_returns_interrupted_error() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = fs::canonicalize(directory.path())?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    let home = root.join("home");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_firestone"));
+    command.args(["--home"]).arg(&home).arg("create");
+
+    let mut process = PtyCommand::spawn_interactive(command, 24, 100, "xterm-256color")?;
+    process.write_input(b"cancel\n")?;
+    let output = process.finish(Duration::from_secs(15))?;
+
+    assert_eq!(output.status.code(), Some(130));
+    assert!(output.stdout.is_empty());
+    assert!(output.terminal_restored);
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("error: create cancelled"));
+    assert!(stderr.contains("hint:  run firestone create again when you are ready"));
+    assert!(!home.join("data/machines").exists());
+    Ok(())
+}
+
+#[test]
+fn create_tty_eof_returns_interrupted_error() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = fs::canonicalize(directory.path())?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    let home = root.join("home");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_firestone"));
+    command.args(["--home"]).arg(&home).arg("create");
+
+    let mut process = PtyCommand::spawn_interactive(command, 24, 100, "xterm-256color")?;
+    process.write_input(b"\x04")?;
+    let output = process.finish(Duration::from_secs(15))?;
+
+    assert_eq!(output.status.code(), Some(130));
+    assert!(output.stdout.is_empty());
+    assert!(output.terminal_restored);
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("error: create wizard received end of input"));
+    assert!(stderr.contains("use --yes with explicit arguments"));
+    assert!(!home.join("data/machines").exists());
+    Ok(())
 }
 
 #[test]

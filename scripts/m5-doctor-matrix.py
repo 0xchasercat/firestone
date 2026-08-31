@@ -299,7 +299,10 @@ def assert_initial_report(
     require(ssh.get("fix") == config["ssh_fix"], "OpenSSH package fix changed")
     namespaces = report["user_namespaces"]
     require(namespaces["status"] == "warn", "missing unshare did not warn")
-    require("--sandbox none" in namespaces.get("hint", ""), "namespace fallback hint changed")
+    require(
+        "generic unshare alone is not proof" in namespaces.get("hint", ""),
+        "namespace diagnostic authority changed",
+    )
     space = report["data_space"]
     require(space["status"] == "warn", "small data filesystem did not warn")
     require("free space" in space.get("hint", ""), "space warning omitted its fix hint")
@@ -343,15 +346,19 @@ def assert_fixed_report(
     if config["passt_status"] == "fail":
         passt_text = report["passt"].get("reason", "") + report["passt"].get("hint", "")
         require("2025_02_17.a1e48a0" in passt_text, "old Ubuntu passt failure omitted minimum")
-    expected_namespace_status = "ok" if namespaces_work else "warn"
+    namespaces = report["user_namespaces"]
     require(
-        report["user_namespaces"]["status"] == expected_namespace_status,
-        "doctor user-namespace status differs from the observed unshare result",
+        namespaces["status"] in {"ok", "warn", "fail"},
+        "doctor returned an invalid user-namespace status",
     )
-    if not namespaces_work:
+    require(
+        "qemu-img does not require user namespaces" in namespaces.get("reason", ""),
+        "namespace diagnosis omitted the qemu-img independence boundary",
+    )
+    if namespaces["status"] == "warn":
         require(
-            "--sandbox none" in report["user_namespaces"].get("hint", ""),
-            "failed unshare omitted the virtiofsd fallback",
+            "generic unshare alone is not proof" in namespaces.get("hint", ""),
+            "inconclusive namespace diagnosis weakened its authority warning",
         )
 
 

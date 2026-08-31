@@ -60,16 +60,16 @@ FINAL_SIGNAL_MASK: set[signal.Signals] | None = None
 
 EXPECTED_FILE_HASHES = {
     "Cargo.lock": "b2ebf4acaa7900c67a0bf54316aae3a227b6a45b6485940f66e06b6258f4b49b",
-    "build/firestone/versions.env": "6dd644c08c830b3a9152fe511e6442ef96e450c0c4567bd8333a6b46d5a2e266",
+    "build/firestone/versions.env": "09afe5c557cacfc17b05aef9586640c8ebfd5d51110aa8ad93ba254989224803",
     "catalog/images.toml": "89f3e1827ed143e02da6d90e8c18bc28f273fcaba9cc301db663dac9cc4d3acf",
-    "deps.toml": "316934629adce4da291b1f4dba73f7e07c1f4c60d366702bbe4f1cc29cd5c734",
-    "docs/verification/doctor-matrix.md": "37c62e94152d89387cd08e8947efac06bc984e31ae68a87d26030f9438451c99",
+    "deps.toml": "4d58a7623e083da70bf02de702b17d3840ba99fdccffc7ebf110a4ccc9801a65",
+    "docs/verification/doctor-matrix.md": "c3254636863e741ae237f61b86b1fca0bbc8d097f1f40f799d090325e4eeb844",
     "scripts/m1-kvm-e2e.py": "719660526334393f2cb5df6b0b7d2eaf5a106f6e41674fdf3feb9476da11d124",
     "scripts/m2-kvm-e2e.py": "152a8f0ae19a0f46b2415186f545e4109c1d4ca47dbd57e335e0757e72f6d66f",
-    "scripts/m3-kvm-e2e.py": "976b4a16001874c7c3be76c03fa2561c5725e8ee7cc3088316b9bc4ab9ab39a7",
+    "scripts/m3-kvm-e2e.py": "61c6b2d74b3ee609b63409aaaafbf59851340c47d27eb84ba0e629796b7b473f",
     "scripts/m4-kvm-e2e.py": "16a14771c0c0e6916d49554f0ed1af24b8fa8ef7e9c28ad9351e587e86c3a99e",
     "scripts/m5-catalog-kvm-e2e.py": "500e414ab16e08b25e592d049491e6c51e3240ce1569dc1207f8efdbc27d833b",
-    "scripts/m5-doctor-matrix.py": "90431c0b296106c42b5d04be7a2088f3801653fd45c16234c0789aa86b41b91d",
+    "scripts/m5-doctor-matrix.py": "dc6e0b44e9c37194089ad84953065349edf65d7525bfb1a81bf9762873286aa6",
 }
 
 EXPECTED_RELEASE_DEPENDENCIES = {
@@ -80,6 +80,14 @@ EXPECTED_RELEASE_DEPENDENCIES = {
     "cloud-hypervisor-edk2": {
         "version": "ch-1e1b96f126",
         "sha256": "9fb511fc0dd423d90a79615a90a8ace9b9e078b4a115ea2c459e0ac2f4e60218",
+    },
+    "passt": {
+        "version": "2025_02_17.a1e48a0",
+        "sha256": "40e59201765c60a0a5bbd0f2caae1aae3fd8f9a9a0628a835159fb2f17ff7025",
+    },
+    "qemu-img": {
+        "version": "8.2.2",
+        "sha256": "30bff329fe1001635cafcfebddc68a1c824d25110c66f968b428c4cf4785d75d",
     },
     "rust-hypervisor-firmware": {
         "version": "0.5.0",

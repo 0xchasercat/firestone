@@ -40,28 +40,28 @@ _firestone() {
             (run)
 _arguments "${_arguments_options[@]}" : \
 '--name=[Name a machine created from an image reference]:NAME:_default' \
-'--arch=[]:ARCH:_default' \
-'--cpus=[]:COUNT:_default' \
-'--memory=[]:SIZE:_default' \
-'--disk=[]:SIZE:_default' \
-'--user=[]:USER:_default' \
-'--net=[]:MODE:_default' \
-'*-p+[]:SPEC:_default' \
-'*--forward=[]:SPEC:_default' \
-'--tap=[]:DEV:_default' \
-'--network-mac=[]:MAC:_default' \
-'*--mount=[]:HOST:GUEST[:ro]:_default' \
-'--user-data=[]:FILE:_files' \
-'--cloud-init-network-config=[]:FILE:_files' \
-'*--ssh-key=[]:FILE:_files' \
-'--vmm-binary=[]:FILE:_files' \
-'--vmm-firmware=[]:FIRMWARE:_default' \
-'*--vmm-arg=[]:ARG:_default' \
-'--vmm-config=[]:JSON:_default' \
-'*--clear=[]:FIELD:_default' \
+'--arch=[Set the guest architecture; it must match the host]:ARCH:_default' \
+'--cpus=[Set the number of virtual CPUs]:COUNT:_default' \
+'--memory=[Set guest memory, for example 2G or 2048M]:SIZE:_default' \
+'--disk=[Set writable disk capacity, for example 20G]:SIZE:_default' \
+'--user=[Set the guest login user created by Firestone provisioning]:USER:_default' \
+'--net=[Select passt, tap, or no network]:MODE:_default' \
+'*-p+[Forward a host port or range to the guest; repeat as needed]:SPEC:_default' \
+'*--forward=[Forward a host port or range to the guest; repeat as needed]:SPEC:_default' \
+'--tap=[Use an existing host tap interface with --net tap]:DEV:_default' \
+'--network-mac=[Set a fixed guest network MAC address]:MAC:_default' \
+'*--mount=[Share a host directory with the guest; repeat as needed]:HOST:GUEST[:ro]:_default' \
+'--user-data=[Add a cloud-init user-data file]:FILE:_files' \
+'--cloud-init-network-config=[Add a cloud-init network-config file]:FILE:_files' \
+'*--ssh-key=[Add an OpenSSH public-key file; repeat as needed]:FILE:_files' \
+'--vmm-binary=[Use a custom cloud-hypervisor executable]:FILE:_files' \
+'--vmm-firmware=[Select auto, rhf, edk2, or a firmware file]:FIRMWARE:_default' \
+'*--vmm-arg=[Append one cloud-hypervisor argument; repeat as needed]:ARG:_default' \
+'--vmm-config=[Merge a JSON object into the generated VMM configuration]:JSON:_default' \
+'*--clear=[Clear an inherited optional field; repeat as needed]:FIELD:_default' \
 '--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
 '--rm[Remove a machine created by this invocation after SSH exits]' \
-'--no-provisioning[]' \
+'--no-provisioning[Disable Firestone'\''s built-in guest provisioning]' \
 '--json[Print events as newline-delimited JSON and disable human output]' \
 '-q[Print only errors and command results]' \
 '--quiet[Print only errors and command results]' \
@@ -78,31 +78,31 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (create)
 _arguments "${_arguments_options[@]}" : \
-'--image=[Supply IMAGE as a flag. A sole positional value is then NAME]:IMAGE:_default' \
+'--image=[Select the image by catalog reference, HTTPS URL, or local file]:IMAGE:_default' \
 '-f+[Layer an existing machine specification below command-line flags]:SPEC.toml:_files' \
 '--file=[Layer an existing machine specification below command-line flags]:SPEC.toml:_files' \
-'--arch=[]:ARCH:_default' \
-'--cpus=[]:COUNT:_default' \
-'--memory=[]:SIZE:_default' \
-'--disk=[]:SIZE:_default' \
-'--user=[]:USER:_default' \
-'--net=[]:MODE:_default' \
-'*-p+[]:SPEC:_default' \
-'*--forward=[]:SPEC:_default' \
-'--tap=[]:DEV:_default' \
-'--network-mac=[]:MAC:_default' \
-'*--mount=[]:HOST:GUEST[:ro]:_default' \
-'--user-data=[]:FILE:_files' \
-'--cloud-init-network-config=[]:FILE:_files' \
-'*--ssh-key=[]:FILE:_files' \
-'--vmm-binary=[]:FILE:_files' \
-'--vmm-firmware=[]:FIRMWARE:_default' \
-'*--vmm-arg=[]:ARG:_default' \
-'--vmm-config=[]:JSON:_default' \
-'*--clear=[]:FIELD:_default' \
+'--arch=[Set the guest architecture; it must match the host]:ARCH:_default' \
+'--cpus=[Set the number of virtual CPUs]:COUNT:_default' \
+'--memory=[Set guest memory, for example 2G or 2048M]:SIZE:_default' \
+'--disk=[Set writable disk capacity, for example 20G]:SIZE:_default' \
+'--user=[Set the guest login user created by Firestone provisioning]:USER:_default' \
+'--net=[Select passt, tap, or no network]:MODE:_default' \
+'*-p+[Forward a host port or range to the guest; repeat as needed]:SPEC:_default' \
+'*--forward=[Forward a host port or range to the guest; repeat as needed]:SPEC:_default' \
+'--tap=[Use an existing host tap interface with --net tap]:DEV:_default' \
+'--network-mac=[Set a fixed guest network MAC address]:MAC:_default' \
+'*--mount=[Share a host directory with the guest; repeat as needed]:HOST:GUEST[:ro]:_default' \
+'--user-data=[Add a cloud-init user-data file]:FILE:_files' \
+'--cloud-init-network-config=[Add a cloud-init network-config file]:FILE:_files' \
+'*--ssh-key=[Add an OpenSSH public-key file; repeat as needed]:FILE:_files' \
+'--vmm-binary=[Use a custom cloud-hypervisor executable]:FILE:_files' \
+'--vmm-firmware=[Select auto, rhf, edk2, or a firmware file]:FIRMWARE:_default' \
+'*--vmm-arg=[Append one cloud-hypervisor argument; repeat as needed]:ARG:_default' \
+'--vmm-config=[Merge a JSON object into the generated VMM configuration]:JSON:_default' \
+'*--clear=[Clear an inherited optional field; repeat as needed]:FIELD:_default' \
 '--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
 '--edit[Open the generated specification in the configured editor]' \
-'--no-provisioning[]' \
+'--no-provisioning[Disable Firestone'\''s built-in guest provisioning]' \
 '--json[Print events as newline-delimited JSON and disable human output]' \
 '-q[Print only errors and command results]' \
 '--quiet[Print only errors and command results]' \
@@ -113,7 +113,7 @@ _arguments "${_arguments_options[@]}" : \
 '--yes[Assume yes when a command may prompt]' \
 '-h[Print help]' \
 '--help[Print help]' \
-'*::positional -- One value is IMAGE; two values are NAME followed by IMAGE:_default' \
+'*::positional -- Set IMAGE, or set both NAME and IMAGE:_default' \
 && ret=0
 ;;
 (start)
@@ -486,7 +486,7 @@ esac
 (doctor)
 _arguments "${_arguments_options[@]}" : \
 '--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
-'--fix[Perform only the safe unprivileged repairs]' \
+'--fix[Apply safe repairs; AppArmor elevation needs a TTY prompt and ignores --yes]' \
 '--json[Print events as newline-delimited JSON and disable human output]' \
 '-q[Print only errors and command results]' \
 '--quiet[Print only errors and command results]' \

@@ -29,9 +29,9 @@ fn architecture() -> &'static str {
     std::env::consts::ARCH
 }
 
-fn dependency_pins() -> [(&'static str, &'static str, &'static str); 4] {
+fn dependency_pins() -> Vec<(&'static str, &'static str, &'static str)> {
     match architecture() {
-        "x86_64" => [
+        "x86_64" => vec![
             (
                 "cloud-hypervisor",
                 "v53.0",
@@ -41,6 +41,16 @@ fn dependency_pins() -> [(&'static str, &'static str, &'static str); 4] {
                 "cloud-hypervisor-edk2",
                 "ch-1e1b96f126",
                 "9fb511fc0dd423d90a79615a90a8ace9b9e078b4a115ea2c459e0ac2f4e60218",
+            ),
+            (
+                "passt",
+                "2025_02_17.a1e48a0",
+                "40e59201765c60a0a5bbd0f2caae1aae3fd8f9a9a0628a835159fb2f17ff7025",
+            ),
+            (
+                "qemu-img",
+                "8.2.2",
+                "30bff329fe1001635cafcfebddc68a1c824d25110c66f968b428c4cf4785d75d",
             ),
             (
                 "rust-hypervisor-firmware",
@@ -53,7 +63,7 @@ fn dependency_pins() -> [(&'static str, &'static str, &'static str); 4] {
                 "9ad3e33c45dd816b24ad483b60ca469974ba54c3b37ef93be3da2a623986646f",
             ),
         ],
-        "aarch64" => [
+        "aarch64" => vec![
             (
                 "cloud-hypervisor",
                 "v53.0",

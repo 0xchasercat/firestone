@@ -16,15 +16,15 @@ use std::{
 
 use firestone_core::{
     Action, Arch, Catalog, Cmd, DependencyManifest, DispatchFuture, Dispatcher, DoctorContext,
-    ErrorKind, Event, EventSink, FirestoneError, GlobalConfig, ImagePullRequest, ImageStore, Level,
-    LiveMachineState, LogSource, LogsResult, MachineLock, MachineRecord, MachineSpec,
-    MachineSpecPatch, MachineState, MachineStatus, MachineSummary, MachineView, Paths,
-    ReadinessOptions, RealValidationHost, RemoveResult, ShimClient, ShimTimeouts, SpecResult,
-    SpecWarningPayload, StartResult, StateImage, StateStore, StateVersion, StopResult, Supervision,
-    ValidationContext, VersionDependency, VersionIdentity, VersionPaths, VersionResult, atomic,
-    cancel_prepared, launch_prepared_cancellable, prepare_start,
-    read_reconciled_machine_state_live, read_reconciled_machine_state_live_locked, run_doctor,
-    stop_unsupervised, validate_machine_spec, wait_for_ssh_ready,
+    DoctorOptions, ErrorKind, Event, EventSink, ExtractedPasstHelper, FirestoneError, GlobalConfig,
+    ImagePullRequest, ImageStore, InternalHelper, Level, LiveMachineState, LogSource, LogsResult,
+    MachineLock, MachineRecord, MachineSpec, MachineSpecPatch, MachineState, MachineStatus,
+    MachineSummary, MachineView, Paths, ReadinessOptions, RealValidationHost, RemoveResult,
+    ShimClient, ShimTimeouts, SpecResult, SpecWarningPayload, StartResult, StateImage, StateStore,
+    StateVersion, StopResult, Supervision, ValidationContext, VersionDependency, VersionIdentity,
+    VersionPaths, VersionResult, atomic, cancel_prepared, launch_prepared_cancellable,
+    prepare_start, read_reconciled_machine_state_live, read_reconciled_machine_state_live_locked,
+    run_doctor, stop_unsupervised, validate_machine_spec, wait_for_ssh_ready,
 };
 
 const SPEC_TEMPLATE: &str = include_str!("../../../templates/firestone.toml");
@@ -682,18 +682,45 @@ impl LocalDispatcher {
         };
         MachineSpec::load(text, &self.global, patch, patch_base_dir, &context)
     }
-    fn doctor(&self, fix: bool, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
+    fn doctor(
+        &self,
+        fix: bool,
+        elevation_confirmed: bool,
+        events: &mut dyn EventSink,
+    ) -> Result<(), FirestoneError> {
         let hostname = env::var("HOSTNAME")
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "localhost".to_owned());
-        let context = DoctorContext::from_paths(
+        let manifest = DependencyManifest::bundled()?;
+        let extracted_passt = if fix {
+            let _ =
+                firestone_core::materialize_embedded_helper(&self.paths, InternalHelper::QemuImg)?;
+            match firestone_core::materialize_embedded_helper(&self.paths, InternalHelper::Passt)? {
+                Some(path) => Some(ExtractedPasstHelper::new(
+                    path,
+                    manifest.embedded_passt("x86_64")?,
+                )?),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let mut context = DoctorContext::from_paths(
             self.paths.clone(),
-            DependencyManifest::bundled()?,
+            manifest,
             hostname,
             jiff::Timestamp::now().to_string(),
         );
-        let report = run_doctor(&context, fix)?;
+        if let Some(helper) = extracted_passt {
+            context = context.with_extracted_passt(helper);
+        }
+        let options = if fix {
+            DoctorOptions::fix(elevation_confirmed)
+        } else {
+            DoctorOptions::inspect()
+        };
+        let report = run_doctor(&context, options)?;
         emit_result(events, "doctor", &report)
     }
 
@@ -807,11 +834,13 @@ impl LocalDispatcher {
             && owned_file_ready(&self.paths.machine_state(name)?)?)
     }
     fn image_store(&self) -> Result<ImageStore, FirestoneError> {
-        ImageStore::for_host(
-            self.paths.clone(),
-            self.catalog.clone(),
-            self.qemu_img.clone(),
-        )
+        let qemu_img = if self.qemu_img == Path::new("qemu-img") {
+            firestone_core::materialize_embedded_helper(&self.paths, InternalHelper::QemuImg)?
+                .unwrap_or_else(|| self.qemu_img.clone())
+        } else {
+            self.qemu_img.clone()
+        };
+        ImageStore::for_host(self.paths.clone(), self.catalog.clone(), qemu_img)
     }
 
     fn shim_program(&self) -> Result<PathBuf, FirestoneError> {
@@ -1557,7 +1586,10 @@ impl Dispatcher for LocalDispatcher {
                 Action::ImageRemove { id, force } => self.image_remove(&id, force, events),
                 Action::ImageInspect { id } => self.image_inspect(&id, events),
                 Action::ImagePrune => self.image_prune(events),
-                Action::Doctor { fix } => self.doctor(fix, events),
+                Action::Doctor {
+                    fix,
+                    elevation_confirmed,
+                } => self.doctor(fix, elevation_confirmed, events),
                 Action::Version => self.version(events),
             }
         })
@@ -2389,7 +2421,27 @@ esac
             option_env!("FIRESTONE_GIT_COMMIT")
         );
         assert_eq!(result.architecture, architecture.as_str());
-        assert_eq!(result.dependencies.len(), 4);
+        let expected_dependencies = match architecture {
+            Arch::X86_64 => 6,
+            Arch::Aarch64 => 4,
+        };
+        assert_eq!(result.dependencies.len(), expected_dependencies);
+        if architecture == Arch::X86_64 {
+            assert_eq!(
+                result
+                    .dependencies
+                    .get("passt")
+                    .map(|value| value.sha256.as_str()),
+                Some("40e59201765c60a0a5bbd0f2caae1aae3fd8f9a9a0628a835159fb2f17ff7025")
+            );
+            assert_eq!(
+                result
+                    .dependencies
+                    .get("qemu-img")
+                    .map(|value| value.sha256.as_str()),
+                Some("30bff329fe1001635cafcfebddc68a1c824d25110c66f968b428c4cf4785d75d")
+            );
+        }
         let cloud_hypervisor = result
             .dependencies
             .get("cloud-hypervisor")
@@ -3336,7 +3388,13 @@ esac
         let mut events = Vec::new();
 
         dispatcher
-            .run(Action::Doctor { fix: false }, &mut events)
+            .run(
+                Action::Doctor {
+                    fix: false,
+                    elevation_confirmed: false,
+                },
+                &mut events,
+            )
             .await?;
 
         let result = events.into_iter().find_map(|event| match event {
@@ -3455,7 +3513,13 @@ esac
 
         events.clear();
         dispatcher
-            .run(Action::Doctor { fix: false }, &mut events)
+            .run(
+                Action::Doctor {
+                    fix: false,
+                    elevation_confirmed: false,
+                },
+                &mut events,
+            )
             .await?;
         assert!(
             events

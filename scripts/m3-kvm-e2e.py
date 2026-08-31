@@ -805,6 +805,8 @@ def installed_artifacts(harness: Harness) -> dict[str, Any]:
         "rust-hypervisor-firmware",
         "cloud-hypervisor-edk2",
         "virtiofsd",
+        "passt",
+        "qemu-img",
     ):
         dependency = dependencies[name]
         artifact = dependency["x86_64"]
@@ -821,7 +823,12 @@ def installed_artifacts(harness: Harness) -> dict[str, Any]:
         }
     require(result["cloud-hypervisor"]["version"] == "v53.0", "Cloud Hypervisor pin changed")
     require(result["virtiofsd"]["version"] == "v1.14.0", "virtiofsd pin changed")
-    for name, expected in (("cloud-hypervisor", "v53"), ("virtiofsd", "1.14.0")):
+    for name, expected in (
+        ("cloud-hypervisor", "v53"),
+        ("virtiofsd", "1.14.0"),
+        ("passt", f"passt {PASST_VERSION}"),
+        ("qemu-img", "qemu-img version 8.2.2"),
+    ):
         completed = harness.run([result[name]["path"], "--version"], check=False)
         combined = completed.stdout + completed.stderr
         require(completed.returncode == 0 and expected.encode() in combined, f"{name} version probe changed")
@@ -831,9 +838,13 @@ def installed_artifacts(harness: Harness) -> dict[str, Any]:
 
 
 def passt_evidence(harness: Harness) -> dict[str, Any]:
-    selected = shutil.which("passt")
-    require(selected is not None, "required host program is missing: passt")
-    path = Path(selected).resolve(strict=True)
+    manifest = tomllib.loads((REPO_ROOT / "deps.toml").read_text(encoding="utf-8"))
+    dependency = manifest["dependency"]["passt"]
+    artifact = dependency["x86_64"]
+    path = harness.home / "data" / "bin" / artifact["install_name"]
+    require(path.is_file(), "embedded passt was not materialized by doctor --fix")
+    actual_sha = sha256(path)
+    require(actual_sha == artifact["sha256"], "materialized passt hash differs from deps.toml")
     completed = harness.run([path, "--version"], check=False)
     combined = completed.stdout + completed.stderr
     require(completed.returncode == 0, "passt --version failed")
@@ -846,7 +857,7 @@ def passt_evidence(harness: Harness) -> dict[str, Any]:
         "version": PASST_VERSION,
         "commit": PASST_COMMIT,
         "path": str(path),
-        "sha256": sha256(path),
+        "sha256": actual_sha,
         "version_output": compact_bytes(combined, 2_048).strip(),
         "version_output_sha256": bytes_sha256(combined),
     }
@@ -1905,17 +1916,18 @@ def run_acceptance(harness: Harness) -> None:
         os.access("/dev/kvm", os.R_OK | os.W_OK),
         "/dev/kvm is not readable and writable",
     )
-    for program in (
-        "cargo",
+    required_programs = [
         "curl",
         "git",
         "ip",
-        "qemu-img",
         "ssh",
         "ssh-keygen",
         "sudo",
         "unshare",
-    ):
+    ]
+    if "FIRESTONE_BIN" not in os.environ:
+        required_programs.append("cargo")
+    for program in required_programs:
         require(shutil.which(program) is not None, f"required host program is missing: {program}")
 
     commit = harness.run(["git", "rev-parse", "HEAD"]).stdout.decode().strip()
@@ -1960,13 +1972,14 @@ def run_acceptance(harness: Harness) -> None:
         "edk2": artifacts["cloud-hypervisor-edk2"],
         "virtiofsd": artifacts["virtiofsd"],
         "passt": passt,
+        "qemu-img": artifacts["qemu-img"],
     }
     pins = {
         "cloud-hypervisor": artifacts["cloud-hypervisor"],
         "virtiofsd": artifacts["virtiofsd"],
         "passt": passt,
+        "qemu-img": artifacts["qemu-img"],
     }
-
     fixtures = create_fixtures(harness)
     initial_sources = fixture_hashes(fixtures)
     tcp_port, exact_8080 = choose_host_port(socket.SOCK_STREAM, 8080)
