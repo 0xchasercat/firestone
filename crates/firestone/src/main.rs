@@ -21,6 +21,7 @@ use std::{
 };
 
 use clap::{CommandFactory as _, Parser, error::ErrorKind as ClapErrorKind};
+use dialoguer::Select;
 use firestone_core::{
     Action, ByteSize, Catalog, Dispatcher, DoctorCheckId, DoctorReport, DoctorStatus, ErrorKind,
     Event, EventSink, FirestoneError, GlobalConfig, ImageRef, MachineSpec, MachineSpecPatch,
@@ -564,6 +565,14 @@ where
                 )
                 .await
         }
+        Command::Catalog => {
+            let (global, catalog) = load_user_configuration(&paths)?;
+            LocalDispatcher::new(paths, global, catalog)
+                .with_source_base(source_base)
+                .run(Action::CatalogList, renderer)
+                .await
+        }
+
         Command::Images(arguments) => {
             let (global, catalog) = load_user_configuration(&paths)?;
             let dispatcher =
@@ -1410,15 +1419,14 @@ where
     Stderr: io::Write,
 {
     renderer.interactive_line(
-        "Create a machine. Press Enter to keep a shown value; type 'cancel' to stop.",
+        "Create a machine. Choose an image with arrow keys and Enter. Press Enter to keep later values; type 'cancel' to stop.",
     )?;
 
-    let image_value = create_prompt(
+    let image = select_create_image(
+        catalog,
         renderer,
-        "Image",
         draft.image.as_ref().map(ImageRef::as_str),
     )?;
-    let image = ImageRef::from(image_value);
     let name_default = match draft.name.take() {
         Some(name) => Some(name),
         None => derive_machine_name(&image).ok(),
@@ -1486,6 +1494,99 @@ where
     Ok(request)
 }
 
+fn select_create_image<Stdout, Stderr>(
+    catalog: &Catalog,
+    renderer: &mut Renderer<Stdout, Stderr>,
+    current: Option<&str>,
+) -> Result<ImageRef, FirestoneError>
+where
+    Stdout: io::Write,
+    Stderr: io::Write,
+{
+    let entries = catalog.entries().collect::<Vec<_>>();
+    let custom_index = entries.len();
+    let mut labels = entries
+        .iter()
+        .map(|entry| {
+            let reference = entry.canonical_reference();
+            if entry.aliases.is_empty() {
+                reference
+            } else {
+                format!("{reference} ({})", entry.aliases.join(", "))
+            }
+        })
+        .collect::<Vec<_>>();
+    labels.push("[Custom URL or local path...]".to_owned());
+
+    let entry_index = |selected: &firestone_core::CatalogEntry| {
+        entries
+            .iter()
+            .position(|entry| std::ptr::eq(*entry, selected))
+    };
+    let default = match current {
+        Some(reference) => catalog
+            .entry(reference)
+            .and_then(entry_index)
+            .unwrap_or(custom_index),
+        None => catalog.entry("ubuntu").and_then(entry_index).unwrap_or(0),
+    };
+
+    let stdin = io::stdin();
+    let mut raw_terminal = RawTerminal::enter(&stdin)?;
+    let selection = Select::new()
+        .with_prompt("Image")
+        .items(&labels)
+        .default(default)
+        .max_length(12)
+        .interact()
+        .map_err(|error| match error {
+            dialoguer::Error::IO(source) if source.kind() == io::ErrorKind::UnexpectedEof => {
+                create_eof_error()
+            }
+            dialoguer::Error::IO(source) => FirestoneError::new(
+                ErrorKind::Generic,
+                "cannot read the create wizard's image selection",
+            )
+            .with_hint("check the terminal input and run firestone create again")
+            .with_source(source),
+        });
+    let restored = raw_terminal.restore();
+    let selection = match (selection, restored) {
+        (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
+        (Ok(selection), Ok(())) => selection,
+    };
+
+    if selection == custom_index {
+        let default = current.filter(|reference| catalog.entry(reference).is_none());
+        return create_prompt(renderer, "Custom image", default).map(ImageRef::from);
+    }
+    entries
+        .get(selection)
+        .map(|entry| ImageRef::from(entry.canonical_reference()))
+        .ok_or_else(|| {
+            FirestoneError::new(
+                ErrorKind::Generic,
+                "create image selection was outside the merged catalog",
+            )
+            .with_hint("run firestone catalog and retry; report a Firestone bug if it repeats")
+        })
+}
+
+fn create_eof_error() -> FirestoneError {
+    FirestoneError::new(
+        ErrorKind::Interrupted,
+        "create wizard received end of input",
+    )
+    .with_hint(
+        "run firestone create again, or use --yes with explicit arguments for non-interactive use",
+    )
+}
+
+fn create_cancelled_error() -> FirestoneError {
+    FirestoneError::new(ErrorKind::Interrupted, "create cancelled")
+        .with_hint("run firestone create again when you are ready")
+}
+
 fn create_prompt<Stdout, Stderr>(
     renderer: &mut Renderer<Stdout, Stderr>,
     label: &str,
@@ -1511,21 +1612,12 @@ where
         .with_source(source)
     })?;
     if read == 0 {
-        return Err(FirestoneError::new(
-            ErrorKind::Interrupted,
-            "create wizard received end of input",
-        )
-        .with_hint(
-            "run firestone create again, or use --yes with explicit arguments for non-interactive use",
-        ));
+        return Err(create_eof_error());
     }
 
     let response = response.trim();
     if response.eq_ignore_ascii_case("cancel") {
-        return Err(
-            FirestoneError::new(ErrorKind::Interrupted, "create cancelled")
-                .with_hint("run firestone create again when you are ready"),
-        );
+        return Err(create_cancelled_error());
     }
     if response.is_empty() {
         return default.map(str::to_owned).ok_or_else(|| {

@@ -49,6 +49,7 @@ pub enum Action {
         lines: u32,
         follow: bool,
     },
+    CatalogList,
     ImageList,
     ImagePull {
         r#ref: ImageRef,

@@ -23,6 +23,35 @@ use wait_timeout::ChildExt as _;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+fn write_test_catalog(home: &Path) -> TestResult {
+    let config = home.join("config");
+    fs::create_dir_all(&config)?;
+    fs::set_permissions(home, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o700))?;
+    fs::write(
+        config.join("catalog.toml"),
+        r#"[[image]]
+distro = "alpine"
+version = "3.22"
+aliases = ["edge"]
+default = true
+firmware = "edk2"
+format = "qcow2"
+sshd_path = "/usr/sbin/sshd"
+
+[image.arch.x86_64]
+url = "https://example.invalid/alpine-x86_64.qcow2"
+sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[image.arch.aarch64]
+firmware = "rhf"
+url = "https://example.invalid/alpine-aarch64.qcow2"
+sha256 = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+"#,
+    )?;
+    Ok(())
+}
+
 #[test]
 fn missing_command_human_emits_readable_help_with_usage_exit() -> TestResult {
     let output = Command::new(env!("CARGO_BIN_EXE_firestone")).output()?;
@@ -655,6 +684,66 @@ fn create_quiet_keeps_final_result_and_hides_feedback() -> TestResult {
 }
 
 #[test]
+fn catalog_lists_merged_entries_for_human_and_json_callers() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = fs::canonicalize(directory.path())?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    let home = root.join("home");
+    write_test_catalog(&home)?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_firestone"))
+        .args(["--home"])
+        .arg(&home)
+        .arg("catalog")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.starts_with("REFERENCE"));
+    let alpine = stdout
+        .lines()
+        .find(|line| line.starts_with("alpine:3.22"))
+        .ok_or("merged Alpine catalog row is missing")?;
+    assert!(alpine.contains("edge"));
+    assert!(alpine.contains("aarch64=rhf, x86_64=edk2"));
+    assert!(alpine.contains("aarch64, x86_64"));
+    assert!(stdout.contains("ubuntu:24.04"));
+    assert!(stdout.contains("noble"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_firestone"))
+        .args(["--json", "--home"])
+        .arg(&home)
+        .arg("catalog")
+        .output()?;
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["type"], "Result");
+    assert_eq!(result["action"], "catalog");
+    let alpine = result["payload"]
+        .as_array()
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry["reference"] == "alpine:3.22")
+        })
+        .ok_or("merged Alpine JSON entry is missing")?;
+    assert_eq!(alpine["aliases"], serde_json::json!(["edge"]));
+    assert_eq!(
+        alpine["architectures"],
+        serde_json::json!([
+            {"architecture":"aarch64","firmware":"rhf"},
+            {"architecture":"x86_64","firmware":"edk2"}
+        ])
+    );
+    Ok(())
+}
+
+#[test]
 fn create_help_explains_wizard_and_spec_options() -> TestResult {
     let output = Command::new(env!("CARGO_BIN_EXE_firestone"))
         .args(["create", "--help"])
@@ -681,7 +770,7 @@ fn create_tty_runs_wizard_with_effective_defaults() -> TestResult {
     command.args(["--home"]).arg(&home).arg("create");
 
     let mut process = PtyCommand::spawn_interactive(command, 24, 100, "xterm-256color")?;
-    process.write_input(b"ubuntu\nwizard\n1\n4G\n30G\nnone\n")?;
+    process.write_input(b"\nwizard\n1\n4G\n30G\nnone\n")?;
     let output = process.finish(Duration::from_secs(15))?;
 
     assert!(
@@ -691,7 +780,7 @@ fn create_tty_runs_wizard_with_effective_defaults() -> TestResult {
     );
     assert!(output.terminal_restored);
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains("Create a machine. Press Enter to keep a shown value"));
+    assert!(stderr.contains("Create a machine. Choose an image with arrow keys and Enter"));
     assert!(stderr.contains("Image: "));
     assert!(stderr.contains("Name [ubuntu]: "));
     assert!(stderr.contains("CPUs [2]: "));
@@ -706,6 +795,62 @@ fn create_tty_runs_wizard_with_effective_defaults() -> TestResult {
     assert!(stdout.contains("  Disk: 30G\n"));
     assert!(stdout.contains("  Network: none\n"));
     assert!(home.join("data/machines/wizard/firestone.toml").is_file());
+    Ok(())
+}
+
+#[test]
+fn create_tty_selects_user_catalog_entry() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = fs::canonicalize(directory.path())?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    let home = root.join("home");
+    write_test_catalog(&home)?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_firestone"));
+    command.args(["--home"]).arg(&home).arg("create");
+
+    let mut process = PtyCommand::spawn_interactive(command, 24, 100, "xterm-256color")?;
+    process.write_input(b"jj\nalpine-dev\n2\n2G\n20G\npasst\n")?;
+    let output = process.finish(Duration::from_secs(15))?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.terminal_restored);
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("alpine:3.22 (edge)"));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("  Name: alpine-dev\n"));
+    assert!(stdout.contains("  Image: alpine:3.22\n"));
+    Ok(())
+}
+
+#[test]
+fn create_tty_custom_image_option_accepts_url() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = fs::canonicalize(directory.path())?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    let home = root.join("home");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_firestone"));
+    command.args(["--home"]).arg(&home).arg("create");
+
+    let mut process = PtyCommand::spawn_interactive(command, 24, 100, "xterm-256color")?;
+    process
+        .write_input(b"j\nhttps://example.invalid/custom.qcow2\ncustom-dev\n2\n2G\n20G\nnone\n")?;
+    let output = process.finish(Duration::from_secs(15))?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.terminal_restored);
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("[Custom URL or local path...]"));
+    assert!(stderr.contains("Custom image: "));
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("  Image: https://example.invalid/custom.qcow2\n"));
     Ok(())
 }
 
@@ -745,7 +890,7 @@ fn create_tty_cancel_returns_interrupted_error() -> TestResult {
     command.args(["--home"]).arg(&home).arg("create");
 
     let mut process = PtyCommand::spawn_interactive(command, 24, 100, "xterm-256color")?;
-    process.write_input(b"cancel\n")?;
+    process.write_input(b"\ncancel\n")?;
     let output = process.finish(Duration::from_secs(15))?;
 
     assert_eq!(output.status.code(), Some(130));
@@ -768,9 +913,8 @@ fn create_tty_eof_returns_interrupted_error() -> TestResult {
     command.args(["--home"]).arg(&home).arg("create");
 
     let mut process = PtyCommand::spawn_interactive(command, 24, 100, "xterm-256color")?;
-    process.write_input(b"\x04")?;
+    process.write_input(b"\n\x04")?;
     let output = process.finish(Duration::from_secs(15))?;
-
     assert_eq!(output.status.code(), Some(130));
     assert!(output.stdout.is_empty());
     assert!(output.terminal_restored);

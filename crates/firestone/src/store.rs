@@ -15,16 +15,17 @@ use std::{
 };
 
 use firestone_core::{
-    Action, Arch, Catalog, Cmd, DependencyManifest, DispatchFuture, Dispatcher, DoctorContext,
-    DoctorOptions, ErrorKind, Event, EventSink, ExtractedPasstHelper, FirestoneError, GlobalConfig,
-    ImagePullRequest, ImageStore, InternalHelper, Level, LiveMachineState, LogSource, LogsResult,
-    MachineLock, MachineRecord, MachineSpec, MachineSpecPatch, MachineState, MachineStatus,
-    MachineSummary, MachineView, Paths, ReadinessOptions, RealValidationHost, RemoveResult,
-    ShimClient, ShimTimeouts, SpecResult, SpecWarningPayload, StartResult, StateImage, StateStore,
-    StateVersion, StopResult, Supervision, ValidationContext, VersionDependency, VersionIdentity,
-    VersionPaths, VersionResult, atomic, cancel_prepared, launch_prepared_cancellable,
-    prepare_start, read_reconciled_machine_state_live, read_reconciled_machine_state_live_locked,
-    run_doctor, stop_unsupervised, validate_machine_spec, wait_for_ssh_ready,
+    Action, Arch, Catalog, CatalogArchitectureSummary, CatalogEntrySummary, Cmd,
+    DependencyManifest, DispatchFuture, Dispatcher, DoctorContext, DoctorOptions, ErrorKind, Event,
+    EventSink, ExtractedPasstHelper, FirestoneError, GlobalConfig, ImagePullRequest, ImageStore,
+    InternalHelper, Level, LiveMachineState, LogSource, LogsResult, MachineLock, MachineRecord,
+    MachineSpec, MachineSpecPatch, MachineState, MachineStatus, MachineSummary, MachineView, Paths,
+    ReadinessOptions, RealValidationHost, RemoveResult, ShimClient, ShimTimeouts, SpecResult,
+    SpecWarningPayload, StartResult, StateImage, StateStore, StateVersion, StopResult, Supervision,
+    ValidationContext, VersionDependency, VersionIdentity, VersionPaths, VersionResult, atomic,
+    cancel_prepared, launch_prepared_cancellable, prepare_start,
+    read_reconciled_machine_state_live, read_reconciled_machine_state_live_locked, run_doctor,
+    stop_unsupervised, validate_machine_spec, wait_for_ssh_ready,
 };
 
 const SPEC_TEMPLATE: &str = include_str!("../../../templates/firestone.toml");
@@ -1233,6 +1234,26 @@ impl LocalDispatcher {
         self.image_store()?.referencing_machines(id)
     }
 
+    fn catalog_list(&self, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
+        let entries = self
+            .catalog
+            .entries()
+            .map(|entry| CatalogEntrySummary {
+                reference: entry.canonical_reference(),
+                aliases: entry.aliases.clone(),
+                architectures: entry
+                    .arch
+                    .iter()
+                    .map(|(architecture, source)| CatalogArchitectureSummary {
+                        architecture: architecture.clone(),
+                        firmware: source.firmware.unwrap_or(entry.firmware),
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        emit_result(events, "catalog", &entries)
+    }
+
     fn image_list(&self, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
         emit_result(events, "images-ls", &self.image_store()?.list()?)
     }
@@ -1581,6 +1602,7 @@ impl Dispatcher for LocalDispatcher {
                     lines,
                     follow,
                 } => self.logs(&name, source, lines, follow, events),
+                Action::CatalogList => self.catalog_list(events),
                 Action::ImageList => self.image_list(events),
                 Action::ImagePull { r#ref, sha256 } => self.image_pull(r#ref, sha256, events),
                 Action::ImageRemove { id, force } => self.image_remove(&id, force, events),

@@ -8,12 +8,14 @@ use std::{
 };
 
 use console::measure_text_width;
-use firestone_core::{
-    DoctorCheckId, DoctorReport, DoctorStatus, ErrorInfo, ErrorKind, Event, EventSink,
-    FirestoneError, Level, LogsResult, MachineRecord, MachineStatus, MachineSummary, MachineView,
-    NetMode, RemoveResult, SshConfigResult, StartResult, StepId, StopResult, Unit, VersionResult,
-};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
+
+use firestone_core::{
+    CatalogEntrySummary, CatalogFirmware, DoctorCheckId, DoctorReport, DoctorStatus, ErrorInfo,
+    ErrorKind, Event, EventSink, FirestoneError, Level, LogsResult, MachineRecord, MachineStatus,
+    MachineSummary, MachineView, NetMode, RemoveResult, SshConfigResult, StartResult, StepId,
+    StopResult, Unit, VersionResult,
+};
 use owo_colors::OwoColorize as _;
 use unicode_width::UnicodeWidthChar;
 
@@ -883,6 +885,11 @@ where
                 serde_json::to_writer(&mut self.stdout, &payload).map_err(json_output_failure)?;
                 finish_record(&mut self.stdout)
             }
+            "catalog" => {
+                let entries: Vec<CatalogEntrySummary> = serde_json::from_value(payload)
+                    .map_err(|error| invalid_result_payload("catalog", error))?;
+                write_catalog_table(&mut self.stdout, &entries).map_err(write_output_failure)
+            }
             "images-pull" => self.render_image_pull_result(&payload),
             "images-rm" => self.render_image_remove_result(&payload),
             "images-prune" => self.render_image_prune_result(&payload),
@@ -1215,6 +1222,91 @@ const fn doctor_check_id_label(id: DoctorCheckId) -> &'static str {
         DoctorCheckId::SshKey => "ssh_key",
         DoctorCheckId::DataSpace => "data_space",
         DoctorCheckId::StaleState => "stale_state",
+    }
+}
+
+fn write_catalog_table<W: Write>(
+    writer: &mut W,
+    entries: &[CatalogEntrySummary],
+) -> io::Result<()> {
+    let rows = entries
+        .iter()
+        .map(|entry| {
+            let aliases = if entry.aliases.is_empty() {
+                String::new()
+            } else {
+                entry.aliases.join(", ")
+            };
+            let architectures = entry
+                .architectures
+                .iter()
+                .map(|architecture| architecture.architecture.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let firmware = entry.architectures.first().map_or_else(
+                || "-".to_owned(),
+                |first| {
+                    if entry
+                        .architectures
+                        .iter()
+                        .all(|architecture| architecture.firmware == first.firmware)
+                    {
+                        catalog_firmware_label(first.firmware).to_owned()
+                    } else {
+                        entry
+                            .architectures
+                            .iter()
+                            .map(|architecture| {
+                                format!(
+                                    "{}={}",
+                                    architecture.architecture,
+                                    catalog_firmware_label(architecture.firmware)
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }
+                },
+            );
+            (entry.reference.as_str(), aliases, firmware, architectures)
+        })
+        .collect::<Vec<_>>();
+
+    let reference_width = rows
+        .iter()
+        .map(|row| display_width(row.0))
+        .fold("REFERENCE".len(), usize::max);
+    let aliases_width = rows
+        .iter()
+        .map(|row| display_width(&row.1))
+        .fold("ALIASES".len(), usize::max);
+    let firmware_width = rows
+        .iter()
+        .map(|row| display_width(&row.2))
+        .fold("FIRMWARE".len(), usize::max);
+
+    writeln!(
+        writer,
+        "{:<reference_width$}  {:<aliases_width$}  {:<firmware_width$}  ARCHITECTURES",
+        "REFERENCE", "ALIASES", "FIRMWARE"
+    )?;
+    for (reference, aliases, firmware, architectures) in rows {
+        write_safe_cell(writer, reference, reference_width)?;
+        writer.write_all(b"  ")?;
+        write_safe_cell(writer, &aliases, aliases_width)?;
+        writer.write_all(b"  ")?;
+        write_safe_cell(writer, &firmware, firmware_width)?;
+        writer.write_all(b"  ")?;
+        write_safe_text(writer, &architectures)?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()
+}
+
+const fn catalog_firmware_label(firmware: CatalogFirmware) -> &'static str {
+    match firmware {
+        CatalogFirmware::Rhf => "rhf",
+        CatalogFirmware::Edk2 => "edk2",
     }
 }
 

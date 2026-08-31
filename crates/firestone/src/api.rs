@@ -74,6 +74,7 @@ pub fn router(dispatcher: Arc<dyn Dispatcher>, config: &GlobalConfig) -> Router 
         .route("/v1/version", get(version))
         .route("/v1/doctor", get(doctor))
         .route("/v1/machines", get(machines).post(create_machine))
+        .route("/v1/catalog", get(catalog))
         .route(
             "/v1/machines/{name}",
             get(machine)
@@ -392,6 +393,10 @@ async fn machine_vmconfig(State(state): State<ApiState>, ApiPath(name): ApiPath)
         StatusCode::OK,
     )
     .await
+}
+
+async fn catalog(State(state): State<ApiState>) -> Response {
+    payload_response(&state, Action::CatalogList, "catalog", StatusCode::OK).await
 }
 
 async fn images(State(state): State<ApiState>) -> Response {

@@ -252,6 +252,7 @@ pub enum Action {
     SetSpec { name: String, spec: MachineSpec },        // PUT
     PatchSpec { name: String, patch: MachineSpecPatch }, // PATCH
     Logs { name: String, source: LogSource, lines: u32, follow: bool },
+    CatalogList,
     ImageList, ImagePull { r#ref: ImageRef, sha256: Option<String> }, ImageInspect { id: String },
     ImageRemove { id: String, force: bool }, ImagePrune,
     Doctor { fix: bool },
@@ -542,6 +543,8 @@ checksum_alg = "sha512"
 ```
 
 Initial catalog: `ubuntu` (24.04 default, 22.04), `debian` (12 default, 13), `fedora` (current stable). Add `arch`, `alma`, `rocky`, `opensuse`, `nixos` only after each boots in CI under the pinned firmware **[verify 3]**. URLs above are believed current; confirm at implementation time and never ship an entry that has not been booted.
+
+`firestone catalog` and `GET /v1/catalog` expose the fully merged built-in and user catalog in canonical-reference order without reading the local image cache. Each row includes aliases and every available architecture paired with its effective firmware after applying an architecture override. The human table may collapse a firmware shared by every architecture; mixed firmware is labeled per architecture.
 
 ### 8.2 Resolution rules
 
@@ -968,7 +971,7 @@ Global flags on every command: `--json` (NDJSON events on stdout, human output o
 | Command | Purpose |
 |---|---|
 | `run [IMAGE\|NAME] [spec flags] [--name N] [--rm] [-- CMD…]` | idempotent: create → start → shell (§15.2) |
-| `create [NAME] [IMAGE] [--image IMAGE] [spec flags] [-f SPEC.toml] [--edit]` | write a spec and never boot. With interactive stdin and stderr, and without `--yes` or `--json`, guide image, name, CPU, memory, disk, and network selection; supplied values become defaults. Non-interactive forms require the same resolved name/image contract as before |
+| `create [NAME] [IMAGE] [--image IMAGE] [spec flags] [-f SPEC.toml] [--edit]` | write a spec and never boot. With interactive stdin and stderr, and without `--yes` or `--json`, select an image from the merged catalog with arrow keys or choose the final custom URL/local-path option, then guide name, CPU, memory, disk, and network selection; supplied values become defaults. Non-interactive forms require the same resolved name/image contract as before |
 | `start NAME [--no-wait] [--timeout D]` | boot and wait for ssh |
 | `stop NAME [--timeout D] [--force]` | graceful ACPI stop, escalate on timeout |
 | `restart NAME` | stop + start |
@@ -980,6 +983,7 @@ Global flags on every command: `--json` (NDJSON events on stdout, human output o
 | `ssh-config NAME` | print an OpenSSH Host block |
 | `console NAME` | attach to hvc0 |
 | `logs NAME [-f] [--source S] [-n N]` | view logs |
+| `catalog` | deterministic table of the merged built-in and user catalog, including aliases, effective firmware, and available architectures |
 | `images ls` / `images pull REF [--sha256 HEX]` / `images inspect ID` / `images rm ID [--force]` / `images prune` | image management; `--sha256` is valid only for an HTTPS URL |
 | `doctor [--fix]` | diagnose host; `--fix` downloads vendorable binaries and prints the rest |
 | `serve [--listen unix:PATH]` | REST listener |
@@ -1089,6 +1093,7 @@ The server holds no state and takes the same machine locks as the CLI. `curl --u
 | POST | `/v1/machines/{name}/restart` | | event stream → `Result` |
 | GET | `/v1/machines/{name}/logs?source=&follow=&lines=` | | `text/plain`, chunked |
 | GET | `/v1/machines/{name}/vmconfig` | | generated VmConfig JSON |
+| GET | `/v1/catalog` | | `[{reference, aliases, architectures: [{architecture, firmware}]}]` |
 | GET | `/v1/images` | | `[Image]` |
 | POST | `/v1/images/pull` | `{ref, sha256?}` | event stream → `Result` |
 | DELETE | `/v1/images/{id}?force=` | | 204 |
@@ -1300,7 +1305,8 @@ Do these in the first milestone, against the pinned versions, and record results
 | Boot | firmware boot of stock cloud images; catalog entries select a tested firmware, while local/URL defaults remain RHF on x86_64 and edk2 on aarch64 | direct kernel boot; one firmware default for every image | Direct boot needs per-distro kernels and rootfs extraction. Firmware is image-specific: the Ubuntu 24.04 x86_64 observation requires edk2, without generalizing that result to untested releases or architectures. |
 | Seed disk | vfat via `fatfs` | ISO via genisoimage | One fewer host dependency. |
 | VMM configuration | JSON `VmConfig` via `vm.create` | argv flags | Data, not shell strings; enables `config_overlay`. |
-| `create` behavior | TTY-guided configuration by default; `--yes`/`--json` and non-TTY use deterministic arguments; never boots; always renders the effective spec and config path; `--edit` opens the editor | silent create; opt-in wizard; always prompt regardless of TTY | Beginners can see and choose the actual machine configuration without making scripts or JSON depend on terminal state. The wizard is a CLI input adapter that produces the same `MachineSpecPatch` used by config and REST. |
+| `create` behavior | TTY-guided configuration by default; the first prompt is a standard arrow-key selector over the merged catalog plus a final custom URL/local-path option, implemented with exactly pinned `dialoguer` 0.12.0 without default features; `--yes`/`--json` and non-TTY use deterministic arguments; never boots; always renders the effective spec and config path; `--edit` opens the editor | blind image text input; fuzzy search dependency; opt-in wizard; always prompt regardless of TTY | Beginners can see what Firestone supports before typing an image. A standard selector is predictable for the bounded catalog, while the custom option keeps every existing image source available. The wizard remains a CLI input adapter that produces the same `MachineSpecPatch` used by config and REST. |
+| Catalog discovery surfaces | Project one `CatalogList` action through `firestone catalog` and `GET /v1/catalog`; return canonical references, aliases, and ordered architecture/effective-firmware pairs; render the human table from that typed payload | treat `images ls` as remote discovery; read only the built-in TOML; derive REST output independently; display one fallback firmware when an architecture overrides it | The owned image store and the remote catalog answer different questions. One shared payload keeps CLI, JSON, REST, built-in entries, and user catalog additions aligned without misreporting architecture-specific firmware. |
 | `run` semantics | idempotent (create/start/shell) | Podman‑style "new instance every time" | "Instant context" every time, no name clutter. |
 | Overlays | qcow2 with a qcow2 backing file via `qemu-img`; M1-06 records fio results without a pass threshold | raw per-machine copies; reflink | Fast creation and small machine disks. The exact x86_64 edk2 path booted under Cloud Hypervisor v53 with `backing_files: true`. |
 | Console | Cloud Hypervisor PTY for virtio-console plus a shim-brokered `console.sock`; serial output remains a file | direct Cloud Hypervisor socket console; shim tees serial | Pinned v53 rejects `console.mode = "Socket"` for the virtio-console device but supports PTY. The shim is already the lifetime owner and can broker reconnects without racing `console.log`. |

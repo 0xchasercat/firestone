@@ -2,7 +2,24 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{LogSource, MachineSpec, MachineState, MachineStatus, SpecWarning, Supervision};
+use crate::{
+    CatalogFirmware, LogSource, MachineSpec, MachineState, MachineStatus, SpecWarning, Supervision,
+};
+
+/// Effective firmware for one architecture offered by a catalog entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogArchitectureSummary {
+    pub architecture: String,
+    pub firmware: CatalogFirmware,
+}
+
+/// One merged catalog row shared by the CLI and REST API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogEntrySummary {
+    pub reference: String,
+    pub aliases: Vec<String>,
+    pub architectures: Vec<CatalogArchitectureSummary>,
+}
 
 /// One machine row shared by CLI list output and the REST collection route.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
