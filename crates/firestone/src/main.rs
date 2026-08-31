@@ -22,16 +22,17 @@ use std::{
 
 use clap::{CommandFactory as _, Parser, error::ErrorKind as ClapErrorKind};
 use firestone_core::{
-    Action, Catalog, Dispatcher, ErrorKind, Event, EventSink, FirestoneError, GlobalConfig,
-    ImageRef, MachineSpec, MachineSpecPatch, MachineStatus, PathInputs, Paths, ProcessSignal,
-    RawTerminal, RealValidationHost, RunResult, ShellResult, SshConfigResult, ValidationContext,
+    Action, ByteSize, Catalog, Dispatcher, DoctorCheckId, DoctorReport, DoctorStatus, ErrorKind,
+    Event, EventSink, FirestoneError, GlobalConfig, ImageRef, MachineSpec, MachineSpecPatch,
+    MachineStatus, NetMode, NetworkSpecPatch, PathInputs, Paths, ProcessSignal, RawTerminal,
+    RealValidationHost, RunResult, ShellResult, SpecClear, SshConfigResult, ValidationContext,
     block_on, console_plan, relay_console, shell_ssh_plan, ssh_config_plan,
 };
 
 use crate::{
     cli::{
-        Cli, Command, CreateRequest, ImageCommand, RunArgs, ShellArgs, derive_machine_name,
-        parse_hidden_vsock_proxy,
+        Cli, Command, CreateDraft, CreateRequest, ImageCommand, RunArgs, ShellArgs,
+        derive_machine_name, parse_hidden_vsock_proxy,
     },
     render::{RenderOptions, Renderer, error_exit_code},
     store::LocalDispatcher,
@@ -312,6 +313,7 @@ fn clap_error_message(error: &clap::Error) -> String {
         .unwrap_or(trimmed)
         .to_owned()
 }
+const DOCTOR_ELEVATION_PROMPT: &str = "Apply these root-owned passt and AppArmor changes? [y/N] ";
 #[derive(Debug, Clone, Copy, Default)]
 struct TerminalMode {
     stdin: bool,
@@ -390,13 +392,25 @@ where
         }
         Command::Create(arguments) => {
             let (global, catalog) = load_user_configuration(&paths)?;
-            let request = arguments.into_request().map_err(|error| {
-                FirestoneError::new(ErrorKind::Usage, clap_error_message(&error))
-                    .with_hint("run firestone create --help for valid forms")
-            })?;
+            let request = if terminal.interactive() && !yes && !json {
+                let draft = arguments.into_draft().map_err(create_usage_error)?;
+                run_create_wizard(
+                    draft,
+                    &inputs.current_dir,
+                    &paths,
+                    &global,
+                    &catalog,
+                    renderer,
+                )?
+            } else {
+                arguments.into_request().map_err(create_usage_error)?
+            };
             let edit = request.edit;
             let (name, loaded) =
                 load_create_spec(request, &inputs.current_dir, &paths, &global, &catalog)?;
+            if !json {
+                renderer.set_create_result_context(paths.machine_spec(&name)?);
+            }
             let dispatcher =
                 LocalDispatcher::new(paths, global, catalog).with_source_base(source_base);
             if edit {
@@ -601,9 +615,7 @@ where
             let dispatcher =
                 LocalDispatcher::new(paths, GlobalConfig::default(), Catalog::built_in()?)
                     .with_source_base(source_base);
-            dispatcher
-                .run(Action::Doctor { fix: arguments.fix }, renderer)
-                .await
+            run_doctor_command(&dispatcher, arguments.fix, json, yes, terminal, renderer).await
         }
         Command::Completions(_) => Err(FirestoneError::new(
             ErrorKind::Generic,
@@ -1271,6 +1283,283 @@ fn run_exit_code(result: &RunResult) -> u8 {
         (None, None) => 1,
     }
 }
+const fn doctor_elevation_prompt_allowed(
+    fix: bool,
+    json: bool,
+    yes: bool,
+    terminal: TerminalMode,
+) -> bool {
+    fix && !json && !yes && terminal.interactive()
+}
+
+fn doctor_manual_commands(events: &[Event]) -> Result<Option<String>, FirestoneError> {
+    let payload = events.iter().find_map(|event| match event {
+        Event::Result { action, payload } if action == "doctor" => Some(payload),
+        _ => None,
+    });
+    let Some(payload) = payload else {
+        return Err(FirestoneError::new(
+            ErrorKind::Generic,
+            "doctor completed without a terminal result",
+        ));
+    };
+    let report = serde_json::from_value::<DoctorReport>(payload.clone()).map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::Generic,
+            "doctor returned an invalid result payload",
+        )
+        .with_source(source)
+    })?;
+    Ok(report
+        .checks
+        .into_iter()
+        .find(|check| {
+            check.id == DoctorCheckId::UserNamespaces
+                && check.status == DoctorStatus::Fail
+                && check
+                    .reason
+                    .contains("AppArmor repair elevation was not explicitly confirmed")
+        })
+        .and_then(|check| check.fix))
+}
+
+async fn run_doctor_command<Stdout, Stderr>(
+    dispatcher: &LocalDispatcher,
+    fix: bool,
+    json: bool,
+    yes: bool,
+    terminal: TerminalMode,
+    renderer: &mut Renderer<Stdout, Stderr>,
+) -> Result<(), FirestoneError>
+where
+    Stdout: io::Write + Send,
+    Stderr: io::Write + Send,
+{
+    if !doctor_elevation_prompt_allowed(fix, json, yes, terminal) {
+        return dispatcher
+            .run(
+                Action::Doctor {
+                    fix,
+                    elevation_confirmed: false,
+                },
+                renderer,
+            )
+            .await;
+    }
+
+    let mut planned_events = Vec::new();
+    dispatcher
+        .run(
+            Action::Doctor {
+                fix: true,
+                elevation_confirmed: false,
+            },
+            &mut planned_events,
+        )
+        .await?;
+    let Some(commands) = doctor_manual_commands(&planned_events)? else {
+        for event in planned_events {
+            renderer.emit(event)?;
+        }
+        return Ok(());
+    };
+
+    renderer.interactive_line("AppArmor remediation commands:")?;
+    for line in commands.lines() {
+        renderer.interactive_line(&format!("  {line}"))?;
+    }
+    if !confirm(renderer, DOCTOR_ELEVATION_PROMPT)? {
+        for event in planned_events {
+            renderer.emit(event)?;
+        }
+        return Ok(());
+    }
+    dispatcher
+        .run(
+            Action::Doctor {
+                fix: true,
+                elevation_confirmed: true,
+            },
+            renderer,
+        )
+        .await
+}
+
+fn create_usage_error(error: clap::Error) -> FirestoneError {
+    FirestoneError::new(ErrorKind::Usage, clap_error_message(&error))
+        .with_hint("run firestone create --help for valid forms")
+}
+
+fn run_create_wizard<Stdout, Stderr>(
+    mut draft: CreateDraft,
+    current_dir: &Path,
+    paths: &Paths,
+    global: &GlobalConfig,
+    catalog: &Catalog,
+    renderer: &mut Renderer<Stdout, Stderr>,
+) -> Result<CreateRequest, FirestoneError>
+where
+    Stdout: io::Write,
+    Stderr: io::Write,
+{
+    renderer.interactive_line(
+        "Create a machine. Press Enter to keep a shown value; type 'cancel' to stop.",
+    )?;
+
+    let image_value = create_prompt(
+        renderer,
+        "Image",
+        draft.image.as_ref().map(ImageRef::as_str),
+    )?;
+    let image = ImageRef::from(image_value);
+    let name_default = match draft.name.take() {
+        Some(name) => Some(name),
+        None => derive_machine_name(&image).ok(),
+    };
+    let name = create_prompt(renderer, "Name", name_default.as_deref())?;
+    let mut request = draft.with_target(name, image);
+    let loaded = preview_create_spec(&request, current_dir, paths, global, catalog)?;
+
+    let cpus_value = create_prompt(renderer, "CPUs", Some(&loaded.spec.cpus.to_string()))?;
+    let cpus = cpus_value.parse::<u8>().map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::Usage,
+            format!("CPU count '{cpus_value}' is not a whole number"),
+        )
+        .with_hint("enter a CPU count from 1 through 255, or type 'cancel'")
+        .with_source(source)
+    })?;
+    if cpus == 0 {
+        return Err(
+            FirestoneError::new(ErrorKind::Usage, "CPU count must be at least 1")
+                .with_hint("enter a CPU count from 1 through 255, or type 'cancel'"),
+        );
+    }
+    request.patch.cpus = Some(cpus);
+
+    let memory_value = create_prompt(renderer, "Memory", Some(&loaded.spec.memory.to_string()))?;
+    request.patch.memory = Some(memory_value.parse::<ByteSize>().map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::Usage,
+            format!("memory size '{memory_value}' is invalid"),
+        )
+        .with_hint("enter a size such as 2G or 2048M, or type 'cancel'")
+        .with_source(source)
+    })?);
+
+    let disk_value = create_prompt(renderer, "Disk", Some(&loaded.spec.disk.to_string()))?;
+    request.patch.disk = Some(disk_value.parse::<ByteSize>().map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::Usage,
+            format!("disk size '{disk_value}' is invalid"),
+        )
+        .with_hint("enter a size such as 20G or 20480M, or type 'cancel'")
+        .with_source(source)
+    })?);
+
+    let network_default =
+        create_network_default(loaded.spec.network.mode, loaded.spec.network.tap.as_deref());
+    let network_value = create_prompt(renderer, "Network", Some(&network_default))?;
+    let (mode, tap) = parse_create_network(&network_value)?;
+    let network = request
+        .patch
+        .network
+        .get_or_insert_with(NetworkSpecPatch::default);
+    network.mode = Some(mode);
+    network.tap = tap;
+    if mode == NetMode::Tap {
+        request
+            .patch
+            .clear
+            .retain(|field| *field != SpecClear::NetworkTap);
+    } else if !request.patch.clear.contains(&SpecClear::NetworkTap) {
+        request.patch.clear.push(SpecClear::NetworkTap);
+    }
+
+    Ok(request)
+}
+
+fn create_prompt<Stdout, Stderr>(
+    renderer: &mut Renderer<Stdout, Stderr>,
+    label: &str,
+    default: Option<&str>,
+) -> Result<String, FirestoneError>
+where
+    Stdout: io::Write,
+    Stderr: io::Write,
+{
+    let prompt = match default {
+        Some(default) => format!("{label} [{default}]: "),
+        None => format!("{label}: "),
+    };
+    renderer.prompt(&prompt)?;
+
+    let mut response = String::new();
+    let read = io::stdin().read_line(&mut response).map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::Generic,
+            format!("cannot read the create wizard's {label} response"),
+        )
+        .with_hint("check the terminal input and run firestone create again")
+        .with_source(source)
+    })?;
+    if read == 0 {
+        return Err(FirestoneError::new(
+            ErrorKind::Interrupted,
+            "create wizard received end of input",
+        )
+        .with_hint(
+            "run firestone create again, or use --yes with explicit arguments for non-interactive use",
+        ));
+    }
+
+    let response = response.trim();
+    if response.eq_ignore_ascii_case("cancel") {
+        return Err(
+            FirestoneError::new(ErrorKind::Interrupted, "create cancelled")
+                .with_hint("run firestone create again when you are ready"),
+        );
+    }
+    if response.is_empty() {
+        return default.map(str::to_owned).ok_or_else(|| {
+            FirestoneError::new(
+                ErrorKind::Usage,
+                format!("{label} is required by the create wizard"),
+            )
+            .with_hint(format!("enter a {label} value, or type 'cancel' to stop"))
+        });
+    }
+    Ok(response.to_owned())
+}
+
+fn create_network_default(mode: NetMode, tap: Option<&str>) -> String {
+    match (mode, tap) {
+        (NetMode::Tap, Some(tap)) => format!("tap:{tap}"),
+        (NetMode::Tap, None) => "tap".to_owned(),
+        (NetMode::Passt, _) => "passt".to_owned(),
+        (NetMode::None, _) => "none".to_owned(),
+    }
+}
+
+fn parse_create_network(value: &str) -> Result<(NetMode, Option<String>), FirestoneError> {
+    match value {
+        "passt" => Ok((NetMode::Passt, None)),
+        "none" => Ok((NetMode::None, None)),
+        "tap" => Err(FirestoneError::new(
+            ErrorKind::Usage,
+            "tap network mode requires an interface name",
+        )
+        .with_hint("enter tap:DEV, for example tap:tap0, or choose passt or none")),
+        _ => match value.strip_prefix("tap:") {
+            Some(tap) if !tap.is_empty() => Ok((NetMode::Tap, Some(tap.to_owned()))),
+            _ => Err(FirestoneError::new(
+                ErrorKind::Usage,
+                format!("network mode '{value}' is invalid"),
+            )
+            .with_hint("enter passt, tap:DEV, none, or type 'cancel'")),
+        },
+    }
+}
 
 fn confirm<Stdout, Stderr>(
     renderer: &mut Renderer<Stdout, Stderr>,
@@ -1296,6 +1585,23 @@ fn load_user_configuration(paths: &Paths) -> Result<(GlobalConfig, Catalog), Fir
     let global = load_global_config(paths)?;
     let catalog = Catalog::load(&paths.catalog_file(), &global.images.catalog)?;
     Ok((global, catalog))
+}
+
+fn preview_create_spec(
+    request: &CreateRequest,
+    current_dir: &Path,
+    paths: &Paths,
+    global: &GlobalConfig,
+    catalog: &Catalog,
+) -> Result<firestone_core::LoadedMachineSpec, FirestoneError> {
+    let preview = CreateRequest {
+        name: request.name.clone(),
+        image: request.image.clone(),
+        patch: request.patch.clone(),
+        file: request.file.clone(),
+        edit: request.edit,
+    };
+    load_create_spec(preview, current_dir, paths, global, catalog).map(|(_, loaded)| loaded)
 }
 
 fn load_create_spec(
@@ -1378,8 +1684,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CreateRequest, finish_command, load_create_spec, load_global_config, render_options,
-        run_with_inputs, signal_handler_error,
+        CreateRequest, TerminalMode, doctor_elevation_prompt_allowed, doctor_manual_commands,
+        finish_command, load_create_spec, load_global_config, render_options, run_with_inputs,
+        signal_handler_error,
     };
     use crate::{
         cli::Cli,
@@ -1420,6 +1727,70 @@ mod tests {
         let root = std::fs::canonicalize(directory.path())?;
         let paths = Paths::from_inputs(&path_inputs(&root))?;
         Ok((directory, paths))
+    }
+
+    #[test]
+    fn doctor_elevation_prompt_requires_diagnosable_interactive_fix() {
+        let interactive = TerminalMode {
+            stdin: true,
+            stdout: false,
+            stderr: true,
+        };
+        assert!(doctor_elevation_prompt_allowed(
+            true,
+            false,
+            false,
+            interactive
+        ));
+        assert!(!doctor_elevation_prompt_allowed(
+            false,
+            false,
+            false,
+            interactive
+        ));
+        assert!(!doctor_elevation_prompt_allowed(
+            true,
+            true,
+            false,
+            interactive
+        ));
+        assert!(!doctor_elevation_prompt_allowed(
+            true,
+            false,
+            true,
+            interactive
+        ));
+        assert!(!doctor_elevation_prompt_allowed(
+            true,
+            false,
+            false,
+            TerminalMode::default()
+        ));
+    }
+
+    #[test]
+    fn doctor_manual_commands_require_specific_apparmor_fix_result() -> TestResult {
+        let report = DoctorReport {
+            checks: vec![DoctorCheck {
+                id: DoctorCheckId::UserNamespaces,
+                status: DoctorStatus::Fail,
+                reason:
+                    "AppArmor repair elevation was not explicitly confirmed in an interactive TTY"
+                        .to_owned(),
+                fix: Some("sudo install passt\nsudo apparmor_parser -r profile".to_owned()),
+                hint: None,
+            }],
+        };
+        let events = vec![Event::Result {
+            action: "doctor".to_owned(),
+            payload: serde_json::to_value(report)?,
+        }];
+
+        assert_eq!(
+            doctor_manual_commands(&events)?.as_deref(),
+            Some("sudo install passt\nsudo apparmor_parser -r profile")
+        );
+        Ok(())
     }
 
     #[test]

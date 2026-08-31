@@ -359,18 +359,21 @@ pub struct EditArgs {
 /// Arguments accepted by firestone doctor.
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
-    /// Perform only the safe unprivileged repairs.
+    /// Apply safe repairs; AppArmor elevation needs a TTY prompt and ignores --yes.
     #[arg(long)]
     pub fix: bool,
 }
 /// Arguments accepted by `firestone create` before positional resolution.
 #[derive(Debug, Args)]
+#[command(
+    after_help = "On a terminal, create prompts for the image, name, CPU, memory, disk, and network.\nPass --yes to use only arguments and configured defaults.\n\nExamples:\n  firestone create ubuntu\n  firestone create dev ubuntu:24.04 --cpus 4 --memory 8G\n  firestone create dev --image debian:12 --net none"
+)]
 pub struct CreateArgs {
-    /// One value is IMAGE; two values are NAME followed by IMAGE.
+    /// Set IMAGE, or set both NAME and IMAGE.
     #[arg(value_name = "NAME_OR_IMAGE", num_args = 0..=2)]
     pub positional: Vec<String>,
 
-    /// Supply IMAGE as a flag. A sole positional value is then NAME.
+    /// Select the image by catalog reference, HTTPS URL, or local file.
     #[arg(long, value_name = "IMAGE")]
     pub image: Option<String>,
 
@@ -386,6 +389,16 @@ pub struct CreateArgs {
     pub spec: SpecArgs,
 }
 
+/// Unresolved create inputs used by the interactive wizard.
+#[derive(Debug)]
+pub(crate) struct CreateDraft {
+    pub(crate) name: Option<String>,
+    pub(crate) image: Option<ImageRef>,
+    pub(crate) patch: MachineSpecPatch,
+    pub(crate) file: Option<PathBuf>,
+    pub(crate) edit: bool,
+}
+
 /// A resolved create invocation for the command runner.
 ///
 /// `patch.image` is deliberately unset. `image` is the sole owned image
@@ -398,10 +411,14 @@ pub struct CreateRequest {
     pub file: Option<PathBuf>,
     pub edit: bool,
 }
-
 impl CreateArgs {
     /// Resolves create's context-sensitive positionals without cloning inputs.
     pub fn into_request(self) -> Result<CreateRequest, clap::Error> {
+        self.into_draft()?.into_request()
+    }
+
+    /// Preserves an omitted target so the terminal wizard can ask for it.
+    pub(crate) fn into_draft(self) -> Result<CreateDraft, clap::Error> {
         let Self {
             positional,
             image,
@@ -409,9 +426,9 @@ impl CreateArgs {
             edit,
             spec,
         } = self;
-        let (name, image) = resolve_create_target(positional, image)?;
+        let (name, image) = resolve_create_inputs(positional, image)?;
 
-        Ok(CreateRequest {
+        Ok(CreateDraft {
             name,
             image,
             patch: spec.into_patch(),
@@ -421,66 +438,123 @@ impl CreateArgs {
     }
 }
 
+impl CreateDraft {
+    pub(crate) fn into_request(self) -> Result<CreateRequest, clap::Error> {
+        let Self {
+            name,
+            image,
+            patch,
+            file,
+            edit,
+        } = self;
+        let image = image.ok_or_else(|| {
+            clap::Error::raw(
+                ErrorKind::MissingRequiredArgument,
+                "image is required; pass IMAGE positionally or with '--image'",
+            )
+        })?;
+        let name = match name {
+            Some(name) => name,
+            None => derive_machine_name(&image)?,
+        };
+        Ok(CreateRequest {
+            name,
+            image,
+            patch,
+            file,
+            edit,
+        })
+    }
+
+    pub(crate) fn with_target(self, name: String, image: ImageRef) -> CreateRequest {
+        CreateRequest {
+            name,
+            image,
+            patch: self.patch,
+            file: self.file,
+            edit: self.edit,
+        }
+    }
+}
 /// Clap's projection of every CLI-settable `MachineSpecPatch` leaf except image.
 ///
 /// Image has context-sensitive positional behavior and therefore lives on
 /// [`CreateArgs`].
 #[derive(Debug, Default, Args)]
 pub struct SpecArgs {
+    /// Set the guest architecture; it must match the host.
     #[arg(long, value_name = "ARCH", value_parser = parse_arch)]
     pub arch: Option<Arch>,
 
+    /// Set the number of virtual CPUs.
     #[arg(long, value_name = "COUNT")]
     pub cpus: Option<u8>,
 
+    /// Set guest memory, for example 2G or 2048M.
     #[arg(long, value_name = "SIZE")]
     pub memory: Option<ByteSize>,
 
+    /// Set writable disk capacity, for example 20G.
     #[arg(long, value_name = "SIZE")]
     pub disk: Option<ByteSize>,
 
+    /// Set the guest login user created by Firestone provisioning.
     #[arg(long, value_name = "USER")]
     pub user: Option<String>,
 
+    /// Select passt, tap, or no network.
     #[arg(long, value_name = "MODE", value_parser = parse_net_mode)]
     pub net: Option<NetMode>,
 
+    /// Forward a host port or range to the guest; repeat as needed.
     #[arg(short = 'p', long, value_name = "SPEC")]
     pub forward: Vec<PortForward>,
 
+    /// Use an existing host tap interface with --net tap.
     #[arg(long, value_name = "DEV")]
     pub tap: Option<String>,
 
+    /// Set a fixed guest network MAC address.
     #[arg(long = "network-mac", value_name = "MAC")]
     pub network_mac: Option<MacAddr>,
 
+    /// Share a host directory with the guest; repeat as needed.
     #[arg(long, value_name = "HOST:GUEST[:ro]", value_parser = parse_mount)]
     pub mount: Vec<MountSpec>,
 
+    /// Add a cloud-init user-data file.
     #[arg(long = "user-data", value_name = "FILE")]
     pub user_data: Option<PathBuf>,
 
+    /// Add a cloud-init network-config file.
     #[arg(long = "cloud-init-network-config", value_name = "FILE")]
     pub cloud_init_network_config: Option<PathBuf>,
 
+    /// Add an OpenSSH public-key file; repeat as needed.
     #[arg(long = "ssh-key", value_name = "FILE")]
     pub ssh_key: Vec<PathBuf>,
 
+    /// Disable Firestone's built-in guest provisioning.
     #[arg(long = "no-provisioning")]
     pub no_provisioning: bool,
 
+    /// Use a custom cloud-hypervisor executable.
     #[arg(long = "vmm-binary", value_name = "FILE")]
     pub vmm_binary: Option<PathBuf>,
 
+    /// Select auto, rhf, edk2, or a firmware file.
     #[arg(long = "vmm-firmware", value_name = "FIRMWARE")]
     pub vmm_firmware: Option<Firmware>,
 
+    /// Append one cloud-hypervisor argument; repeat as needed.
     #[arg(long = "vmm-arg", value_name = "ARG", allow_hyphen_values = true)]
     pub vmm_arg: Vec<String>,
 
+    /// Merge a JSON object into the generated VMM configuration.
     #[arg(long = "vmm-config", value_name = "JSON", value_parser = parse_vmm_config)]
     pub vmm_config: Option<serde_json::Value>,
 
+    /// Clear an inherited optional field; repeat as needed.
     #[arg(long, value_name = "FIELD")]
     pub clear: Vec<SpecClear>,
 }
@@ -588,10 +662,10 @@ fn non_empty<T>(values: Vec<T>) -> Option<Vec<T>> {
     }
 }
 
-fn resolve_create_target(
+fn resolve_create_inputs(
     positional: Vec<String>,
     image_flag: Option<String>,
-) -> Result<(String, ImageRef), clap::Error> {
+) -> Result<(Option<String>, Option<ImageRef>), clap::Error> {
     if positional.len() > 2 {
         return Err(clap::Error::raw(
             ErrorKind::TooManyValues,
@@ -604,14 +678,11 @@ fn resolve_create_target(
     let second = positional.next();
 
     let (explicit_name, image) = match (first, second, image_flag) {
-        (None, None, None) => {
-            return Err(clap::Error::raw(
-                ErrorKind::MissingRequiredArgument,
-                "image is required; pass IMAGE positionally or with '--image'",
-            ));
+        (None, None, None) => (None, None),
+        (None, None, Some(image)) | (Some(image), None, None) => (None, Some(image)),
+        (Some(name), None, Some(image)) | (Some(name), Some(image), None) => {
+            (Some(name), Some(image))
         }
-        (None, None, Some(image)) | (Some(image), None, None) => (None, image),
-        (Some(name), None, Some(image)) | (Some(name), Some(image), None) => (Some(name), image),
         (Some(_), Some(_), Some(_)) => {
             return Err(clap::Error::raw(
                 ErrorKind::ArgumentConflict,
@@ -626,12 +697,7 @@ fn resolve_create_target(
         }
     };
 
-    let image = ImageRef::from(image);
-    let name = match explicit_name {
-        Some(name) => name,
-        None => derive_machine_name(&image)?,
-    };
-    Ok((name, image))
+    Ok((explicit_name, image.map(ImageRef::from)))
 }
 
 pub(crate) fn derive_machine_name(image: &ImageRef) -> Result<String, clap::Error> {

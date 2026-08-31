@@ -54,56 +54,56 @@ complete -c firestone -n "__fish_firestone_needs_command" -f -a "version" -d 'Pr
 complete -c firestone -n "__fish_firestone_needs_command" -f -a "serve" -d 'Run the stateless REST API over a private Unix socket'
 complete -c firestone -n "__fish_firestone_needs_command" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c firestone -n "__fish_firestone_using_subcommand run" -l name -d 'Name a machine created from an image reference' -r
-complete -c firestone -n "__fish_firestone_using_subcommand run" -l arch -r
-complete -c firestone -n "__fish_firestone_using_subcommand run" -l cpus -r
-complete -c firestone -n "__fish_firestone_using_subcommand run" -l memory -r
-complete -c firestone -n "__fish_firestone_using_subcommand run" -l disk -r
-complete -c firestone -n "__fish_firestone_using_subcommand run" -l user -r
-complete -c firestone -n "__fish_firestone_using_subcommand run" -l net -r
-complete -c firestone -n "__fish_firestone_using_subcommand run" -s p -l forward -r
-complete -c firestone -n "__fish_firestone_using_subcommand run" -l tap -r
-complete -c firestone -n "__fish_firestone_using_subcommand run" -l network-mac -r
-complete -c firestone -n "__fish_firestone_using_subcommand run" -l mount -r
-complete -c firestone -n "__fish_firestone_using_subcommand run" -l user-data -r -F
-complete -c firestone -n "__fish_firestone_using_subcommand run" -l cloud-init-network-config -r -F
-complete -c firestone -n "__fish_firestone_using_subcommand run" -l ssh-key -r -F
-complete -c firestone -n "__fish_firestone_using_subcommand run" -l vmm-binary -r -F
-complete -c firestone -n "__fish_firestone_using_subcommand run" -l vmm-firmware -r
-complete -c firestone -n "__fish_firestone_using_subcommand run" -l vmm-arg -r
-complete -c firestone -n "__fish_firestone_using_subcommand run" -l vmm-config -r
-complete -c firestone -n "__fish_firestone_using_subcommand run" -l clear -r
+complete -c firestone -n "__fish_firestone_using_subcommand run" -l arch -d 'Set the guest architecture; it must match the host' -r
+complete -c firestone -n "__fish_firestone_using_subcommand run" -l cpus -d 'Set the number of virtual CPUs' -r
+complete -c firestone -n "__fish_firestone_using_subcommand run" -l memory -d 'Set guest memory, for example 2G or 2048M' -r
+complete -c firestone -n "__fish_firestone_using_subcommand run" -l disk -d 'Set writable disk capacity, for example 20G' -r
+complete -c firestone -n "__fish_firestone_using_subcommand run" -l user -d 'Set the guest login user created by Firestone provisioning' -r
+complete -c firestone -n "__fish_firestone_using_subcommand run" -l net -d 'Select passt, tap, or no network' -r
+complete -c firestone -n "__fish_firestone_using_subcommand run" -s p -l forward -d 'Forward a host port or range to the guest; repeat as needed' -r
+complete -c firestone -n "__fish_firestone_using_subcommand run" -l tap -d 'Use an existing host tap interface with --net tap' -r
+complete -c firestone -n "__fish_firestone_using_subcommand run" -l network-mac -d 'Set a fixed guest network MAC address' -r
+complete -c firestone -n "__fish_firestone_using_subcommand run" -l mount -d 'Share a host directory with the guest; repeat as needed' -r
+complete -c firestone -n "__fish_firestone_using_subcommand run" -l user-data -d 'Add a cloud-init user-data file' -r -F
+complete -c firestone -n "__fish_firestone_using_subcommand run" -l cloud-init-network-config -d 'Add a cloud-init network-config file' -r -F
+complete -c firestone -n "__fish_firestone_using_subcommand run" -l ssh-key -d 'Add an OpenSSH public-key file; repeat as needed' -r -F
+complete -c firestone -n "__fish_firestone_using_subcommand run" -l vmm-binary -d 'Use a custom cloud-hypervisor executable' -r -F
+complete -c firestone -n "__fish_firestone_using_subcommand run" -l vmm-firmware -d 'Select auto, rhf, edk2, or a firmware file' -r
+complete -c firestone -n "__fish_firestone_using_subcommand run" -l vmm-arg -d 'Append one cloud-hypervisor argument; repeat as needed' -r
+complete -c firestone -n "__fish_firestone_using_subcommand run" -l vmm-config -d 'Merge a JSON object into the generated VMM configuration' -r
+complete -c firestone -n "__fish_firestone_using_subcommand run" -l clear -d 'Clear an inherited optional field; repeat as needed' -r
 complete -c firestone -n "__fish_firestone_using_subcommand run" -l home -d 'Override the Firestone home root (config, data, and runtime)' -r -F
 complete -c firestone -n "__fish_firestone_using_subcommand run" -l rm -d 'Remove a machine created by this invocation after SSH exits'
-complete -c firestone -n "__fish_firestone_using_subcommand run" -l no-provisioning
+complete -c firestone -n "__fish_firestone_using_subcommand run" -l no-provisioning -d 'Disable Firestone\'s built-in guest provisioning'
 complete -c firestone -n "__fish_firestone_using_subcommand run" -l json -d 'Print events as newline-delimited JSON and disable human output'
 complete -c firestone -n "__fish_firestone_using_subcommand run" -s q -l quiet -d 'Print only errors and command results'
 complete -c firestone -n "__fish_firestone_using_subcommand run" -s v -l verbose -d 'Increase log detail. Pass twice for debug output'
 complete -c firestone -n "__fish_firestone_using_subcommand run" -l no-color -d 'Disable colored output'
 complete -c firestone -n "__fish_firestone_using_subcommand run" -s y -l yes -d 'Assume yes when a command may prompt'
 complete -c firestone -n "__fish_firestone_using_subcommand run" -s h -l help -d 'Print help'
-complete -c firestone -n "__fish_firestone_using_subcommand create" -l image -d 'Supply IMAGE as a flag. A sole positional value is then NAME' -r
+complete -c firestone -n "__fish_firestone_using_subcommand create" -l image -d 'Select the image by catalog reference, HTTPS URL, or local file' -r
 complete -c firestone -n "__fish_firestone_using_subcommand create" -s f -l file -d 'Layer an existing machine specification below command-line flags' -r -F
-complete -c firestone -n "__fish_firestone_using_subcommand create" -l arch -r
-complete -c firestone -n "__fish_firestone_using_subcommand create" -l cpus -r
-complete -c firestone -n "__fish_firestone_using_subcommand create" -l memory -r
-complete -c firestone -n "__fish_firestone_using_subcommand create" -l disk -r
-complete -c firestone -n "__fish_firestone_using_subcommand create" -l user -r
-complete -c firestone -n "__fish_firestone_using_subcommand create" -l net -r
-complete -c firestone -n "__fish_firestone_using_subcommand create" -s p -l forward -r
-complete -c firestone -n "__fish_firestone_using_subcommand create" -l tap -r
-complete -c firestone -n "__fish_firestone_using_subcommand create" -l network-mac -r
-complete -c firestone -n "__fish_firestone_using_subcommand create" -l mount -r
-complete -c firestone -n "__fish_firestone_using_subcommand create" -l user-data -r -F
-complete -c firestone -n "__fish_firestone_using_subcommand create" -l cloud-init-network-config -r -F
-complete -c firestone -n "__fish_firestone_using_subcommand create" -l ssh-key -r -F
-complete -c firestone -n "__fish_firestone_using_subcommand create" -l vmm-binary -r -F
-complete -c firestone -n "__fish_firestone_using_subcommand create" -l vmm-firmware -r
-complete -c firestone -n "__fish_firestone_using_subcommand create" -l vmm-arg -r
-complete -c firestone -n "__fish_firestone_using_subcommand create" -l vmm-config -r
-complete -c firestone -n "__fish_firestone_using_subcommand create" -l clear -r
+complete -c firestone -n "__fish_firestone_using_subcommand create" -l arch -d 'Set the guest architecture; it must match the host' -r
+complete -c firestone -n "__fish_firestone_using_subcommand create" -l cpus -d 'Set the number of virtual CPUs' -r
+complete -c firestone -n "__fish_firestone_using_subcommand create" -l memory -d 'Set guest memory, for example 2G or 2048M' -r
+complete -c firestone -n "__fish_firestone_using_subcommand create" -l disk -d 'Set writable disk capacity, for example 20G' -r
+complete -c firestone -n "__fish_firestone_using_subcommand create" -l user -d 'Set the guest login user created by Firestone provisioning' -r
+complete -c firestone -n "__fish_firestone_using_subcommand create" -l net -d 'Select passt, tap, or no network' -r
+complete -c firestone -n "__fish_firestone_using_subcommand create" -s p -l forward -d 'Forward a host port or range to the guest; repeat as needed' -r
+complete -c firestone -n "__fish_firestone_using_subcommand create" -l tap -d 'Use an existing host tap interface with --net tap' -r
+complete -c firestone -n "__fish_firestone_using_subcommand create" -l network-mac -d 'Set a fixed guest network MAC address' -r
+complete -c firestone -n "__fish_firestone_using_subcommand create" -l mount -d 'Share a host directory with the guest; repeat as needed' -r
+complete -c firestone -n "__fish_firestone_using_subcommand create" -l user-data -d 'Add a cloud-init user-data file' -r -F
+complete -c firestone -n "__fish_firestone_using_subcommand create" -l cloud-init-network-config -d 'Add a cloud-init network-config file' -r -F
+complete -c firestone -n "__fish_firestone_using_subcommand create" -l ssh-key -d 'Add an OpenSSH public-key file; repeat as needed' -r -F
+complete -c firestone -n "__fish_firestone_using_subcommand create" -l vmm-binary -d 'Use a custom cloud-hypervisor executable' -r -F
+complete -c firestone -n "__fish_firestone_using_subcommand create" -l vmm-firmware -d 'Select auto, rhf, edk2, or a firmware file' -r
+complete -c firestone -n "__fish_firestone_using_subcommand create" -l vmm-arg -d 'Append one cloud-hypervisor argument; repeat as needed' -r
+complete -c firestone -n "__fish_firestone_using_subcommand create" -l vmm-config -d 'Merge a JSON object into the generated VMM configuration' -r
+complete -c firestone -n "__fish_firestone_using_subcommand create" -l clear -d 'Clear an inherited optional field; repeat as needed' -r
 complete -c firestone -n "__fish_firestone_using_subcommand create" -l home -d 'Override the Firestone home root (config, data, and runtime)' -r -F
 complete -c firestone -n "__fish_firestone_using_subcommand create" -l edit -d 'Open the generated specification in the configured editor'
-complete -c firestone -n "__fish_firestone_using_subcommand create" -l no-provisioning
+complete -c firestone -n "__fish_firestone_using_subcommand create" -l no-provisioning -d 'Disable Firestone\'s built-in guest provisioning'
 complete -c firestone -n "__fish_firestone_using_subcommand create" -l json -d 'Print events as newline-delimited JSON and disable human output'
 complete -c firestone -n "__fish_firestone_using_subcommand create" -s q -l quiet -d 'Print only errors and command results'
 complete -c firestone -n "__fish_firestone_using_subcommand create" -s v -l verbose -d 'Increase log detail. Pass twice for debug output'
@@ -269,7 +269,7 @@ complete -c firestone -n "__fish_firestone_using_subcommand images; and __fish_s
 complete -c firestone -n "__fish_firestone_using_subcommand images; and __fish_seen_subcommand_from help" -f -a "prune" -d 'Remove all unreferenced images'
 complete -c firestone -n "__fish_firestone_using_subcommand images; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c firestone -n "__fish_firestone_using_subcommand doctor" -l home -d 'Override the Firestone home root (config, data, and runtime)' -r -F
-complete -c firestone -n "__fish_firestone_using_subcommand doctor" -l fix -d 'Perform only the safe unprivileged repairs'
+complete -c firestone -n "__fish_firestone_using_subcommand doctor" -l fix -d 'Apply safe repairs; AppArmor elevation needs a TTY prompt and ignores --yes'
 complete -c firestone -n "__fish_firestone_using_subcommand doctor" -l json -d 'Print events as newline-delimited JSON and disable human output'
 complete -c firestone -n "__fish_firestone_using_subcommand doctor" -s q -l quiet -d 'Print only errors and command results'
 complete -c firestone -n "__fish_firestone_using_subcommand doctor" -s v -l verbose -d 'Increase log detail. Pass twice for debug output'

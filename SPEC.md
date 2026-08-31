@@ -49,7 +49,7 @@ Firestone is a modern, minimal, product‑grade tool for running Linux virtual m
 Principles, in priority order. When two conflict, the earlier wins.
 
 1. **Correctness and reliability before polish.** A polished experience that is not backed by true correctness and structural reliability is a scam. Few features, done completely.
-2. **Sane defaults, zero paternalism.** The default path just works. Every other window stays open. Firestone never enforces opinions on the user's machine, never runs privileged commands on the user's behalf, and never silently "fixes" things. It tells the user exactly what to run and why.
+2. **Sane defaults, zero paternalism.** The default path just works. Every other window stays open. Firestone never silently changes host policy. A privileged repair is permitted only from an interactive `doctor --fix` after Firestone displays the exact change and the user explicitly confirms it; non-interactive callers receive commands instead. Every failure still says exactly what to run and why.
 3. **Frictionless for beginners, unrestricted for power users.** Configurability is designed to minimize friction, not merely to exist. Every knob is reachable from the CLI and from the config file, deterministically.
 4. **Never a black box.** Every action produces immediate, continuous, informative feedback: what is happening, what is being waited on, how long it took, what failed and why.
 5. **Three identical surfaces.** CLI, config file and REST API project one model. An action through any surface is reflected identically in the others. No exceptions.
@@ -72,7 +72,7 @@ Principles, in priority order. When two conflict, the earlier wins.
 - Image management: built‑in catalog, pull with checksum verification, list, remove, prune.
 - `doctor`: diagnoses the host and prints exact fixes.
 - REST API over a unix socket exposing the same actions with the same streaming feedback.
-- x86_64 and aarch64 hosts. Guests run the host architecture only.
+- Linux x86_64 hosts and same-architecture guests. aarch64 remains a compile-only target without runtime or standalone-helper support.
 
 ### 2.2 Non-goals (v0.1)
 
@@ -968,7 +968,7 @@ Global flags on every command: `--json` (NDJSON events on stdout, human output o
 | Command | Purpose |
 |---|---|
 | `run [IMAGE\|NAME] [spec flags] [--name N] [--rm] [-- CMD…]` | idempotent: create → start → shell (§15.2) |
-| `create [NAME] IMAGE [spec flags] [-f SPEC.toml] [--edit]` | write a spec; never boots, never prompts. One positional = image (name derived as in `run`); two = name then image |
+| `create [NAME] [IMAGE] [--image IMAGE] [spec flags] [-f SPEC.toml] [--edit]` | write a spec and never boot. With interactive stdin and stderr, and without `--yes` or `--json`, guide image, name, CPU, memory, disk, and network selection; supplied values become defaults. Non-interactive forms require the same resolved name/image contract as before |
 | `start NAME [--no-wait] [--timeout D]` | boot and wait for ssh |
 | `stop NAME [--timeout D] [--force]` | graceful ACPI stop, escalate on timeout |
 | `restart NAME` | stop + start |
@@ -1017,16 +1017,17 @@ $ firestone run ubuntu
 
 - One line per step: spinner (braille, 80 ms) while active; `✓` green, `✗` red, `-` dim for skipped, `!` yellow for warnings. Label column fixed width; detail right of it; elapsed appended dim when > 1 s.
 - Progress steps (`image`) render a bar with bytes and rate.
-- All feedback goes to stderr; stdout carries only data (`ls` table, `show`, `ssh-config`, `--json` streams), so pipes work.
+- All feedback goes to stderr; stdout carries only data (`create` summary, `ls` table, `show`, `ssh-config`, `--json` streams), so pipes work.
 - Non‑TTY: no control characters or spinner frames; each step prints `[image] ubuntu:24.04 · x86_64 · cached` on start/done; NO_COLOR respected.
 - `--json`: NDJSON `Event`s on stdout, one per line, and nothing else on stdout.
 - `ls` table: `NAME  STATUS  IMAGE  CPUS  MEM  UPTIME  FORWARDS`; statuses `running`, `running!` (degraded), `stopped`, `failed`, `starting`, `stopping`, `created`. Never truncates names.
 - Time, sizes, rates use short human units (`1.3s`, `613 MB`, `48 MB/s`).
 - Success ends with a single result line where useful (`start`: `ubuntu is running · shell: firestone shell ubuntu`). No decorative banners.
+- Human `create` prints a labeled effective-spec block containing name, canonical image, CPUs, memory, disk, network, forwards, mounts, the resolved `firestone.toml` path, and exact `edit` and `start` commands. Quiet mode still prints this terminal result. JSON and REST retain the canonical `MachineRecord` payload without CLI-only path or command fields.
 
 ### 15.4 Prompts
 
-Prompts appear only when stdin and stderr are TTYs and `--yes` is absent. They exist for exactly two situations: `rm` of a running machine, and `images rm` of an image in use. Non‑interactive invocations of those fail with a hint to pass `--force`/`--yes`. Nothing else prompts.
+Prompts appear only when stdin and stderr are TTYs and `--yes` is absent. `create` runs the guided configuration flow described in §15.1; `--yes` accepts supplied values and configured defaults without prompting, while `--json` is always non-interactive. Destructive confirmation remains limited to `rm` of a running machine and `images rm` of an image in use. `doctor --fix` may separately request explicit approval immediately before the bounded AppArmor elevation in §17.3. EOF or cancellation makes no mutation and exits 130. Non-interactive destructive invocations fail with a hint to pass `--force`/`--yes`.
 
 ### 15.5 Exit codes
 
@@ -1116,7 +1117,7 @@ HTTP status by kind: `usage`/`invalid_spec` 400, `not_found` 404, `conflict`/`al
 - Linux, x86_64 or aarch64, KVM available (`/dev/kvm` readable and writable by the user).
 - `$XDG_RUNTIME_DIR` (or the `/tmp` fallback) writable.
 - Unprivileged user namespaces for virtiofsd's default sandbox (optional; degrades to `--sandbox none`).
-- No root, no capabilities, no kernel modules beyond KVM.
+- Rootless by default; no capabilities or kernel modules beyond KVM. The only privileged path is the explicit, confirmed AppArmor helper installation in §17.3.
 
 ### 17.2 Binaries
 
@@ -1126,15 +1127,15 @@ HTTP status by kind: `usage`/`invalid_spec` 400, `not_found` 404, `conflict`/`al
 | `hypervisor-fw` | RHF firmware | rust-hypervisor-firmware releases | vendored, pinned |
 | `CLOUDHV.fd` / `CLOUDHV_EFI.fd` | edk2 firmware | cloud-hypervisor edk2 releases | vendored, pinned |
 | `virtiofsd` | shared folders | virtio-fs/virtiofsd releases (static) | vendored, pinned |
-| `passt` | networking | distro package (`passt`) | system; `2025_02_17.a1e48a0` or newer with the pinned M3 command grammar |
-| `qemu-img` | overlays, raw→qcow2 | distro package (`qemu-utils` / `qemu-img`) | system |
+| `passt` | networking | Firestone static helper release from pinned commit `a1e48a02ff3550eb7875a7df6726086e9b3a1213` | x86_64 musl payload embedded in Firestone, checksum-verified and materialized on first use; no host package |
+| `qemu-img` | overlays, raw→qcow2 | Firestone static helper release from signed QEMU 8.2.2 source | x86_64 musl payload embedded in Firestone, checksum-verified and materialized on first use; no host package |
 | `ssh`, `ssh-keygen` | shell | distro package (`openssh-client`) | system |
 
-Pins live in `deps.toml` in the repository (name, version, per‑arch URL, sha256). Checksums are computed from the real downloads at pin time, never typed from memory. Vendored binaries install to `<data>/bin/<name>-<version>` and are selected by exact version; `vmm.binary` overrides the VMM only.
+Pins live in `deps.toml` in the repository (name, version, runtime architectures, immutable URL, sha256, source and license provenance). Checksums come from real downloaded or twice-built bytes. The x86_64 release build downloads and verifies the two helper assets before Cargo, then `build.rs` independently matches them to `deps.toml` and embeds them with `include_bytes!`; a strict release build fails when either payload or hash is absent. First use publishes a versioned `<data>/bin/<name>-<version>` executable under a current-user lock with no-follow validation, exact length/hash/mode readback, fsync, and no-replace publication. A verified literal root-owned passt copy installed for AppArmor takes precedence. Development builds retain PATH fallback; the accepted aarch64 target remains compile-only and carries no helper/runtime claim. `vmm.binary` overrides the VMM only.
 
 ### 17.3 `doctor` checks
 
-Each check prints `ok`, `warn` or `fail`, a one‑line reason, and for failures the exact command to run. `--fix` performs only the actions firestone can do unprivileged (download vendored binaries, generate the SSH key, create directories).
+Each check prints `ok`, `warn` or `fail`, a one-line reason, and exact remediation. `--fix` performs ordinary current-user repairs directly. When Ubuntu AppArmor blocks passt's mandatory user namespace, an interactive `doctor --fix` first displays the literal root-owned helper/profile changes and requires an explicit confirmation; `--yes` never authorizes elevation. Confirmed repair invokes only `install` and `apparmor_parser` through `sudo` or `pkexec`, never changes a sysctl, and verifies helper hash/version/root ownership/non-writability, exact profile bytes, and loaded profile state. Non-interactive or declined repair prints the exact administrator commands without invoking them.
 
 1. host architecture supported
 2. `/dev/kvm` exists and opens O_RDWR → fix: `sudo usermod -aG kvm $USER` (group name detected from the device's owner group) + re‑login
@@ -1142,10 +1143,10 @@ Each check prints `ok`, `warn` or `fail`, a one‑line reason, and for failures 
 4. `XDG_RUNTIME_DIR` set and writable → warn and name the fallback
 5. vendored `cloud-hypervisor`, `hypervisor-fw`, edk2 present with matching checksums → fix: `doctor --fix`
 6. vendored `virtiofsd` present → fix: `doctor --fix`
-7. `passt` on PATH and `passt --version` ≥ `2025_02_17.a1e48a0`, with `--foreground`, `--one-off`, `--vhost-user`, socket, repair-path, log, and TCP/UDP forward options → fix: distro install command (apt/dnf/pacman/zypper detected)
-8. `qemu-img` on PATH → fix: distro install command
+7. embedded `passt 2025_02_17.a1e48a0` has the pinned command grammar; runtime selection prefers a verified literal root-owned AppArmor copy, then the checksum-verified materialization, with PATH fallback only in development
+8. embedded `qemu-img 8.2.2` is present in x86_64 standalone builds and materializes with the pinned hash; qemu-img does not require user namespaces
 9. `ssh`, `ssh-keygen` on PATH → fix: distro install command
-10. user namespaces available (`/proc/sys/user/max_user_namespaces` > 0 and `unshare -U true` works) → warn: virtiofsd will run with `--sandbox none`
+10. user namespaces: inspect `max_user_namespaces`, optional `unprivileged_userns_clone`, AppArmor enable/restriction state, self seccomp/container facts, the bounded passt mandatory-stage stderr, and readable PID-correlated audit evidence. `Couldn't create user namespace` is the first-stage failure; `Failed to detach isolating namespaces` proves userns already succeeded. Report AppArmor as confirmed only with correlated evidence, otherwise `consistent with`. A passt denial is `fail`; virtiofsd alone may warn and use `--sandbox none`
 11. firestone SSH key present → fix: generated by `--fix`
 12. free space in the data dir ≥ 5 GB → warn
 13. stale machine states (runtime dir missing while `state.json` says running) → info, reconciled
@@ -1156,7 +1157,7 @@ Each check prints `ok`, `warn` or `fail`, a one‑line reason, and for failures 
 
 ### 18.1 Language and crates
 
-Rust, edition 2024, stable toolchain, single static binary (`x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` release targets; glibc for dev).
+Rust, edition 2024, stable toolchain. The accepted `x86_64-unknown-linux-musl` release is one static, standalone executable carrying passt and qemu-img payloads. `aarch64-unknown-linux-musl` remains a compile-only Firestone target without embedded-helper or runtime support; glibc builds are for development.
 
 | Concern | Crate |
 |---|---|
@@ -1278,6 +1279,8 @@ Do these in the first milestone, against the pinned versions, and record results
 | 16 | resolved | virtiofsd supports read-only mode and `--sandbox namespace` rootless | Exact-main `47daf52` E2E 4 mounted namespace-sandboxed read-write and read-only virtio-fs shares and proved host/guest I/O plus read-only denial |
 | 17 | resolved | target-image systemd supports `ListenStream=vsock::22` and `serial-getty@hvc0` | Ubuntu 24.04.4 KVM boot; inspect loaded units/listeners and exercise SSH plus hvc0 |
 | 18 | open | The CI runner exposes `/dev/kvm` | `ls -l /dev/kvm` in a workflow |
+| 19 | resolved | pinned passt and qemu-img sources produce reproducible static x86_64 helper payloads with complete corresponding source and license provenance | Native x86_64 double build from digest-pinned Alpine and a 91-APK hash lock produced byte-identical passt SHA-256 `40e59201765c60a0a5bbd0f2caae1aae3fd8f9a9a0628a835159fb2f17ff7025` (322,144 bytes) and qemu-img SHA-256 `30bff329fe1001635cafcfebddc68a1c824d25110c66f968b428c4cf4785d75d` (3,065,192 bytes), both without PT_INTERP, DT_NEEDED, or build-id; corresponding-source SHA-256 `e0195a3ea6c7448e6de07e829347dee2e49eb86f9ff529b49e852ea8a1a38fac` |
+| 20 | resolved | the literal root-owned passt AppArmor profile permits passt userns on Ubuntu 24.04 without granting userns to a user-writable path | On bare-metal `w` (Ubuntu 24.04 x86_64, AppArmor enabled), the exact `abi <abi/4.0>,` profile parsed and loaded as `firestone-passt-2025_02_17.a1e48a0 (unconfined)` against the root-owned mode-0755 helper. With `kernel.apparmor_restrict_unprivileged_userns=1`, unprofiled passt run as uid 65534 exited 1 at `Failed to detach isolating namespaces`; the literal profiled copy passed that stage and remained running until the bounded 2 s timeout (124), with no mandatory-stage userns denial. The profile, helper, sockets and test files were removed, the sysctl restored to 0, and loaded-profile absence verified. |
 
 ---
 
@@ -1289,7 +1292,7 @@ Do these in the first milestone, against the pinned versions, and record results
 | Process model | no global daemon; one shim per machine; stateless `serve` | pure daemonless; libvirt‑style daemon | Exit codes, ordered start/stop and single‑writer state need a supervisor; a global daemon is bloat and a single point of failure. |
 | State store | filesystem (TOML spec + JSON state, flock, atomic rename) | SQLite | Transparent, no dependency, trivially inspectable; scale is tens of machines, not thousands. |
 | Liveness | socket connect + `vmm.ping` | pid files | Pids go stale; sockets in tmpfs self‑clean on reboot. |
-| Rootless | yes, by default; nothing needs capabilities | root + bridge | passt + userspace vsock + user‑owned tap make root unnecessary; matches non‑paternalism. |
+| Rootless | yes by default; no capabilities. A user-confirmed `doctor --fix` may install only the exact embedded passt bytes and a literal-path AppArmor profile as root | wildcard profile over `<data>/bin/*`; root + bridge; silent sudo | A wildcard over a user-writable directory lets replaced code inherit `userns,` and defeats the host mitigation. The versioned root-owned attachment preserves the default rootless VM path while containing the one host-policy exception. |
 | Default network | passt (vhost‑user) | slirp4netns/libslirp; bridge/tap | passt is fast, unprivileged, transparent addressing, forwards; slirp is slow and legacy; bridges need root and infrastructure. |
 | VM‑to‑VM networking | not in v0.1; tap mode for users who need it | managed bridge | Owning an L2 story is a big surface; defer until demanded. |
 | Shell transport | ssh over vsock | ssh over forwarded TCP port; serial login | Works with no network, full ssh feature set, no port allocation, keeps `shell` working when users break networking. |
@@ -1297,7 +1300,7 @@ Do these in the first milestone, against the pinned versions, and record results
 | Boot | firmware boot of stock cloud images; catalog entries select a tested firmware, while local/URL defaults remain RHF on x86_64 and edk2 on aarch64 | direct kernel boot; one firmware default for every image | Direct boot needs per-distro kernels and rootfs extraction. Firmware is image-specific: the Ubuntu 24.04 x86_64 observation requires edk2, without generalizing that result to untested releases or architectures. |
 | Seed disk | vfat via `fatfs` | ISO via genisoimage | One fewer host dependency. |
 | VMM configuration | JSON `VmConfig` via `vm.create` | argv flags | Data, not shell strings; enables `config_overlay`. |
-| `create` behavior | silent, never boots, `--edit` opens editor | prompt "boot with defaults?" | Prompts break scripting; `run` is the verb that boots. |
+| `create` behavior | TTY-guided configuration by default; `--yes`/`--json` and non-TTY use deterministic arguments; never boots; always renders the effective spec and config path; `--edit` opens the editor | silent create; opt-in wizard; always prompt regardless of TTY | Beginners can see and choose the actual machine configuration without making scripts or JSON depend on terminal state. The wizard is a CLI input adapter that produces the same `MachineSpecPatch` used by config and REST. |
 | `run` semantics | idempotent (create/start/shell) | Podman‑style "new instance every time" | "Instant context" every time, no name clutter. |
 | Overlays | qcow2 with a qcow2 backing file via `qemu-img`; M1-06 records fio results without a pass threshold | raw per-machine copies; reflink | Fast creation and small machine disks. The exact x86_64 edk2 path booted under Cloud Hypervisor v53 with `backing_files: true`. |
 | Console | Cloud Hypervisor PTY for virtio-console plus a shim-brokered `console.sock`; serial output remains a file | direct Cloud Hypervisor socket console; shim tees serial | Pinned v53 rejects `console.mode = "Socket"` for the virtio-console device but supports PTY. The shim is already the lifetime owner and can broker reconnects without racing `console.log`. |
@@ -1308,8 +1311,10 @@ Do these in the first milestone, against the pinned versions, and record results
 | CLI support crates | `jiff` for RFC 3339 timestamps; `shlex` for `VISUAL`/`EDITOR` argv; `unicode-width` for terminal table columns | hand-written timestamp formatting, shell-word parsing, or Unicode width tables; invoke the editor through a shell | These are bounded data-formatting/parsing concerns with mature implementations. Direct argv execution preserves the no-shell process invariant, while measured display width keeps deterministic tables aligned without truncating user data. |
 | M5 terminal feedback | Keep `firestone-core` terminal-UI-free; the binary uses exactly pinned `indicatif` 0.18.6, `console` 0.16.4, and `owo-colors` 4.4.0. Live ordered rows are enabled only when stderr is a TTY and `TERM` is not `dumb`; each step occurrence keeps its own settled row. `NO_COLOR` and `--no-color` disable only SGR color, cursor hiding is forbidden, and non-TTY, JSON, quiet, `serve`, and dumb-terminal streams retain their static contracts. | Hand-written ANSI; a core progress abstraction; replacing settled rows by step id; disabling all TTY control under `NO_COLOR` | The binary already owns terminal policy, while the core owns events. Mature width/progress/color crates avoid a second terminal implementation. Occurrence rows preserve repeated `fs` events, and capability gates keep automation byte-stable without sacrificing an interactive no-color progress display. |
 | M5 error diagnostic precedence | Preserve the primary operational error kind and hint when cleanup also fails. Supervised process exits retain their configured kind and report the program, numeric exit code or signal, and at most the last ten control-safe lines from a current-user mode-0600 regular process log. Once an HTTP status is parsed, VMM API failures retain that status and a bounded control-escaped body preview. Raw transport/read failures are distinct from checksum or content-length verification failures. | Let cleanup replace the root error; bespoke VMM/sidecar messages; discard malformed error bodies; classify every image read as checksum | Stable kinds drive both CLI exits and REST statuses, so secondary failures cannot change them. One bounded process diagnostic prevents divergent failure text and unbounded or secret-file reads. Status-aware previews make VMM failures actionable, while transport/integrity separation reserves checksum status for actual verification failures. |
-| Dependency pins | cloud-hypervisor v53.0; Rust Hypervisor Firmware 0.5.0; cloud-hypervisor edk2 ch-1e1b96f126; Firestone virtiofsd v1.14.0 release `virtiofsd-v1.14.0-firestone.1` for both musl targets plus upstream source | moving `latest` URLs; edk2 newer than the VMM-tested tag; mutable virtiofsd CI artifact; distro virtiofsd | Exact release URLs and SHA-256 values make refreshes reproducible. Cloud Hypervisor v53.0 pins the edk2 build in its integration assets. Firestone's public release reproduces upstream virtiofsd v1.14.0 for x86_64 and aarch64 from the pinned source and exposes immutable anonymous-download assets verified by `scripts/pin-deps.sh verify --arch all`. |
+| Dependency pins | cloud-hypervisor v53.0; Rust Hypervisor Firmware 0.5.0; cloud-hypervisor edk2 ch-1e1b96f126; Firestone virtiofsd v1.14.0 for both compile targets; Firestone static-helper release `helpers-v0.1.0-firestone.1` with passt `2025_02_17.a1e48a0` and qemu-img 8.2.2 for x86_64 plus corresponding source/build provenance | moving `latest` URLs; distro passt/qemu-img; mutable CI artifacts; unverified source-only builds | Exact release URLs and SHA-256 values make refreshes reproducible. The helper build verifies QEMU's detached signature, all source/APK hashes, static ELF facts, exact versions, and byte identity before publication; `scripts/pin-deps.sh` re-downloads every public asset. |
 | Doctor passt minimum | passt `2025_02_17.a1e48a0` or newer; exact help tokens for foreground, one-off, vhost-user, socket-path, repair-path, and log-file; successful no-side-effect `--tcp-ports none --udp-ports none --help` parser probe | the first vhost-user release; presence alone; version alone; require truncated tail help tokens | M3 depends on grammar added after the first vhost-user release, including repair-path control. The pinned binary's fixed help buffer can truncate the TCP/UDP tail, so a parse-only help invocation verifies those long options without opening sockets. Checking the release date, visible tokens, and parser result rejects older or feature-stripped builds without claiming verify 14 runtime interoperability. |
+| Embedded helper publication | Strict x86_64 release builds download the pinned passt/qemu-img assets before Cargo; `firestone-core/build.rs` checks target, manifest identity and SHA-256 before generating `include_bytes!` metadata; runtime publishes immutable versioned executable files under `Paths` | compile helper sources inside Cargo; commit opaque binaries; download helpers on first use; trust PATH | Cargo remains network-free and the released Firestone byte identifies the exact helper bytes. First-use materialization avoids host packages while retaining auditable normal executable paths and process identity. |
+| AppArmor passt remediation | Diagnose passt's mandatory userns stage with host policy/seccomp/container/audit context; install a checksum-verified root-owned literal passt copy and matching unconfined `userns,` profile only after an interactive confirmation; noninteractive prints commands | wildcard user-owned profile; infer AppArmor from `unshare` alone; silently invoke sudo; disable the kernel restriction | AppArmor attaches policy by path, not manifest hash. Literal root-owned attachment prevents same-user replacement from inheriting userns. Correlated evidence avoids blaming AppArmor for container seccomp or disabled kernel user namespaces. |
 | [verify 1] firmware mapping at Cloud Hypervisor v53.0 | RHF 0.5.0 uses `payload.kernel`; edk2 ch-1e1b96f126 uses `payload.firmware`; Ubuntu 24.04 x86_64 accepts edk2 as its default path | pass either firmware through the other payload field; treat RHF as the accepted Ubuntu default | The pinned v53 CLI, README, and `PayloadConfig` source define the mapping. Run `577116f86ef6c61a302a5fabccf775ae267ee6be` verified the pinned edk2 SHA-256 `9fb511fc0dd423d90a79615a90a8ace9b9e078b4a115ea2c459e0ac2f4e60218`, emitted `payload.firmware`, and reached `m1-graceful login:`. RHF remains source-mapped and separately observed, not the accepted default for this image. |
 | [verify 2] API and VmConfig at Cloud Hypervisor v53.0 | Use `GET /api/v1/vmm.ping`, `PUT vm.create`, `PUT vm.boot`, `GET vm.info`, `PUT vm.power-button`, `PUT vm.shutdown`, and `PUT vmm.shutdown`. Ping and info return 200 JSON; create, boot, power-button, and VM shutdown return empty 204; VMM shutdown returns 200 with `Content-Length: 0`. Root disks use `image_type: "Qcow2", backing_files: true`; CIDATA uses `image_type: "Raw", readonly: true`; the accepted console uses `mode: "Pty"`. | infer fields, methods, or status codes from endpoint names; use image auto-detection; use the rejected console socket mode | Tag v53.0 is commit `9ed824d6d08df3e96f7d5f50795d9449ac99f431`. Its [OpenAPI](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/9ed824d6d08df3e96f7d5f50795d9449ac99f431/vmm/src/api/openapi/cloud-hypervisor.yaml) and handlers define the wire contract. M1-06 exercised create, boot, ping 200, info 200 `Running`, power-button, and process exit using the exact persisted VmConfig bytes. |
 | VMM API transport and framing | `UnixStream` plus `nix`, one fresh connection and one absolute deadline per request; 51,200-byte create body, 16-KiB headers, 64-KiB ping/error bodies, 1-MiB info body, and zero-byte empty successes; strict non-chunked `Content-Length` framing | `hyper` + `hyperlocal`; the unbounded upstream client; reading to EOF; accepting chunked or ambiguous framing | Cloud Hypervisor v53.0 pins micro-http commit `5c2254d6cf4f32a668d0d8e57ba20bebad9d4fba`. Its 51,200-byte server limit is in `micro-http/src/server.rs` lines 21-24, and Cloud Hypervisor does not override it (`vmm/src/api/http/mod.rs` lines 440-489). The pinned response writer emits HTTP/1.1 keep-alive, non-chunked `Content-Length` framing in `micro-http/src/response.rs` lines 79-85, 160-194, 245-304, and 357-373. A small closed parser avoids new dependencies, bounds hostile or drifted responses, and lets liveness reuse the lifecycle transport instead of maintaining a second parser. |

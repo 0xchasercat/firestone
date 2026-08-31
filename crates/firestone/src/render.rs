@@ -3,14 +3,15 @@ use std::{
     error::Error as _,
     fmt,
     io::{self, Write},
+    path::PathBuf,
     time::Duration,
 };
 
 use console::measure_text_width;
 use firestone_core::{
     DoctorCheckId, DoctorReport, DoctorStatus, ErrorInfo, ErrorKind, Event, EventSink,
-    FirestoneError, Level, LogsResult, MachineStatus, MachineSummary, MachineView, RemoveResult,
-    SshConfigResult, StartResult, StepId, StopResult, Unit, VersionResult,
+    FirestoneError, Level, LogsResult, MachineRecord, MachineStatus, MachineSummary, MachineView,
+    NetMode, RemoveResult, SshConfigResult, StartResult, StepId, StopResult, Unit, VersionResult,
 };
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
 use owo_colors::OwoColorize as _;
@@ -456,6 +457,10 @@ fn info_marker(color_enabled: bool) -> String {
         "·".to_owned()
     }
 }
+/// Human-only details that do not belong in the shared create payload.
+struct CreateResultContext {
+    config_path: PathBuf,
+}
 
 /// An `EventSink` whose two streams are supplied by the caller.
 ///
@@ -467,6 +472,7 @@ pub struct Renderer<Stdout, Stderr> {
     options: RenderOptions,
     exit_override: Option<u8>,
     progress: Option<TerminalProgress>,
+    create_result: Option<CreateResultContext>,
 }
 
 impl Renderer<io::Stdout, io::Stderr> {
@@ -480,6 +486,7 @@ impl Renderer<io::Stdout, io::Stderr> {
             options,
             exit_override: None,
             progress,
+            create_result: None,
         }
     }
 }
@@ -496,6 +503,7 @@ where
             options,
             exit_override: None,
             progress: None,
+            create_result: None,
         }
     }
 
@@ -507,6 +515,15 @@ where
 
     pub fn set_exit_override(&mut self, exit: u8) {
         self.exit_override = Some(exit);
+    }
+
+    pub(crate) fn set_create_result_context(&mut self, config_path: PathBuf) {
+        self.create_result = Some(CreateResultContext { config_path });
+    }
+
+    /// Writes one line of interactive guidance to stderr.
+    pub(crate) fn interactive_line(&mut self, message: &str) -> Result<(), FirestoneError> {
+        self.write_feedback_line(format_args!("{message}"))
     }
 
     #[cfg(test)]
@@ -809,7 +826,15 @@ where
         payload: serde_json::Value,
     ) -> Result<(), FirestoneError> {
         match action {
-            "create" | "edit" => Ok(()),
+            "create" => {
+                let result: MachineRecord = serde_json::from_value(payload)
+                    .map_err(|error| invalid_result_payload("create", error))?;
+                let context = self.create_result.take().ok_or_else(|| {
+                    invalid_result_value("create", "missing human result context")
+                })?;
+                self.render_create_result(&result, &context)
+            }
+            "edit" => Ok(()),
             "start" | "restart" => {
                 let result: StartResult = serde_json::from_value(payload)
                     .map_err(|error| invalid_result_payload(action, error))?;
@@ -874,6 +899,98 @@ where
             _ if payload.is_null() => Ok(()),
             _ => self.render_other_result(payload),
         }
+    }
+
+    fn render_create_result(
+        &mut self,
+        result: &MachineRecord,
+        context: &CreateResultContext,
+    ) -> Result<(), FirestoneError> {
+        write_line(&mut self.stdout, format_args!("Created machine"))?;
+        write_line(&mut self.stdout, format_args!("  Name: {}", result.name))?;
+        write_line(
+            &mut self.stdout,
+            format_args!("  Image: {}", result.spec.image),
+        )?;
+        write_line(
+            &mut self.stdout,
+            format_args!("  CPUs: {}", result.spec.cpus),
+        )?;
+        write_line(
+            &mut self.stdout,
+            format_args!("  Memory: {}", result.spec.memory),
+        )?;
+        write_line(
+            &mut self.stdout,
+            format_args!("  Disk: {}", result.spec.disk),
+        )?;
+        match (result.spec.network.mode, result.spec.network.tap.as_deref()) {
+            (NetMode::Tap, Some(tap)) => {
+                write_line(&mut self.stdout, format_args!("  Network: tap ({tap})"))?;
+            }
+            (NetMode::Tap, None) => {
+                write_line(&mut self.stdout, format_args!("  Network: tap"))?;
+            }
+            (NetMode::Passt, _) => {
+                write_line(&mut self.stdout, format_args!("  Network: passt"))?;
+            }
+            (NetMode::None, _) => {
+                write_line(&mut self.stdout, format_args!("  Network: none"))?;
+            }
+        }
+
+        if result.spec.network.forward.is_empty() {
+            write_line(&mut self.stdout, format_args!("  Forwards: none"))?;
+        } else {
+            write_line(&mut self.stdout, format_args!("  Forwards:"))?;
+            for forward in &result.spec.network.forward {
+                write_line(&mut self.stdout, format_args!("    {forward}"))?;
+            }
+        }
+
+        if result.spec.mounts.is_empty() {
+            write_line(&mut self.stdout, format_args!("  Mounts: none"))?;
+        } else {
+            write_line(&mut self.stdout, format_args!("  Mounts:"))?;
+            for (index, mount) in result.spec.mounts.iter().enumerate() {
+                let access = if mount.readonly {
+                    "read-only"
+                } else {
+                    "read-write"
+                };
+                match mount.tag.as_deref() {
+                    Some(tag) => write_line(
+                        &mut self.stdout,
+                        format_args!(
+                            "    {} -> {} ({access}, tag {tag})",
+                            mount.host.display(),
+                            mount.guest.display()
+                        ),
+                    )?,
+                    None => write_line(
+                        &mut self.stdout,
+                        format_args!(
+                            "    {} -> {} ({access}, tag share{index})",
+                            mount.host.display(),
+                            mount.guest.display()
+                        ),
+                    )?,
+                }
+            }
+        }
+
+        write_line(
+            &mut self.stdout,
+            format_args!("  Config: {}", context.config_path.display()),
+        )?;
+        write_line(
+            &mut self.stdout,
+            format_args!("Edit: firestone edit {}", result.name),
+        )?;
+        write_line(
+            &mut self.stdout,
+            format_args!("Start: firestone start {}", result.name),
+        )
     }
 
     fn render_version_result(&mut self, result: &VersionResult) -> Result<(), FirestoneError> {
@@ -1383,8 +1500,8 @@ mod tests {
     use std::{collections::BTreeMap, error::Error, io, path::PathBuf};
 
     use firestone_core::{
-        DoctorCheck, DoctorCheckId, DoctorReport, DoctorStatus, EventSink, ImageRef, MachineSpec,
-        MachineState, MachineStatus, StateImage, StateVersion, StepId,
+        DoctorCheck, DoctorCheckId, DoctorReport, DoctorStatus, EventSink, ImageRef, MachineRecord,
+        MachineSpec, MachineState, MachineStatus, MountSpec, StateImage, StateVersion, StepId,
     };
     use indicatif::{InMemoryTerm, ProgressDrawTarget};
     use serde_json::json;
@@ -1905,21 +2022,63 @@ mod tests {
     }
 
     #[test]
-    fn create_result_is_silent_in_human_mode() -> TestResult {
+    fn create_result_renders_effective_summary_and_commands() -> TestResult {
+        let mut spec = MachineSpec {
+            image: ImageRef::new("ubuntu:24.04"),
+            ..MachineSpec::default()
+        };
+        spec.network.forward.push("8080:80".parse()?);
+        spec.mounts.push(MountSpec {
+            host: PathBuf::from("/srv/project"),
+            guest: PathBuf::from("/wo\u{1b}rk"),
+            readonly: true,
+            tag: None,
+        });
+        let record = MachineRecord {
+            name: "dev".to_owned(),
+            spec,
+            state: MachineState {
+                version: StateVersion,
+                status: MachineStatus::Created,
+                image: StateImage {
+                    r#ref: "ubuntu".to_owned(),
+                    id: None,
+                    sha256: None,
+                },
+                mac: None,
+                cid: 3,
+                instance_id: None,
+                shim_pid: None,
+                vmm_pid: None,
+                sidecar_pids: BTreeMap::new(),
+                runtime_dir: PathBuf::from("/run/user/1000/firestone/dev"),
+                started_at: None,
+                forwards: Vec::new(),
+                degraded: Vec::new(),
+                last_exit: None,
+            },
+        };
         let mut renderer =
             Renderer::new(Vec::new(), Vec::new(), RenderOptions::human(false, false));
+        renderer.set_create_result_context(PathBuf::from(
+            "/home/alice/.local/share/firestone/machines/dev/firestone.toml",
+        ));
 
         renderer.emit(Event::Result {
             action: "create".to_owned(),
-            payload: json!({"name": "dev"}),
+            payload: serde_json::to_value(record)?,
         })?;
 
         let (stdout, stderr) = renderer.into_writers();
-        assert!(stdout.is_empty());
+        let output = String::from_utf8(stdout)?;
+        assert_eq!(
+            output,
+            "Created machine\n  Name: dev\n  Image: ubuntu:24.04\n  CPUs: 2\n  Memory: 2G\n  Disk: 20G\n  Network: passt\n  Forwards:\n    8080:80\n  Mounts:\n    /srv/project -> /wo�rk (read-only, tag share0)\n  Config: /home/alice/.local/share/firestone/machines/dev/firestone.toml\nEdit: firestone edit dev\nStart: firestone start dev\n"
+        );
+        assert!(!output.contains('\u{1b}'));
         assert!(stderr.is_empty());
         Ok(())
     }
-
     #[test]
     fn show_result_is_deterministic_pretty_json() -> TestResult {
         let spec = MachineSpec {

@@ -10,6 +10,7 @@ pub mod console;
 pub mod deps;
 pub mod dispatcher;
 pub mod doctor;
+pub mod embedded_helpers;
 pub mod error;
 pub mod event;
 pub mod image;
@@ -42,8 +43,13 @@ pub use console::{
 pub use deps::{DependencyArtifact, DependencyManifest};
 pub use dispatcher::{DispatchFuture, Dispatcher, EventSink, block_on};
 pub use doctor::{
-    DoctorCheck, DoctorCheckId, DoctorContext, DoctorReport, DoctorStatus,
-    read_reconciled_machine_state_live, read_reconciled_machine_state_live_locked, run_doctor,
+    APPARMOR_PASST_EXECUTABLE, APPARMOR_PASST_PROFILE, APPARMOR_PASST_PROFILE_NAME, DoctorCheck,
+    DoctorCheckId, DoctorContext, DoctorOptions, DoctorReport, DoctorStatus, ExtractedPasstHelper,
+    VerifiedPasst, read_reconciled_machine_state_live, read_reconciled_machine_state_live_locked,
+    resolve_verified_apparmor_passt, run_doctor,
+};
+pub use embedded_helpers::{
+    EmbeddedHelper, InternalHelper, embedded_helper, materialize_embedded_helper,
 };
 pub use error::{ErrorInfo, ErrorKind, FirestoneError};
 pub use event::{Event, Level, StepId, Unit};

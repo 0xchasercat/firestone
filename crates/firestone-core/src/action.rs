@@ -65,6 +65,8 @@ pub enum Action {
     ImagePrune,
     Doctor {
         fix: bool,
+        #[serde(default)]
+        elevation_confirmed: bool,
     },
     Version,
 }

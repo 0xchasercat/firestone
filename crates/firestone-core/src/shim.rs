@@ -51,13 +51,14 @@ use crate::cmd::ProcessDiagnostic;
 
 use crate::{
     Arch, Cmd, ConsoleBroker, DependencyManifest, ErrorInfo, ErrorKind, Event, EventSink,
-    ExitReason, FirestoneError, ImageStore, LastExit, MachineLock, MachineSpec, MachineState,
-    MachineStatus, ManagedProcess, NetMode, NetworkPlan, NetworkPlanOptions, Paths, ProcessSignal,
-    RealValidationHost, StateStore, StepId, VirtiofsPlan, VirtiofsReadinessPlan, VirtiofsSandbox,
-    VmConfigInput, VmState, VmmApi, VmmApiLivenessProbe, VmmPingProbe, atomic, ensure_ssh_identity,
-    invalidate_known_hosts_for_seed, network::NetworkPlanSnapshot, prepare_network,
+    ExitReason, FirestoneError, ImageStore, InternalHelper, LastExit, MachineLock, MachineSpec,
+    MachineState, MachineStatus, ManagedProcess, NetMode, NetworkPlan, NetworkPlanOptions, Paths,
+    ProcessSignal, RealValidationHost, StateStore, StepId, VirtiofsPlan, VirtiofsReadinessPlan,
+    VirtiofsSandbox, VmConfigInput, VmState, VmmApi, VmmApiLivenessProbe, VmmPingProbe, atomic,
+    embedded_helper, ensure_ssh_identity, invalidate_known_hosts_for_seed,
+    materialize_embedded_helper, network::NetworkPlanSnapshot, prepare_network,
     prepare_virtiofs_plans_with_readiness, publish_seed_with_sshd_path, publish_vm_config,
-    virtiofs::VirtiofsPlanSnapshot,
+    resolve_verified_apparmor_passt, virtiofs::VirtiofsPlanSnapshot,
 };
 
 const PLAN_VERSION: u32 = 2;
@@ -925,10 +926,26 @@ pub fn prepare_start(
     let prepared = (|| -> Result<PreparedStart, FirestoneError> {
         let architecture = image_store.architecture();
         let passt_program = if spec.network.mode == NetMode::Passt {
-            find_required_program(
-                "passt",
-                "run `firestone doctor` and install the pinned passt",
-            )?
+            if embedded_helper(InternalHelper::Passt).is_some() {
+                let artifact = manifest.embedded_passt(architecture.as_str())?;
+                match resolve_verified_apparmor_passt(paths, &artifact)? {
+                    Some(verified) => verified.executable().to_path_buf(),
+                    None => materialize_embedded_helper(paths, InternalHelper::Passt)?.ok_or_else(
+                        || {
+                            FirestoneError::new(
+                                ErrorKind::Dependency,
+                                "standalone Firestone has no embedded passt payload",
+                            )
+                            .with_hint("replace the executable with an intact x86_64 release")
+                        },
+                    )?,
+                }
+            } else {
+                find_required_program(
+                    "passt",
+                    "run `firestone doctor` and install the pinned passt",
+                )?
+            }
         } else {
             PathBuf::from("passt")
         };

@@ -278,6 +278,36 @@ impl Paths {
         self.data_dir.join("bin")
     }
 
+    /// User-owned staging directory for the generated AppArmor profile.
+    #[must_use]
+    pub fn apparmor_staging_dir(&self) -> PathBuf {
+        self.data_dir.join("apparmor")
+    }
+
+    /// Generated profile staged before an explicitly authorized root install.
+    #[must_use]
+    pub fn apparmor_passt_staged_profile(&self) -> PathBuf {
+        self.apparmor_staging_dir()
+            .join("firestone-passt-2025_02_17.a1e48a0")
+    }
+
+    /// Literal versioned root-owned passt attachment target.
+    #[must_use]
+    pub fn apparmor_passt_executable(&self) -> PathBuf {
+        PathBuf::from("/usr/libexec/firestone/passt-2025_02_17.a1e48a0")
+    }
+
+    /// Installed AppArmor policy for the literal passt attachment target.
+    #[must_use]
+    pub fn apparmor_passt_profile(&self) -> PathBuf {
+        PathBuf::from("/etc/apparmor.d/firestone-passt-2025_02_17.a1e48a0")
+    }
+
+    /// Kernel list used to confirm that the passt policy is loaded.
+    #[must_use]
+    pub fn apparmor_loaded_profiles(&self) -> PathBuf {
+        PathBuf::from("/sys/kernel/security/apparmor/profiles")
+    }
     #[must_use]
     pub fn ssh_dir(&self) -> PathBuf {
         self.data_dir.join("ssh")
@@ -1708,6 +1738,22 @@ mod tests {
         assert_eq!(
             paths.binary_file("cloud-hypervisor-1")?,
             PathBuf::from("/firestone/data/bin/cloud-hypervisor-1")
+        );
+        assert_eq!(
+            paths.apparmor_passt_staged_profile(),
+            PathBuf::from("/firestone/data/apparmor/firestone-passt-2025_02_17.a1e48a0")
+        );
+        assert_eq!(
+            paths.apparmor_passt_executable(),
+            PathBuf::from("/usr/libexec/firestone/passt-2025_02_17.a1e48a0")
+        );
+        assert_eq!(
+            paths.apparmor_passt_profile(),
+            PathBuf::from("/etc/apparmor.d/firestone-passt-2025_02_17.a1e48a0")
+        );
+        assert_eq!(
+            paths.apparmor_loaded_profiles(),
+            PathBuf::from("/sys/kernel/security/apparmor/profiles")
         );
         assert_eq!(
             paths.image_file("ubuntu.qcow2")?,
