@@ -24,6 +24,52 @@ use wait_timeout::ChildExt as _;
 type TestResult = Result<(), Box<dyn Error>>;
 
 #[test]
+fn missing_command_human_emits_readable_help_with_usage_exit() -> TestResult {
+    let output = Command::new(env!("CARGO_BIN_EXE_firestone")).output()?;
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.starts_with(
+        "Firestone's command-line interface\n\nUsage: firestone [OPTIONS] <COMMAND>\n\nCommands:\n"
+    ));
+    assert!(stderr.contains("\n  run          Create or reuse a machine"));
+    assert!(stderr.contains("\nOptions:\n"));
+    assert!(!stderr.contains('\u{fffd}'));
+    Ok(())
+}
+
+#[test]
+fn missing_command_json_requested_emits_structured_usage_error() -> TestResult {
+    let output = Command::new(env!("CARGO_BIN_EXE_firestone"))
+        .arg("--json")
+        .output()?;
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(value["error"]["kind"], "usage");
+    assert_eq!(
+        value["error"]["message"],
+        "'firestone' requires a subcommand but one was not provided"
+    );
+    Ok(())
+}
+#[test]
+fn invalid_argument_human_emits_single_line_error_and_hint() -> TestResult {
+    let output = Command::new(env!("CARGO_BIN_EXE_firestone"))
+        .arg("--bogus")
+        .output()?;
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr)?,
+        "error: unexpected argument '--bogus' found\nhint:  run `firestone --help` for command usage\n"
+    );
+    Ok(())
+}
+#[test]
 fn invalid_argument_json_requested_emits_structured_usage_error() -> TestResult {
     let output = Command::new(env!("CARGO_BIN_EXE_firestone"))
         .args(["--json", "--bogus"])

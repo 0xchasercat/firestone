@@ -66,6 +66,13 @@ fn main() -> ExitCode {
             let _ = error.print();
             return ExitCode::SUCCESS;
         }
+        Err(error)
+            if !requested_json
+                && error.kind() == ClapErrorKind::DisplayHelpOnMissingArgumentOrSubcommand =>
+        {
+            let _ = error.print();
+            return ExitCode::from(2);
+        }
         Err(error) => {
             let options = render_options(
                 requested_json,
@@ -306,10 +313,10 @@ fn requested_flag(arguments: &[std::ffi::OsString], flag: &str) -> bool {
 
 fn clap_error_message(error: &clap::Error) -> String {
     let rendered = error.to_string();
-    let trimmed = rendered.trim();
-    trimmed
+    let primary = rendered.lines().next().unwrap_or(&rendered).trim();
+    primary
         .strip_prefix("error: ")
-        .unwrap_or(trimmed)
+        .unwrap_or(primary)
         .to_owned()
 }
 #[derive(Debug, Clone, Copy, Default)]
