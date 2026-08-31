@@ -36,7 +36,7 @@ download() {
 
     [[ $url == https://* ]] || fail "download URL is not HTTPS: $url"
     printf 'download %s\n' "$url" >&2
-    curl \
+    if ! curl \
         --fail \
         --location \
         --proto '=https' \
@@ -48,6 +48,10 @@ download() {
         --connect-timeout 20 \
         --output "$output" \
         "$url"
+    then
+        rm -f -- "$output"
+        fail "download failed: $url"
+    fi
     actual_sha=$(sha256_file "$output")
     [[ $actual_sha == "$expected_sha" ]] ||
         fail "$url checksum mismatch: expected $expected_sha, got $actual_sha"

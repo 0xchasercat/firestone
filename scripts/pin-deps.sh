@@ -95,7 +95,7 @@ download() {
     local output=$2
 
     printf 'download %s\n' "$url" >&2
-    curl \
+    if ! curl \
         --fail \
         --location \
         --proto '=https' \
@@ -107,6 +107,10 @@ download() {
         --connect-timeout 20 \
         --output "$output" \
         "$url"
+    then
+        rm -f -- "$output"
+        fail "download failed: $url"
+    fi
 }
 
 download_hash() {
