@@ -2421,7 +2421,27 @@ esac
             option_env!("FIRESTONE_GIT_COMMIT")
         );
         assert_eq!(result.architecture, architecture.as_str());
-        assert_eq!(result.dependencies.len(), 4);
+        let expected_dependencies = match architecture {
+            Arch::X86_64 => 6,
+            Arch::Aarch64 => 4,
+        };
+        assert_eq!(result.dependencies.len(), expected_dependencies);
+        if architecture == Arch::X86_64 {
+            assert_eq!(
+                result
+                    .dependencies
+                    .get("passt")
+                    .map(|value| value.sha256.as_str()),
+                Some("40e59201765c60a0a5bbd0f2caae1aae3fd8f9a9a0628a835159fb2f17ff7025")
+            );
+            assert_eq!(
+                result
+                    .dependencies
+                    .get("qemu-img")
+                    .map(|value| value.sha256.as_str()),
+                Some("30bff329fe1001635cafcfebddc68a1c824d25110c66f968b428c4cf4785d75d")
+            );
+        }
         let cloud_hypervisor = result
             .dependencies
             .get("cloud-hypervisor")

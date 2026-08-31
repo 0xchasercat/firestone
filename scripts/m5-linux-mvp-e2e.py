@@ -63,7 +63,7 @@ EXPECTED_FILE_HASHES = {
     "build/firestone/versions.env": "65b2beb19b2cea5e93ece587f60f05171f49111221e3220aac65867095fca6df",
     "catalog/images.toml": "89f3e1827ed143e02da6d90e8c18bc28f273fcaba9cc301db663dac9cc4d3acf",
     "deps.toml": "57019e51437d3b5129f26803acf3d186e4c4c4ea79d869aa386c9b7e69156c74",
-    "docs/verification/doctor-matrix.md": "37c62e94152d89387cd08e8947efac06bc984e31ae68a87d26030f9438451c99",
+    "docs/verification/doctor-matrix.md": "c3254636863e741ae237f61b86b1fca0bbc8d097f1f40f799d090325e4eeb844",
     "scripts/m1-kvm-e2e.py": "719660526334393f2cb5df6b0b7d2eaf5a106f6e41674fdf3feb9476da11d124",
     "scripts/m2-kvm-e2e.py": "152a8f0ae19a0f46b2415186f545e4109c1d4ca47dbd57e335e0757e72f6d66f",
     "scripts/m3-kvm-e2e.py": "61c6b2d74b3ee609b63409aaaafbf59851340c47d27eb84ba0e629796b7b473f",

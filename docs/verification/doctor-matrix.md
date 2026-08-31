@@ -39,7 +39,7 @@ The harness first gave doctor an empty `PATH` while leaving `/etc/os-release`, `
 | passt | fail | distribution-specific install or source-build hint; no unverified `fix` field |
 | qemu-img | fail | exact apt, dnf, or pacman package command |
 | OpenSSH | fail | exact apt, dnf, or pacman package command |
-| user namespaces | warn | `unshare` absent from the isolated path; `--sandbox none` hint |
+| user namespaces | warn | passt is unavailable, so the result is inconclusive; hint states that generic `unshare` alone is not proof |
 | Firestone SSH key | fail | fix exactly `firestone doctor --fix` |
 | data space | warn | 1,073,729,536 bytes available, below 5 GiB; free-space hint |
 | stale state | ok | no pre-existing Firestone machine state |
@@ -64,7 +64,7 @@ Each row ran as uid 10001 with a one-GiB tmpfs home. Command traps named `sudo`,
 
 The package database and executable ownership facts were byte-for-byte equal before and after. The fake KVM file's device, inode, uid, gid, and mode were unchanged. The runtime result changed from fail to a warning that named the secure `/tmp/firestone-10001` fallback. Vendored binaries, virtiofsd, qemu-img, OpenSSH, and the Firestone key changed to ok.
 
-Ubuntu kept the expected passt failure because the installed package is too old. Fedora and Arch passed passt. User namespaces followed the actual container result: Ubuntu and Fedora warned after `unshare -U true` was denied; the local Arch run used Docker's unconfined seccomp option for x86_64 emulation and `unshare` succeeded, so doctor reported ok. The harness calculates this expectation from a real `unshare` invocation rather than assuming all containers behave alike.
+Ubuntu kept the expected passt failure because the installed package is too old. Fedora and Arch passed passt. User-namespace authority now comes from passt's mandatory namespace stage together with kernel, AppArmor, seccomp/container, and correlated audit facts; the matrix retains `unshare -U true` only as a comparison and does not force doctor status from that generic probe. Inconclusive results must state that generic unshare alone is not proof, and every result records that qemu-img is independent of user namespaces.
 
 ## Reproduce locally
 
