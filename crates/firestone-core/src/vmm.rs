@@ -8,8 +8,9 @@ use serde::{Serialize, Serializer};
 use serde_json::{Map, Value};
 
 use crate::{
-    Arch, CatalogFirmware, DependencyManifest, ErrorKind, FirestoneError, Firmware, MacAddr,
-    MachineSpec, MachineState, NetworkPlan, Paths, VirtiofsPlan, atomic,
+    Arch, CatalogFirmware, DependencyArtifact, DependencyManifest, ErrorKind, FirestoneError,
+    Firmware, MacAddr, MachineSpec, MachineState, NetworkPlan, Paths, VirtiofsPlan, atomic,
+    embedded_helpers::verified_pinned_artifact,
     virtiofs::{VIRTIOFS_NUM_QUEUES, VIRTIOFS_QUEUE_SIZE},
 };
 
@@ -376,20 +377,18 @@ fn resolve_payload(
     );
     match effective {
         EffectiveFirmware::Rhf => {
-            let path = installed_firmware(
-                paths,
-                manifest,
-                "rust-hypervisor-firmware",
-                input.architecture,
-            )?;
+            let artifact =
+                manifest.artifact("rust-hypervisor-firmware", input.architecture.as_str())?;
+            let path = installed_firmware(paths, &artifact)?;
             Ok(PayloadConfig {
                 firmware: None,
                 kernel: Some(path),
             })
         }
         EffectiveFirmware::Edk2 => {
-            let path =
-                installed_firmware(paths, manifest, "cloud-hypervisor-edk2", input.architecture)?;
+            let artifact =
+                manifest.artifact("cloud-hypervisor-edk2", input.architecture.as_str())?;
+            let path = installed_firmware(paths, &artifact)?;
             Ok(PayloadConfig {
                 firmware: Some(path),
                 kernel: None,
@@ -403,7 +402,7 @@ fn resolve_payload(
                 )
                 .with_hint("resolve custom firmware through Paths before building VmConfig"));
             }
-            require_regular_firmware(path, false)?;
+            require_custom_firmware(path)?;
             Ok(PayloadConfig {
                 firmware: Some(path.to_path_buf()),
                 kernel: None,
@@ -436,56 +435,46 @@ fn effective_firmware(
     }
 }
 
-fn installed_firmware(
-    paths: &Paths,
+/// Resolves the one Firestone-owned firmware artifact needed for this start.
+/// Custom firmware paths remain entirely user-managed.
+pub(crate) fn selected_pinned_firmware(
     manifest: &DependencyManifest,
-    dependency: &str,
+    firmware: &Firmware,
     architecture: Arch,
-) -> Result<PathBuf, FirestoneError> {
-    paths.validate_bin_data_directory()?;
-    let artifact = manifest.artifact(dependency, architecture.as_str())?;
-    let path = paths.binary_file(&artifact.install_name)?;
-    require_regular_firmware(&path, true)?;
-    Ok(path)
+    catalog_firmware: Option<CatalogFirmware>,
+) -> Result<Option<DependencyArtifact>, FirestoneError> {
+    let dependency = match effective_firmware(firmware, architecture, catalog_firmware) {
+        EffectiveFirmware::Rhf => "rust-hypervisor-firmware",
+        EffectiveFirmware::Edk2 => "cloud-hypervisor-edk2",
+        EffectiveFirmware::Custom(_) => return Ok(None),
+    };
+    manifest
+        .artifact(dependency, architecture.as_str())
+        .map(Some)
 }
 
-fn require_regular_firmware(path: &Path, installed: bool) -> Result<(), FirestoneError> {
+fn installed_firmware(
+    paths: &Paths,
+    artifact: &DependencyArtifact,
+) -> Result<PathBuf, FirestoneError> {
+    verified_pinned_artifact(paths, artifact)
+}
+
+fn require_custom_firmware(path: &Path) -> Result<(), FirestoneError> {
     let metadata = fs::symlink_metadata(path).map_err(|source| {
-        let (kind, hint) = if installed {
-            (
-                ErrorKind::Dependency,
-                "run `firestone doctor --fix` to install the pinned firmware",
-            )
-        } else {
-            (
-                ErrorKind::InvalidSpec,
-                "correct vmm.firmware to an existing regular file",
-            )
-        };
         FirestoneError::new(
-            kind,
+            ErrorKind::InvalidSpec,
             format!("firmware file {} is unavailable", path.display()),
         )
-        .with_hint(hint)
+        .with_hint("correct vmm.firmware to an existing regular file")
         .with_source(source)
     })?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        let (kind, hint) = if installed {
-            (
-                ErrorKind::Dependency,
-                "run `firestone doctor --fix` to reinstall the pinned firmware",
-            )
-        } else {
-            (
-                ErrorKind::InvalidSpec,
-                "set vmm.firmware to an existing regular file",
-            )
-        };
         return Err(FirestoneError::new(
-            kind,
+            ErrorKind::InvalidSpec,
             format!("firmware path {} is not a regular file", path.display()),
         )
-        .with_hint(hint));
+        .with_hint("set vmm.firmware to an existing regular file"));
     }
     Ok(())
 }
@@ -704,6 +693,7 @@ mod tests {
         prepare_network, prepare_virtiofs_plans,
     };
     use serde_json::{Value, json};
+    use sha2::{Digest as _, Sha256};
     use tempfile::TempDir;
 
     static NO_NETWORK: NetworkPlan = NetworkPlan::None;
@@ -737,6 +727,65 @@ mod tests {
         ))
     }
 
+    const FIRMWARE_FIXTURE: &[u8] = b"firmware fixture";
+    const VIRTIOFSD_FIXTURE: &[u8] = b"virtiofsd fixture";
+
+    fn fixture_manifest() -> Result<DependencyManifest, crate::FirestoneError> {
+        let firmware_sha = format!("{:x}", Sha256::digest(FIRMWARE_FIXTURE));
+        let virtiofsd_sha = format!("{:x}", Sha256::digest(VIRTIOFSD_FIXTURE));
+        DependencyManifest::parse(&format!(
+            r#"manifest_version = 1
+
+[dependency.rust-hypervisor-firmware]
+version = "0.5.0"
+availability = "binary"
+[dependency.rust-hypervisor-firmware.x86_64]
+asset = "hypervisor-fw"
+install_name = "hypervisor-fw-0.5.0"
+url = "https://example.invalid/hypervisor-fw-x86_64"
+sha256 = "{firmware_sha}"
+[dependency.rust-hypervisor-firmware.aarch64]
+asset = "hypervisor-fw"
+install_name = "hypervisor-fw-0.5.0"
+url = "https://example.invalid/hypervisor-fw-aarch64"
+sha256 = "{firmware_sha}"
+
+[dependency.cloud-hypervisor-edk2]
+version = "ch-test"
+availability = "binary"
+[dependency.cloud-hypervisor-edk2.x86_64]
+asset = "CLOUDHV.fd"
+install_name = "CLOUDHV-ch-test.fd"
+url = "https://example.invalid/edk2-x86_64"
+sha256 = "{firmware_sha}"
+[dependency.cloud-hypervisor-edk2.aarch64]
+asset = "CLOUDHV_EFI.fd"
+install_name = "CLOUDHV_EFI-ch-test.fd"
+url = "https://example.invalid/edk2-aarch64"
+sha256 = "{firmware_sha}"
+
+[dependency.virtiofsd]
+version = "v1.14.0"
+availability = "binary"
+[dependency.virtiofsd.x86_64]
+asset = "virtiofsd"
+install_name = "virtiofsd-v1.14.0"
+url = "https://example.invalid/virtiofsd"
+sha256 = "{virtiofsd_sha}"
+"#,
+        ))
+    }
+
+    fn fixture_artifact_bytes(dependency: &str) -> Result<&'static [u8], io::Error> {
+        match dependency {
+            "rust-hypervisor-firmware" | "cloud-hypervisor-edk2" => Ok(FIRMWARE_FIXTURE),
+            "virtiofsd" => Ok(VIRTIOFSD_FIXTURE),
+            other => Err(io::Error::other(format!(
+                "no fixture bytes for dependency {other}"
+            ))),
+        }
+    }
+
     struct Fixture {
         _temp: TempDir,
         paths: Paths,
@@ -768,7 +817,7 @@ mod tests {
             Ok(Self {
                 _temp: temp,
                 paths,
-                manifest: DependencyManifest::bundled()?,
+                manifest: fixture_manifest()?,
             })
         }
 
@@ -779,7 +828,8 @@ mod tests {
         ) -> Result<PathBuf, Box<dyn std::error::Error>> {
             let artifact = self.manifest.artifact(dependency, architecture.as_str())?;
             let path = self.paths.binary_file(&artifact.install_name)?;
-            fs::write(&path, b"firmware fixture")?;
+            fs::write(&path, fixture_artifact_bytes(dependency)?)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(artifact.expected_mode()))?;
             Ok(path)
         }
     }
@@ -1516,6 +1566,29 @@ mod tests {
     }
 
     #[test]
+    fn installed_firmware_checksum_mismatch_refuses_vmconfig_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let installed = fixture.install("rust-hypervisor-firmware", Arch::X86_64)?;
+        fs::write(&installed, b"tampered firmware")?;
+        fs::set_permissions(&installed, fs::Permissions::from_mode(0o644))?;
+        let spec = MachineSpec::default();
+        let state = state(&fixture.paths)?;
+
+        let error = publish_vm_config(
+            &fixture.paths,
+            &fixture.manifest,
+            input(&spec, &state, Arch::X86_64, None),
+        )
+        .err()
+        .ok_or("tampered firmware should fail")?;
+
+        assert_eq!(error.kind(), ErrorKind::Checksum);
+        assert!(!fixture.paths.machine_vmconfig("demo")?.exists());
+        Ok(())
+    }
+
+    #[test]
     fn missing_installed_firmware_returns_actionable_dependency_error()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::new()?;
@@ -1531,10 +1604,14 @@ mod tests {
         .ok_or("missing firmware should fail")?;
 
         assert_eq!(error.kind(), ErrorKind::Dependency);
-        assert!(error.message().contains("firmware file"));
+        assert!(
+            error
+                .message()
+                .contains("pinned 'rust-hypervisor-firmware'")
+        );
         assert_eq!(
             error.hint(),
-            Some("run `firestone doctor --fix` to install the pinned firmware")
+            Some("retry start so Firestone can install the selected pinned firmware")
         );
         Ok(())
     }
