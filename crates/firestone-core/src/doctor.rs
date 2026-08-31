@@ -1573,7 +1573,8 @@ fn passt_userns_probe(context: &DoctorContext) -> PasstUsernsProbe {
         Ok(Some(selected)) => selected,
         Ok(None) => {
             return PasstUsernsProbe::Inconclusive(
-                "passt is unavailable, so its mandatory userns stage was not tested".to_owned(),
+                "passt is unavailable, so its mandatory isolation stages were not tested"
+                    .to_owned(),
             );
         }
         Err(error) => {
@@ -1592,49 +1593,48 @@ fn passt_userns_probe(context: &DoctorContext) -> PasstUsernsProbe {
         }
     };
     let socket = probe_dir.path().join("net.sock");
+    let log = probe_dir.path().join("passt.log");
     let output = Cmd::new(program)
-        .args(["--foreground", "--one-off", "--socket-path"])
+        .args(["--foreground", "--one-off", "--vhost-user", "--socket"])
         .arg(socket.as_os_str())
-        .args(["--tcp-ports", "none", "--udp-ports", "none"])
+        .arg("--log-file")
+        .arg(log.as_os_str())
+        .args(["--repair-path", "none"])
+        .cwd("/")
         .stdin_null()
         .timeout(PASST_USERNS_PROBE_TIMEOUT)
         .capture_limit(PASST_USERNS_STDERR_BYTES)
         .error_kind(ErrorKind::Dependency)
+        .reduced_environment()
         .output();
     match output {
         Ok(output) => {
-            let stderr = bounded_stderr(&output);
-            if stderr.contains(PASST_USERNS_FAILURE) {
+            let diagnostics = passt_probe_diagnostics(bounded_stderr(&output), &log);
+            if diagnostics.contains(PASST_USERNS_FAILURE)
+                || diagnostics.contains(PASST_LATER_ISOLATION_FAILURE)
+            {
                 PasstUsernsProbe::Denied {
                     pid: Some(output.pid()),
-                    stderr,
+                    stderr: diagnostics,
                 }
-            } else if stderr.contains(PASST_LATER_ISOLATION_FAILURE) {
-                PasstUsernsProbe::Available(format!(
-                    "passt pid {} reached the later namespace-detach stage after userns creation",
-                    output.pid()
-                ))
             } else {
                 PasstUsernsProbe::Inconclusive(format!(
-                    "passt exited before a recognized userns stage: {stderr}"
+                    "passt exited before proving usable runtime isolation: {diagnostics}"
                 ))
             }
         }
         Err(error) if error.kind() == ErrorKind::Timeout => {
-            let detail = error.message();
-            if detail.contains(PASST_USERNS_FAILURE) {
+            let diagnostics = passt_probe_diagnostics(bounded_text(error.message()), &log);
+            if diagnostics.contains(PASST_USERNS_FAILURE)
+                || diagnostics.contains(PASST_LATER_ISOLATION_FAILURE)
+            {
                 PasstUsernsProbe::Denied {
                     pid: None,
-                    stderr: bounded_text(detail),
+                    stderr: diagnostics,
                 }
-            } else if detail.contains(PASST_LATER_ISOLATION_FAILURE) {
-                PasstUsernsProbe::Available(
-                    "passt reached the later namespace-detach stage after userns creation"
-                        .to_owned(),
-                )
             } else if exact_pinned {
                 PasstUsernsProbe::Available(format!(
-                    "pinned passt remained active for {} ms after its synchronous userns stage",
+                    "pinned passt remained active in vhost-user mode for {} ms after its synchronous isolation stages",
                     PASST_USERNS_PROBE_TIMEOUT.as_millis()
                 ))
             } else {
@@ -1645,10 +1645,20 @@ fn passt_userns_probe(context: &DoctorContext) -> PasstUsernsProbe {
             }
         }
         Err(error) => PasstUsernsProbe::Inconclusive(format!(
-            "cannot run the bounded passt userns probe: {}",
+            "cannot run the bounded passt isolation probe: {}",
             firestone_error_reason(&error)
         )),
     }
+}
+
+fn passt_probe_diagnostics(mut stderr: String, log: &Path) -> String {
+    if let Ok(contents) = read_tail_text(log, PASST_USERNS_STDERR_BYTES as u64) {
+        if !contents.trim().is_empty() {
+            stderr.push_str("; passt log: ");
+            stderr.push_str(&bounded_text(&contents));
+        }
+    }
+    stderr
 }
 
 fn bounded_stderr(output: &crate::CmdOutput) -> String {
@@ -1776,10 +1786,10 @@ fn diagnose_user_namespaces(context: &DoctorContext) -> UserNamespaceDiagnosis {
         PasstUsernsProbe::Available(evidence) => UserNamespaceDiagnosis {
             status: DoctorStatus::Ok,
             reason: format!(
-                "passt userns creation confirmed: {evidence}; {facts}; {qemu_note}"
+                "passt runtime isolation is usable: {evidence}; {facts}; {qemu_note}"
             ),
             apparmor_remediation: false,
-            hint: "passt can use its mandatory user namespace stage".to_owned(),
+            hint: "passt can enter the isolation mode used at runtime".to_owned(),
         },
         PasstUsernsProbe::Denied { pid, stderr } => {
             let audit = correlated_audit_evidence(context, pid, probe_started);
@@ -1788,7 +1798,7 @@ fn diagnose_user_namespaces(context: &DoctorContext) -> UserNamespaceDiagnosis {
                 AuditEvidence::Correlated(path) => UserNamespaceDiagnosis {
                     status: DoctorStatus::Fail,
                     reason: format!(
-                        "confirmed AppArmor userns denial: correlated passt pid audit record in {}; passt stderr: {stderr}; {facts}; {qemu_note}",
+                        "confirmed AppArmor passt isolation denial: correlated passt pid audit record in {}; passt diagnostics: {stderr}; {facts}; {qemu_note}",
                         path.display()
                     ),
                     apparmor_remediation: true,
@@ -1807,7 +1817,7 @@ fn diagnose_user_namespaces(context: &DoctorContext) -> UserNamespaceDiagnosis {
                     UserNamespaceDiagnosis {
                         status: DoctorStatus::Fail,
                         reason: format!(
-                            "passt userns denial is consistent with AppArmor but not confirmed: {audit_detail}; passt stderr: {stderr}; {facts}; {qemu_note}"
+                            "passt runtime isolation denial is consistent with AppArmor but not confirmed: {audit_detail}; passt diagnostics: {stderr}; {facts}; {qemu_note}"
                         ),
                         apparmor_remediation: true,
                         hint: format!(
@@ -1821,7 +1831,7 @@ fn diagnose_user_namespaces(context: &DoctorContext) -> UserNamespaceDiagnosis {
                     UserNamespaceDiagnosis {
                         status: DoctorStatus::Fail,
                         reason: format!(
-                            "passt confirmed userns creation failed; container or seccomp policy is consistent with the denial, but the cause is not confirmed; passt stderr: {stderr}; {facts}; {qemu_note}"
+                            "passt runtime isolation failed; container or seccomp policy is consistent with the denial, but the cause is not confirmed; passt diagnostics: {stderr}; {facts}; {qemu_note}"
                         ),
                         apparmor_remediation: false,
                         hint: "inspect the outer container seccomp and namespace policy; Firestone does not weaken it or change sysctls".to_owned(),
@@ -1831,7 +1841,7 @@ fn diagnose_user_namespaces(context: &DoctorContext) -> UserNamespaceDiagnosis {
                     UserNamespaceDiagnosis {
                         status: DoctorStatus::Fail,
                         reason: format!(
-                            "passt confirmed userns creation failed, but the denying policy is not confirmed; passt stderr: {stderr}; {facts}; {qemu_note}"
+                            "passt runtime isolation failed, but the denying policy is not confirmed; passt diagnostics: {stderr}; {facts}; {qemu_note}"
                         ),
                         apparmor_remediation: false,
                         hint: "inspect host userns policy and readable audit logs; a generic unshare result is not authoritative for passt".to_owned(),
@@ -1842,7 +1852,7 @@ fn diagnose_user_namespaces(context: &DoctorContext) -> UserNamespaceDiagnosis {
         PasstUsernsProbe::Inconclusive(detail) => UserNamespaceDiagnosis {
             status: DoctorStatus::Warn,
             reason: format!(
-                "passt userns result is inconclusive: {detail}; {facts}; {qemu_note}"
+                "passt runtime isolation result is inconclusive: {detail}; {facts}; {qemu_note}"
             ),
             apparmor_remediation: false,
             hint: "repair or install the pinned passt helper and retry; generic unshare alone is not proof".to_owned(),
@@ -1850,7 +1860,7 @@ fn diagnose_user_namespaces(context: &DoctorContext) -> UserNamespaceDiagnosis {
     }
 }
 
-/// Checks passt's mandatory first user namespace stage and reports policy facts.
+/// Checks every mandatory passt isolation stage in the mode used at runtime.
 fn check_user_namespaces(context: &DoctorContext) -> DoctorCheck {
     let diagnosis = diagnose_user_namespaces(context);
     let mut check = DoctorCheck::new(
@@ -3447,8 +3457,7 @@ Seccomp:	0
                 &fake_bin.join("passt"),
                 r#"case "$1" in --version) printf 'passt 2025_02_17.a1e48a0
 ' ;; --help) printf '%s
-' '--foreground --one-off --vhost-user --socket-path --repair-path --log-file' ;; --tcp-ports) exit 0 ;; --foreground) printf 'Failed to detach isolating namespaces: Operation not permitted
-' >&2; exit 1 ;; *) exit 2 ;; esac"#,
+' '--foreground --one-off --vhost-user --socket-path --repair-path --log-file' ;; --tcp-ports) exit 0 ;; --foreground) sleep 3 ;; *) exit 2 ;; esac"#,
             )?;
             write_executable(&fake_bin.join("qemu-img"), "printf 'qemu-img fixture\\n'")?;
             write_executable(&fake_bin.join("ssh"), "printf 'OpenSSH fixture\\n' >&2")?;
@@ -3567,8 +3576,11 @@ case "$1" in
   --help) printf '%s
 ' '--foreground --one-off --vhost-user --socket-path --repair-path --log-file' ;;
   --tcp-ports) exit 0 ;;
-  --foreground) printf "Failed to detach isolating namespaces: Operation not permitted
-" >&2; exit 1 ;;
+  --foreground)
+    case "$0" in
+      */system/usr/libexec/firestone/passt-*) sleep 3 ;;
+      *) printf "Failed to detach isolating namespaces: Operation not permitted\n" >&2; exit 1 ;;
+    esac ;;
   *) exit 2 ;;
 esac
 "#
@@ -4399,17 +4411,42 @@ fi"#,
     }
 
     #[test]
-    fn passt_later_isolation_failure_proves_userns_succeeded()
+    fn passt_later_isolation_failure_is_denied_in_runtime_mode()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::healthy()?;
+        fs::write(&fixture.context.apparmor_enabled, "Y\n")?;
+        fs::write(&fixture.context.apparmor_restrict_userns, "1\n")?;
         let unshare = PathBuf::from(&fixture.context.search_path).join("unshare");
         write_executable(&unshare, "printf generic-unshare-failed >&2; exit 77")?;
+        let arguments = fixture.context.paths.runtime_dir().join("passt-probe-args");
+        let passt = PathBuf::from(&fixture.context.search_path).join("passt");
+        write_executable(
+            &passt,
+            &format!(
+                r#"case "$1" in
+  --version) printf 'passt 2025_02_17.a1e48a0\n' ;;
+  --foreground) printf '%s\n' "$@" > '{}'; printf 'Failed to detach isolating namespaces: Operation not permitted\n' >&2; exit 1 ;;
+  *) exit 2 ;;
+esac"#,
+                arguments.display()
+            ),
+        )?;
 
         let check = check_user_namespaces(&fixture.context);
 
-        assert_eq!(check.status, DoctorStatus::Ok);
-        assert!(check.reason.contains("later namespace-detach stage"));
-        assert!(check.reason.contains("self_seccomp=0"));
+        assert_eq!(check.status, DoctorStatus::Fail);
+        assert!(check.reason.contains(super::PASST_LATER_ISOLATION_FAILURE));
+        assert_eq!(check.fix.as_deref(), Some("firestone doctor --fix"));
+        let actual = fs::read_to_string(arguments)?
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &actual[..4],
+            ["--foreground", "--one-off", "--vhost-user", "--socket"]
+        );
+        assert_eq!(&actual[actual.len() - 2..], ["--repair-path", "none"]);
+        assert!(actual.iter().any(|argument| argument == "--log-file"));
         Ok(())
     }
 
@@ -4520,12 +4557,16 @@ fi"#,
         let check = check_user_namespaces(&fixture.context);
 
         assert_eq!(check.status, DoctorStatus::Fail);
-        assert!(check.reason.contains("confirmed AppArmor userns denial"));
+        assert!(
+            check
+                .reason
+                .contains("confirmed AppArmor passt isolation denial")
+        );
         assert!(check.reason.contains(&audit.display().to_string()));
         Ok(())
     }
     #[test]
-    fn verified_passt_requires_exact_bytes_root_identity_and_loaded_literal_profile()
+    fn repaired_passt_resolution_requires_exact_bytes_and_loaded_literal_profile()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut fixture = Fixture::healthy()?;
         let source = provide_extracted_passt(&mut fixture)?;
@@ -4576,6 +4617,10 @@ fi"#,
         assert!(!APPARMOR_PASST_PROFILE_CONTENT.contains('*'));
         let path_passt = PathBuf::from(&fixture.context.search_path).join("passt");
         fs::remove_file(path_passt)?;
+        let (selected, exact_pinned) = super::selected_passt(&fixture.context)?
+            .ok_or("verified AppArmor passt was not selected")?;
+        assert_eq!(selected, fixture.context.apparmor_passt_executable);
+        assert!(exact_pinned);
         let passt_check = check_passt(&fixture.context);
         assert_eq!(passt_check.status, DoctorStatus::Ok, "{passt_check:#?}");
         assert!(passt_check.reason.contains(crate::PINNED_PASST_VERSION));
@@ -4644,7 +4689,7 @@ fi"#,
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn confirmed_apparmor_fix_routes_fake_privileged_commands_and_rechecks()
+    fn confirmed_apparmor_fix_selects_authorized_pinned_binary_and_rechecks()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut fixture = Fixture::healthy()?;
         configure_apparmor_passt_denial(&fixture)?;
@@ -4697,7 +4742,11 @@ printf '{} (unconfined)
 
         let userns = check(&report, DoctorCheckId::UserNamespaces);
         assert_eq!(userns.status, DoctorStatus::Ok, "{userns:#?}");
-        assert!(userns.reason.contains("userns creation confirmed"));
+        assert!(userns.reason.contains("runtime isolation is usable"));
+        let (selected, exact_pinned) =
+            super::selected_passt(&fixture.context)?.ok_or("repaired passt was not selected")?;
+        assert_eq!(selected, fixture.context.apparmor_passt_executable);
+        assert!(exact_pinned);
         assert_eq!(
             fs::read(&fixture.context.apparmor_passt_executable)?,
             fs::read(source)?
