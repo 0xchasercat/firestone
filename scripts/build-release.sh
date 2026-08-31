@@ -144,16 +144,19 @@ readonly musl_headers_url musl_headers_sha
 deps_manifest="$repository_root/deps.toml"
 helper_docker_env=()
 if [[ $target_arch == x86_64 ]]; then
+    cloud_hypervisor_asset=$(manifest_value dependency.cloud-hypervisor.x86_64 asset "$deps_manifest")
+    cloud_hypervisor_url=$(manifest_value dependency.cloud-hypervisor.x86_64 url "$deps_manifest")
+    cloud_hypervisor_sha=$(manifest_value dependency.cloud-hypervisor.x86_64 sha256 "$deps_manifest")
     passt_asset=$(manifest_value dependency.passt.x86_64 asset "$deps_manifest")
     passt_url=$(manifest_value dependency.passt.x86_64 url "$deps_manifest")
     passt_sha=$(manifest_value dependency.passt.x86_64 sha256 "$deps_manifest")
     qemu_img_asset=$(manifest_value dependency.qemu-img.x86_64 asset "$deps_manifest")
     qemu_img_url=$(manifest_value dependency.qemu-img.x86_64 url "$deps_manifest")
     qemu_img_sha=$(manifest_value dependency.qemu-img.x86_64 sha256 "$deps_manifest")
-    for value in "$passt_asset" "$qemu_img_asset"; do
+    for value in "$cloud_hypervisor_asset" "$passt_asset" "$qemu_img_asset"; do
         [[ -n $value && $value != */* ]] || fail "invalid embedded helper asset name '$value'"
     done
-    for value in "$passt_sha" "$qemu_img_sha"; do
+    for value in "$cloud_hypervisor_sha" "$passt_sha" "$qemu_img_sha"; do
         [[ $value =~ ^[0-9a-f]{64}$ ]] || fail "invalid embedded helper checksum '$value'"
     done
     helper_docker_env=(
@@ -197,6 +200,7 @@ trap cleanup EXIT
 mkdir -p "$work_dir/cargo-home" "$work_dir/home" "$work_dir/inputs" "$work_dir/target"
 download "$musl_headers_url" "$musl_headers_sha" "$work_dir/inputs/musl-dev.apk"
 if [[ $target_arch == x86_64 ]]; then
+    download "$cloud_hypervisor_url" "$cloud_hypervisor_sha" "$work_dir/inputs/$cloud_hypervisor_asset"
     download "$passt_url" "$passt_sha" "$work_dir/inputs/$passt_asset"
     download "$qemu_img_url" "$qemu_img_sha" "$work_dir/inputs/$qemu_img_asset"
 fi

@@ -98,10 +98,12 @@ jobs:
           (cd "$RUNNER_TEMP/run-1" && sha256sum -c SHA256SUMS)
           (cd "$RUNNER_TEMP/run-2" && sha256sum -c SHA256SUMS)
 
-      - name: Smoke x86_64 version, completions, and help
+      - name: Smoke x86_64 version, embedded VMM, completions, and help
         if: matrix.arch == 'x86_64'
         env:
           ARTIFACT: firestone-v0.1.0-x86_64-unknown-linux-musl
+          CLOUD_HYPERVISOR_INSTALL_NAME: cloud-hypervisor-v53.0
+          CLOUD_HYPERVISOR_SHA256: 448af3d4e59b22c2987f7df94c213ad40fb53a10d437e42b5ee6c4fce7c29ecc
         run: |
           set -euo pipefail
           binary="$RUNNER_TEMP/run-1/$ARTIFACT"
@@ -118,6 +120,19 @@ jobs:
             *"\"architecture\":\"x86_64\""*"\"git_commit\":\"$GITHUB_SHA\""*) ;;
             *) printf '%s\n' "$json_output" >&2; exit 1 ;;
           esac
+          set +e
+          FIRESTONE_HOME="$home" "$binary" doctor --fix \
+            >"$RUNNER_TEMP/doctor.stdout" 2>"$RUNNER_TEMP/doctor.stderr"
+          doctor_status=$?
+          set -e
+          case "$doctor_status" in
+            0 | 5) ;;
+            *) cat "$RUNNER_TEMP/doctor.stdout" "$RUNNER_TEMP/doctor.stderr" >&2; exit 1 ;;
+          esac
+          vmm="$home/data/bin/$CLOUD_HYPERVISOR_INSTALL_NAME"
+          test "$(stat -c %a "$vmm")" = 755
+          printf '%s  %s\n' "$CLOUD_HYPERVISOR_SHA256" "$vmm" | sha256sum -c -
+          test "$("$vmm" --version | sed -n '1p')" = 'cloud-hypervisor v53.0'
           for shell in bash elvish fish powershell zsh; do
             output="$RUNNER_TEMP/completions.$shell"
             "$binary" completions "$shell" >"$output"

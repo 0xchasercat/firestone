@@ -695,6 +695,11 @@ impl LocalDispatcher {
             .unwrap_or_else(|| "localhost".to_owned());
         let manifest = DependencyManifest::bundled()?;
         let extracted_passt = if fix {
+            let _ = firestone_core::materialize_embedded_helper(
+                &self.paths,
+                InternalHelper::CloudHypervisor,
+            )?;
+
             let _ =
                 firestone_core::materialize_embedded_helper(&self.paths, InternalHelper::QemuImg)?;
             match firestone_core::materialize_embedded_helper(&self.paths, InternalHelper::Passt)? {
