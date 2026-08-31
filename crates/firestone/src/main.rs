@@ -1531,8 +1531,6 @@ where
         None => catalog.entry("ubuntu").and_then(entry_index).unwrap_or(0),
     };
 
-    let stdin = io::stdin();
-    let mut raw_terminal = RawTerminal::enter(&stdin)?;
     let selection = Select::new()
         .with_prompt("Image")
         .items(&labels)
@@ -1549,13 +1547,7 @@ where
             )
             .with_hint("check the terminal input and run firestone create again")
             .with_source(source),
-        });
-    let restored = raw_terminal.restore();
-    let selection = match (selection, restored) {
-        (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
-        (Ok(selection), Ok(())) => selection,
-    };
-
+        })?;
     if selection == custom_index {
         let default = current.filter(|reference| catalog.entry(reference).is_none());
         return create_prompt(renderer, "Custom image", default).map(ImageRef::from);
