@@ -250,6 +250,14 @@ async fn non_stream_routes_project_exact_actions_statuses_and_payloads() -> Test
         },
         Case {
             method: Method::GET,
+            uri: "/v1/catalog",
+            body: None,
+            result_action: "catalog",
+            expected_action: Action::CatalogList,
+            status: StatusCode::OK,
+        },
+        Case {
+            method: Method::GET,
             uri: "/v1/images",
             body: None,
             result_action: "images-ls",

@@ -215,6 +215,12 @@ impl Catalog {
     pub fn contains_reference(&self, reference: &str) -> bool {
         self.find(reference).is_some()
     }
+
+    /// Finds a canonical, default, or alias reference without selecting an architecture.
+    #[must_use]
+    pub fn entry(&self, reference: &str) -> Option<&CatalogEntry> {
+        self.find(reference)
+    }
     /// Iterates over canonical entries in lexical `distro:version` order.
     pub fn entries(&self) -> impl ExactSizeIterator<Item = &CatalogEntry> {
         self.entries.values()

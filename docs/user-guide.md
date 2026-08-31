@@ -89,7 +89,7 @@ Create without booting:
 ```sh
 firestone create dev ubuntu --cpus 4 --memory 4G --disk 40G
 ```
-On a terminal, `create` opens a guided image, name, CPU, memory, disk, and network flow. Supplied arguments become the shown defaults. Pass `--yes` to skip the wizard; `--json` and non-terminal invocations are always deterministic and non-interactive.
+On a terminal, `create` starts with an arrow-key selector over the merged catalog. Choose the final custom option for an HTTPS URL or local path, then continue through name, CPU, memory, disk, and network prompts. Supplied arguments become the shown defaults. Pass `--yes` to skip the wizard; `--json` and non-terminal invocations are always deterministic and non-interactive.
 
 After publication, human output prints the effective image/resources/network, forwards, mounts, exact `firestone.toml` path, and ready-to-run `firestone edit NAME` and `firestone start NAME` commands. `firestone create --help` lists every equivalent configuration flag.
 
@@ -130,6 +130,14 @@ firestone rm dev
 ## Images and the built-in catalog
 
 The Linux MVP catalog has only the releases authorized by [SPEC section 8.1](../SPEC.md). Every x86_64 source uses a dated vendor build, its matching checksum document, edk2, login user `root`, and `/usr/sbin/sshd`.
+
+Print the catalog Firestone will actually resolve before creating a machine:
+
+```sh
+firestone catalog
+```
+
+The table merges the built-in entries with `~/.config/firestone/catalog.toml` and configured extra catalogs. It reports canonical references, aliases, available architectures, and effective firmware; `images ls` remains the separate list of artifacts already downloaded into the owned cache.
 
 | Reference | Aliases and default | Vendor build | Verification |
 |---|---|---|---|

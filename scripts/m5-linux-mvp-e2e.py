@@ -59,8 +59,8 @@ HANDLED_SIGNALS = frozenset({signal.SIGINT, signal.SIGTERM, signal.SIGHUP})
 FINAL_SIGNAL_MASK: set[signal.Signals] | None = None
 
 EXPECTED_FILE_HASHES = {
-    "Cargo.lock": "b2ebf4acaa7900c67a0bf54316aae3a227b6a45b6485940f66e06b6258f4b49b",
-    "build/firestone/versions.env": "09afe5c557cacfc17b05aef9586640c8ebfd5d51110aa8ad93ba254989224803",
+    "Cargo.lock": "e95d68163dd015cf1e98e8b6f03fd82b05afe5d49f6e56d575eb44cf8830d5f5",
+    "build/firestone/versions.env": "b9262638c59f83a5eeb400f8663d8855080af6e4ba063d749a8a14f2a22c5a3a",
     "catalog/images.toml": "89f3e1827ed143e02da6d90e8c18bc28f273fcaba9cc301db663dac9cc4d3acf",
     "deps.toml": "4d58a7623e083da70bf02de702b17d3840ba99fdccffc7ebf110a4ccc9801a65",
     "docs/verification/doctor-matrix.md": "c3254636863e741ae237f61b86b1fca0bbc8d097f1f40f799d090325e4eeb844",

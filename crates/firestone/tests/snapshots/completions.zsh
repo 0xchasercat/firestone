@@ -336,6 +336,21 @@ _arguments "${_arguments_options[@]}" : \
 ':name:_default' \
 && ret=0
 ;;
+(catalog)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
 (images)
 _arguments "${_arguments_options[@]}" : \
 '--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
@@ -610,6 +625,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(catalog)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (images)
 _arguments "${_arguments_options[@]}" : \
 ":: :_firestone__subcmd__help__subcmd__images_commands" \
@@ -693,6 +712,7 @@ _firestone_commands() {
 'ssh-config:Print an OpenSSH Host block for the machine' \
 'console:Attach to the machine'\''s hvc0 console' \
 'logs:Print a bounded machine log' \
+'catalog:Print the merged built-in and user image catalog' \
 'images:Manage the owned image store' \
 'doctor:Check host requirements and optional safe repairs' \
 'completions:Generate a shell completion script on stdout' \
@@ -701,6 +721,11 @@ _firestone_commands() {
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'firestone commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__catalog_commands] )) ||
+_firestone__subcmd__catalog_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone catalog commands' commands "$@"
 }
 (( $+functions[_firestone__subcmd__completions_commands] )) ||
 _firestone__subcmd__completions_commands() {
@@ -743,6 +768,7 @@ _firestone__subcmd__help_commands() {
 'ssh-config:Print an OpenSSH Host block for the machine' \
 'console:Attach to the machine'\''s hvc0 console' \
 'logs:Print a bounded machine log' \
+'catalog:Print the merged built-in and user image catalog' \
 'images:Manage the owned image store' \
 'doctor:Check host requirements and optional safe repairs' \
 'completions:Generate a shell completion script on stdout' \
@@ -751,6 +777,11 @@ _firestone__subcmd__help_commands() {
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'firestone help commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__catalog_commands] )) ||
+_firestone__subcmd__help__subcmd__catalog_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help catalog commands' commands "$@"
 }
 (( $+functions[_firestone__subcmd__help__subcmd__completions_commands] )) ||
 _firestone__subcmd__help__subcmd__completions_commands() {

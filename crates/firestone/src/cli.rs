@@ -93,6 +93,9 @@ pub enum Command {
     /// Print a bounded machine log.
     Logs(LogsArgs),
 
+    /// Print the merged built-in and user image catalog.
+    Catalog,
+
     /// Manage the owned image store.
     Images(ImagesArgs),
 
