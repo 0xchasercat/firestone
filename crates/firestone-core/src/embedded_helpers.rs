@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Read, Seek as _, SeekFrom, Write as _},
+    io::{self, Read, Seek as _, SeekFrom, Write},
     os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
 };
@@ -12,11 +12,67 @@ use nix::{
 use sha2::{Digest as _, Sha256};
 use tempfile::Builder as TempBuilder;
 
-use crate::{ErrorKind, FirestoneError, Paths};
+use crate::{DependencyArtifact, ErrorKind, FirestoneError, Paths};
 
 const HELPER_LOCK_NAME: &str = ".embedded-helpers.lock";
 const EXECUTABLE_MODE: u32 = 0o755;
 const LOCK_MODE: u32 = 0o600;
+
+#[derive(Debug, Clone, Copy)]
+enum ArtifactOrigin {
+    Embedded,
+    Pinned,
+}
+
+impl ArtifactOrigin {
+    const fn adjective(self) -> &'static str {
+        match self {
+            Self::Embedded => "embedded",
+            Self::Pinned => "pinned",
+        }
+    }
+
+    const fn mismatch_hint(self) -> &'static str {
+        match self {
+            Self::Embedded => "remove the named file and retry with an intact Firestone release",
+            Self::Pinned => "remove the named file and retry from a trusted network",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ArtifactIdentity<'a> {
+    dependency: &'a str,
+    install_name: &'a str,
+    sha256: &'a str,
+    mode: u32,
+    expected_length: Option<u64>,
+    origin: ArtifactOrigin,
+}
+
+impl ArtifactIdentity<'_> {
+    fn embedded(helper: EmbeddedHelper) -> ArtifactIdentity<'static> {
+        ArtifactIdentity {
+            dependency: helper.kind().dependency(),
+            install_name: helper.install_name(),
+            sha256: helper.sha256(),
+            mode: EXECUTABLE_MODE,
+            expected_length: Some(helper.bytes().len() as u64),
+            origin: ArtifactOrigin::Embedded,
+        }
+    }
+
+    fn pinned(artifact: &DependencyArtifact) -> ArtifactIdentity<'_> {
+        ArtifactIdentity {
+            dependency: &artifact.dependency,
+            install_name: &artifact.install_name,
+            sha256: &artifact.sha256,
+            mode: artifact.expected_mode(),
+            expected_length: None,
+            origin: ArtifactOrigin::Pinned,
+        }
+    }
+}
 
 /// A helper executable carried inside a standalone Firestone release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,80 +178,128 @@ pub fn materialize_embedded_helper(
 
 fn materialize(paths: &Paths, helper: EmbeddedHelper) -> Result<PathBuf, FirestoneError> {
     verify_payload(helper)?;
+    let identity = ArtifactIdentity::embedded(helper);
+    materialize_with(paths, identity, |output| {
+        output.write_all(helper.bytes()).map_err(|source| {
+            artifact_io_error(identity, "write partial file", &paths.bin_dir(), source)
+        })
+    })
+}
+
+/// Publishes one downloaded manifest artifact through the locked, no-follow
+/// path used for embedded helpers.
+pub(crate) fn install_pinned_artifact_with(
+    paths: &Paths,
+    artifact: &DependencyArtifact,
+    write_source: impl FnOnce(&mut dyn Write) -> Result<(), FirestoneError>,
+) -> Result<PathBuf, FirestoneError> {
+    materialize_with(paths, ArtifactIdentity::pinned(artifact), write_source)
+}
+
+/// Opens and verifies a published manifest artifact without following its
+/// final path component.
+pub(crate) fn verified_pinned_artifact(
+    paths: &Paths,
+    artifact: &DependencyArtifact,
+) -> Result<PathBuf, FirestoneError> {
+    paths.validate_bin_data_directory()?;
+    let identity = ArtifactIdentity::pinned(artifact);
+    let destination = paths.binary_file(identity.install_name)?;
+    if verify_installed(paths, &destination, identity)? {
+        return Ok(destination);
+    }
+    Err(FirestoneError::new(
+        ErrorKind::Dependency,
+        format!(
+            "pinned '{}' is unavailable at {}",
+            identity.dependency,
+            destination.display()
+        ),
+    )
+    .with_hint("retry start so Firestone can install the selected pinned firmware"))
+}
+
+fn materialize_with(
+    paths: &Paths,
+    identity: ArtifactIdentity<'_>,
+    write_source: impl FnOnce(&mut dyn Write) -> Result<(), FirestoneError>,
+) -> Result<PathBuf, FirestoneError> {
     paths.ensure_owned_data_directory(&paths.bin_dir(), "binary directory", true)?;
     paths.validate_bin_data_directory()?;
     let _lock = acquire_helper_lock(paths)?;
     paths.validate_bin_data_directory()?;
 
-    let destination = paths.binary_file(helper.install_name())?;
-    if verify_installed(paths, &destination, helper)? {
+    let destination = paths.binary_file(identity.install_name)?;
+    if verify_installed(paths, &destination, identity)? {
         return Ok(destination);
     }
 
     let mut partial = TempBuilder::new()
-        .prefix(&format!(".{}.", helper.install_name()))
+        .prefix(&format!(".{}.", identity.install_name))
         .suffix(".partial")
         .tempfile_in(paths.bin_dir())
         .map_err(|source| {
-            helper_io_error(helper, "create partial file", &paths.bin_dir(), source)
+            artifact_io_error(identity, "create partial file", &paths.bin_dir(), source)
         })?;
-    partial
-        .as_file_mut()
-        .write_all(helper.bytes())
-        .map_err(|source| helper_io_error(helper, "write partial file", partial.path(), source))?;
-    partial
-        .as_file_mut()
-        .flush()
-        .map_err(|source| helper_io_error(helper, "flush partial file", partial.path(), source))?;
+    write_source(partial.as_file_mut())?;
+    partial.as_file_mut().flush().map_err(|source| {
+        artifact_io_error(identity, "flush partial file", partial.path(), source)
+    })?;
     partial
         .as_file()
-        .set_permissions(fs::Permissions::from_mode(EXECUTABLE_MODE))
-        .map_err(|source| helper_io_error(helper, "set partial mode", partial.path(), source))?;
-    partial
-        .as_file()
-        .sync_all()
-        .map_err(|source| helper_io_error(helper, "sync partial file", partial.path(), source))?;
+        .set_permissions(fs::Permissions::from_mode(identity.mode))
+        .map_err(|source| {
+            artifact_io_error(identity, "set partial mode", partial.path(), source)
+        })?;
+    partial.as_file().sync_all().map_err(|source| {
+        artifact_io_error(identity, "sync partial file", partial.path(), source)
+    })?;
     partial
         .as_file_mut()
         .seek(SeekFrom::Start(0))
-        .map_err(|source| helper_io_error(helper, "rewind partial file", partial.path(), source))?;
-    let readback = sha256_reader(partial.as_file_mut())
-        .map_err(|source| helper_io_error(helper, "hash partial file", partial.path(), source))?;
-    if readback != helper.sha256() {
+        .map_err(|source| {
+            artifact_io_error(identity, "rewind partial file", partial.path(), source)
+        })?;
+    let readback = sha256_reader(partial.as_file_mut()).map_err(|source| {
+        artifact_io_error(identity, "hash partial file", partial.path(), source)
+    })?;
+    if readback != identity.sha256 {
         return Err(FirestoneError::new(
             ErrorKind::Checksum,
             format!(
-                "embedded `{}` partial checksum mismatch: expected {}, got {readback}",
-                helper.kind().dependency(),
-                helper.sha256()
+                "{} '{}' partial checksum mismatch: expected {}, got {readback}",
+                identity.origin.adjective(),
+                identity.dependency,
+                identity.sha256
             ),
         )
-        .with_hint("the partial file was removed; check local memory and storage integrity"));
+        .with_hint(identity.origin.mismatch_hint()));
     }
 
     match partial.persist_noclobber(&destination) {
         Ok(file) => file.sync_all().map_err(|source| {
-            helper_io_error(helper, "sync published file", &destination, source)
+            artifact_io_error(identity, "sync published file", &destination, source)
         })?,
         Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
             drop(error.file);
         }
         Err(error) => {
-            return Err(helper_io_error(
-                helper,
+            return Err(artifact_io_error(
+                identity,
                 "publish partial file",
                 &destination,
                 error.error,
             ));
         }
     }
-    sync_directory(&paths.bin_dir(), helper)?;
-    if !verify_installed(paths, &destination, helper)? {
+    sync_directory(&paths.bin_dir(), identity)?;
+    if !verify_installed(paths, &destination, identity)? {
         return Err(FirestoneError::new(
             ErrorKind::Dependency,
             format!(
-                "embedded `{}` was not present after publication at {}",
-                helper.kind().dependency(),
+                "{} '{}' was not present after publication at {}",
+                identity.origin.adjective(),
+                identity.dependency,
                 destination.display()
             ),
         )
@@ -259,7 +363,7 @@ fn acquire_helper_lock(paths: &Paths) -> Result<Flock<File>, FirestoneError> {
 fn verify_installed(
     paths: &Paths,
     destination: &Path,
-    helper: EmbeddedHelper,
+    identity: ArtifactIdentity<'_>,
 ) -> Result<bool, FirestoneError> {
     let mut options = OpenOptions::new();
     options
@@ -269,8 +373,8 @@ fn verify_installed(
         Ok(file) => file,
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(source) => {
-            return Err(helper_io_error(
-                helper,
+            return Err(artifact_io_error(
+                identity,
                 "open installed file",
                 destination,
                 source,
@@ -279,46 +383,51 @@ fn verify_installed(
     };
     paths.validate_owned_data_file_handle(
         destination,
-        &format!("embedded {}", helper.kind().dependency()),
-        EXECUTABLE_MODE,
+        &format!("{} {}", identity.origin.adjective(), identity.dependency),
+        identity.mode,
         &file,
     )?;
-    let metadata = file
-        .metadata()
-        .map_err(|source| helper_io_error(helper, "inspect installed file", destination, source))?;
-    if metadata.len() != helper.bytes().len() as u64 {
+    let metadata = file.metadata().map_err(|source| {
+        artifact_io_error(identity, "inspect installed file", destination, source)
+    })?;
+    if let Some(expected_length) = identity.expected_length
+        && metadata.len() != expected_length
+    {
         return Err(FirestoneError::new(
             ErrorKind::Checksum,
             format!(
-                "embedded `{}` at {} has length {}; expected {}",
-                helper.kind().dependency(),
+                "{} '{}' at {} has length {}; expected {}",
+                identity.origin.adjective(),
+                identity.dependency,
                 destination.display(),
                 metadata.len(),
-                helper.bytes().len()
+                expected_length
             ),
         )
-        .with_hint("remove the named file and retry with an intact Firestone release"));
+        .with_hint(identity.origin.mismatch_hint()));
     }
-    let actual = sha256_reader(&mut file)
-        .map_err(|source| helper_io_error(helper, "hash installed file", destination, source))?;
-    if actual != helper.sha256() {
+    let actual = sha256_reader(&mut file).map_err(|source| {
+        artifact_io_error(identity, "hash installed file", destination, source)
+    })?;
+    if actual != identity.sha256 {
         return Err(FirestoneError::new(
             ErrorKind::Checksum,
             format!(
-                "embedded `{}` at {} has checksum {actual}; expected {}",
-                helper.kind().dependency(),
+                "{} '{}' at {} has checksum {actual}; expected {}",
+                identity.origin.adjective(),
+                identity.dependency,
                 destination.display(),
-                helper.sha256()
+                identity.sha256
             ),
         )
-        .with_hint("remove the named file and retry with an intact Firestone release"));
+        .with_hint(identity.origin.mismatch_hint()));
     }
     Ok(true)
 }
 
-fn sync_directory(path: &Path, helper: EmbeddedHelper) -> Result<(), FirestoneError> {
+fn sync_directory(path: &Path, identity: ArtifactIdentity<'_>) -> Result<(), FirestoneError> {
     sync_plain_directory(path)
-        .map_err(|source| helper_io_error(helper, "sync binary directory", path, source))
+        .map_err(|source| artifact_io_error(identity, "sync binary directory", path, source))
 }
 
 fn sync_plain_directory(path: &Path) -> io::Result<()> {
@@ -342,8 +451,8 @@ fn sha256_reader(reader: &mut dyn Read) -> io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn helper_io_error(
-    helper: EmbeddedHelper,
+fn artifact_io_error(
+    identity: ArtifactIdentity<'_>,
     operation: &str,
     path: &Path,
     source: io::Error,
@@ -351,8 +460,9 @@ fn helper_io_error(
     FirestoneError::new(
         ErrorKind::Dependency,
         format!(
-            "cannot {operation} for embedded `{}` at {}",
-            helper.kind().dependency(),
+            "cannot {operation} for {} '{}' at {}",
+            identity.origin.adjective(),
+            identity.dependency,
             path.display()
         ),
     )
