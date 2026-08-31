@@ -25,11 +25,12 @@ use sha2::{Digest, Sha256, Sha512};
 use url::Url;
 
 use crate::{
-    Arch, ByteSize, Catalog, CatalogChecksum, CatalogFirmware, ChecksumAlgorithm, Cmd, ErrorKind,
-    Event, EventSink, FirestoneError, ImageFormat, ImageRef, Level, MachineLock, MachineState,
-    Paths, StateImage, StateStore, StepId, Unit, atomic,
+    Arch, ByteSize, Catalog, CatalogChecksum, CatalogFirmware, ChecksumAlgorithm, Cmd,
+    DependencyArtifact, ErrorKind, Event, EventSink, FirestoneError, ImageFormat, ImageRef, Level,
+    MachineLock, MachineState, Paths, StateImage, StateStore, StepId, Unit, atomic,
     bounded::{self, BoundedReadError},
     catalog::{SshdPath, parse_https_url},
+    embedded_helpers::install_pinned_artifact_with,
 };
 const IMAGE_METADATA_VERSION: u32 = 1;
 const IMAGE_ID_PREFIX: &str = "image-";
@@ -38,6 +39,7 @@ const IMAGE_BUFFER_SIZE: usize = 1024 * 1024;
 const IMAGE_PROGRESS_INTERVAL_BYTES: u64 = 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SIDECAR_BYTES: u64 = 64 * 1024;
+const MAX_DEPENDENCY_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -555,6 +557,71 @@ impl ImageStore {
     #[must_use]
     pub const fn architecture(&self) -> Arch {
         self.architecture
+    }
+
+    /// Installs one pinned dependency with the image client's strict HTTPS
+    /// transport and the shared secure artifact publisher.
+    pub(crate) fn ensure_pinned_artifact(
+        &self,
+        artifact: &DependencyArtifact,
+    ) -> Result<PathBuf, FirestoneError> {
+        let url = parse_https_url(&artifact.url).ok_or_else(|| {
+            FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "dependency '{}' has an invalid HTTPS URL",
+                    artifact.dependency
+                ),
+            )
+            .with_hint("restore the bundled dependency manifest")
+        })?;
+        install_pinned_artifact_with(&self.paths, artifact, |output| {
+            let mut response = self.http.get(&url).map_err(|source| {
+                FirestoneError::new(
+                    ErrorKind::Dependency,
+                    format!(
+                        "cannot download pinned dependency '{}' from {url}",
+                        artifact.dependency
+                    ),
+                )
+                .with_hint("check network access and retry start")
+                .with_source(source)
+            })?;
+            if response
+                .content_length
+                .is_some_and(|length| length > MAX_DEPENDENCY_ARTIFACT_BYTES)
+            {
+                return Err(FirestoneError::new(
+                    ErrorKind::Dependency,
+                    format!(
+                        "pinned dependency '{}' exceeds the {} byte download limit",
+                        artifact.dependency, MAX_DEPENDENCY_ARTIFACT_BYTES
+                    ),
+                ));
+            }
+            let mut bounded = response
+                .body
+                .as_mut()
+                .take(MAX_DEPENDENCY_ARTIFACT_BYTES.saturating_add(1));
+            let copied = io::copy(&mut bounded, output).map_err(|source| {
+                FirestoneError::new(
+                    ErrorKind::Dependency,
+                    format!("cannot store pinned dependency '{}'", artifact.dependency),
+                )
+                .with_hint("check the Firestone data directory permissions and free space")
+                .with_source(source)
+            })?;
+            if copied > MAX_DEPENDENCY_ARTIFACT_BYTES {
+                return Err(FirestoneError::new(
+                    ErrorKind::Dependency,
+                    format!(
+                        "pinned dependency '{}' exceeds the {} byte download limit",
+                        artifact.dependency, MAX_DEPENDENCY_ARTIFACT_BYTES
+                    ),
+                ));
+            }
+            Ok(())
+        })
     }
 
     /// Resolves local files first, then strict HTTPS URLs, then the catalog.
@@ -3551,7 +3618,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::{MachineStatus, PathInputs, StateVersion};
+    use crate::{
+        CloudInitSpec, DependencyManifest, Firmware, MachineSpec, MachineStatus, NetMode,
+        NetworkSpec, PathInputs, ShimTimeouts, StateVersion, VmmSpec, prepare_start,
+    };
 
     const FIXED_TIME: &str = "2026-08-28T09:00:00Z";
     const LOCK_HELPER_ENV: &str = "FIRESTONE_IMAGE_LOCK_HELPER";
@@ -3849,6 +3919,139 @@ else:
         let lock = MachineLock::acquire(name, &paths.machine_lock(name)?, events)?;
         StateStore::new(paths.machine_state(name)?).write_from_locked_action(state, &lock)?;
         Ok(lock)
+    }
+
+    fn firmware_manifest(
+        dependency: &str,
+        install_name: &str,
+        url: &str,
+        bytes: &[u8],
+    ) -> Result<DependencyManifest, FirestoneError> {
+        DependencyManifest::parse(&format!(
+            "manifest_version = 1\n\n[dependency.{dependency}]\nversion = \"test\"\navailability = \"binary\"\n[dependency.{dependency}.x86_64]\nasset = \"firmware\"\ninstall_name = \"{install_name}\"\nurl = \"{url}\"\nsha256 = \"{}\"\n",
+            sha256_bytes(bytes)
+        ))
+    }
+
+    fn prepare_firmware_start(
+        fixture: &Fixture,
+        name: &str,
+        firmware: Firmware,
+        manifest: &DependencyManifest,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let source = fixture.write_source(&format!("{name}.raw"), b"raw-machine-image")?;
+        let state = machine_state(
+            &fixture.paths,
+            name,
+            StateImage {
+                r#ref: source.to_string_lossy().into_owned(),
+                id: None,
+                sha256: None,
+            },
+        )?;
+        let spec = MachineSpec {
+            image: ImageRef::new(source.to_string_lossy().into_owned()),
+            arch: Some(Arch::X86_64),
+            network: NetworkSpec {
+                mode: NetMode::None,
+                ..NetworkSpec::default()
+            },
+            cloud_init: CloudInitSpec {
+                provisioning: false,
+                ..CloudInitSpec::default()
+            },
+            vmm: VmmSpec {
+                binary: Some(fixture.store.qemu_img.clone()),
+                firmware,
+                ..VmmSpec::default()
+            },
+            ..MachineSpec::default()
+        };
+        let mut events = Vec::new();
+        let lock = create_machine(&fixture.paths, name, &state, &mut events)?;
+        let prepared = prepare_start(
+            &fixture.paths,
+            &fixture.store,
+            manifest,
+            name,
+            &spec,
+            state,
+            &fixture.root,
+            &lock,
+            &mut events,
+            ShimTimeouts::default(),
+        )?;
+        assert_eq!(prepared.state().status, MachineStatus::Created);
+        Ok(())
+    }
+
+    #[test]
+    fn first_start_missing_named_firmware_is_securely_installed_before_vmconfig()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let firmware = b"first-start-edk2";
+        let url = "https://firmware.example.invalid/CLOUDHV.fd";
+        let manifest = firmware_manifest(
+            "cloud-hypervisor-edk2",
+            "CLOUDHV-first-start.fd",
+            url,
+            firmware,
+        )?;
+        fixture.http.push(
+            url,
+            firmware.to_vec(),
+            Some(firmware.len() as u64),
+            Some("application/octet-stream"),
+        )?;
+
+        prepare_firmware_start(&fixture, "first-firmware", Firmware::EDK2, &manifest)?;
+
+        let artifact = manifest.artifact("cloud-hypervisor-edk2", "x86_64")?;
+        let installed = fixture.paths.binary_file(&artifact.install_name)?;
+        assert_eq!(fs::read(&installed)?, firmware);
+        assert_eq!(
+            fs::metadata(&installed)?.permissions().mode() & 0o7777,
+            0o644
+        );
+        let vmconfig: serde_json::Value = serde_json::from_slice(&fs::read(
+            fixture.paths.machine_vmconfig("first-firmware")?,
+        )?)?;
+        assert_eq!(
+            vmconfig["payload"]["firmware"],
+            installed.to_string_lossy().as_ref()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn first_start_custom_firmware_does_not_install_or_modify_pinned_artifacts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let custom = fixture.write_source("custom.fd", b"custom firmware")?;
+        let manifest = firmware_manifest(
+            "cloud-hypervisor-edk2",
+            "CLOUDHV-unused.fd",
+            "https://firmware.example.invalid/unused.fd",
+            b"unused pinned firmware",
+        )?;
+
+        prepare_firmware_start(
+            &fixture,
+            "custom-firmware",
+            Firmware::path(custom.clone())?,
+            &manifest,
+        )?;
+
+        assert_eq!(fs::read(&custom)?, b"custom firmware");
+        assert!(!fixture.paths.bin_dir().exists());
+        let vmconfig: serde_json::Value = serde_json::from_slice(&fs::read(
+            fixture.paths.machine_vmconfig("custom-firmware")?,
+        )?)?;
+        assert_eq!(
+            vmconfig["payload"]["firmware"],
+            custom.to_string_lossy().as_ref()
+        );
+        Ok(())
     }
 
     #[test]

@@ -1,0 +1,5392 @@
+{
+  "openapi": "3.1.0",
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "info": {
+    "title": "Firestone REST API",
+    "version": "0.1.0",
+    "description": "Static contract for the existing Firestone v0.1 REST adapter. The API is HTTP/1.1 over a private Unix-domain socket; it has no TCP listener and no bearer-token mode. Socket ownership and mode 0600 are the authentication boundary. The document lists the 18 methods explicitly authored in the Firestone router. Axum also performs its normal implicit HEAD handling for GET registrations, but those incidental HEAD variants are not separate Firestone operations. Unknown paths and unsupported methods both return the stable 404 ErrorEnvelope. JSON successes and errors use application/json without a charset; action progress defaults to application/x-ndjson; logs use text/plain. Closing a mutation stream stops delivery while the shared action continues to a safe point; closing a followed log stream cancels that open-ended read."
+  },
+  "servers": [
+    {
+      "url": "http://firestone",
+      "description": "Placeholder HTTP authority used by Unix-socket clients such as curl --unix-socket. No TCP connection is made.",
+      "x-firestone-transport": "unix",
+      "x-firestone-default-socket": "$XDG_RUNTIME_DIR/firestone/serve.sock",
+      "x-firestone-fallback-socket": "/tmp/firestone-<uid>/serve.sock",
+      "x-firestone-socket-mode": "0600",
+      "x-firestone-listener-override": "--listen unix:PATH, restricted to a socket directly inside the resolved Firestone runtime directory"
+    }
+  ],
+  "security": [],
+  "tags": [
+    {
+      "name": "System",
+      "description": "Build identity and inspect-only host diagnostics."
+    },
+    {
+      "name": "Machines",
+      "description": "Machine desired state, lifecycle, logs, and generated VMM config."
+    },
+    {
+      "name": "Catalog",
+      "description": "Merged image discovery independent of the local cache."
+    },
+    {
+      "name": "Images",
+      "description": "Immutable image-cache lifecycle."
+    }
+  ],
+  "paths": {
+    "/v1/version": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "operationId": "getVersion",
+        "summary": "Get version and build identity",
+        "description": "Returns the raw VersionResult payload. Request bodies and undocumented query fields are ignored; malformed percent encoding is rejected before routing.",
+        "responses": {
+          "200": {
+            "description": "Version, release identity, selected dependency pins, and resolved paths.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VersionResult"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/Version"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Error504"
+          }
+        }
+      }
+    },
+    "/v1/doctor": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "operationId": "getDoctorReport",
+        "summary": "Inspect host requirements",
+        "description": "Runs the shared doctor action with fix=false and elevation_confirmed=false. It never performs repair. Request bodies and undocumented query fields are ignored.",
+        "responses": {
+          "200": {
+            "description": "Ordered report containing all 13 host checks.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DoctorReport"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/Doctor"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Error504"
+          }
+        }
+      }
+    },
+    "/v1/machines": {
+      "get": {
+        "tags": [
+          "Machines"
+        ],
+        "operationId": "listMachines",
+        "summary": "List machines",
+        "description": "Returns the same summaries as the CLI list action. Request bodies and undocumented query fields are ignored.",
+        "responses": {
+          "200": {
+            "description": "Machine summaries.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MachineSummaryList"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/Machines"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Error504"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Machines"
+        ],
+        "operationId": "createMachine",
+        "summary": "Create a machine",
+        "description": "Layers the supplied MachineSpecPatch over the router's snapshot of global create defaults, validates the resulting effective spec, and dispatches the shared create action. Both name and spec are required; spec may be {}.",
+        "responses": {
+          "201": {
+            "description": "Created machine and effective state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MachineRecord"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/MachineRecord"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Error504"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "description": "Exactly one JSON object. Unknown fields are rejected.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateMachineRequest"
+              },
+              "examples": {
+                "default": {
+                  "$ref": "#/components/examples/CreateMachineRequest"
+                }
+              }
+            }
+          },
+          "x-firestone-max-body-bytes": 1048576
+        }
+      }
+    },
+    "/v1/machines/{name}": {
+      "get": {
+        "tags": [
+          "Machines"
+        ],
+        "operationId": "getMachine",
+        "summary": "Get one machine",
+        "description": "Returns the effective spec, reconciled state, and nullable live supervision. Request bodies and undocumented query fields are ignored.",
+        "responses": {
+          "200": {
+            "description": "Machine view.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MachineView"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/MachineView"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Error504"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineName"
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "Machines"
+        ],
+        "operationId": "replaceMachineSpec",
+        "summary": "Replace a machine spec",
+        "description": "Accepts MachineSpec directly. Every property is input-optional because serde fills omitted properties from built-in MachineSpec defaults; this PUT therefore does not require clients to send every property.",
+        "responses": {
+          "200": {
+            "description": "Effective saved spec and all non-fatal warnings.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SpecResult"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/SpecResult"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Error504"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineName"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "A JSON object is required; {} resets the effective spec to built-in defaults. Unknown fields are rejected.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MachineSpecInput"
+              },
+              "examples": {
+                "default": {
+                  "$ref": "#/components/examples/MachineSpecInput"
+                }
+              }
+            }
+          },
+          "x-firestone-max-body-bytes": 1048576
+        }
+      },
+      "patch": {
+        "tags": [
+          "Machines"
+        ],
+        "operationId": "patchMachineSpec",
+        "summary": "Patch a machine spec",
+        "description": "Applies the sparse MachineSpecPatch through the shared layering and path-provenance rules. Null patch properties mean no update; use clear for deletion.",
+        "responses": {
+          "200": {
+            "description": "Effective saved spec and all non-fatal warnings.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SpecResult"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/SpecResult"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Error504"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineName"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "A JSON object is required; {} is a valid no-op. Unknown fields are rejected.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MachineSpecPatch"
+              },
+              "examples": {
+                "default": {
+                  "$ref": "#/components/examples/MachineSpecPatch"
+                }
+              }
+            }
+          },
+          "x-firestone-max-body-bytes": 1048576
+        }
+      },
+      "delete": {
+        "tags": [
+          "Machines"
+        ],
+        "operationId": "deleteMachine",
+        "summary": "Delete a machine",
+        "description": "The request body is ignored. If removal emits no progress before Result, success is an empty 204. If a running machine must stop first, success is a 200 NDJSON stream by default or a 200 aggregate when Accept selects application/json.",
+        "responses": {
+          "200": {
+            "description": "Removal progress and typed terminal result.",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string",
+                  "description": "LF-delimited compact JSON records. Progress records arrive as produced. Success ends with exactly one typed Result record; a dispatcher failure after progress ends with one ErrorEnvelope record under HTTP 200.",
+                  "x-ndjson-item-schema": {
+                    "oneOf": [
+                      {
+                        "$ref": "#/components/schemas/NonTerminalEvent"
+                      },
+                      {
+                        "$ref": "#/components/schemas/RemoveMachineResultEvent"
+                      },
+                      {
+                        "$ref": "#/components/schemas/ErrorEnvelope"
+                      }
+                    ]
+                  },
+                  "x-firestone-terminal-records": [
+                    "RemoveMachineResultEvent",
+                    "ErrorEnvelope"
+                  ]
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/RemoveMachineNdjson"
+                  }
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemoveMachineDispatchOutput"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/RemoveMachineAggregate"
+                  }
+                }
+              }
+            }
+          },
+          "204": {
+            "description": "Machine removed without preceding progress. Empty body and no Content-Type header."
+          },
+          "400": {
+            "$ref": "#/components/responses/ActionError400"
+          },
+          "404": {
+            "$ref": "#/components/responses/ActionError404"
+          },
+          "409": {
+            "$ref": "#/components/responses/ActionError409"
+          },
+          "500": {
+            "$ref": "#/components/responses/ActionError500"
+          },
+          "502": {
+            "$ref": "#/components/responses/ActionError502"
+          },
+          "503": {
+            "$ref": "#/components/responses/ActionError503"
+          },
+          "504": {
+            "$ref": "#/components/responses/ActionError504"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineName"
+          },
+          {
+            "$ref": "#/components/parameters/Force"
+          }
+        ],
+        "x-firestone-aggregation-accept": "application/json"
+      }
+    },
+    "/v1/machines/{name}/start": {
+      "post": {
+        "tags": [
+          "Machines"
+        ],
+        "operationId": "startMachine",
+        "summary": "Start a machine",
+        "description": "Streams shared action Events by default. Accept: application/json waits for completion and aggregates progress. Closing a mutation response stops delivery but the action continues to a safe point.",
+        "responses": {
+          "200": {
+            "description": "Start progress and terminal running result.",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string",
+                  "description": "LF-delimited compact JSON records. Progress records arrive as produced. Success ends with exactly one typed Result record; a dispatcher failure after progress ends with one ErrorEnvelope record under HTTP 200.",
+                  "x-ndjson-item-schema": {
+                    "oneOf": [
+                      {
+                        "$ref": "#/components/schemas/NonTerminalEvent"
+                      },
+                      {
+                        "$ref": "#/components/schemas/StartResultEvent"
+                      },
+                      {
+                        "$ref": "#/components/schemas/ErrorEnvelope"
+                      }
+                    ]
+                  },
+                  "x-firestone-terminal-records": [
+                    "StartResultEvent",
+                    "ErrorEnvelope"
+                  ]
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/StartNdjson"
+                  }
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartDispatchOutput"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/StartAggregate"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ActionError400"
+          },
+          "404": {
+            "$ref": "#/components/responses/ActionError404"
+          },
+          "409": {
+            "$ref": "#/components/responses/ActionError409"
+          },
+          "500": {
+            "$ref": "#/components/responses/ActionError500"
+          },
+          "502": {
+            "$ref": "#/components/responses/ActionError502"
+          },
+          "503": {
+            "$ref": "#/components/responses/ActionError503"
+          },
+          "504": {
+            "$ref": "#/components/responses/ActionError504"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineName"
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "description": "Optional JSON object. A zero-byte body or {} uses wait=true and the configured start timeout; top-level JSON null is invalid.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartRequest"
+              },
+              "examples": {
+                "default": {
+                  "$ref": "#/components/examples/StartRequest"
+                }
+              }
+            }
+          },
+          "x-firestone-max-body-bytes": 1048576
+        },
+        "x-firestone-aggregation-accept": "application/json"
+      }
+    },
+    "/v1/machines/{name}/stop": {
+      "post": {
+        "tags": [
+          "Machines"
+        ],
+        "operationId": "stopMachine",
+        "summary": "Stop a machine",
+        "description": "Streams shared stop Events by default or aggregates when Accept selects application/json.",
+        "responses": {
+          "200": {
+            "description": "Stop progress and terminal stopped result.",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string",
+                  "description": "LF-delimited compact JSON records. Progress records arrive as produced. Success ends with exactly one typed Result record; a dispatcher failure after progress ends with one ErrorEnvelope record under HTTP 200.",
+                  "x-ndjson-item-schema": {
+                    "oneOf": [
+                      {
+                        "$ref": "#/components/schemas/NonTerminalEvent"
+                      },
+                      {
+                        "$ref": "#/components/schemas/StopResultEvent"
+                      },
+                      {
+                        "$ref": "#/components/schemas/ErrorEnvelope"
+                      }
+                    ]
+                  },
+                  "x-firestone-terminal-records": [
+                    "StopResultEvent",
+                    "ErrorEnvelope"
+                  ]
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/StopNdjson"
+                  }
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StopDispatchOutput"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/StopAggregate"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ActionError400"
+          },
+          "404": {
+            "$ref": "#/components/responses/ActionError404"
+          },
+          "409": {
+            "$ref": "#/components/responses/ActionError409"
+          },
+          "500": {
+            "$ref": "#/components/responses/ActionError500"
+          },
+          "502": {
+            "$ref": "#/components/responses/ActionError502"
+          },
+          "503": {
+            "$ref": "#/components/responses/ActionError503"
+          },
+          "504": {
+            "$ref": "#/components/responses/ActionError504"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineName"
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "description": "Optional JSON object. A zero-byte body or {} uses force=false and the configured stop timeout; top-level JSON null is invalid.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StopRequest"
+              },
+              "examples": {
+                "default": {
+                  "$ref": "#/components/examples/StopRequest"
+                }
+              }
+            }
+          },
+          "x-firestone-max-body-bytes": 1048576
+        },
+        "x-firestone-aggregation-accept": "application/json"
+      }
+    },
+    "/v1/machines/{name}/restart": {
+      "post": {
+        "tags": [
+          "Machines"
+        ],
+        "operationId": "restartMachine",
+        "summary": "Restart a machine",
+        "description": "The HTTP request body must contain zero bytes; even {} is rejected. Restart uses the configured start timeout and the configured stop timeout, with no route-local timeout field.",
+        "responses": {
+          "200": {
+            "description": "Restart progress and terminal running result.",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string",
+                  "description": "LF-delimited compact JSON records. Progress records arrive as produced. Success ends with exactly one typed Result record; a dispatcher failure after progress ends with one ErrorEnvelope record under HTTP 200.",
+                  "x-ndjson-item-schema": {
+                    "oneOf": [
+                      {
+                        "$ref": "#/components/schemas/NonTerminalEvent"
+                      },
+                      {
+                        "$ref": "#/components/schemas/RestartResultEvent"
+                      },
+                      {
+                        "$ref": "#/components/schemas/ErrorEnvelope"
+                      }
+                    ]
+                  },
+                  "x-firestone-terminal-records": [
+                    "RestartResultEvent",
+                    "ErrorEnvelope"
+                  ]
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/RestartNdjson"
+                  }
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestartDispatchOutput"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/RestartAggregate"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ActionError400"
+          },
+          "404": {
+            "$ref": "#/components/responses/ActionError404"
+          },
+          "409": {
+            "$ref": "#/components/responses/ActionError409"
+          },
+          "500": {
+            "$ref": "#/components/responses/ActionError500"
+          },
+          "502": {
+            "$ref": "#/components/responses/ActionError502"
+          },
+          "503": {
+            "$ref": "#/components/responses/ActionError503"
+          },
+          "504": {
+            "$ref": "#/components/responses/ActionError504"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineName"
+          }
+        ],
+        "x-firestone-aggregation-accept": "application/json"
+      }
+    },
+    "/v1/machines/{name}/logs": {
+      "get": {
+        "tags": [
+          "Machines"
+        ],
+        "operationId": "getMachineLogs",
+        "summary": "Read machine logs",
+        "description": "Returns sanitized text chunks from the selected owned log. Newlines are preserved; every other Unicode control character is replaced with U+FFFD. A Result before Output yields an empty 200. An error before Output is JSON; an error after streaming begins closes the text stream without an error record. Request bodies are ignored.",
+        "responses": {
+          "200": {
+            "description": "Sanitized log bytes, streamed without an added delimiter.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/Logs"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Error504"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineName"
+          },
+          {
+            "$ref": "#/components/parameters/LogSource"
+          },
+          {
+            "$ref": "#/components/parameters/LogFollow"
+          },
+          {
+            "$ref": "#/components/parameters/LogLines"
+          }
+        ]
+      }
+    },
+    "/v1/machines/{name}/vmconfig": {
+      "get": {
+        "tags": [
+          "Machines"
+        ],
+        "operationId": "getMachineVmConfig",
+        "summary": "Get generated Cloud Hypervisor config",
+        "description": "Returns the canonical persisted Cloud Hypervisor v53 JSON value (maximum 51,200 bytes). Validated config_overlay data may add fields, so the schema deliberately remains extensible. Request bodies and undocumented query fields are ignored.",
+        "responses": {
+          "200": {
+            "description": "Canonical VmConfig.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VmConfig"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/VmConfig"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Error504"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineName"
+          }
+        ]
+      }
+    },
+    "/v1/catalog": {
+      "get": {
+        "tags": [
+          "Catalog"
+        ],
+        "operationId": "listCatalog",
+        "summary": "List merged image catalog",
+        "description": "Returns the merged built-in and user catalog in canonical-reference order, independent of the local image cache. Request bodies and undocumented query fields are ignored.",
+        "responses": {
+          "200": {
+            "description": "Merged catalog entries.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogEntrySummaryList"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/Catalog"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Error504"
+          }
+        }
+      }
+    },
+    "/v1/images": {
+      "get": {
+        "tags": [
+          "Images"
+        ],
+        "operationId": "listImages",
+        "summary": "List stored images",
+        "description": "Returns every valid stored image pair. Request bodies and undocumented query fields are ignored.",
+        "responses": {
+          "200": {
+            "description": "Stored image records.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StoredImageList"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/Images"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Error504"
+          }
+        }
+      }
+    },
+    "/v1/images/pull": {
+      "post": {
+        "tags": [
+          "Images"
+        ],
+        "operationId": "pullImage",
+        "summary": "Pull or import an image",
+        "description": "Streams image resolution, download, verification, and conversion Events by default. Accept: application/json aggregates them. sha256 may be supplied only for a direct HTTPS reference.",
+        "responses": {
+          "200": {
+            "description": "Image pull progress and terminal stored-image result.",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string",
+                  "description": "LF-delimited compact JSON records. Progress records arrive as produced. Success ends with exactly one typed Result record; a dispatcher failure after progress ends with one ErrorEnvelope record under HTTP 200.",
+                  "x-ndjson-item-schema": {
+                    "oneOf": [
+                      {
+                        "$ref": "#/components/schemas/NonTerminalEvent"
+                      },
+                      {
+                        "$ref": "#/components/schemas/PullImageResultEvent"
+                      },
+                      {
+                        "$ref": "#/components/schemas/ErrorEnvelope"
+                      }
+                    ]
+                  },
+                  "x-firestone-terminal-records": [
+                    "PullImageResultEvent",
+                    "ErrorEnvelope"
+                  ]
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/PullImageNdjson"
+                  }
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PullImageDispatchOutput"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/PullImageAggregate"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ActionError400"
+          },
+          "404": {
+            "$ref": "#/components/responses/ActionError404"
+          },
+          "409": {
+            "$ref": "#/components/responses/ActionError409"
+          },
+          "500": {
+            "$ref": "#/components/responses/ActionError500"
+          },
+          "502": {
+            "$ref": "#/components/responses/ActionError502"
+          },
+          "503": {
+            "$ref": "#/components/responses/ActionError503"
+          },
+          "504": {
+            "$ref": "#/components/responses/ActionError504"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "description": "Exactly one JSON object. ref is required; sha256 may be omitted or null. Unknown fields are rejected.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PullImageRequest"
+              },
+              "examples": {
+                "default": {
+                  "$ref": "#/components/examples/PullImageRequest"
+                }
+              }
+            }
+          },
+          "x-firestone-max-body-bytes": 1048576
+        },
+        "x-firestone-aggregation-accept": "application/json"
+      }
+    },
+    "/v1/images/prune": {
+      "post": {
+        "tags": [
+          "Images"
+        ],
+        "operationId": "pruneImages",
+        "summary": "Prune unreferenced images",
+        "description": "The HTTP request body must contain zero bytes; even {} is rejected. Progress Events are collected internally and discarded; success returns only the typed prune payload.",
+        "responses": {
+          "200": {
+            "description": "Removed image IDs and total bytes freed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImagePruneResult"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/ImagePrune"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Error504"
+          }
+        }
+      }
+    },
+    "/v1/images/{id}": {
+      "delete": {
+        "tags": [
+          "Images"
+        ],
+        "operationId": "deleteImage",
+        "summary": "Delete one image",
+        "description": "The request body and Accept header are ignored. Progress and the internal ImageRemoveResult are discarded; success is always empty 204.",
+        "responses": {
+          "204": {
+            "description": "Image removed. Empty body and no Content-Type header."
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Error504"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ImageId"
+          },
+          {
+            "$ref": "#/components/parameters/Force"
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Architecture": {
+        "type": "string",
+        "enum": [
+          "x86_64",
+          "aarch64"
+        ],
+        "description": "CPU architecture accepted by the shared machine model."
+      },
+      "ByteSizeInput": {
+        "oneOf": [
+          {
+            "type": "string",
+            "pattern": "^\\s*0*(?:0|(?:[1-9][0-9]{0,12}|1[0-6][0-9]{12}|17[0-4][0-9]{11}|175[0-8][0-9]{10}|1759[0-1][0-9]{9}|175920[0-9]{8}|175921[0-7][0-9]{7}|1759218[0-5][0-9]{6}|175921860[0-3][0-9]{4}|1759218604[0-3][0-9]{3}|17592186044[0-3][0-9]{2}|1759218604440[0-9]|1759218604441[0-4]|17592186044415))[Mm]?\\s*$",
+            "description": "Whole MiB with no suffix or M/m, from 0 through 17592186044415; surrounding whitespace and leading zeroes are accepted."
+          },
+          {
+            "type": "string",
+            "pattern": "^\\s*0*(?:0|(?:[1-9][0-9]{0,9}|1[0-6][0-9]{9}|170[0-9]{8}|171[0-6][0-9]{7}|1717[0-8][0-9]{6}|17179[0-7][0-9]{5}|171798[0-5][0-9]{4}|1717986[0-8][0-9]{3}|171798690[0-9]{2}|171798691[0-7][0-9]|1717986918[0-2]|17179869183))[Gg]\\s*$",
+            "description": "Whole GiB with G/g, from 0 through 17179869183; surrounding whitespace and leading zeroes are accepted."
+          },
+          {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 17592186044415,
+            "description": "Whole MiB."
+          }
+        ]
+      },
+      "ByteSize": {
+        "type": "string",
+        "pattern": "^[0-9]+[MG]$",
+        "description": "Canonical whole-MiB or whole-GiB size emitted by Firestone.",
+        "examples": [
+          "2G",
+          "512M"
+        ]
+      },
+      "ImageRef": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Catalog reference, strict HTTPS URL, or local image path. Pull resolution performs source-specific validation.",
+        "examples": [
+          "ubuntu:24.04"
+        ]
+      },
+      "MacAddress": {
+        "type": "string",
+        "pattern": "^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$",
+        "examples": [
+          "52:54:00:9a:1f:c3"
+        ]
+      },
+      "Firmware": {
+        "type": "string",
+        "minLength": 1,
+        "description": "auto, rhf, edk2, or a non-empty UTF-8 firmware path.",
+        "examples": [
+          "auto",
+          "edk2"
+        ]
+      },
+      "CatalogFirmware": {
+        "type": "string",
+        "enum": [
+          "rhf",
+          "edk2"
+        ]
+      },
+      "NetMode": {
+        "type": "string",
+        "enum": [
+          "passt",
+          "tap",
+          "none"
+        ]
+      },
+      "PortForward": {
+        "type": "string",
+        "minLength": 3,
+        "description": "[proto:][bind:]HOST:GUEST. Protocol is tcp (default) or udp; port/range endpoints are 1 through 65535 and host/guest ranges have equal lengths.",
+        "examples": [
+          "127.0.0.1:8080:80",
+          "udp:5353:5353"
+        ]
+      },
+      "Path": {
+        "type": "string",
+        "description": "UTF-8 filesystem path."
+      },
+      "SpecClear": {
+        "type": "string",
+        "enum": [
+          "arch",
+          "network.forward",
+          "network.tap",
+          "network.mac",
+          "mount",
+          "cloud_init.user_data",
+          "cloud_init.network_config",
+          "cloud_init.ssh_keys",
+          "vmm.binary",
+          "vmm.extra_args",
+          "vmm.config_overlay"
+        ]
+      },
+      "JsonObject": {
+        "type": "object",
+        "additionalProperties": true,
+        "description": "JSON object; nested null values retain RFC 7396 deletion semantics."
+      },
+      "MountSpecInput": {
+        "type": "object",
+        "properties": {
+          "host": {
+            "$ref": "#/components/schemas/Path"
+          },
+          "guest": {
+            "$ref": "#/components/schemas/GuestMountPath"
+          },
+          "readonly": {
+            "type": "boolean",
+            "default": false
+          },
+          "tag": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1,
+            "maxLength": 36,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,35}$"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "host",
+          "guest"
+        ],
+        "description": "One virtio-fs mount. host and guest are required; readonly defaults to false and tag defaults to a generated shareN value when omitted."
+      },
+      "MountSpec": {
+        "type": "object",
+        "properties": {
+          "host": {
+            "$ref": "#/components/schemas/Path"
+          },
+          "guest": {
+            "$ref": "#/components/schemas/GuestMountPath"
+          },
+          "readonly": {
+            "type": "boolean"
+          },
+          "tag": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 36,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,35}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "host",
+          "guest",
+          "readonly",
+          "tag"
+        ]
+      },
+      "NetworkSpecInput": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/NetMode"
+          },
+          "forward": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortForward"
+            }
+          },
+          "tap": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mac": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MacAddress"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "description": "All properties may be omitted and inherit NetworkSpec defaults. Only the Option-backed tap and mac properties accept JSON null.",
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "mode": {
+                  "const": "tap"
+                }
+              },
+              "required": [
+                "mode"
+              ]
+            },
+            "then": {
+              "properties": {
+                "tap": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 15,
+                  "not": {
+                    "enum": [
+                      ".",
+                      ".."
+                    ]
+                  },
+                  "pattern": "^[^/\\u0000]+$"
+                }
+              },
+              "required": [
+                "tap"
+              ]
+            }
+          }
+        ]
+      },
+      "NetworkSpec": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/NetMode"
+          },
+          "forward": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortForward"
+            }
+          },
+          "tap": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "mac": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MacAddress"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "mode",
+          "forward",
+          "tap",
+          "mac"
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "mode": {
+                  "const": "tap"
+                }
+              },
+              "required": [
+                "mode"
+              ]
+            },
+            "then": {
+              "properties": {
+                "tap": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 15,
+                  "not": {
+                    "enum": [
+                      ".",
+                      ".."
+                    ]
+                  },
+                  "pattern": "^[^/\\u0000]+$"
+                }
+              },
+              "required": [
+                "tap"
+              ]
+            }
+          }
+        ]
+      },
+      "CloudInitSpecInput": {
+        "type": "object",
+        "properties": {
+          "user_data": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Path"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "network_config": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Path"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ssh_keys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Path"
+            }
+          },
+          "provisioning": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "description": "All properties may be omitted and inherit CloudInitSpec defaults. Only user_data and network_config accept JSON null."
+      },
+      "CloudInitSpec": {
+        "type": "object",
+        "properties": {
+          "user_data": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Path"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "network_config": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Path"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ssh_keys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Path"
+            }
+          },
+          "provisioning": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "user_data",
+          "network_config",
+          "ssh_keys",
+          "provisioning"
+        ]
+      },
+      "VmmSpecInput": {
+        "type": "object",
+        "properties": {
+          "binary": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Path"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "firmware": {
+            "$ref": "#/components/schemas/Firmware"
+          },
+          "extra_args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "config_overlay": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JsonObject"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "description": "All properties may be omitted and inherit VmmSpec defaults. binary and config_overlay accept JSON null; config_overlay must otherwise be an object."
+      },
+      "VmmSpec": {
+        "type": "object",
+        "properties": {
+          "binary": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Path"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "firmware": {
+            "$ref": "#/components/schemas/Firmware"
+          },
+          "extra_args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "config_overlay": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JsonObject"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "binary",
+          "firmware",
+          "extra_args",
+          "config_overlay"
+        ]
+      },
+      "MachineSpecInput": {
+        "type": "object",
+        "properties": {
+          "image": {
+            "$ref": "#/components/schemas/MachineImageRef"
+          },
+          "arch": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Architecture"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "cpus": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 255
+          },
+          "memory": {
+            "$ref": "#/components/schemas/MemorySizeInput"
+          },
+          "disk": {
+            "$ref": "#/components/schemas/ByteSizeInput"
+          },
+          "user": {
+            "type": "string",
+            "pattern": "^[a-z_][a-z0-9_-]*$"
+          },
+          "network": {
+            "$ref": "#/components/schemas/NetworkSpecInput"
+          },
+          "mount": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MountSpecInput"
+            },
+            "maxItems": 16
+          },
+          "cloud_init": {
+            "$ref": "#/components/schemas/CloudInitSpecInput"
+          },
+          "vmm": {
+            "$ref": "#/components/schemas/VmmSpecInput"
+          }
+        },
+        "additionalProperties": false,
+        "description": "Complete-spec input accepted by PUT. Because MachineSpec uses serde defaults, every property may be omitted and is filled from built-in defaults. Only arch is Option-backed and accepts JSON null. Unknown properties are rejected."
+      },
+      "MachineSpec": {
+        "type": "object",
+        "properties": {
+          "image": {
+            "$ref": "#/components/schemas/MachineImageRef"
+          },
+          "arch": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Architecture"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "cpus": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 255
+          },
+          "memory": {
+            "$ref": "#/components/schemas/MemorySize"
+          },
+          "disk": {
+            "$ref": "#/components/schemas/ByteSize"
+          },
+          "user": {
+            "type": "string",
+            "pattern": "^[a-z_][a-z0-9_-]*$"
+          },
+          "network": {
+            "$ref": "#/components/schemas/NetworkSpec"
+          },
+          "mount": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MountSpec"
+            },
+            "maxItems": 16
+          },
+          "cloud_init": {
+            "$ref": "#/components/schemas/CloudInitSpec"
+          },
+          "vmm": {
+            "$ref": "#/components/schemas/VmmSpec"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "image",
+          "arch",
+          "cpus",
+          "memory",
+          "disk",
+          "user",
+          "network",
+          "mount",
+          "cloud_init",
+          "vmm"
+        ],
+        "description": "Effective machine spec returned by Firestone. Optional values are emitted as JSON null; all top-level properties are present."
+      },
+      "NetworkSpecPatch": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NetMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "forward": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/PortForward"
+                }
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "tap": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Empty text is accepted while inactive; the effective value is validated as a Linux TAP name when mode is tap."
+          },
+          "mac": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MacAddress"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "description": "Sparse network layer. Missing or null properties make no change; use the root clear list to remove an effective value."
+      },
+      "CloudInitSpecPatch": {
+        "type": "object",
+        "properties": {
+          "user_data": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Path"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "network_config": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Path"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ssh_keys": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Path"
+                }
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "provisioning": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "description": "Sparse cloud-init layer. Missing or null properties make no change."
+      },
+      "VmmSpecPatch": {
+        "type": "object",
+        "properties": {
+          "binary": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Path"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "firmware": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Firmware"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "extra_args": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "config_overlay": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JsonObject"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "description": "Sparse VMM layer. config_overlay must be an object when non-null."
+      },
+      "MachineSpecPatch": {
+        "type": "object",
+        "properties": {
+          "clear": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SpecClear"
+            },
+            "uniqueItems": true
+          },
+          "image": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MachineImageRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "arch": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Architecture"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "cpus": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "maximum": 255
+          },
+          "memory": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MemorySizeInput"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "disk": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ByteSizeInput"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "user": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[a-z_][a-z0-9_-]*$"
+          },
+          "network": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NetworkSpecPatch"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "mount": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/MountSpecInput"
+                },
+                "maxItems": 16
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "cloud_init": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CloudInitSpecPatch"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "vmm": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/VmmSpecPatch"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "description": "Sparse layer used by create and PATCH. Every property is optional. Null Option-backed values are treated as absent, not as clear operations. clear is the only way to clear optional or vector leaves; a layer cannot set and clear the same leaf.",
+        "allOf": [
+          {
+            "not": {
+              "properties": {
+                "clear": {
+                  "contains": {
+                    "const": "arch"
+                  }
+                },
+                "arch": {
+                  "not": {
+                    "type": "null"
+                  }
+                }
+              },
+              "required": [
+                "clear",
+                "arch"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "clear": {
+                  "contains": {
+                    "const": "network.forward"
+                  }
+                },
+                "network": {
+                  "type": "object",
+                  "properties": {
+                    "forward": {
+                      "not": {
+                        "type": "null"
+                      }
+                    }
+                  },
+                  "required": [
+                    "forward"
+                  ]
+                }
+              },
+              "required": [
+                "clear",
+                "network"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "clear": {
+                  "contains": {
+                    "const": "network.tap"
+                  }
+                },
+                "network": {
+                  "type": "object",
+                  "properties": {
+                    "tap": {
+                      "not": {
+                        "type": "null"
+                      }
+                    }
+                  },
+                  "required": [
+                    "tap"
+                  ]
+                }
+              },
+              "required": [
+                "clear",
+                "network"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "clear": {
+                  "contains": {
+                    "const": "network.mac"
+                  }
+                },
+                "network": {
+                  "type": "object",
+                  "properties": {
+                    "mac": {
+                      "not": {
+                        "type": "null"
+                      }
+                    }
+                  },
+                  "required": [
+                    "mac"
+                  ]
+                }
+              },
+              "required": [
+                "clear",
+                "network"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "clear": {
+                  "contains": {
+                    "const": "mount"
+                  }
+                },
+                "mount": {
+                  "not": {
+                    "type": "null"
+                  }
+                }
+              },
+              "required": [
+                "clear",
+                "mount"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "clear": {
+                  "contains": {
+                    "const": "cloud_init.user_data"
+                  }
+                },
+                "cloud_init": {
+                  "type": "object",
+                  "properties": {
+                    "user_data": {
+                      "not": {
+                        "type": "null"
+                      }
+                    }
+                  },
+                  "required": [
+                    "user_data"
+                  ]
+                }
+              },
+              "required": [
+                "clear",
+                "cloud_init"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "clear": {
+                  "contains": {
+                    "const": "cloud_init.network_config"
+                  }
+                },
+                "cloud_init": {
+                  "type": "object",
+                  "properties": {
+                    "network_config": {
+                      "not": {
+                        "type": "null"
+                      }
+                    }
+                  },
+                  "required": [
+                    "network_config"
+                  ]
+                }
+              },
+              "required": [
+                "clear",
+                "cloud_init"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "clear": {
+                  "contains": {
+                    "const": "cloud_init.ssh_keys"
+                  }
+                },
+                "cloud_init": {
+                  "type": "object",
+                  "properties": {
+                    "ssh_keys": {
+                      "not": {
+                        "type": "null"
+                      }
+                    }
+                  },
+                  "required": [
+                    "ssh_keys"
+                  ]
+                }
+              },
+              "required": [
+                "clear",
+                "cloud_init"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "clear": {
+                  "contains": {
+                    "const": "vmm.binary"
+                  }
+                },
+                "vmm": {
+                  "type": "object",
+                  "properties": {
+                    "binary": {
+                      "not": {
+                        "type": "null"
+                      }
+                    }
+                  },
+                  "required": [
+                    "binary"
+                  ]
+                }
+              },
+              "required": [
+                "clear",
+                "vmm"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "clear": {
+                  "contains": {
+                    "const": "vmm.extra_args"
+                  }
+                },
+                "vmm": {
+                  "type": "object",
+                  "properties": {
+                    "extra_args": {
+                      "not": {
+                        "type": "null"
+                      }
+                    }
+                  },
+                  "required": [
+                    "extra_args"
+                  ]
+                }
+              },
+              "required": [
+                "clear",
+                "vmm"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "clear": {
+                  "contains": {
+                    "const": "vmm.config_overlay"
+                  }
+                },
+                "vmm": {
+                  "type": "object",
+                  "properties": {
+                    "config_overlay": {
+                      "not": {
+                        "type": "null"
+                      }
+                    }
+                  },
+                  "required": [
+                    "config_overlay"
+                  ]
+                }
+              },
+              "required": [
+                "clear",
+                "vmm"
+              ]
+            }
+          }
+        ]
+      },
+      "CreateMachineRequest": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^(?!\\.{1,2}$)[^/\\u0000-\\u001F\\u007F-\\u009F]+$",
+            "description": "One non-empty Unix path component without control characters."
+          },
+          "spec": {
+            "$ref": "#/components/schemas/MachineSpecPatch"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "spec"
+        ]
+      },
+      "StartRequest": {
+        "type": "object",
+        "properties": {
+          "wait": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "default": true,
+            "description": "Wait for guest SSH readiness when true."
+          },
+          "timeout_s": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "maximum": 3600,
+            "description": "Whole-second start/readiness deadline. Omission or null uses the configured start timeout."
+          }
+        },
+        "additionalProperties": false,
+        "description": "Optional JSON body. An empty HTTP body is equivalent to {}."
+      },
+      "StopRequest": {
+        "type": "object",
+        "properties": {
+          "timeout_s": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "maximum": 3600,
+            "description": "Whole-second stop deadline. Omission or null uses the configured stop timeout."
+          },
+          "force": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "default": false,
+            "description": "Allow forced teardown after the graceful stop path."
+          }
+        },
+        "additionalProperties": false,
+        "description": "Optional JSON body. An empty HTTP body is equivalent to {}."
+      },
+      "PullImageRequest": {
+        "type": "object",
+        "properties": {
+          "ref": {
+            "$ref": "#/components/schemas/ImageRef"
+          },
+          "sha256": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9A-Fa-f]{64}$",
+            "description": "Optional complete source SHA-256. The dispatcher normalizes accepted hexadecimal to lowercase."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "ref"
+        ]
+      },
+      "MachineStatus": {
+        "type": "string",
+        "enum": [
+          "created",
+          "starting",
+          "running",
+          "stopping",
+          "stopped",
+          "failed"
+        ]
+      },
+      "Supervision": {
+        "type": "string",
+        "enum": [
+          "supervised",
+          "unsupervised"
+        ]
+      },
+      "StateImage": {
+        "type": "object",
+        "properties": {
+          "ref": {
+            "type": "string",
+            "minLength": 1
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "description": "Pinned image identifier as stored in state; state serde does not enforce the image-store ID grammar."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "description": "Pinned source digest as stored in state; state serde does not enforce digest syntax."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "ref",
+          "id",
+          "sha256"
+        ],
+        "oneOf": [
+          {
+            "properties": {
+              "id": {
+                "type": "null"
+              },
+              "sha256": {
+                "type": "null"
+              }
+            }
+          },
+          {
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "sha256": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        ]
+      },
+      "LastExit": {
+        "type": "object",
+        "properties": {
+          "at": {
+            "type": "string"
+          },
+          "code": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": -2147483648,
+                "maximum": 2147483647
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "signal": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": -2147483648,
+                "maximum": 2147483647
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Known values include guest shutdown, stale, and host reboot; concrete failure diagnostics are also preserved."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "at",
+          "code",
+          "signal",
+          "reason"
+        ],
+        "description": "code and signal cannot both be non-null.",
+        "oneOf": [
+          {
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "signal": {
+                "type": "null"
+              }
+            }
+          },
+          {
+            "properties": {
+              "code": {
+                "type": "null"
+              },
+              "signal": {
+                "type": "integer"
+              }
+            }
+          },
+          {
+            "properties": {
+              "code": {
+                "type": "null"
+              },
+              "signal": {
+                "type": "null"
+              }
+            }
+          }
+        ]
+      },
+      "MachineState": {
+        "type": "object",
+        "properties": {
+          "version": {
+            "type": "integer",
+            "const": 1
+          },
+          "status": {
+            "$ref": "#/components/schemas/MachineStatus"
+          },
+          "image": {
+            "$ref": "#/components/schemas/StateImage"
+          },
+          "mac": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "Persisted state text; state serde does not re-parse it as MacAddr."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "cid": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295,
+            "description": "Production-created machines use 3; state serde accepts any u32 and VmConfig generation rejects non-3 values."
+          },
+          "instance_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "shim_pid": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 4294967295
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "vmm_pid": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 4294967295
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sidecar_pids": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            }
+          },
+          "runtime_dir": {
+            "$ref": "#/components/schemas/Path"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "forwards": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "degraded": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "last_exit": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LastExit"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "status",
+          "image",
+          "mac",
+          "cid",
+          "instance_id",
+          "shim_pid",
+          "vmm_pid",
+          "sidecar_pids",
+          "runtime_dir",
+          "started_at",
+          "forwards",
+          "degraded",
+          "last_exit"
+        ]
+      },
+      "MachineSummary": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "created",
+              "starting",
+              "running",
+              "running!",
+              "running (unsupervised)",
+              "running! (unsupervised)",
+              "stopping",
+              "stopped",
+              "failed"
+            ]
+          },
+          "image": {
+            "type": "string"
+          },
+          "cpus": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 255
+          },
+          "memory": {
+            "$ref": "#/components/schemas/MemorySize"
+          },
+          "uptime": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9]+[smhd]$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "forwards": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "status",
+          "image",
+          "cpus",
+          "memory",
+          "uptime",
+          "forwards"
+        ]
+      },
+      "MachineView": {
+        "type": "object",
+        "properties": {
+          "spec": {
+            "$ref": "#/components/schemas/MachineSpec"
+          },
+          "state": {
+            "$ref": "#/components/schemas/MachineState"
+          },
+          "supervision": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Supervision"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "spec",
+          "state",
+          "supervision"
+        ]
+      },
+      "MachineRecord": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "spec": {
+            "$ref": "#/components/schemas/MachineSpec"
+          },
+          "state": {
+            "$ref": "#/components/schemas/MachineState"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "spec",
+          "state"
+        ]
+      },
+      "StartResult": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MachineStatus"
+          },
+          "elapsed_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          },
+          "forwards": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "mounts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "status",
+          "elapsed_ms",
+          "forwards",
+          "mounts"
+        ]
+      },
+      "StopResult": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MachineStatus"
+          },
+          "elapsed_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "status",
+          "elapsed_ms"
+        ]
+      },
+      "RemoveResult": {
+        "type": "object",
+        "properties": {
+          "removed": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "removed"
+        ]
+      },
+      "SpecWarning": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "key",
+          "message"
+        ]
+      },
+      "SpecResult": {
+        "type": "object",
+        "properties": {
+          "spec": {
+            "$ref": "#/components/schemas/MachineSpec"
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SpecWarning"
+            }
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "spec",
+          "warnings"
+        ]
+      },
+      "VersionIdentity": {
+        "type": "object",
+        "properties": {
+          "release": {
+            "type": "string",
+            "pattern": "^v.+$"
+          },
+          "git_commit": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{40}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "release",
+          "git_commit"
+        ]
+      },
+      "VersionDependency": {
+        "type": "object",
+        "properties": {
+          "version": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "sha256"
+        ]
+      },
+      "VersionPaths": {
+        "type": "object",
+        "properties": {
+          "config": {
+            "$ref": "#/components/schemas/Path"
+          },
+          "data": {
+            "$ref": "#/components/schemas/Path"
+          },
+          "runtime": {
+            "$ref": "#/components/schemas/Path"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "config",
+          "data",
+          "runtime"
+        ]
+      },
+      "VersionResult": {
+        "type": "object",
+        "properties": {
+          "version": {
+            "type": "string"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/VersionIdentity"
+          },
+          "architecture": {
+            "$ref": "#/components/schemas/Architecture"
+          },
+          "dependencies": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/VersionDependency"
+            }
+          },
+          "paths": {
+            "$ref": "#/components/schemas/VersionPaths"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "identity",
+          "architecture",
+          "dependencies",
+          "paths"
+        ]
+      },
+      "DoctorStatus": {
+        "type": "string",
+        "enum": [
+          "ok",
+          "warn",
+          "fail"
+        ]
+      },
+      "DoctorCheckId": {
+        "type": "string",
+        "enum": [
+          "host_arch",
+          "kvm",
+          "nested_virtualization",
+          "runtime_dir",
+          "vendored_binaries",
+          "virtiofsd",
+          "passt",
+          "qemu_img",
+          "ssh",
+          "user_namespaces",
+          "ssh_key",
+          "data_space",
+          "stale_state"
+        ]
+      },
+      "DoctorCheck": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/DoctorCheckId"
+          },
+          "status": {
+            "$ref": "#/components/schemas/DoctorStatus"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "fix": {
+            "type": "string"
+          },
+          "hint": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "status",
+          "reason"
+        ],
+        "description": "fix and hint are omitted when absent; they are never emitted as null."
+      },
+      "DoctorReport": {
+        "type": "object",
+        "properties": {
+          "checks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DoctorCheck"
+            },
+            "minItems": 13,
+            "maxItems": 13
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "checks"
+        ]
+      },
+      "CatalogArchitectureSummary": {
+        "type": "object",
+        "properties": {
+          "architecture": {
+            "$ref": "#/components/schemas/Architecture"
+          },
+          "firmware": {
+            "$ref": "#/components/schemas/CatalogFirmware"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "architecture",
+          "firmware"
+        ]
+      },
+      "CatalogEntrySummary": {
+        "type": "object",
+        "properties": {
+          "reference": {
+            "type": "string"
+          },
+          "aliases": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "architectures": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogArchitectureSummary"
+            }
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "reference",
+          "aliases",
+          "architectures"
+        ]
+      },
+      "ImageFormat": {
+        "type": "string",
+        "enum": [
+          "qcow2",
+          "raw"
+        ]
+      },
+      "ChecksumAlgorithm": {
+        "type": "string",
+        "enum": [
+          "sha256",
+          "sha512"
+        ]
+      },
+      "ImageMetadata": {
+        "type": "object",
+        "properties": {
+          "version": {
+            "type": "integer",
+            "const": 1
+          },
+          "id": {
+            "type": "string",
+            "pattern": "^image-[0-9a-f]{64}$"
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 18446744073709551615
+          },
+          "source_ref": {
+            "type": "string",
+            "minLength": 1
+          },
+          "source_url": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uri",
+                "pattern": "^https://"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "source_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "stored_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "architecture": {
+            "$ref": "#/components/schemas/Architecture"
+          },
+          "firmware": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CatalogFirmware"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sshd_path": {
+            "type": "string",
+            "pattern": "^/(?!\\.\\.?(?:/|$))(?!.*?/\\.\\.?(?:/|$))(?:[A-Za-z0-9._+-]+/)*[A-Za-z0-9._+-]+$",
+            "maxLength": 4096,
+            "description": "Omitted when the default /usr/sbin/sshd applies; dot and dot-dot components are forbidden."
+          },
+          "source_format": {
+            "$ref": "#/components/schemas/ImageFormat"
+          },
+          "stored_format": {
+            "type": "string",
+            "const": "qcow2"
+          },
+          "verification_algorithm": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChecksumAlgorithm"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "verification_digest": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^(?:[0-9a-f]{64}|[0-9a-f]{128})$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "size": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 18446744073709551615
+          },
+          "pulled_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "id",
+          "generation",
+          "source_ref",
+          "source_url",
+          "source_sha256",
+          "stored_sha256",
+          "architecture",
+          "firmware",
+          "source_format",
+          "stored_format",
+          "verification_algorithm",
+          "verification_digest",
+          "size",
+          "pulled_at"
+        ],
+        "description": "Strict image sidecar metadata. sshd_path is omitted when it has the default value.",
+        "allOf": [
+          {
+            "oneOf": [
+              {
+                "properties": {
+                  "verification_algorithm": {
+                    "type": "null"
+                  },
+                  "verification_digest": {
+                    "type": "null"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "verification_algorithm": {
+                    "const": "sha256"
+                  },
+                  "verification_digest": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "verification_algorithm": {
+                    "const": "sha512"
+                  },
+                  "verification_digest": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{128}$"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "StoredImage": {
+        "type": "object",
+        "properties": {
+          "metadata": {
+            "$ref": "#/components/schemas/ImageMetadata"
+          },
+          "path": {
+            "$ref": "#/components/schemas/Path"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "metadata",
+          "path"
+        ]
+      },
+      "PulledImage": {
+        "type": "object",
+        "properties": {
+          "metadata": {
+            "$ref": "#/components/schemas/ImageMetadata"
+          },
+          "path": {
+            "$ref": "#/components/schemas/Path"
+          },
+          "firmware": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CatalogFirmware"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "cached": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "metadata",
+          "path",
+          "firmware",
+          "cached"
+        ]
+      },
+      "ImagePruneResult": {
+        "type": "object",
+        "properties": {
+          "removed": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^image-[0-9a-f]{64}$"
+            }
+          },
+          "bytes_freed": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "removed",
+          "bytes_freed"
+        ]
+      },
+      "ErrorKind": {
+        "type": "string",
+        "enum": [
+          "generic",
+          "usage",
+          "invalid_spec",
+          "not_found",
+          "not_running",
+          "conflict",
+          "already_exists",
+          "already_running",
+          "busy",
+          "dependency",
+          "timeout",
+          "checksum",
+          "interrupted"
+        ]
+      },
+      "ErrorInfo": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/ErrorKind"
+          },
+          "message": {
+            "type": "string"
+          },
+          "hint": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "message"
+        ],
+        "description": "hint is omitted when the error has no public remediation hint."
+      },
+      "ErrorEnvelope": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorInfo"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "error"
+        ]
+      },
+      "Unit": {
+        "type": "string",
+        "enum": [
+          "bytes"
+        ]
+      },
+      "Level": {
+        "type": "string",
+        "enum": [
+          "trace",
+          "debug",
+          "info",
+          "warn",
+          "error"
+        ]
+      },
+      "StepStartEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "StepStart"
+          },
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "id",
+          "label"
+        ]
+      },
+      "StepUpdateEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "StepUpdate"
+          },
+          "id": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "id",
+          "detail"
+        ]
+      },
+      "ProgressEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "Progress"
+          },
+          "id": {
+            "type": "string"
+          },
+          "done": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          },
+          "total": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 18446744073709551615
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "unit": {
+            "$ref": "#/components/schemas/Unit"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "id",
+          "done",
+          "total",
+          "unit"
+        ]
+      },
+      "StepDoneEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "StepDone"
+          },
+          "id": {
+            "type": "string"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "elapsed_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "id",
+          "detail",
+          "elapsed_ms"
+        ]
+      },
+      "StepSkipEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "StepSkip"
+          },
+          "id": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "id",
+          "reason"
+        ]
+      },
+      "StepFailEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "StepFail"
+          },
+          "id": {
+            "type": "string"
+          },
+          "error": {
+            "$ref": "#/components/schemas/ErrorInfo"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "id",
+          "error"
+        ]
+      },
+      "LogEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "Log"
+          },
+          "level": {
+            "$ref": "#/components/schemas/Level"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "level",
+          "message"
+        ]
+      },
+      "OutputEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "Output"
+          },
+          "data": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "data"
+        ]
+      },
+      "ResultEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "Result"
+          },
+          "action": {
+            "type": "string"
+          },
+          "payload": {}
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "action",
+          "payload"
+        ]
+      },
+      "NonTerminalEvent": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/StepStartEvent"
+          },
+          {
+            "$ref": "#/components/schemas/StepUpdateEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ProgressEvent"
+          },
+          {
+            "$ref": "#/components/schemas/StepDoneEvent"
+          },
+          {
+            "$ref": "#/components/schemas/StepSkipEvent"
+          },
+          {
+            "$ref": "#/components/schemas/StepFailEvent"
+          },
+          {
+            "$ref": "#/components/schemas/LogEvent"
+          },
+          {
+            "$ref": "#/components/schemas/OutputEvent"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "type",
+          "mapping": {
+            "StepStart": "#/components/schemas/StepStartEvent",
+            "StepUpdate": "#/components/schemas/StepUpdateEvent",
+            "Progress": "#/components/schemas/ProgressEvent",
+            "StepDone": "#/components/schemas/StepDoneEvent",
+            "StepSkip": "#/components/schemas/StepSkipEvent",
+            "StepFail": "#/components/schemas/StepFailEvent",
+            "Log": "#/components/schemas/LogEvent",
+            "Output": "#/components/schemas/OutputEvent"
+          }
+        }
+      },
+      "Event": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/StepStartEvent"
+          },
+          {
+            "$ref": "#/components/schemas/StepUpdateEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ProgressEvent"
+          },
+          {
+            "$ref": "#/components/schemas/StepDoneEvent"
+          },
+          {
+            "$ref": "#/components/schemas/StepSkipEvent"
+          },
+          {
+            "$ref": "#/components/schemas/StepFailEvent"
+          },
+          {
+            "$ref": "#/components/schemas/LogEvent"
+          },
+          {
+            "$ref": "#/components/schemas/OutputEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ResultEvent"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "type",
+          "mapping": {
+            "StepStart": "#/components/schemas/StepStartEvent",
+            "StepUpdate": "#/components/schemas/StepUpdateEvent",
+            "Progress": "#/components/schemas/ProgressEvent",
+            "StepDone": "#/components/schemas/StepDoneEvent",
+            "StepSkip": "#/components/schemas/StepSkipEvent",
+            "StepFail": "#/components/schemas/StepFailEvent",
+            "Log": "#/components/schemas/LogEvent",
+            "Output": "#/components/schemas/OutputEvent",
+            "Result": "#/components/schemas/ResultEvent"
+          }
+        }
+      },
+      "StartResultEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "Result"
+          },
+          "action": {
+            "type": "string",
+            "const": "start"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/StartResult"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "action",
+          "payload"
+        ]
+      },
+      "StopResultEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "Result"
+          },
+          "action": {
+            "type": "string",
+            "const": "stop"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/StopResult"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "action",
+          "payload"
+        ]
+      },
+      "RestartResultEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "Result"
+          },
+          "action": {
+            "type": "string",
+            "const": "restart"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/StartResult"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "action",
+          "payload"
+        ]
+      },
+      "PullImageResultEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "Result"
+          },
+          "action": {
+            "type": "string",
+            "const": "images-pull"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/PulledImage"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "action",
+          "payload"
+        ]
+      },
+      "RemoveMachineResultEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "Result"
+          },
+          "action": {
+            "type": "string",
+            "const": "rm"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/RemoveResult"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "action",
+          "payload"
+        ]
+      },
+      "StartDispatchOutput": {
+        "type": "object",
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NonTerminalEvent"
+            }
+          },
+          "result": {
+            "$ref": "#/components/schemas/StartResultEvent"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "events",
+          "result"
+        ]
+      },
+      "StopDispatchOutput": {
+        "type": "object",
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NonTerminalEvent"
+            }
+          },
+          "result": {
+            "$ref": "#/components/schemas/StopResultEvent"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "events",
+          "result"
+        ]
+      },
+      "RestartDispatchOutput": {
+        "type": "object",
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NonTerminalEvent"
+            }
+          },
+          "result": {
+            "$ref": "#/components/schemas/RestartResultEvent"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "events",
+          "result"
+        ]
+      },
+      "PullImageDispatchOutput": {
+        "type": "object",
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NonTerminalEvent"
+            }
+          },
+          "result": {
+            "$ref": "#/components/schemas/PullImageResultEvent"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "events",
+          "result"
+        ]
+      },
+      "RemoveMachineDispatchOutput": {
+        "type": "object",
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NonTerminalEvent"
+            }
+          },
+          "result": {
+            "$ref": "#/components/schemas/RemoveMachineResultEvent"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "events",
+          "result"
+        ]
+      },
+      "VmCpusConfig": {
+        "type": "object",
+        "properties": {
+          "boot_vcpus": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 255
+          },
+          "max_vcpus": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 255
+          }
+        },
+        "additionalProperties": true,
+        "required": [
+          "boot_vcpus",
+          "max_vcpus"
+        ],
+        "description": "Firestone emits equal boot_vcpus and max_vcpus."
+      },
+      "VmMemoryConfig": {
+        "type": "object",
+        "properties": {
+          "size": {
+            "type": "integer",
+            "minimum": 134217728,
+            "maximum": 18446744073709551615
+          },
+          "shared": {
+            "type": "boolean",
+            "const": true
+          }
+        },
+        "additionalProperties": true,
+        "required": [
+          "size",
+          "shared"
+        ]
+      },
+      "VmPayloadConfig": {
+        "type": "object",
+        "properties": {
+          "firmware": {
+            "$ref": "#/components/schemas/Path"
+          },
+          "kernel": {
+            "$ref": "#/components/schemas/Path"
+          }
+        },
+        "oneOf": [
+          {
+            "required": [
+              "firmware"
+            ]
+          },
+          {
+            "required": [
+              "kernel"
+            ]
+          }
+        ],
+        "additionalProperties": true,
+        "description": "Exactly one Firestone-owned boot payload is present. A validated config overlay may add non-conflicting Cloud Hypervisor fields."
+      },
+      "VmMachineDisk": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "$ref": "#/components/schemas/Path"
+          },
+          "readonly": {
+            "type": "boolean",
+            "const": false
+          },
+          "image_type": {
+            "type": "string",
+            "const": "Qcow2"
+          },
+          "backing_files": {
+            "type": "boolean",
+            "const": true
+          },
+          "vhost_user": {
+            "type": "boolean",
+            "const": false
+          }
+        },
+        "additionalProperties": true,
+        "required": [
+          "path",
+          "image_type",
+          "backing_files"
+        ],
+        "description": "First disk: writable qcow2 overlay. readonly is absent or false."
+      },
+      "VmSeedDisk": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "$ref": "#/components/schemas/Path"
+          },
+          "readonly": {
+            "type": "boolean",
+            "const": true
+          },
+          "image_type": {
+            "type": "string",
+            "const": "Raw"
+          },
+          "backing_files": {
+            "type": "boolean",
+            "const": false
+          },
+          "vhost_user": {
+            "type": "boolean",
+            "const": false
+          }
+        },
+        "additionalProperties": true,
+        "required": [
+          "path",
+          "readonly",
+          "image_type"
+        ],
+        "description": "Second disk: read-only raw CIDATA seed. backing_files is absent or false."
+      },
+      "VmAdditionalDisk": {
+        "description": "Additional Cloud Hypervisor disk supplied by a validated config overlay."
+      },
+      "VmNetConfig": {
+        "type": "object",
+        "properties": {
+          "tap": {
+            "type": "string"
+          },
+          "mac": {
+            "$ref": "#/components/schemas/MacAddress"
+          },
+          "ip": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "ipv4"
+              },
+              {
+                "type": "string",
+                "format": "ipv6"
+              }
+            ]
+          },
+          "mask": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "ipv4"
+              },
+              {
+                "type": "string",
+                "format": "ipv6"
+              }
+            ]
+          },
+          "vhost_user": {
+            "type": "boolean"
+          },
+          "vhost_socket": {
+            "type": "string"
+          },
+          "vhost_mode": {
+            "type": "string",
+            "const": "Client"
+          }
+        },
+        "additionalProperties": true,
+        "required": [
+          "mac"
+        ],
+        "description": "Tap fields or passt vhost-user fields are present according to the resolved network plan; absent optional fields are omitted."
+      },
+      "VmFsConfig": {
+        "type": "object",
+        "properties": {
+          "tag": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 36
+          },
+          "socket": {
+            "$ref": "#/components/schemas/Path"
+          },
+          "num_queues": {
+            "type": "integer",
+            "const": 1
+          },
+          "queue_size": {
+            "type": "integer",
+            "const": 1024
+          }
+        },
+        "additionalProperties": true,
+        "required": [
+          "tag",
+          "socket",
+          "num_queues",
+          "queue_size"
+        ]
+      },
+      "VmVsockConfig": {
+        "type": "object",
+        "properties": {
+          "cid": {
+            "type": "integer",
+            "const": 3
+          },
+          "socket": {
+            "$ref": "#/components/schemas/Path"
+          }
+        },
+        "additionalProperties": true,
+        "required": [
+          "cid",
+          "socket"
+        ]
+      },
+      "VmSerialConfig": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "const": "File"
+          },
+          "file": {
+            "$ref": "#/components/schemas/Path"
+          }
+        },
+        "additionalProperties": true,
+        "required": [
+          "mode",
+          "file"
+        ]
+      },
+      "VmConsoleConfig": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "const": "Pty"
+          }
+        },
+        "additionalProperties": true,
+        "required": [
+          "mode"
+        ]
+      },
+      "VmRngConfig": {
+        "type": "object",
+        "properties": {
+          "src": {
+            "type": "string",
+            "const": "/dev/urandom"
+          }
+        },
+        "additionalProperties": true,
+        "required": [
+          "src"
+        ]
+      },
+      "VmConfig": {
+        "type": "object",
+        "properties": {
+          "cpus": {
+            "$ref": "#/components/schemas/VmCpusConfig"
+          },
+          "memory": {
+            "$ref": "#/components/schemas/VmMemoryConfig"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/VmPayloadConfig"
+          },
+          "disks": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "$ref": "#/components/schemas/VmMachineDisk"
+              },
+              {
+                "$ref": "#/components/schemas/VmSeedDisk"
+              }
+            ],
+            "items": {
+              "$ref": "#/components/schemas/VmAdditionalDisk"
+            },
+            "minItems": 2
+          },
+          "net": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "$ref": "#/components/schemas/VmNetConfig"
+              }
+            ],
+            "items": {},
+            "minItems": 1,
+            "description": "The Firestone-owned first entry is typed; validated config_overlay may append Cloud Hypervisor entries."
+          },
+          "fs": {
+            "type": "array",
+            "items": {},
+            "contains": {
+              "$ref": "#/components/schemas/VmFsConfig"
+            },
+            "minContains": 1,
+            "minItems": 1,
+            "description": "Contains the Firestone-owned filesystem entries; validated config_overlay may append Cloud Hypervisor entries."
+          },
+          "vsock": {
+            "$ref": "#/components/schemas/VmVsockConfig"
+          },
+          "serial": {
+            "$ref": "#/components/schemas/VmSerialConfig"
+          },
+          "console": {
+            "$ref": "#/components/schemas/VmConsoleConfig"
+          },
+          "rng": {
+            "$ref": "#/components/schemas/VmRngConfig"
+          }
+        },
+        "additionalProperties": true,
+        "required": [
+          "cpus",
+          "memory",
+          "payload",
+          "disks",
+          "vsock",
+          "serial",
+          "console",
+          "rng"
+        ],
+        "description": "Canonical Cloud Hypervisor v53 VmConfig persisted for the machine. net and fs are omitted when disabled. A validated RFC 7396 config overlay may add fields but cannot change Firestone-owned required values."
+      },
+      "MachineSummaryList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/MachineSummary"
+        }
+      },
+      "CatalogEntrySummaryList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/CatalogEntrySummary"
+        }
+      },
+      "StoredImageList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/StoredImage"
+        }
+      },
+      "MemorySizeInput": {
+        "oneOf": [
+          {
+            "type": "string",
+            "pattern": "^\\s*0*(?:12[8-9]|1[3-9][0-9]|[2-9][0-9]{2}|[1-9][0-9]{3,12}|1[0-6][0-9]{12}|17[0-4][0-9]{11}|175[0-8][0-9]{10}|1759[0-1][0-9]{9}|175920[0-9]{8}|175921[0-7][0-9]{7}|1759218[0-5][0-9]{6}|175921860[0-3][0-9]{4}|1759218604[0-3][0-9]{3}|17592186044[0-3][0-9]{2}|1759218604440[0-9]|1759218604441[0-4]|17592186044415)[Mm]?\\s*$",
+            "description": "Whole MiB from 128 through 17592186044415; surrounding whitespace and leading zeroes are accepted."
+          },
+          {
+            "type": "string",
+            "pattern": "^\\s*0*(?:[1-9][0-9]{0,9}|1[0-6][0-9]{9}|170[0-9]{8}|171[0-6][0-9]{7}|1717[0-8][0-9]{6}|17179[0-7][0-9]{5}|171798[0-5][0-9]{4}|1717986[0-8][0-9]{3}|171798690[0-9]{2}|171798691[0-7][0-9]|1717986918[0-2]|17179869183)[Gg]\\s*$",
+            "description": "Whole GiB from 1 through 17179869183; surrounding whitespace and leading zeroes are accepted."
+          },
+          {
+            "type": "integer",
+            "minimum": 128,
+            "maximum": 17592186044415,
+            "description": "Whole MiB."
+          }
+        ],
+        "description": "Machine memory must resolve to at least 128 MiB and fit in u64 bytes."
+      },
+      "MemorySize": {
+        "type": "string",
+        "pattern": "^(?:(?:12[8-9]|1[3-9][0-9]|[2-9][0-9]{2}|[1-9][0-9]{3,12}|1[0-6][0-9]{12}|17[0-4][0-9]{11}|175[0-8][0-9]{10}|1759[0-1][0-9]{9}|175920[0-9]{8}|175921[0-7][0-9]{7}|1759218[0-5][0-9]{6}|175921860[0-3][0-9]{4}|1759218604[0-3][0-9]{3}|17592186044[0-3][0-9]{2}|1759218604440[0-9]|1759218604441[0-4]|17592186044415)M|(?:[1-9][0-9]{0,9}|1[0-6][0-9]{9}|170[0-9]{8}|171[0-6][0-9]{7}|1717[0-8][0-9]{6}|17179[0-7][0-9]{5}|171798[0-5][0-9]{4}|1717986[0-8][0-9]{3}|171798690[0-9]{2}|171798691[0-7][0-9]|1717986918[0-2]|17179869183)G)$",
+        "description": "Canonical effective memory size, at least 128 MiB."
+      },
+      "GuestMountPath": {
+        "type": "string",
+        "minLength": 2,
+        "maxLength": 4095,
+        "pattern": "^/(?:(?!\\.{1,2}(?:/|$))[^/\\u0000-\\u001F\\u007F]+)(?:/(?:(?!\\.{1,2}(?:/|$))[^/\\u0000-\\u001F\\u007F]+))*$",
+        "description": "Canonical absolute non-root guest path with no dot components, duplicate separators, trailing slash, NUL, or ASCII control characters. Linux byte and component limits are validated after decoding."
+      },
+      "MachineImageRef": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ImageRef"
+          },
+          {
+            "pattern": "\\S"
+          }
+        ],
+        "description": "Machine image reference containing at least one non-whitespace character."
+      }
+    },
+    "parameters": {
+      "MachineName": {
+        "name": "name",
+        "in": "path",
+        "required": true,
+        "description": "Percent-decoded UTF-8 machine name. Core path validation requires one non-empty Unix path component without control characters.",
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!\\.{1,2}$)[^/\\u0000-\\u001F\\u007F-\\u009F]+$"
+        },
+        "example": "dev"
+      },
+      "ImageId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "Complete lowercase stable image ID shown by GET /v1/images.",
+        "schema": {
+          "type": "string",
+          "pattern": "^image-[0-9a-f]{64}$"
+        },
+        "example": "image-0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "Force": {
+        "name": "force",
+        "in": "query",
+        "required": false,
+        "description": "Defaults to false. Unknown, duplicate, or non-boolean query fields are rejected on force-query routes.",
+        "schema": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "LogSource": {
+        "name": "source",
+        "in": "query",
+        "required": false,
+        "description": "Owned log source. virtiofsd-N accepts a decimal u16 index from 0 through 65535. Defaults to console.",
+        "schema": {
+          "type": "string",
+          "pattern": "^(?:console|vmm|shim|passt|virtiofsd-0*(?:[0-9]{1,4}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))$",
+          "default": "console"
+        }
+      },
+      "LogFollow": {
+        "name": "follow",
+        "in": "query",
+        "required": false,
+        "description": "Keep the text stream open and follow safe rotations. Defaults to false.",
+        "schema": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "LogLines": {
+        "name": "lines",
+        "in": "query",
+        "required": false,
+        "description": "Number of trailing lines. Zero is valid.",
+        "schema": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100000,
+          "default": 200
+        }
+      }
+    },
+    "responses": {
+      "Error400": {
+        "description": "Bad request: usage or invalid_spec.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            },
+            "examples": {
+              "default": {
+                "$ref": "#/components/examples/Error400"
+              }
+            }
+          }
+        },
+        "x-firestone-error-kinds": [
+          "usage",
+          "invalid_spec"
+        ]
+      },
+      "ActionError400": {
+        "description": "Bad request: usage or invalid_spec. Before the first event, a default-stream dispatcher error is one NDJSON line; request-validation errors remain JSON. With JSON aggregation selected, dispatcher errors are JSON.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            },
+            "examples": {
+              "default": {
+                "$ref": "#/components/examples/Error400"
+              }
+            }
+          },
+          "application/x-ndjson": {
+            "schema": {
+              "type": "string",
+              "description": "One LF-terminated ErrorEnvelope record.",
+              "x-ndjson-item-schema": {
+                "$ref": "#/components/schemas/ErrorEnvelope"
+              }
+            },
+            "examples": {
+              "default": {
+                "$ref": "#/components/examples/NdjsonError400"
+              }
+            }
+          }
+        },
+        "x-firestone-error-kinds": [
+          "usage",
+          "invalid_spec"
+        ]
+      },
+      "Error404": {
+        "description": "Resource or route not found: not_found.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            },
+            "examples": {
+              "default": {
+                "$ref": "#/components/examples/Error404"
+              }
+            }
+          }
+        },
+        "x-firestone-error-kinds": [
+          "not_found"
+        ]
+      },
+      "ActionError404": {
+        "description": "Resource or route not found: not_found. Before the first event, a default-stream dispatcher error is one NDJSON line; request-validation errors remain JSON. With JSON aggregation selected, dispatcher errors are JSON.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            },
+            "examples": {
+              "default": {
+                "$ref": "#/components/examples/Error404"
+              }
+            }
+          },
+          "application/x-ndjson": {
+            "schema": {
+              "type": "string",
+              "description": "One LF-terminated ErrorEnvelope record.",
+              "x-ndjson-item-schema": {
+                "$ref": "#/components/schemas/ErrorEnvelope"
+              }
+            },
+            "examples": {
+              "default": {
+                "$ref": "#/components/examples/NdjsonError404"
+              }
+            }
+          }
+        },
+        "x-firestone-error-kinds": [
+          "not_found"
+        ]
+      },
+      "Error409": {
+        "description": "Conflict: conflict, already_running, or busy.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            },
+            "examples": {
+              "default": {
+                "$ref": "#/components/examples/Error409"
+              }
+            }
+          }
+        },
+        "x-firestone-error-kinds": [
+          "conflict",
+          "already_running",
+          "busy"
+        ]
+      },
+      "ActionError409": {
+        "description": "Conflict: conflict, already_running, or busy. Before the first event, a default-stream dispatcher error is one NDJSON line; request-validation errors remain JSON. With JSON aggregation selected, dispatcher errors are JSON.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            },
+            "examples": {
+              "default": {
+                "$ref": "#/components/examples/Error409"
+              }
+            }
+          },
+          "application/x-ndjson": {
+            "schema": {
+              "type": "string",
+              "description": "One LF-terminated ErrorEnvelope record.",
+              "x-ndjson-item-schema": {
+                "$ref": "#/components/schemas/ErrorEnvelope"
+              }
+            },
+            "examples": {
+              "default": {
+                "$ref": "#/components/examples/NdjsonError409"
+              }
+            }
+          }
+        },
+        "x-firestone-error-kinds": [
+          "conflict",
+          "already_running",
+          "busy"
+        ]
+      },
+      "Error500": {
+        "description": "Internal action failure: generic, not_running, already_exists, or interrupted.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            },
+            "examples": {
+              "default": {
+                "$ref": "#/components/examples/Error500"
+              }
+            }
+          }
+        },
+        "x-firestone-error-kinds": [
+          "generic",
+          "not_running",
+          "already_exists",
+          "interrupted"
+        ]
+      },
+      "ActionError500": {
+        "description": "Internal action failure: generic, not_running, already_exists, or interrupted. Before the first event, a default-stream dispatcher error is one NDJSON line; request-validation errors remain JSON. With JSON aggregation selected, dispatcher errors are JSON.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            },
+            "examples": {
+              "default": {
+                "$ref": "#/components/examples/Error500"
+              }
+            }
+          },
+          "application/x-ndjson": {
+            "schema": {
+              "type": "string",
+              "description": "One LF-terminated ErrorEnvelope record.",
+              "x-ndjson-item-schema": {
+                "$ref": "#/components/schemas/ErrorEnvelope"
+              }
+            },
+            "examples": {
+              "default": {
+                "$ref": "#/components/examples/NdjsonError500"
+              }
+            }
+          }
+        },
+        "x-firestone-error-kinds": [
+          "generic",
+          "not_running",
+          "already_exists",
+          "interrupted"
+        ]
+      },
+      "Error502": {
+        "description": "Image checksum or verification failure: checksum.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            },
+            "examples": {
+              "default": {
+                "$ref": "#/components/examples/Error502"
+              }
+            }
+          }
+        },
+        "x-firestone-error-kinds": [
+          "checksum"
+        ]
+      },
+      "ActionError502": {
+        "description": "Image checksum or verification failure: checksum. Before the first event, a default-stream dispatcher error is one NDJSON line; request-validation errors remain JSON. With JSON aggregation selected, dispatcher errors are JSON.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            },
+            "examples": {
+              "default": {
+                "$ref": "#/components/examples/Error502"
+              }
+            }
+          },
+          "application/x-ndjson": {
+            "schema": {
+              "type": "string",
+              "description": "One LF-terminated ErrorEnvelope record.",
+              "x-ndjson-item-schema": {
+                "$ref": "#/components/schemas/ErrorEnvelope"
+              }
+            },
+            "examples": {
+              "default": {
+                "$ref": "#/components/examples/NdjsonError502"
+              }
+            }
+          }
+        },
+        "x-firestone-error-kinds": [
+          "checksum"
+        ]
+      },
+      "Error503": {
+        "description": "Host dependency unavailable or broken: dependency.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            },
+            "examples": {
+              "default": {
+                "$ref": "#/components/examples/Error503"
+              }
+            }
+          }
+        },
+        "x-firestone-error-kinds": [
+          "dependency"
+        ]
+      },
+      "ActionError503": {
+        "description": "Host dependency unavailable or broken: dependency. Before the first event, a default-stream dispatcher error is one NDJSON line; request-validation errors remain JSON. With JSON aggregation selected, dispatcher errors are JSON.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            },
+            "examples": {
+              "default": {
+                "$ref": "#/components/examples/Error503"
+              }
+            }
+          },
+          "application/x-ndjson": {
+            "schema": {
+              "type": "string",
+              "description": "One LF-terminated ErrorEnvelope record.",
+              "x-ndjson-item-schema": {
+                "$ref": "#/components/schemas/ErrorEnvelope"
+              }
+            },
+            "examples": {
+              "default": {
+                "$ref": "#/components/examples/NdjsonError503"
+              }
+            }
+          }
+        },
+        "x-firestone-error-kinds": [
+          "dependency"
+        ]
+      },
+      "Error504": {
+        "description": "Bounded action deadline exceeded: timeout.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            },
+            "examples": {
+              "default": {
+                "$ref": "#/components/examples/Error504"
+              }
+            }
+          }
+        },
+        "x-firestone-error-kinds": [
+          "timeout"
+        ]
+      },
+      "ActionError504": {
+        "description": "Bounded action deadline exceeded: timeout. Before the first event, a default-stream dispatcher error is one NDJSON line; request-validation errors remain JSON. With JSON aggregation selected, dispatcher errors are JSON.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            },
+            "examples": {
+              "default": {
+                "$ref": "#/components/examples/Error504"
+              }
+            }
+          },
+          "application/x-ndjson": {
+            "schema": {
+              "type": "string",
+              "description": "One LF-terminated ErrorEnvelope record.",
+              "x-ndjson-item-schema": {
+                "$ref": "#/components/schemas/ErrorEnvelope"
+              }
+            },
+            "examples": {
+              "default": {
+                "$ref": "#/components/examples/NdjsonError504"
+              }
+            }
+          }
+        },
+        "x-firestone-error-kinds": [
+          "timeout"
+        ]
+      }
+    },
+    "examples": {
+      "Version": {
+        "summary": "Development build version payload",
+        "value": {
+          "version": "0.1.0",
+          "identity": {
+            "release": "v0.1.0",
+            "git_commit": null
+          },
+          "architecture": "x86_64",
+          "dependencies": {
+            "cloud-hypervisor": {
+              "version": "v53.0",
+              "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+            }
+          },
+          "paths": {
+            "config": "/home/alice/.config/firestone",
+            "data": "/home/alice/.local/share/firestone",
+            "runtime": "/run/user/1000/firestone"
+          }
+        }
+      },
+      "Doctor": {
+        "summary": "Inspect-only doctor report (abbreviated)",
+        "value": {
+          "checks": [
+            {
+              "id": "host_arch",
+              "status": "ok",
+              "reason": "host_arch check passed"
+            },
+            {
+              "id": "kvm",
+              "status": "ok",
+              "reason": "kvm check passed"
+            },
+            {
+              "id": "nested_virtualization",
+              "status": "ok",
+              "reason": "nested_virtualization check passed"
+            },
+            {
+              "id": "runtime_dir",
+              "status": "ok",
+              "reason": "runtime_dir check passed"
+            },
+            {
+              "id": "vendored_binaries",
+              "status": "ok",
+              "reason": "vendored_binaries check passed"
+            },
+            {
+              "id": "virtiofsd",
+              "status": "ok",
+              "reason": "virtiofsd check passed"
+            },
+            {
+              "id": "passt",
+              "status": "ok",
+              "reason": "passt check passed"
+            },
+            {
+              "id": "qemu_img",
+              "status": "ok",
+              "reason": "qemu_img check passed"
+            },
+            {
+              "id": "ssh",
+              "status": "ok",
+              "reason": "ssh check passed"
+            },
+            {
+              "id": "user_namespaces",
+              "status": "ok",
+              "reason": "user_namespaces check passed"
+            },
+            {
+              "id": "ssh_key",
+              "status": "ok",
+              "reason": "ssh_key check passed"
+            },
+            {
+              "id": "data_space",
+              "status": "ok",
+              "reason": "data_space check passed"
+            },
+            {
+              "id": "stale_state",
+              "status": "ok",
+              "reason": "stale_state check passed"
+            }
+          ]
+        }
+      },
+      "Machines": {
+        "value": [
+          {
+            "name": "dev",
+            "status": "created",
+            "image": "ubuntu:24.04",
+            "cpus": 2,
+            "memory": "2G",
+            "uptime": null,
+            "forwards": []
+          }
+        ]
+      },
+      "CreateMachineRequest": {
+        "value": {
+          "name": "dev",
+          "spec": {
+            "cpus": 2,
+            "memory": "2G"
+          }
+        }
+      },
+      "MachineRecord": {
+        "value": {
+          "name": "dev",
+          "spec": {
+            "image": "ubuntu:24.04",
+            "arch": null,
+            "cpus": 2,
+            "memory": "2G",
+            "disk": "20G",
+            "user": "root",
+            "network": {
+              "mode": "passt",
+              "forward": [],
+              "tap": null,
+              "mac": null
+            },
+            "mount": [],
+            "cloud_init": {
+              "user_data": null,
+              "network_config": null,
+              "ssh_keys": [],
+              "provisioning": true
+            },
+            "vmm": {
+              "binary": null,
+              "firmware": "auto",
+              "extra_args": [],
+              "config_overlay": null
+            }
+          },
+          "state": {
+            "version": 1,
+            "status": "created",
+            "image": {
+              "ref": "ubuntu:24.04",
+              "id": null,
+              "sha256": null
+            },
+            "mac": null,
+            "cid": 3,
+            "instance_id": null,
+            "shim_pid": null,
+            "vmm_pid": null,
+            "sidecar_pids": {},
+            "runtime_dir": "/run/user/1000/firestone/dev",
+            "started_at": null,
+            "forwards": [],
+            "degraded": [],
+            "last_exit": null
+          }
+        }
+      },
+      "MachineView": {
+        "value": {
+          "spec": {
+            "image": "ubuntu:24.04",
+            "arch": null,
+            "cpus": 2,
+            "memory": "2G",
+            "disk": "20G",
+            "user": "root",
+            "network": {
+              "mode": "passt",
+              "forward": [],
+              "tap": null,
+              "mac": null
+            },
+            "mount": [],
+            "cloud_init": {
+              "user_data": null,
+              "network_config": null,
+              "ssh_keys": [],
+              "provisioning": true
+            },
+            "vmm": {
+              "binary": null,
+              "firmware": "auto",
+              "extra_args": [],
+              "config_overlay": null
+            }
+          },
+          "state": {
+            "version": 1,
+            "status": "created",
+            "image": {
+              "ref": "ubuntu:24.04",
+              "id": null,
+              "sha256": null
+            },
+            "mac": null,
+            "cid": 3,
+            "instance_id": null,
+            "shim_pid": null,
+            "vmm_pid": null,
+            "sidecar_pids": {},
+            "runtime_dir": "/run/user/1000/firestone/dev",
+            "started_at": null,
+            "forwards": [],
+            "degraded": [],
+            "last_exit": null
+          },
+          "supervision": null
+        }
+      },
+      "MachineSpecInput": {
+        "value": {
+          "image": "ubuntu:24.04",
+          "cpus": 4,
+          "memory": "4G",
+          "network": {
+            "mode": "passt"
+          }
+        }
+      },
+      "MachineSpecPatch": {
+        "value": {
+          "cpus": 4,
+          "clear": [
+            "network.forward"
+          ]
+        }
+      },
+      "SpecResult": {
+        "value": {
+          "spec": {
+            "image": "ubuntu:24.04",
+            "arch": null,
+            "cpus": 4,
+            "memory": "2G",
+            "disk": "20G",
+            "user": "root",
+            "network": {
+              "mode": "passt",
+              "forward": [],
+              "tap": null,
+              "mac": null
+            },
+            "mount": [],
+            "cloud_init": {
+              "user_data": null,
+              "network_config": null,
+              "ssh_keys": [],
+              "provisioning": true
+            },
+            "vmm": {
+              "binary": null,
+              "firmware": "auto",
+              "extra_args": [],
+              "config_overlay": null
+            }
+          },
+          "warnings": []
+        }
+      },
+      "StartRequest": {
+        "value": {
+          "wait": true,
+          "timeout_s": 600
+        }
+      },
+      "StopRequest": {
+        "value": {
+          "timeout_s": 30,
+          "force": false
+        }
+      },
+      "PullImageRequest": {
+        "value": {
+          "ref": "https://images.example.invalid/base.qcow2",
+          "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      },
+      "StartNdjson": {
+        "value": "{\"type\":\"StepStart\",\"id\":\"vmm\",\"label\":\"start virtual machine\"}\n{\"type\":\"Result\",\"action\":\"start\",\"payload\":{\"name\":\"dev\",\"status\":\"running\",\"elapsed_ms\":1534,\"forwards\":[],\"mounts\":[]}}\n"
+      },
+      "StopNdjson": {
+        "value": "{\"type\":\"Result\",\"action\":\"stop\",\"payload\":{\"name\":\"dev\",\"status\":\"stopped\",\"elapsed_ms\":421}}\n"
+      },
+      "RestartNdjson": {
+        "value": "{\"type\":\"Result\",\"action\":\"restart\",\"payload\":{\"name\":\"dev\",\"status\":\"running\",\"elapsed_ms\":1902,\"forwards\":[],\"mounts\":[]}}\n"
+      },
+      "PullImageNdjson": {
+        "value": "{\"type\":\"Result\",\"action\":\"images-pull\",\"payload\":{\"metadata\":{\"version\":1,\"id\":\"image-0000000000000000000000000000000000000000000000000000000000000000\",\"generation\":1,\"source_ref\":\"ubuntu:24.04\",\"source_url\":\"https://cloud-images.example.invalid/ubuntu-24.04.qcow2\",\"source_sha256\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"stored_sha256\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"architecture\":\"x86_64\",\"firmware\":\"edk2\",\"source_format\":\"qcow2\",\"stored_format\":\"qcow2\",\"verification_algorithm\":\"sha256\",\"verification_digest\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"size\":536870912,\"pulled_at\":\"2026-09-01T12:00:00Z\"},\"path\":\"/home/alice/.local/share/firestone/images/image-0000000000000000000000000000000000000000000000000000000000000000.qcow2\",\"firmware\":\"edk2\",\"cached\":false}}\n"
+      },
+      "RemoveMachineNdjson": {
+        "value": "{\"type\":\"StepStart\",\"id\":\"stop\",\"label\":\"acpi power button\"}\n{\"type\":\"Result\",\"action\":\"rm\",\"payload\":{\"removed\":[\"dev\"]}}\n"
+      },
+      "StartAggregate": {
+        "value": {
+          "events": [
+            {
+              "type": "StepStart",
+              "id": "vmm",
+              "label": "start virtual machine"
+            }
+          ],
+          "result": {
+            "type": "Result",
+            "action": "start",
+            "payload": {
+              "name": "dev",
+              "status": "running",
+              "elapsed_ms": 1534,
+              "forwards": [],
+              "mounts": []
+            }
+          }
+        }
+      },
+      "StopAggregate": {
+        "value": {
+          "events": [],
+          "result": {
+            "type": "Result",
+            "action": "stop",
+            "payload": {
+              "name": "dev",
+              "status": "stopped",
+              "elapsed_ms": 421
+            }
+          }
+        }
+      },
+      "RestartAggregate": {
+        "value": {
+          "events": [],
+          "result": {
+            "type": "Result",
+            "action": "restart",
+            "payload": {
+              "name": "dev",
+              "status": "running",
+              "elapsed_ms": 1902,
+              "forwards": [],
+              "mounts": []
+            }
+          }
+        }
+      },
+      "PullImageAggregate": {
+        "value": {
+          "events": [],
+          "result": {
+            "type": "Result",
+            "action": "images-pull",
+            "payload": {
+              "metadata": {
+                "version": 1,
+                "id": "image-0000000000000000000000000000000000000000000000000000000000000000",
+                "generation": 1,
+                "source_ref": "ubuntu:24.04",
+                "source_url": "https://cloud-images.example.invalid/ubuntu-24.04.qcow2",
+                "source_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "stored_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "architecture": "x86_64",
+                "firmware": "edk2",
+                "source_format": "qcow2",
+                "stored_format": "qcow2",
+                "verification_algorithm": "sha256",
+                "verification_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+                "size": 536870912,
+                "pulled_at": "2026-09-01T12:00:00Z"
+              },
+              "path": "/home/alice/.local/share/firestone/images/image-0000000000000000000000000000000000000000000000000000000000000000.qcow2",
+              "firmware": "edk2",
+              "cached": false
+            }
+          }
+        }
+      },
+      "RemoveMachineAggregate": {
+        "value": {
+          "events": [
+            {
+              "type": "StepStart",
+              "id": "stop",
+              "label": "acpi power button"
+            }
+          ],
+          "result": {
+            "type": "Result",
+            "action": "rm",
+            "payload": {
+              "removed": [
+                "dev"
+              ]
+            }
+          }
+        }
+      },
+      "Logs": {
+        "value": "cloud-hypervisor: booted\nlogin: ready\n"
+      },
+      "VmConfig": {
+        "value": {
+          "cpus": {
+            "boot_vcpus": 2,
+            "max_vcpus": 2
+          },
+          "memory": {
+            "size": 2147483648,
+            "shared": true
+          },
+          "payload": {
+            "kernel": "/home/alice/.local/share/firestone/bin/hypervisor-fw"
+          },
+          "disks": [
+            {
+              "path": "/home/alice/.local/share/firestone/machines/dev/disk.qcow2",
+              "image_type": "Qcow2",
+              "backing_files": true
+            },
+            {
+              "path": "/home/alice/.local/share/firestone/machines/dev/seed.img",
+              "readonly": true,
+              "image_type": "Raw"
+            }
+          ],
+          "vsock": {
+            "cid": 3,
+            "socket": "/run/user/1000/firestone/dev/vsock.sock"
+          },
+          "serial": {
+            "mode": "File",
+            "file": "/home/alice/.local/share/firestone/machines/dev/console.log"
+          },
+          "console": {
+            "mode": "Pty"
+          },
+          "rng": {
+            "src": "/dev/urandom"
+          }
+        }
+      },
+      "Catalog": {
+        "value": [
+          {
+            "reference": "ubuntu:24.04",
+            "aliases": [
+              "ubuntu",
+              "noble"
+            ],
+            "architectures": [
+              {
+                "architecture": "aarch64",
+                "firmware": "edk2"
+              },
+              {
+                "architecture": "x86_64",
+                "firmware": "edk2"
+              }
+            ]
+          }
+        ]
+      },
+      "Images": {
+        "value": [
+          {
+            "metadata": {
+              "version": 1,
+              "id": "image-0000000000000000000000000000000000000000000000000000000000000000",
+              "generation": 1,
+              "source_ref": "ubuntu:24.04",
+              "source_url": "https://cloud-images.example.invalid/ubuntu-24.04.qcow2",
+              "source_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+              "stored_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+              "architecture": "x86_64",
+              "firmware": "edk2",
+              "source_format": "qcow2",
+              "stored_format": "qcow2",
+              "verification_algorithm": "sha256",
+              "verification_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+              "size": 536870912,
+              "pulled_at": "2026-09-01T12:00:00Z"
+            },
+            "path": "/home/alice/.local/share/firestone/images/image-0000000000000000000000000000000000000000000000000000000000000000.qcow2"
+          }
+        ]
+      },
+      "ImagePrune": {
+        "value": {
+          "removed": [
+            "image-0000000000000000000000000000000000000000000000000000000000000000"
+          ],
+          "bytes_freed": 536870912
+        }
+      },
+      "Error400": {
+        "value": {
+          "error": {
+            "kind": "usage",
+            "message": "request body is not valid for this route",
+            "hint": "send one application/json object with only the documented fields"
+          }
+        }
+      },
+      "NdjsonError400": {
+        "value": "{\"error\":{\"kind\":\"usage\",\"message\":\"request body is not valid for this route\",\"hint\":\"send one application/json object with only the documented fields\"}}\n"
+      },
+      "Error404": {
+        "value": {
+          "error": {
+            "kind": "not_found",
+            "message": "no machine named 'dev'",
+            "hint": "firestone ls"
+          }
+        }
+      },
+      "NdjsonError404": {
+        "value": "{\"error\":{\"kind\":\"not_found\",\"message\":\"no machine named 'dev'\",\"hint\":\"firestone ls\"}}\n"
+      },
+      "Error409": {
+        "value": {
+          "error": {
+            "kind": "conflict",
+            "message": "another operation is active",
+            "hint": "wait for it to finish and retry"
+          }
+        }
+      },
+      "NdjsonError409": {
+        "value": "{\"error\":{\"kind\":\"conflict\",\"message\":\"another operation is active\",\"hint\":\"wait for it to finish and retry\"}}\n"
+      },
+      "Error500": {
+        "value": {
+          "error": {
+            "kind": "generic",
+            "message": "the action could not be completed",
+            "hint": "retry the request; if it fails again, report a Firestone bug"
+          }
+        }
+      },
+      "NdjsonError500": {
+        "value": "{\"error\":{\"kind\":\"generic\",\"message\":\"the action could not be completed\",\"hint\":\"retry the request; if it fails again, report a Firestone bug\"}}\n"
+      },
+      "Error502": {
+        "value": {
+          "error": {
+            "kind": "checksum",
+            "message": "image checksum did not match",
+            "hint": "retry from a trusted source"
+          }
+        }
+      },
+      "NdjsonError502": {
+        "value": "{\"error\":{\"kind\":\"checksum\",\"message\":\"image checksum did not match\",\"hint\":\"retry from a trusted source\"}}\n"
+      },
+      "Error503": {
+        "value": {
+          "error": {
+            "kind": "dependency",
+            "message": "/dev/kvm is unavailable",
+            "hint": "run firestone doctor"
+          }
+        }
+      },
+      "NdjsonError503": {
+        "value": "{\"error\":{\"kind\":\"dependency\",\"message\":\"/dev/kvm is unavailable\",\"hint\":\"run firestone doctor\"}}\n"
+      },
+      "Error504": {
+        "value": {
+          "error": {
+            "kind": "timeout",
+            "message": "the action timed out",
+            "hint": "retry with a larger bounded timeout"
+          }
+        }
+      },
+      "NdjsonError504": {
+        "value": "{\"error\":{\"kind\":\"timeout\",\"message\":\"the action timed out\",\"hint\":\"retry with a larger bounded timeout\"}}\n"
+      }
+    }
+  },
+  "x-firestone-transport": {
+    "scheme": "http-over-unix",
+    "listener": "unix only",
+    "authentication": "current-user ownership and mode 0600 socket permissions",
+    "tcp": false
+  },
+  "x-firestone-request-limits": {
+    "inspected_body_bytes": 1048576,
+    "body_limit_applies_to": [
+      "POST /v1/machines",
+      "PUT /v1/machines/{name}",
+      "PATCH /v1/machines/{name}",
+      "POST /v1/machines/{name}/start",
+      "POST /v1/machines/{name}/stop",
+      "POST /v1/machines/{name}/restart",
+      "POST /v1/images/pull",
+      "POST /v1/images/prune"
+    ],
+    "timeout_s": {
+      "minimum": 1,
+      "maximum": 3600
+    },
+    "log_lines": {
+      "minimum": 0,
+      "maximum": 100000,
+      "default": 200
+    },
+    "event_channel_capacity": 16
+  }
+}

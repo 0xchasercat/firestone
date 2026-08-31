@@ -43,6 +43,7 @@ firestone doctor
 ```
 
 `doctor --fix` creates Firestone-owned directories, materializes the embedded Cloud Hypervisor, passt, and qemu-img executables, downloads and checksum-verifies the pinned firmware and `virtiofsd` binaries, and generates Firestone's SSH key. It never changes a sysctl, KVM permissions, or machines. When Ubuntu AppArmor blocks passt's mandatory user namespace, an interactive run first prints the exact root-owned helper/profile commands and asks for confirmation. `--yes` and `--json` never authorize elevation; non-interactive runs only print the administrator commands.
+A normal `start` never runs the rest of doctor implicitly. When `auto`, `rhf`, or `edk2` selects a missing pinned firmware, start downloads and securely publishes only that artifact before writing VmConfig. A custom firmware path is used as-is and is never downloaded over or rewritten.
 
 Each check is `ok`, `warn`, or `fail`. A failed report exits with status 5. Warnings do not block VM use.
 
@@ -56,7 +57,7 @@ Each check is `ok`, `warn`, or `fail`. A failed report exits with status 5. Warn
 | `passt` | The standalone binary includes the exact helper. If AppArmor restricts unprivileged user namespaces, review the literal `/usr/libexec/firestone/passt-2025_02_17.a1e48a0` profile commands printed by doctor. Firestone never grants `userns,` to `~/.local/share/firestone/bin/*` or another user-writable wildcard. |
 | `qemu-img` | The standalone binary includes qemu-img 8.2.2 and materializes it on first image operation or `doctor --fix`. It does not need user namespaces. |
 | OpenSSH | Install `openssh-client` on Ubuntu, `openssh-clients` on Fedora, or `openssh` on Arch. |
-| User namespaces | Doctor distinguishes disabled kernel namespaces, container seccomp, confirmed AppArmor audit evidence, and failures merely consistent with AppArmor. A passt mandatory-stage denial is a failure. A virtiofsd-only denial warns and uses `--sandbox none`. |
+| User namespaces | Doctor probes passt with the same foreground, one-off vhost-user isolation mode used by a VM. Both `Couldn't create user namespace` and `Failed to detach isolating namespaces` are fatal. When host facts point to AppArmor, interactive `doctor --fix` offers the literal root-owned pinned helper/profile repair. A virtiofsd-only denial warns and uses `--sandbox none`. |
 | Free space | Free space on the filesystem containing the data directory before pulling images. The warning threshold is 5 GB. |
 | Stale state | Doctor and ordinary reads reconcile state against live processes and sockets. Repair the named path or lock error if reconciliation itself fails. |
 
@@ -80,7 +81,7 @@ Create a disposable machine and remove it when the command exits:
 firestone run ubuntu --name scratch --rm -- true
 ```
 
-The first boot downloads and verifies the image and runs cloud-init. Later starts use the owned image cache and the machine's qcow2 overlay.
+The first boot downloads and verifies the image, securely installs the selected pinned firmware when missing, and runs cloud-init. Later starts use the owned firmware and image cache plus the machine's qcow2 overlay.
 
 ## Machine lifecycle
 
@@ -308,6 +309,7 @@ Cloud-init contents and private SSH keys are never written to process logs. A us
 ## REST over a Unix socket
 
 `serve` is optional and stateless. It projects the same actions and locks as the CLI. The default listener is `$XDG_RUNTIME_DIR/firestone/serve.sock`, or `/tmp/firestone-<uid>/serve.sock` when the runtime fallback is active.
+The complete static contract is [`openapi.json`](openapi.json). It is an OpenAPI 3.1 JSON document covering request and response shapes, the default NDJSON streams, `Accept: application/json` aggregation, error statuses, limits, and Unix-socket transport. Firestone does not serve the document as an API endpoint.
 
 Start the server and locate its socket:
 
