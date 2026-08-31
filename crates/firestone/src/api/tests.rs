@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     error::Error,
     sync::{
         Arc, Mutex,
@@ -23,7 +24,7 @@ use tower::ServiceExt;
 
 use super::{
     DEFAULT_LOG_LINES, EVENT_BUFFER_CAPACITY, MAX_JSON_BODY_BYTES, MAX_LOG_LINES,
-    NDJSON_CONTENT_TYPE, TEXT_CONTENT_TYPE, router,
+    NDJSON_CONTENT_TYPE, REST_ROUTES, TEXT_CONTENT_TYPE, router,
 };
 use crate::render::{RenderOptions, Renderer};
 
@@ -144,7 +145,96 @@ fn expected_ndjson(events: &[Event]) -> Result<Vec<u8>, serde_json::Error> {
     }
     Ok(bytes)
 }
+#[tokio::test]
+async fn openapi_routes_and_methods_match_the_axum_contract() -> TestResult {
+    const OPERATION_KEYS: [&str; 8] = [
+        "get", "put", "post", "delete", "options", "head", "patch", "trace",
+    ];
 
+    let document: Value = serde_json::from_str(include_str!("../../../../docs/openapi.json"))?;
+    assert_eq!(document["openapi"], "3.1.0");
+    let path_items = document["paths"]
+        .as_object()
+        .ok_or("OpenAPI paths must be an object")?;
+    let documented_paths = path_items.keys().cloned().collect::<BTreeSet<_>>();
+    let mut documented_operations = BTreeSet::new();
+    for (path, value) in path_items {
+        let path_item = value
+            .as_object()
+            .ok_or_else(|| format!("OpenAPI path item {path} must be an object"))?;
+        for (method, operation) in path_item {
+            if !OPERATION_KEYS.contains(&method.as_str()) {
+                return Err(
+                    format!("OpenAPI path item {path} has unsupported key {method}").into(),
+                );
+            }
+            if !operation.is_object() {
+                return Err(format!("OpenAPI operation {method} {path} must be an object").into());
+            }
+            documented_operations.insert((path.clone(), method.to_ascii_uppercase()));
+        }
+    }
+
+    let configured_paths = REST_ROUTES
+        .iter()
+        .map(|route| route.path.to_owned())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        configured_paths.len(),
+        REST_ROUTES.len(),
+        "REST route table contains a duplicate path"
+    );
+    assert_eq!(documented_paths, configured_paths);
+
+    let configured_operations = REST_ROUTES
+        .iter()
+        .flat_map(|route| {
+            route
+                .authored_methods
+                .iter()
+                .map(|method| (route.path.to_owned(), (*method).to_owned()))
+        })
+        .collect::<BTreeSet<_>>();
+
+    let dispatcher = Arc::new(RecordingDispatcher::success(
+        "version",
+        json!({"unused":true}),
+        Vec::new(),
+    ));
+    let app = app(Arc::clone(&dispatcher));
+    let probe = Method::from_bytes(b"FIRESTONE-OPENAPI-PROBE")?;
+    for route in REST_ROUTES {
+        let uri = route
+            .path
+            .replace("{name}", "contract")
+            .replace("{id}", "contract");
+        let response = send(&app, request(probe.clone(), &uri, Body::empty())?).await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+
+        let mut methods = BTreeSet::new();
+        for value in response.headers().get_all(header::ALLOW) {
+            for method in value.to_str()?.split(',') {
+                methods.insert(method.trim().to_owned());
+            }
+        }
+        if methods.is_empty() {
+            return Err(format!("registered route {uri} did not advertise Allow").into());
+        }
+
+        let mut expected_methods = route
+            .authored_methods
+            .iter()
+            .map(|method| (*method).to_owned())
+            .collect::<BTreeSet<_>>();
+        if expected_methods.contains("GET") {
+            expected_methods.insert("HEAD".to_owned());
+        }
+        assert_eq!(methods, expected_methods, "{uri}");
+    }
+    assert_eq!(dispatcher.actions()?, Vec::<Action>::new());
+    assert_eq!(documented_operations, configured_operations);
+    Ok(())
+}
 #[tokio::test]
 async fn non_stream_routes_project_exact_actions_statuses_and_payloads() -> TestResult {
     struct Case {
