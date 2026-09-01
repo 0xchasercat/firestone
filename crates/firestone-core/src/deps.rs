@@ -636,8 +636,7 @@ availability = "binary"
     /// SPEC §8.5, §17.2: the OCI packing helper is an executable published
     /// mode 0755, and its x86_64-only runtime scope is reported, not guessed.
     #[test]
-    fn mkfs_ext4_bundled_manifest_resolves_x86_64_only()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn mkfs_ext4_bundled_manifest_resolves_x86_64_only() -> Result<(), Box<dyn std::error::Error>> {
         let manifest = DependencyManifest::bundled()?;
 
         let x86_64 = manifest.mkfs_ext4("x86_64")?;
