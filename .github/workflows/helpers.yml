@@ -94,7 +94,7 @@ jobs:
             sleep 0.05
           done
           if [[ $ready == true ]]; then
-            kill "$pid"
+            kill "$pid" 2>/dev/null || :
             wait "$pid" 2>/dev/null || :
             test -s "$smoke/passt.log"
           else
