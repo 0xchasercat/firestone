@@ -68,7 +68,7 @@ FINAL_SIGNAL_MASK: set[signal.Signals] | None = None
 # and with the actual Cargo.lock — which is strictly stronger, because a fixed
 # literal cannot catch a lock edited without updating its pin.
 EXPECTED_FILE_HASHES = {
-    "catalog/images.toml": "89f3e1827ed143e02da6d90e8c18bc28f273fcaba9cc301db663dac9cc4d3acf",
+    "catalog/images.toml": "23affd021f17f46f52ce909ec6c9e1b524cee46d54e8cd71f3db32fd7f5cb028",
     "deps.toml": "4d58a7623e083da70bf02de702b17d3840ba99fdccffc7ebf110a4ccc9801a65",
     "docs/verification/doctor-matrix.md": "c3254636863e741ae237f61b86b1fca0bbc8d097f1f40f799d090325e4eeb844",
     "scripts/m1-kvm-e2e.py": "719660526334393f2cb5df6b0b7d2eaf5a106f6e41674fdf3feb9476da11d124",
