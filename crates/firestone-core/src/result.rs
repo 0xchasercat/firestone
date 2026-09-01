@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CatalogFirmware, LogSource, MachineSpec, MachineState, MachineStatus, SpecWarning, Supervision,
+    ByteSize, CatalogFirmware, LogSource, MachineSpec, MachineState, MachineStatus, SpecWarning,
+    Supervision,
 };
 
 /// Effective firmware for one architecture offered by a catalog entry.
@@ -57,6 +58,19 @@ pub struct StartResult {
     pub elapsed_ms: u64,
     pub forwards: Vec<String>,
     pub mounts: Vec<String>,
+}
+
+/// The effective CPU and memory of a machine after one resize action.
+///
+/// `applied_live` is true only when Cloud Hypervisor accepted `vm.resize` for a
+/// running machine. Otherwise the values were written to the spec and take
+/// effect on the next start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResizeResult {
+    pub name: String,
+    pub applied_live: bool,
+    pub cpus: u8,
+    pub memory: ByteSize,
 }
 
 /// A completed or idempotently skipped stop.

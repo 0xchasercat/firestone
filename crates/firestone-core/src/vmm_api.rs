@@ -64,6 +64,16 @@ pub struct VmInfo {
     pub device_tree: Option<Value>,
 }
 
+/// Cloud Hypervisor's v53 `VmResize` body. Absent fields leave that resource
+/// untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+struct VmResizeRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    desired_vcpus: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    desired_ram: Option<u64>,
+}
+
 /// A one-request-per-connection Cloud Hypervisor v53 API client.
 ///
 /// Each method uses one absolute deadline for connect, all partial writes, and
@@ -118,6 +128,38 @@ impl<'a> VmmApi<'a> {
             .request_inner(endpoint, None)
             .map_err(|failure| self.firestone_error(endpoint, failure))?;
         decode_json(response.body(), "vm.info JSON response")
+            .map_err(|failure| self.firestone_error(endpoint, failure))
+    }
+
+    /// Resizes a booted VM's vCPU count and RAM in place.
+    ///
+    /// Cloud Hypervisor v53 answers `PUT /api/v1/vm.resize` with 204 and no
+    /// body. `desired_ram` may only reach the boot size plus the `hotplug_size`
+    /// declared in the boot configuration, and `desired_vcpus` may only reach
+    /// `cpus.max_vcpus`; the caller checks that headroom before asking.
+    pub fn vm_resize(
+        &self,
+        desired_vcpus: Option<u8>,
+        desired_ram: Option<u64>,
+    ) -> Result<(), FirestoneError> {
+        let endpoint = Endpoint::VmResize;
+        let request = VmResizeRequest {
+            desired_vcpus: desired_vcpus.map(u32::from),
+            desired_ram,
+        };
+        let body = serde_json::to_vec(&request).map_err(|source| {
+            FirestoneError::new(
+                ErrorKind::Generic,
+                "cannot encode the VMM API vm.resize request body",
+            )
+            .with_hint("report this Firestone serialization bug")
+            .with_source(source)
+        })?;
+        if body.len() > MAX_CREATE_BODY_BYTES {
+            return Err(self.firestone_error(endpoint, ClientFailure::RequestBodyTooLarge));
+        }
+        self.request_inner(endpoint, Some(&body))
+            .map(|_| ())
             .map_err(|failure| self.firestone_error(endpoint, failure))
     }
 
@@ -297,6 +339,7 @@ enum Endpoint {
     VmPowerButton,
     VmShutdown,
     VmmShutdown,
+    VmResize,
 }
 
 impl Endpoint {
@@ -307,7 +350,8 @@ impl Endpoint {
             | Self::VmBoot
             | Self::VmPowerButton
             | Self::VmShutdown
-            | Self::VmmShutdown => "PUT",
+            | Self::VmmShutdown
+            | Self::VmResize => "PUT",
         }
     }
 
@@ -320,13 +364,18 @@ impl Endpoint {
             Self::VmPowerButton => "/api/v1/vm.power-button",
             Self::VmShutdown => "/api/v1/vm.shutdown",
             Self::VmmShutdown => "/api/v1/vmm.shutdown",
+            Self::VmResize => "/api/v1/vm.resize",
         }
     }
 
     const fn expected_status(self) -> u16 {
         match self {
             Self::VmmPing | Self::VmInfo | Self::VmmShutdown => 200,
-            Self::VmCreate | Self::VmBoot | Self::VmPowerButton | Self::VmShutdown => 204,
+            Self::VmCreate
+            | Self::VmBoot
+            | Self::VmPowerButton
+            | Self::VmShutdown
+            | Self::VmResize => 204,
         }
     }
 
@@ -338,12 +387,13 @@ impl Endpoint {
             | Self::VmBoot
             | Self::VmPowerButton
             | Self::VmShutdown
-            | Self::VmmShutdown => 0,
+            | Self::VmmShutdown
+            | Self::VmResize => 0,
         }
     }
 
     const fn has_request_body(self) -> bool {
-        matches!(self, Self::VmCreate)
+        matches!(self, Self::VmCreate | Self::VmResize)
     }
 }
 
@@ -1205,6 +1255,61 @@ mod tests {
             vmm_shutdown_server.finish()?,
             b"PUT /api/v1/vmm.shutdown HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n\r\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn vm_resize_omits_absent_fields_and_expects_204() -> Result<(), Box<dyn std::error::Error>> {
+        for (cpus, memory, body) in [
+            (
+                Some(4_u8),
+                Some(4_294_967_296_u64),
+                br#"{"desired_vcpus":4,"desired_ram":4294967296}"#.as_slice(),
+            ),
+            (Some(4), None, br#"{"desired_vcpus":4}"#.as_slice()),
+            (
+                None,
+                Some(4_294_967_296),
+                br#"{"desired_ram":4294967296}"#.as_slice(),
+            ),
+        ] {
+            let server = FakeServer::spawn(vec![no_content_response()], false)?;
+            VmmApi::new(server.path(), TEST_TIMEOUT).vm_resize(cpus, memory)?;
+            let mut expected = format!(
+                "PUT /api/v1/vm.resize HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            expected.extend_from_slice(body);
+            assert_eq!(server.finish()?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vm_resize_non_204_status_surfaces_the_body_preview() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let server = FakeServer::spawn(
+            vec![response(
+                "500 Internal Server Error",
+                b"no hotplug headroom",
+            )],
+            false,
+        )?;
+        let error = require_error(
+            VmmApi::new(server.path(), TEST_TIMEOUT).vm_resize(Some(8), None),
+            "a non-204 resize must fail",
+        )?;
+        let _ = server.finish()?;
+        assert_eq!(error.kind(), ErrorKind::Generic);
+        assert!(
+            error
+                .message()
+                .contains("VMM API PUT /api/v1/vm.resize returned HTTP status 500"),
+            "{}",
+            error.message()
+        );
+        assert!(error.message().contains("no hotplug headroom"));
         Ok(())
     }
 

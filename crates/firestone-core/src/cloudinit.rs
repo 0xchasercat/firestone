@@ -863,7 +863,7 @@ mod tests {
     const GOLDEN_SCRIPT_MULTIPART: &[u8] =
         include_bytes!("../testdata/cloud-init-script.multipart");
     const GOLDEN_SEED_SHA256: &str =
-        "eddaac95d6ca1cb7ecb174c67788df8d19b06f51dda0ab9c15df72c79f14771d";
+        "d7db86bd93fbcd6ed6d4c10f546ea93503d7770aa0aeb1ef944f815af6b90a36";
 
     struct Fixture {
         _temp: TempDir,
@@ -1016,7 +1016,7 @@ mod tests {
             rendered.user_data.len(),
             GOLDEN_MULTIPART.len()
         );
-        assert_eq!(rendered.instance_id, "iid-demo-77caef92bee2");
+        assert_eq!(rendered.instance_id, "iid-demo-06caf6ddb473");
         assert_eq!(
             rendered.meta_data,
             format!(
@@ -1052,7 +1052,7 @@ mod tests {
         )?;
 
         assert_eq!(rendered.user_data, GOLDEN_USER_MULTIPART);
-        assert_eq!(rendered.instance_id, "iid-demo-331c6c041fc0");
+        assert_eq!(rendered.instance_id, "iid-demo-53fd64c9054e");
         Ok(())
     }
 
@@ -1070,14 +1070,14 @@ mod tests {
         let repeated = render_cloud_init(&fixture.paths, "demo", &spec)?;
         assert_eq!(rendered, repeated);
         assert_eq!(rendered.user_data, GOLDEN_USER_MULTIPART);
-        assert_eq!(rendered.instance_id, "iid-demo-331c6c041fc0");
+        assert_eq!(rendered.instance_id, "iid-demo-53fd64c9054e");
 
         let published = publish_seed(&fixture.paths, "demo", &spec)?;
         let seed = fs::read(fixture.paths.machine_seed_image("demo")?)?;
         assert_eq!(published, rendered);
         assert_eq!(
             hex_digest(&seed),
-            "5ed7766c9b604f97659c2e4ee3b4a4ad5de143498a40381b42164983f68991b8"
+            "e4d07c7001f5e68249f4ecac7f6dc857e4d07fdfb3b7e809afc837dd5e36c873"
         );
         verify_seed_filesystem(&seed, &published)?;
         Ok(())
@@ -1249,6 +1249,32 @@ mod tests {
         Ok(())
     }
 
+    /// Cloud Hypervisor v53 hotplugs vCPUs offline. The udev rule is what makes
+    /// `firestone resize --cpus` visible to the guest scheduler without a login.
+    #[test]
+    fn rendered_cloud_init_auto_onlines_hotplugged_cpus() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let fixture = Fixture::new(true)?;
+        let rendered = render_cloud_init(&fixture.paths, "demo", &MachineSpec::default())?;
+        let user_data = std::str::from_utf8(&rendered.user_data)?;
+
+        let rule = user_data
+            .find("- path: /etc/udev/rules.d/80-firestone-hotplug-cpu.rules")
+            .ok_or("rendered cloud-init did not write the hotplug-cpu udev rule")?;
+        assert!(
+            user_data.contains("ACTION==\"add\", SUBSYSTEM==\"cpu\", ATTR{online}=\"1\""),
+            "rendered cloud-init did not carry the hotplug-cpu udev rule body"
+        );
+        let reload = user_data
+            .find("udevadm control --reload")
+            .ok_or("rendered cloud-init did not reload udev rules")?;
+        assert!(
+            rule < reload,
+            "the rule must be written before udev reloads"
+        );
+        Ok(())
+    }
+
     #[test]
     fn seed_publication_rebuild_is_byte_identical_and_matches_golden_hash()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1362,7 +1388,7 @@ mod tests {
             first.network_config.as_deref(),
             Some(first_bytes.as_slice())
         );
-        assert_eq!(first.instance_id, "iid-demo-6be2ed98af05");
+        assert_eq!(first.instance_id, "iid-demo-0639c722e439");
         assert_ne!(first.instance_id, without_network.instance_id);
         assert_eq!(
             fs::read(fixture.paths.machine_seed_file("demo", "network-config")?)?,
@@ -1375,7 +1401,7 @@ mod tests {
             changed.network_config.as_deref(),
             Some(second_bytes.as_slice())
         );
-        assert_eq!(changed.instance_id, "iid-demo-3fb3e38f47a8");
+        assert_eq!(changed.instance_id, "iid-demo-7fc6b25ae6fd");
         assert_ne!(changed.instance_id, first.instance_id);
         let seed = fs::read(fixture.paths.machine_seed_image("demo")?)?;
         verify_seed_filesystem(&seed, &changed)?;
@@ -1401,7 +1427,7 @@ mod tests {
         assert_eq!(linked, direct);
         fs::write(&target, "#cloud-config\nhostname: changed\n")?;
         let changed = render_cloud_init(&fixture.paths, "demo", &spec)?;
-        assert_eq!(changed.instance_id, "iid-demo-2aa289e6ac6e");
+        assert_eq!(changed.instance_id, "iid-demo-11bf07aaae1c");
         assert_ne!(changed.instance_id, direct.instance_id);
         Ok(())
     }
@@ -1525,7 +1551,7 @@ mod tests {
         spec.cloud_init.ssh_keys = vec![PathBuf::from("keys-clean.pub")];
         let clean = render_cloud_init(&fixture.paths, "demo", &spec)?;
         assert_eq!(rendered, clean);
-        assert_eq!(rendered.instance_id, "iid-demo-82b55541fe2b");
+        assert_eq!(rendered.instance_id, "iid-demo-6776222a95f6");
         Ok(())
     }
 
@@ -1537,7 +1563,7 @@ mod tests {
         fs::write(machine_dir.join("user.pub"), USER_KEY)?;
 
         let baseline = render_cloud_init(&fixture.paths, "demo", &MachineSpec::default())?;
-        assert_eq!(baseline.instance_id, "iid-demo-dd4f451e0c43");
+        assert_eq!(baseline.instance_id, "iid-demo-e75d5456fd4c");
         assert_eq!(
             render_cloud_init(&fixture.paths, "demo", &MachineSpec::default())?,
             baseline
@@ -1554,13 +1580,13 @@ mod tests {
 
         unrelated.user = "ubuntu".to_owned();
         let changed_user = render_cloud_init(&fixture.paths, "demo", &unrelated)?;
-        assert_eq!(changed_user.instance_id, "iid-demo-1cdcb9351f3c");
+        assert_eq!(changed_user.instance_id, "iid-demo-4b98c7ff95cc");
         assert_ne!(changed_user.instance_id, baseline.instance_id);
 
         let mut key_spec = MachineSpec::default();
         key_spec.cloud_init.ssh_keys = vec![PathBuf::from("user.pub")];
         let changed_key = render_cloud_init(&fixture.paths, "demo", &key_spec)?;
-        assert_eq!(changed_key.instance_id, "iid-demo-9d17ff3299fb");
+        assert_eq!(changed_key.instance_id, "iid-demo-8872ce46d1f2");
         assert_ne!(changed_key.instance_id, baseline.instance_id);
 
         let mut mount_spec = MachineSpec {
@@ -1573,7 +1599,7 @@ mod tests {
             ..MachineSpec::default()
         };
         let changed_mount = render_cloud_init(&fixture.paths, "demo", &mount_spec)?;
-        assert_eq!(changed_mount.instance_id, "iid-demo-fc1e09393a54");
+        assert_eq!(changed_mount.instance_id, "iid-demo-d6276c1e119f");
         assert_ne!(changed_mount.instance_id, baseline.instance_id);
         assert!(
             std::str::from_utf8(&changed_mount.user_data)?

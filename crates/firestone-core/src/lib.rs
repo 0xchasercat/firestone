@@ -56,7 +56,8 @@ pub use event::{Event, Level, StepId, Unit};
 pub use image::{
     ImageInspection, ImageMetadata, ImageMetadataVersion, ImagePruneResult, ImagePullRequest,
     ImageRemoveResult, ImageSourceLocation, ImageStore, ImageVerification, OverlayInfo,
-    PreparedMachineImage, PulledImage, ResolvedImageSource, StoredImage,
+    PreparedMachineImage, PulledImage, ResolvedImageSource, StoredImage, disk_shrink_error,
+    overlay_virtual_size,
 };
 pub use lock::MachineLock;
 pub use network::{
@@ -69,9 +70,9 @@ pub use paths::{PathInputs, Paths};
 pub use readiness::{ReadinessOptions, wait_for_ssh_ready};
 pub use result::{
     CatalogArchitectureSummary, CatalogEntrySummary, LogsResult, MachineRecord, MachineSummary,
-    MachineView, RemoveResult, RunResult, ShellResult, SpecResult, SpecWarningPayload,
-    SshConfigResult, StartResult, StopResult, VersionDependency, VersionIdentity, VersionPaths,
-    VersionResult,
+    MachineView, RemoveResult, ResizeResult, RunResult, ShellResult, SpecResult,
+    SpecWarningPayload, SshConfigResult, StartResult, StopResult, VersionDependency,
+    VersionIdentity, VersionPaths, VersionResult,
 };
 pub use shim::{
     PreparedStart, ShimClient, ShimPids, ShimStatus, ShimTimeouts, cancel_prepared,

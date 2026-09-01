@@ -13,8 +13,8 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressState, P
 use firestone_core::{
     CatalogEntrySummary, CatalogFirmware, DoctorCheckId, DoctorReport, DoctorStatus, ErrorInfo,
     ErrorKind, Event, EventSink, FirestoneError, Level, LogsResult, MachineRecord, MachineStatus,
-    MachineSummary, MachineView, NetMode, RemoveResult, SshConfigResult, StartResult, StepId,
-    StopResult, Unit, VersionResult,
+    MachineSummary, MachineView, NetMode, RemoveResult, ResizeResult, SshConfigResult, StartResult,
+    StepId, StopResult, Unit, VersionResult,
 };
 use owo_colors::OwoColorize as _;
 use unicode_width::UnicodeWidthChar;
@@ -848,6 +848,22 @@ where
                 write_line(
                     &mut self.stdout,
                     format_args!("{} is {}", result.name, machine_status_label(result.status)),
+                )
+            }
+            "resize" => {
+                let result: ResizeResult = serde_json::from_value(payload)
+                    .map_err(|error| invalid_result_payload("resize", error))?;
+                let scope = if result.applied_live {
+                    "applied live"
+                } else {
+                    "applies on next start"
+                };
+                write_line(
+                    &mut self.stdout,
+                    format_args!(
+                        "{} is {} vCPU · {} · {scope}",
+                        result.name, result.cpus, result.memory
+                    ),
                 )
             }
             "rm" => {

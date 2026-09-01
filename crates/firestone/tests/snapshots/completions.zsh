@@ -42,7 +42,9 @@ _arguments "${_arguments_options[@]}" : \
 '--name=[Name a machine created from an image reference]:NAME:_default' \
 '--arch=[Set the guest architecture; it must match the host]:ARCH:_default' \
 '--cpus=[Set the number of virtual CPUs]:COUNT:_default' \
+'--cpus-max=[Reserve vCPU hotplug headroom for \`resize\`; must be at least --cpus]:COUNT:_default' \
 '--memory=[Set guest memory, for example 2G or 2048M]:SIZE:_default' \
+'--memory-max=[Reserve memory hotplug headroom for \`resize\`; must be at least --memory]:SIZE:_default' \
 '--disk=[Set writable disk capacity, for example 20G]:SIZE:_default' \
 '--user=[Set the guest login user created by Firestone provisioning]:USER:_default' \
 '--net=[Select passt, tap, or no network]:MODE:_default' \
@@ -83,7 +85,9 @@ _arguments "${_arguments_options[@]}" : \
 '--file=[Layer an existing machine specification below command-line flags]:SPEC.toml:_files' \
 '--arch=[Set the guest architecture; it must match the host]:ARCH:_default' \
 '--cpus=[Set the number of virtual CPUs]:COUNT:_default' \
+'--cpus-max=[Reserve vCPU hotplug headroom for \`resize\`; must be at least --cpus]:COUNT:_default' \
 '--memory=[Set guest memory, for example 2G or 2048M]:SIZE:_default' \
+'--memory-max=[Reserve memory hotplug headroom for \`resize\`; must be at least --memory]:SIZE:_default' \
 '--disk=[Set writable disk capacity, for example 20G]:SIZE:_default' \
 '--user=[Set the guest login user created by Firestone provisioning]:USER:_default' \
 '--net=[Select passt, tap, or no network]:MODE:_default' \
@@ -154,6 +158,24 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (restart)
 _arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':name:_default' \
+&& ret=0
+;;
+(resize)
+_arguments "${_arguments_options[@]}" : \
+'--cpus=[Set the number of virtual CPUs]:COUNT:_default' \
+'--memory=[Set guest memory, for example 4G or 4096M]:SIZE:_default' \
 '--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
 '--json[Print events as newline-delimited JSON and disable human output]' \
 '-q[Print only errors and command results]' \
@@ -612,6 +634,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(resize)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (rm)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -725,6 +751,7 @@ _firestone_commands() {
 'start:Start a machine and wait for SSH readiness' \
 'stop:Stop a machine' \
 'restart:Stop and start a machine' \
+'resize:Change a machine'\''s CPU count or memory' \
 'rm:Stop and remove one or more machines' \
 'ls:List machines' \
 'list:List machines' \
@@ -784,6 +811,7 @@ _firestone__subcmd__help_commands() {
 'start:Start a machine and wait for SSH readiness' \
 'stop:Stop a machine' \
 'restart:Stop and start a machine' \
+'resize:Change a machine'\''s CPU count or memory' \
 'rm:Stop and remove one or more machines' \
 'ls:List machines' \
 'show:Show a machine'\''s specification and runtime state' \
@@ -883,6 +911,11 @@ _firestone__subcmd__help__subcmd__logs_commands() {
 _firestone__subcmd__help__subcmd__ls_commands() {
     local commands; commands=()
     _describe -t commands 'firestone help ls commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__resize_commands] )) ||
+_firestone__subcmd__help__subcmd__resize_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help resize commands' commands "$@"
 }
 (( $+functions[_firestone__subcmd__help__subcmd__restart_commands] )) ||
 _firestone__subcmd__help__subcmd__restart_commands() {
@@ -1027,6 +1060,11 @@ _firestone__subcmd__logs_commands() {
 _firestone__subcmd__ls_commands() {
     local commands; commands=()
     _describe -t commands 'firestone ls commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__resize_commands] )) ||
+_firestone__subcmd__resize_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone resize commands' commands "$@"
 }
 (( $+functions[_firestone__subcmd__restart_commands] )) ||
 _firestone__subcmd__restart_commands() {

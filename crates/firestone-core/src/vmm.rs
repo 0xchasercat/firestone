@@ -85,6 +85,11 @@ struct CpusConfig {
 struct MemoryConfig {
     size: u64,
     shared: bool,
+    /// Present only when `memory_max` opts a machine into RAM hotplug. Cloud
+    /// Hypervisor v53 needs the headroom declared at boot; omitting the field
+    /// keeps every existing machine's `vm.create` bytes unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hotplug_size: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -312,14 +317,21 @@ fn base_vm_config(
     };
 
     let vcpus = u32::from(input.spec.cpus);
+    let max_vcpus = u32::from(input.spec.cpus_max.unwrap_or(input.spec.cpus));
+    let memory = input.spec.memory.as_bytes();
+    let hotplug_size = input
+        .spec
+        .memory_max
+        .map(|memory_max| memory_max.as_bytes().saturating_sub(memory));
     Ok(VmConfig {
         cpus: CpusConfig {
             boot_vcpus: vcpus,
-            max_vcpus: vcpus,
+            max_vcpus,
         },
         memory: MemoryConfig {
-            size: input.spec.memory.as_bytes(),
+            size: memory,
             shared: true,
+            hotplug_size,
         },
         payload,
         disks: vec![
@@ -875,6 +887,77 @@ sha256 = "{virtiofsd_sha}"
                 },
                 "console": {"mode": "Pty"},
                 "rng": {"src": "/dev/urandom"}
+            })
+        );
+        Ok(())
+    }
+
+    /// Machines that never opt into `cpus_max`/`memory_max` must keep the exact
+    /// `vm.create` bytes they had before hotplug support existed. A change here
+    /// would reprovision every existing machine's VmConfig for no reason.
+    #[test]
+    fn vmconfig_without_resize_headroom_bytes_are_unchanged()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let paths = paths_for_root(PathBuf::from("/firestone"))?;
+        let spec = MachineSpec::default();
+        assert_eq!(spec.cpus_max, None);
+        assert_eq!(spec.memory_max, None);
+        let state = state(&paths)?;
+        let typed = base_vm_config(
+            &paths,
+            input(&spec, &state, Arch::X86_64, None),
+            PayloadConfig {
+                firmware: None,
+                kernel: Some(PathBuf::from("/firestone/data/bin/hypervisor-fw-0.5.0")),
+            },
+        )?;
+        let mut value = serde_json::to_value(typed)?;
+        super::sort_json(&mut value);
+
+        assert_eq!(
+            String::from_utf8(serde_json::to_vec(&value)?)?,
+            "{\"console\":{\"mode\":\"Pty\"},\
+\"cpus\":{\"boot_vcpus\":2,\"max_vcpus\":2},\
+\"disks\":[{\"backing_files\":true,\"image_type\":\"Qcow2\",\"path\":\"/firestone/data/machines/demo/disk.qcow2\"},\
+{\"image_type\":\"Raw\",\"path\":\"/firestone/data/machines/demo/seed.img\",\"readonly\":true}],\
+\"memory\":{\"shared\":true,\"size\":2147483648},\
+\"payload\":{\"kernel\":\"/firestone/data/bin/hypervisor-fw-0.5.0\"},\
+\"rng\":{\"src\":\"/dev/urandom\"},\
+\"serial\":{\"file\":\"/firestone/data/machines/demo/console.log\",\"mode\":\"File\"},\
+\"vsock\":{\"cid\":3,\"socket\":\"/firestone/run/demo/vsock.sock\"}}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vmconfig_resize_headroom_maps_to_max_vcpus_and_hotplug_size()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let paths = paths_for_root(PathBuf::from("/firestone"))?;
+        let spec = MachineSpec {
+            cpus: 2,
+            cpus_max: Some(8),
+            memory: crate::ByteSize::from_gib(2)?,
+            memory_max: Some(crate::ByteSize::from_gib(6)?),
+            ..MachineSpec::default()
+        };
+        let state = state(&paths)?;
+        let typed = base_vm_config(
+            &paths,
+            input(&spec, &state, Arch::X86_64, None),
+            PayloadConfig {
+                firmware: None,
+                kernel: Some(PathBuf::from("/firestone/data/bin/hypervisor-fw-0.5.0")),
+            },
+        )?;
+        let value = serde_json::to_value(typed)?;
+
+        assert_eq!(value["cpus"], json!({"boot_vcpus": 2, "max_vcpus": 8}));
+        assert_eq!(
+            value["memory"],
+            json!({
+                "size": 2_147_483_648_u64,
+                "shared": true,
+                "hotplug_size": 4_294_967_296_u64
             })
         );
         Ok(())

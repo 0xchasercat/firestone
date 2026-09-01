@@ -328,6 +328,20 @@ fn create_fake_machine(
     fake_vmm: &Path,
     behavior: &str,
 ) -> Result<Output, Box<dyn Error>> {
+    create_fake_machine_with_spec(home, path, name, source, firmware, fake_vmm, behavior, &[])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_fake_machine_with_spec(
+    home: &Path,
+    path: &OsString,
+    name: &str,
+    source: &Path,
+    firmware: &Path,
+    fake_vmm: &Path,
+    behavior: &str,
+    spec_flags: &[&str],
+) -> Result<Output, Box<dyn Error>> {
     let root = source.parent().ok_or("image source has no parent")?;
     let machine_dir = home.join("data/machines").join(name);
     let record = root.join(format!("{name}-requests.log"));
@@ -346,6 +360,7 @@ fn create_fake_machine(
         .arg(fake_vmm)
         .arg("--vmm-firmware")
         .arg(firmware);
+    command.args(spec_flags);
     for value in [
         "--record".to_owned(),
         record.to_string_lossy().into_owned(),
@@ -2180,5 +2195,266 @@ fn m3_sidecar_partial_launch_and_sigint_roll_back_every_process() -> TestResult 
     );
     assert!(!home.join("run").join(cancel_name).exists());
     assert_processes_gone(&fs::read_to_string(cancel_record)?)?;
+    Ok(())
+}
+
+#[test]
+fn resize_live_disk_grow_and_headroom_refusal_without_kvm() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = fs::canonicalize(directory.path())?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(
+        env!("CARGO_BIN_EXE_firestone"),
+        fs::Permissions::from_mode(0o755),
+    )?;
+    let home = root.join("home");
+    let fake_vmm = compile_fake_vmm(&root)?;
+    let bin = root.join("bin");
+    fs::create_dir(&bin)?;
+    let qemu_img = bin.join("qemu-img");
+    fs::copy(&fake_vmm, &qemu_img)?;
+    fs::set_permissions(&qemu_img, fs::Permissions::from_mode(0o700))?;
+    let mut path_entries = vec![bin.clone()];
+    if let Some(existing) = env::var_os("PATH") {
+        path_entries.extend(env::split_paths(&existing));
+    }
+    let path = env::join_paths(path_entries)?;
+    let source = root.join("resize-base.qcow2");
+    fs::write(&source, b"QFI\xfbRESIZE")?;
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600))?;
+    let firmware = root.join("resize-firmware.fd");
+    fs::write(&firmware, b"firmware")?;
+    fs::set_permissions(&firmware, fs::Permissions::from_mode(0o600))?;
+    let _cleanup = MachineCleanup {
+        home: home.clone(),
+        path: path.clone(),
+        names: vec!["sizable".to_owned(), "plain".to_owned()],
+    };
+
+    let created = create_fake_machine_with_spec(
+        &home,
+        &path,
+        "sizable",
+        &source,
+        &firmware,
+        &fake_vmm,
+        "ignore-power",
+        &[
+            "--cpus",
+            "2",
+            "--cpus-max",
+            "8",
+            "--memory",
+            "2G",
+            "--memory-max",
+            "6G",
+            "--disk",
+            "20G",
+        ],
+    )?;
+    require_success(&created, "create sizable")?;
+
+    // A stopped machine resizes as a spec patch: nothing is applied live.
+    let cold = firestone(&home, &path)
+        .args(["--json", "resize", "sizable", "--cpus", "4"])
+        .output()?;
+    require_success(&cold, "cold resize")?;
+    let cold_result = ndjson(&cold)?
+        .last()
+        .cloned()
+        .ok_or("missing cold result")?;
+    assert_eq!(cold_result["action"], "resize");
+    assert_eq!(cold_result["payload"]["applied_live"], false);
+    assert_eq!(cold_result["payload"]["cpus"], 4);
+    assert_eq!(cold_result["payload"]["memory"], "2G");
+
+    let start = firestone(&home, &path)
+        .args([
+            "--json",
+            "start",
+            "sizable",
+            "--no-wait",
+            "--timeout",
+            "20s",
+        ])
+        .output()?;
+    require_success(&start, "start sizable")?;
+
+    // The published VmConfig carries the opt-in hotplug headroom.
+    let vmconfig: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.join("data/machines/sizable/vmconfig.json"))?)?;
+    assert_eq!(vmconfig["cpus"]["boot_vcpus"], 4);
+    assert_eq!(vmconfig["cpus"]["max_vcpus"], 8);
+    assert_eq!(vmconfig["memory"]["size"], 2_147_483_648_u64);
+    assert_eq!(vmconfig["memory"]["hotplug_size"], 4_294_967_296_u64);
+
+    // Inside that headroom, the running machine is resized live.
+    let live = firestone(&home, &path)
+        .args([
+            "--json", "resize", "sizable", "--cpus", "6", "--memory", "4G",
+        ])
+        .output()?;
+    require_success(&live, "live resize")?;
+    let live_result = ndjson(&live)?
+        .last()
+        .cloned()
+        .ok_or("missing live result")?;
+    assert_eq!(live_result["payload"]["applied_live"], true);
+    assert_eq!(live_result["payload"]["cpus"], 6);
+    assert_eq!(live_result["payload"]["memory"], "4G");
+
+    let requests = fs::read_to_string(root.join("sizable-requests.log"))?;
+    assert!(
+        requests.contains("PUT /api/v1/vm.resize"),
+        "fake VMM never saw vm.resize: {requests}"
+    );
+    let resize_body: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("sizable-body.resize"))?)?;
+    assert_eq!(resize_body["desired_vcpus"], 6);
+    assert_eq!(resize_body["desired_ram"], 4_294_967_296_u64);
+
+    // Desired state matches: the spec carries the live values.
+    let show = firestone(&home, &path)
+        .args(["--json", "show", "sizable"])
+        .output()?;
+    require_success(&show, "show sizable")?;
+    let view = ndjson(&show)?
+        .last()
+        .cloned()
+        .ok_or("missing show result")?;
+    assert_eq!(view["payload"]["spec"]["cpus"], 6);
+    assert_eq!(view["payload"]["spec"]["memory"], "4G");
+
+    // Above the declared ceiling the spec itself is invalid.
+    let over_ceiling = firestone(&home, &path)
+        .args(["--json", "resize", "sizable", "--cpus", "9"])
+        .output()?;
+    assert_eq!(over_ceiling.status.code(), Some(2));
+    let ceiling_error = ndjson(&over_ceiling)?
+        .last()
+        .cloned()
+        .ok_or("missing ceiling error")?;
+    assert_eq!(ceiling_error["error"]["kind"], "invalid_spec");
+    assert!(
+        ceiling_error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("cpus_max")),
+        "{ceiling_error}"
+    );
+
+    let unchanged = firestone(&home, &path)
+        .args(["--json", "show", "sizable"])
+        .output()?;
+    require_success(&unchanged, "show after refusal")?;
+    let unchanged_view = ndjson(&unchanged)?
+        .last()
+        .cloned()
+        .ok_or("missing show result")?;
+    assert_eq!(unchanged_view["payload"]["spec"]["cpus"], 6);
+
+    let stop = firestone(&home, &path)
+        .args(["--json", "stop", "sizable", "--force", "--timeout", "5s"])
+        .output()?;
+    require_success(&stop, "stop sizable")?;
+
+    // Raising `disk` grows the overlay on the next start; lowering it is refused.
+    let spec_path = home.join("data/machines/sizable/firestone.toml");
+    let spec = fs::read_to_string(&spec_path)?;
+    fs::write(&spec_path, spec.replace("disk = \"20G\"", "disk = \"10G\""))?;
+    let shrink = firestone(&home, &path)
+        .args(["--json", "resize", "sizable", "--cpus", "2"])
+        .output()?;
+    assert_eq!(shrink.status.code(), Some(2));
+    let shrink_error = ndjson(&shrink)?
+        .last()
+        .cloned()
+        .ok_or("missing shrink error")?;
+    assert_eq!(shrink_error["error"]["kind"], "invalid_spec");
+    assert!(
+        shrink_error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("disk shrink is not supported")),
+        "{shrink_error}"
+    );
+
+    fs::write(&spec_path, spec.replace("disk = \"20G\"", "disk = \"30G\""))?;
+    let regrow = firestone(&home, &path)
+        .args([
+            "--json",
+            "start",
+            "sizable",
+            "--no-wait",
+            "--timeout",
+            "20s",
+        ])
+        .output()?;
+    require_success(&regrow, "start after disk grow")?;
+    let disk_step = ndjson(&regrow)?
+        .into_iter()
+        .find(|event| event.get("id").and_then(serde_json::Value::as_str) == Some("disk"))
+        .ok_or("missing disk step")?;
+    assert_eq!(
+        disk_step["detail"].as_str(),
+        Some("grown to 30G overlay"),
+        "{disk_step}"
+    );
+    let qemu_log = fs::read_to_string(bin.join("qemu-img.qemu.log"))?;
+    assert!(
+        qemu_log
+            .lines()
+            .any(|line| line.starts_with("resize -f qcow2 ") && line.ends_with(" 32212254720")),
+        "qemu-img never grew the overlay: {qemu_log}"
+    );
+
+    // A machine booted without headroom refuses a live resize and keeps its spec.
+    let plain = create_fake_machine_with_spec(
+        &home,
+        &path,
+        "plain",
+        &source,
+        &firmware,
+        &fake_vmm,
+        "ignore-power",
+        &["--cpus", "2", "--memory", "2G"],
+    )?;
+    require_success(&plain, "create plain")?;
+    let plain_start = firestone(&home, &path)
+        .args(["--json", "start", "plain", "--no-wait", "--timeout", "20s"])
+        .output()?;
+    require_success(&plain_start, "start plain")?;
+    let plain_vmconfig: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.join("data/machines/plain/vmconfig.json"))?)?;
+    assert_eq!(plain_vmconfig["cpus"]["max_vcpus"], 2);
+    assert!(plain_vmconfig["memory"].get("hotplug_size").is_none());
+
+    for flag in [["--cpus", "4"], ["--memory", "4G"]] {
+        let refused = firestone(&home, &path)
+            .args(["--json", "resize", "plain"])
+            .args(flag)
+            .output()?;
+        assert_eq!(refused.status.code(), Some(4), "{flag:?}");
+        let error = ndjson(&refused)?
+            .last()
+            .cloned()
+            .ok_or("missing refusal error")?;
+        assert_eq!(error["error"]["kind"], "conflict");
+        assert!(
+            error["error"]["hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("set cpus_max/memory_max and restart")),
+            "{error}"
+        );
+    }
+
+    let plain_show = firestone(&home, &path)
+        .args(["--json", "show", "plain"])
+        .output()?;
+    require_success(&plain_show, "show plain")?;
+    let plain_view = ndjson(&plain_show)?
+        .last()
+        .cloned()
+        .ok_or("missing show result")?;
+    assert_eq!(plain_view["payload"]["spec"]["cpus"], 2);
+    assert_eq!(plain_view["payload"]["spec"]["memory"], "2G");
     Ok(())
 }

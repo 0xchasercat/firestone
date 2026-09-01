@@ -490,6 +490,20 @@ where
                 )
                 .await
         }
+        Command::Resize(arguments) => {
+            let (global, catalog) = load_user_configuration(&paths)?;
+            LocalDispatcher::new(paths, global, catalog)
+                .with_source_base(source_base)
+                .run(
+                    Action::Resize {
+                        name: arguments.name,
+                        cpus: arguments.cpus,
+                        memory: arguments.memory,
+                    },
+                    renderer,
+                )
+                .await
+        }
         Command::Remove(arguments) => {
             let (global, catalog) = load_user_configuration(&paths)?;
             let dispatcher =

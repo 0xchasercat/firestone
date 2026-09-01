@@ -37,7 +37,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     if matches!(
         arguments.get(1).map(String::as_str),
-        Some("convert" | "create" | "info")
+        Some("convert" | "create" | "info" | "resize")
     ) {
         return run_qemu(&arguments);
     }
@@ -87,6 +87,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let pty = FakePty::open()?;
     let _ = fs::remove_file(&options.api_socket);
     let mut sidecar_connections = Vec::new();
+    let mut reported_vcpus: u64 = 0;
+    let mut reported_ram: u64 = 1;
     let listener = UnixListener::bind(&options.api_socket)?;
     for connection in listener.incoming() {
         let mut stream = connection?;
@@ -116,6 +118,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
             }
             "/api/v1/vm.create" => {
+                reported_vcpus = json_u64(&request.body, "\"boot_vcpus\":").unwrap_or(0);
+                reported_ram = json_u64(&request.body, "\"size\":").unwrap_or(1);
                 fs::write(&options.body, &request.body)?;
                 sidecar_connections.extend(connect_sidecars(&request.body)?);
                 start_vsock(&request.body)?;
@@ -150,6 +154,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     return Ok(());
                 }
             }
+            "/api/v1/vm.resize" if options.behavior == "resize-fail" => {
+                response(
+                    &mut stream,
+                    "500 Internal Server Error",
+                    b"injected resize failure",
+                )?;
+            }
+            "/api/v1/vm.resize" => {
+                fs::write(
+                    options.body.with_extension("resize"),
+                    &request.body,
+                )?;
+                if let Some(vcpus) = json_u64(&request.body, "\"desired_vcpus\":") {
+                    reported_vcpus = vcpus;
+                }
+                if let Some(ram) = json_u64(&request.body, "\"desired_ram\":") {
+                    reported_ram = ram;
+                }
+                no_content(&mut stream)?;
+            }
             "/api/v1/vm.info" => {
                 let state = if options.behavior == "info-shutdown" {
                     "Shutdown"
@@ -157,7 +181,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "Running"
                 };
                 let body = format!(
-                    "{{\"config\":{{\"console\":{{\"mode\":\"Pty\",\"file\":{:?}}}}},\"state\":\"{state}\",\"memory_actual_size\":1,\"device_tree\":null}}",
+                    "{{\"config\":{{\"console\":{{\"mode\":\"Pty\",\"file\":{:?}}},\"cpus\":{{\"boot_vcpus\":{reported_vcpus},\"max_vcpus\":{reported_vcpus}}},\"memory\":{{\"size\":{reported_ram}}}}},\"state\":\"{state}\",\"memory_actual_size\":{reported_ram},\"device_tree\":null}}",
                     pty.path
                 );
                 response(&mut stream, "200 OK", body.as_bytes())?;
@@ -273,6 +297,16 @@ fn run_fake_sidecar(arguments: &[String]) -> Result<(), Box<dyn std::error::Erro
     let mut buffer = [0_u8; 4096];
     while stream.read(&mut buffer)? != 0 {}
     Ok(())
+}
+
+fn json_u64(body: &[u8], marker: &str) -> Option<u64> {
+    let text = std::str::from_utf8(body).ok()?;
+    let start = text.find(marker)? + marker.len();
+    let rest = &text[start..];
+    let end = rest
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
 }
 
 fn json_string_values(text: &str, marker: &str) -> Vec<PathBuf> {
@@ -414,6 +448,19 @@ fn run_qemu(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let backing = arguments.get(7).ok_or("missing overlay backing")?;
             let target = Path::new(arguments.get(8).ok_or("missing overlay target")?);
             let size = arguments.get(9).ok_or("missing overlay size")?;
+            let mut output = vec![b'Q', b'F', b'I', 0xfb];
+            output.extend_from_slice(format!("OVERLAY\n{backing}\n{size}\n").as_bytes());
+            fs::write(target, output)?;
+        }
+        Some("resize") => {
+            let target = Path::new(arguments.get(4).ok_or("missing resize target")?);
+            let size = arguments.get(5).ok_or("missing resize size")?;
+            let data = fs::read(target)?;
+            let suffix = data.get(4..).unwrap_or_default();
+            let text = std::str::from_utf8(suffix)?;
+            let mut lines = text.lines();
+            let _ = lines.next();
+            let backing = lines.next().ok_or("missing backing")?;
             let mut output = vec![b'Q', b'F', b'I', 0xfb];
             output.extend_from_slice(format!("OVERLAY\n{backing}\n{size}\n").as_bytes());
             fs::write(target, output)?;

@@ -39,6 +39,7 @@ Register-ArgumentCompleter -Native -CommandName 'firestone' -ScriptBlock {
             [CompletionResult]::new('start', 'start', [CompletionResultType]::ParameterValue, 'Start a machine and wait for SSH readiness')
             [CompletionResult]::new('stop', 'stop', [CompletionResultType]::ParameterValue, 'Stop a machine')
             [CompletionResult]::new('restart', 'restart', [CompletionResultType]::ParameterValue, 'Stop and start a machine')
+            [CompletionResult]::new('resize', 'resize', [CompletionResultType]::ParameterValue, 'Change a machine''s CPU count or memory')
             [CompletionResult]::new('rm', 'rm', [CompletionResultType]::ParameterValue, 'Stop and remove one or more machines')
             [CompletionResult]::new('ls', 'ls', [CompletionResultType]::ParameterValue, 'List machines')
             [CompletionResult]::new('list', 'list', [CompletionResultType]::ParameterValue, 'List machines')
@@ -63,7 +64,9 @@ Register-ArgumentCompleter -Native -CommandName 'firestone' -ScriptBlock {
             [CompletionResult]::new('--name', '--name', [CompletionResultType]::ParameterName, 'Name a machine created from an image reference')
             [CompletionResult]::new('--arch', '--arch', [CompletionResultType]::ParameterName, 'Set the guest architecture; it must match the host')
             [CompletionResult]::new('--cpus', '--cpus', [CompletionResultType]::ParameterName, 'Set the number of virtual CPUs')
+            [CompletionResult]::new('--cpus-max', '--cpus-max', [CompletionResultType]::ParameterName, 'Reserve vCPU hotplug headroom for `resize`; must be at least --cpus')
             [CompletionResult]::new('--memory', '--memory', [CompletionResultType]::ParameterName, 'Set guest memory, for example 2G or 2048M')
+            [CompletionResult]::new('--memory-max', '--memory-max', [CompletionResultType]::ParameterName, 'Reserve memory hotplug headroom for `resize`; must be at least --memory')
             [CompletionResult]::new('--disk', '--disk', [CompletionResultType]::ParameterName, 'Set writable disk capacity, for example 20G')
             [CompletionResult]::new('--user', '--user', [CompletionResultType]::ParameterName, 'Set the guest login user created by Firestone provisioning')
             [CompletionResult]::new('--net', '--net', [CompletionResultType]::ParameterName, 'Select passt, tap, or no network')
@@ -101,7 +104,9 @@ Register-ArgumentCompleter -Native -CommandName 'firestone' -ScriptBlock {
             [CompletionResult]::new('--file', '--file', [CompletionResultType]::ParameterName, 'Layer an existing machine specification below command-line flags')
             [CompletionResult]::new('--arch', '--arch', [CompletionResultType]::ParameterName, 'Set the guest architecture; it must match the host')
             [CompletionResult]::new('--cpus', '--cpus', [CompletionResultType]::ParameterName, 'Set the number of virtual CPUs')
+            [CompletionResult]::new('--cpus-max', '--cpus-max', [CompletionResultType]::ParameterName, 'Reserve vCPU hotplug headroom for `resize`; must be at least --cpus')
             [CompletionResult]::new('--memory', '--memory', [CompletionResultType]::ParameterName, 'Set guest memory, for example 2G or 2048M')
+            [CompletionResult]::new('--memory-max', '--memory-max', [CompletionResultType]::ParameterName, 'Reserve memory hotplug headroom for `resize`; must be at least --memory')
             [CompletionResult]::new('--disk', '--disk', [CompletionResultType]::ParameterName, 'Set writable disk capacity, for example 20G')
             [CompletionResult]::new('--user', '--user', [CompletionResultType]::ParameterName, 'Set the guest login user created by Firestone provisioning')
             [CompletionResult]::new('--net', '--net', [CompletionResultType]::ParameterName, 'Select passt, tap, or no network')
@@ -166,6 +171,22 @@ Register-ArgumentCompleter -Native -CommandName 'firestone' -ScriptBlock {
             break
         }
         'firestone;restart' {
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;resize' {
+            [CompletionResult]::new('--cpus', '--cpus', [CompletionResultType]::ParameterName, 'Set the number of virtual CPUs')
+            [CompletionResult]::new('--memory', '--memory', [CompletionResultType]::ParameterName, 'Set guest memory, for example 4G or 4096M')
             [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
             [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
             [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
@@ -542,6 +563,7 @@ Register-ArgumentCompleter -Native -CommandName 'firestone' -ScriptBlock {
             [CompletionResult]::new('start', 'start', [CompletionResultType]::ParameterValue, 'Start a machine and wait for SSH readiness')
             [CompletionResult]::new('stop', 'stop', [CompletionResultType]::ParameterValue, 'Stop a machine')
             [CompletionResult]::new('restart', 'restart', [CompletionResultType]::ParameterValue, 'Stop and start a machine')
+            [CompletionResult]::new('resize', 'resize', [CompletionResultType]::ParameterValue, 'Change a machine''s CPU count or memory')
             [CompletionResult]::new('rm', 'rm', [CompletionResultType]::ParameterValue, 'Stop and remove one or more machines')
             [CompletionResult]::new('ls', 'ls', [CompletionResultType]::ParameterValue, 'List machines')
             [CompletionResult]::new('show', 'show', [CompletionResultType]::ParameterValue, 'Show a machine''s specification and runtime state')
@@ -573,6 +595,9 @@ Register-ArgumentCompleter -Native -CommandName 'firestone' -ScriptBlock {
             break
         }
         'firestone;help;restart' {
+            break
+        }
+        'firestone;help;resize' {
             break
         }
         'firestone;help;rm' {

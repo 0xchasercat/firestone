@@ -35,7 +35,9 @@ pub struct MachineSpec {
     pub image: ImageRef,
     pub arch: Option<Arch>,
     pub cpus: u8,
+    pub cpus_max: Option<u8>,
     pub memory: ByteSize,
+    pub memory_max: Option<ByteSize>,
     pub disk: ByteSize,
     pub user: String,
     pub network: NetworkSpec,
@@ -51,7 +53,9 @@ impl Default for MachineSpec {
             image: ImageRef::default(),
             arch: None,
             cpus: 2,
+            cpus_max: None,
             memory: ByteSize::BUILTIN_MEMORY,
+            memory_max: None,
             disk: ByteSize::BUILTIN_DISK,
             user: "root".to_owned(),
             network: NetworkSpec::default(),
@@ -235,6 +239,10 @@ pub enum SpecClear {
     VmmExtraArgs,
     #[serde(rename = "vmm.config_overlay")]
     VmmConfigOverlay,
+    #[serde(rename = "cpus_max")]
+    CpusMax,
+    #[serde(rename = "memory_max")]
+    MemoryMax,
 }
 
 impl SpecClear {
@@ -250,6 +258,8 @@ impl SpecClear {
         Self::VmmBinary,
         Self::VmmExtraArgs,
         Self::VmmConfigOverlay,
+        Self::CpusMax,
+        Self::MemoryMax,
     ];
 
     #[must_use]
@@ -266,6 +276,8 @@ impl SpecClear {
             Self::VmmBinary => "vmm.binary",
             Self::VmmExtraArgs => "vmm.extra_args",
             Self::VmmConfigOverlay => "vmm.config_overlay",
+            Self::CpusMax => "cpus_max",
+            Self::MemoryMax => "memory_max",
         }
     }
 }
@@ -309,7 +321,11 @@ pub struct MachineSpecPatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpus: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpus_max: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<ByteSize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_max: Option<ByteSize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk: Option<ByteSize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -331,7 +347,9 @@ struct MachineSpecPatchWire {
     image: Option<ImageRef>,
     arch: Option<Arch>,
     cpus: Option<u8>,
+    cpus_max: Option<u8>,
     memory: Option<ByteSize>,
+    memory_max: Option<ByteSize>,
     disk: Option<ByteSize>,
     user: Option<String>,
     network: Option<NetworkSpecPatch>,
@@ -352,7 +370,9 @@ impl<'de> Deserialize<'de> for MachineSpecPatch {
             image: wire.image,
             arch: wire.arch,
             cpus: wire.cpus,
+            cpus_max: wire.cpus_max,
             memory: wire.memory,
+            memory_max: wire.memory_max,
             disk: wire.disk,
             user: wire.user,
             network: wire.network,
@@ -409,8 +429,14 @@ impl MachineSpecPatch {
         if let Some(cpus) = self.cpus {
             spec.cpus = cpus;
         }
+        if let Some(cpus_max) = self.cpus_max {
+            spec.cpus_max = Some(cpus_max);
+        }
         if let Some(memory) = self.memory {
             spec.memory = memory;
+        }
+        if let Some(memory_max) = self.memory_max {
+            spec.memory_max = Some(memory_max);
         }
         if let Some(disk) = self.disk {
             spec.disk = disk;
@@ -504,6 +530,8 @@ impl MachineSpecPatch {
                 .vmm
                 .as_ref()
                 .is_some_and(|vmm| vmm.config_overlay.is_some()),
+            SpecClear::CpusMax => self.cpus_max.is_some(),
+            SpecClear::MemoryMax => self.memory_max.is_some(),
         }
     }
 
@@ -521,6 +549,8 @@ impl MachineSpecPatch {
                 SpecClear::VmmBinary => spec.vmm.binary = None,
                 SpecClear::VmmExtraArgs => spec.vmm.extra_args.clear(),
                 SpecClear::VmmConfigOverlay => spec.vmm.config_overlay = None,
+                SpecClear::CpusMax => spec.cpus_max = None,
+                SpecClear::MemoryMax => spec.memory_max = None,
             }
         }
     }
@@ -561,13 +591,21 @@ impl From<&MachineSpec> for MachineSpecPatch {
         if spec.vmm.config_overlay.is_none() {
             clear.push(SpecClear::VmmConfigOverlay);
         }
+        if spec.cpus_max.is_none() {
+            clear.push(SpecClear::CpusMax);
+        }
+        if spec.memory_max.is_none() {
+            clear.push(SpecClear::MemoryMax);
+        }
 
         Self {
             clear,
             image: Some(spec.image.clone()),
             arch: spec.arch,
             cpus: Some(spec.cpus),
+            cpus_max: spec.cpus_max,
             memory: Some(spec.memory),
+            memory_max: spec.memory_max,
             disk: Some(spec.disk),
             user: Some(spec.user.clone()),
             network: Some(NetworkSpecPatch {
@@ -809,7 +847,9 @@ pub const SPEC_FIELD_METADATA: &[SpecFieldMetadata] = &[
     field("image", "image", None, PatchMerge::Replace, false),
     field("arch", "arch", None, PatchMerge::Replace, false),
     field("cpus", "cpus", None, PatchMerge::Replace, false),
+    field("cpus_max", "cpus-max", None, PatchMerge::Replace, false),
     field("memory", "memory", None, PatchMerge::Replace, false),
+    field("memory_max", "memory-max", None, PatchMerge::Replace, false),
     field("disk", "disk", None, PatchMerge::Replace, false),
     field("user", "user", None, PatchMerge::Replace, false),
     field("network.mode", "net", None, PatchMerge::Replace, false),
@@ -1116,7 +1156,9 @@ impl TableSchema {
                 "image",
                 "arch",
                 "cpus",
+                "cpus_max",
                 "memory",
+                "memory_max",
                 "disk",
                 "user",
                 "network",
@@ -1885,7 +1927,9 @@ config_overlay = "[]"
             image: ImageRef::from("ubuntu:24.04"),
             arch: Some(Arch::X86_64),
             cpus: 4,
+            cpus_max: Some(8),
             memory: gib(8),
+            memory_max: Some(gib(16)),
             disk: gib(40),
             user: "developer".to_owned(),
             network: NetworkSpec {
@@ -1962,7 +2006,9 @@ config_overlay = "[]"
             image: Some(spec.image),
             arch: spec.arch,
             cpus: Some(spec.cpus),
+            cpus_max: spec.cpus_max,
             memory: Some(spec.memory),
+            memory_max: spec.memory_max,
             disk: Some(spec.disk),
             user: Some(spec.user),
             network: Some(NetworkSpecPatch {
