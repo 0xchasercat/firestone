@@ -40,7 +40,10 @@ pub use cmd::{Cmd, CmdOutput, ManagedProcess, ProcessSignal};
 pub use console::{
     ConsoleBroker, ConsolePlan, ConsoleResult, RawTerminal, console_plan, relay_console,
 };
-pub use deps::{DependencyArtifact, DependencyManifest};
+pub use deps::{
+    DIRECT_BOOT_KERNEL_DEPENDENCY, DependencyArtifact, DependencyManifest,
+    PINNED_DIRECT_BOOT_KERNEL_VERSION,
+};
 pub use dispatcher::{DispatchFuture, Dispatcher, EventSink, block_on};
 pub use doctor::{
     APPARMOR_PASST_EXECUTABLE, APPARMOR_PASST_PROFILE, APPARMOR_PASST_PROFILE_NAME, DoctorCheck,

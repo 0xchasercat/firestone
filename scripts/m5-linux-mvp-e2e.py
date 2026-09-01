@@ -69,7 +69,7 @@ FINAL_SIGNAL_MASK: set[signal.Signals] | None = None
 # literal cannot catch a lock edited without updating its pin.
 EXPECTED_FILE_HASHES = {
     "catalog/images.toml": "23affd021f17f46f52ce909ec6c9e1b524cee46d54e8cd71f3db32fd7f5cb028",
-    "deps.toml": "4d58a7623e083da70bf02de702b17d3840ba99fdccffc7ebf110a4ccc9801a65",
+    "deps.toml": "20e8023d5c8d829ecdf688019ada96a12df74e5eb0f2d8b24a7a8f83eb55e202",
     "docs/verification/doctor-matrix.md": "c3254636863e741ae237f61b86b1fca0bbc8d097f1f40f799d090325e4eeb844",
     "scripts/m1-kvm-e2e.py": "719660526334393f2cb5df6b0b7d2eaf5a106f6e41674fdf3feb9476da11d124",
     "scripts/m2-kvm-e2e.py": "152a8f0ae19a0f46b2415186f545e4109c1d4ca47dbd57e335e0757e72f6d66f",
@@ -105,6 +105,17 @@ EXPECTED_RELEASE_DEPENDENCIES = {
         "sha256": "9ad3e33c45dd816b24ad483b60ca469974ba54c3b37ef93be3da2a623986646f",
     },
 }
+
+# Pinned in deps.toml and reported by `version`, but never installed by an M5
+# machine: the OCI direct-boot kernel is materialized only for M6 OCI boots.
+EXPECTED_LAZY_DEPENDENCIES = {
+    "cloud-hypervisor-kernel": {
+        "version": "ch-release-v6.16.9-20260508",
+        "sha256": "58088758f601a04ef85b09cf23db5530d51edc039ed47afbf2264c5b762cb568",
+    },
+}
+
+EXPECTED_MANIFEST_DEPENDENCIES = EXPECTED_RELEASE_DEPENDENCIES | EXPECTED_LAZY_DEPENDENCIES
 
 # FIRESTONE_VERSION and CARGO_LOCK_SHA256 are absent for the same reason: both
 # are consequences of the release version, and validate_pins derives and checks
@@ -878,7 +889,7 @@ def validate_pins(root: Path = REPO_ROOT) -> dict[str, Any]:
     dependencies = dependencies_document.get("dependency")
     require(isinstance(dependencies, dict), "deps.toml dependency table is missing")
     require(
-        set(dependencies) == set(EXPECTED_RELEASE_DEPENDENCIES),
+        set(dependencies) == set(EXPECTED_MANIFEST_DEPENDENCIES),
         f"deps.toml dependency set changed: {sorted(dependencies)}",
     )
 
@@ -903,7 +914,7 @@ def validate_pins(root: Path = REPO_ROOT) -> dict[str, Any]:
         record["artifacts"] = artifacts
         recorded_dependencies[name] = record
 
-        release_expected = EXPECTED_RELEASE_DEPENDENCIES[name]
+        release_expected = EXPECTED_MANIFEST_DEPENDENCIES[name]
         require(dependency.get("version") == release_expected["version"], f"{name} version changed")
         x86 = dependency.get("x86_64")
         require(isinstance(x86, dict), f"{name}.x86_64 is missing")
@@ -1066,7 +1077,7 @@ def validate_release_identity(
         f"release name is {identity.get('release')!r}, expected 'v{expected_version}'",
     )
     require(identity.get("git_commit") == expected_commit, "release commit does not match accepted main")
-    require(payload.get("dependencies") == EXPECTED_RELEASE_DEPENDENCIES, "release dependency identities changed")
+    require(payload.get("dependencies") == EXPECTED_MANIFEST_DEPENDENCIES, "release dependency identities changed")
     shutil.rmtree(home)
 
 

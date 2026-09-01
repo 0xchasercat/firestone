@@ -477,7 +477,10 @@ color = "auto"          # "auto" | "always" | "never"   (NO_COLOR env also respe
 
 [images]
 catalog = []            # extra catalog files, merged over the built-in one
+insecure_registries = []  # exact "host:port" OCI registries reachable over plain HTTP (§8.5)
 ```
+
+`images.insecure_registries` is global only; it is never a machine key. Each entry is a literal `host:port` with a mandatory one-to-five-digit port and no scheme, path, or wildcard, and `docker.io`/`registry-1.docker.io` are rejected outright. The default empty list means every registry is contacted over HTTPS.
 
 ### 7.4 CLI flag ↔ field mapping
 
@@ -581,6 +584,74 @@ User-entered image arguments retain path-first resolution. Persisted machine ref
 - Cloud Hypervisor v53 accepted the exact qcow2 overlay with `backing_files: true` and booted the converted Ubuntu 24.04 x86_64 source through edk2 to a serial login prompt. The M1-06 guest fio run records overlay and raw auxiliary-disk measurements in §21. This specification defines no performance threshold, so none is inferred. The aarch64 result remains open outside the M1 gate.
 - Base images are mode 0400 and never attached read-write. `images rm` refuses (without `--force`) while any complete `state.json` references the full id; `images prune` removes only valid unreferenced pairs and reports stored bytes freed.
 
+### 8.5 OCI images (normative)
+
+An OCI image is pulled from a Registry V2 endpoint, merged into one root filesystem, packed into an ext4 image and published into the same owned image store as a catalog or URL image. It then boots through the pinned kernel (§9.5) with `firestone-init` as PID 1 (§10.5) instead of firmware plus cloud-init. Everything in §8.3 and §8.4 that concerns the store — the `images/.lock`, the owned qcow2 base, mode 0400, overlays, `images rm`/`prune` — applies unchanged.
+
+**Reference grammar.** An OCI reference is `[REGISTRY/]NAME[:TAG][@DIGEST]`. `NAME` is one or more `/`-separated components; each component starts and ends with a lowercase alphanumeric and may contain single `.`, single or double `_`, and one to three `-` as separators. `TAG` matches `[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`. `DIGEST` is `sha256:` followed by exactly 64 lowercase hex digits. `REGISTRY` is a DNS host or `localhost`, with an optional `:PORT` of one to five digits.
+
+Normalization is applied once, at parse time, and its result is the canonical reference persisted in `state.json` and the sidecar:
+
+- an absent `REGISTRY` becomes `docker.io`;
+- a single-component `NAME` under `docker.io` becomes `library/NAME`;
+- an absent tag and digest become `:latest`;
+- `docker://NAME` therefore normalizes to `docker.io/library/NAME:latest`;
+- a reference carrying both a tag and a digest keeps both, and the digest alone selects the manifest.
+
+`docker.io` is contacted at the host `registry-1.docker.io`; the canonical reference keeps `docker.io`. Uppercase in `NAME`, an empty component, a `..` component, a percent-encoded byte, a userinfo `@` before the digest, a query, a fragment, or any control character is rejected while parsing with kind `invalid_spec`.
+
+**Resolution.** `oci://REF` and `docker://REF` are explicit: the prefix is stripped and the remainder is parsed as an OCI reference only. It is never probed as a path and never matched against the catalog. An unprefixed argument is an OCI reference if and only if it contains `/` **and** its first `/`-separated component contains `.` or `:` or equals `localhost`. So `nginx`, `ubuntu`, and `ubuntu:24.04` are never OCI references, while `ghcr.io/org/app:1`, `localhost:5000/app`, and `docker.io/library/alpine` are.
+
+The rule joins §8.2's ordered list between the HTTPS URL rule and the catalog rules, which becomes (the new step in bold):
+
+1. Absolute or relative path that exists → local file.
+2. `https://…` → download to the images dir.
+3. **`oci://…`, `docker://…`, or an unprefixed reference matching the registry heuristic → OCI reference.**
+4. `distro:version` or `distro:alias` → catalog entry.
+5. `distro` → the catalog entry marked `default` for that distro.
+6. Otherwise error `unknown image` listing the closest catalog names.
+
+The persisted-reference classifier (§8.2) gains the same step in the same position: it classifies a strict HTTPS URL, then a canonical OCI reference, then an absolute canonical path, and otherwise a validated catalog reference. A relative filesystem name can therefore never shadow a stored OCI reference.
+
+**Registry V2 protocol subset.** Firestone speaks only what a read-only pull needs, over the §8.3 HTTPS transport rules (identity encoding, 30 s connect timeout, 30 min request timeout, at most five redirects, no credentials in a redirect target):
+
+- `GET /v2/`, `GET /v2/<name>/manifests/<reference>`, and `GET /v2/<name>/blobs/<digest>`. Nothing is ever pushed, deleted, or mounted.
+- Manifest requests send `Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json`. Any other returned media type is an error naming what the registry sent.
+- **Anonymous Bearer flow.** The first request carries no credentials. On `401` with a `WWW-Authenticate: Bearer …` challenge, Firestone parses `realm`, `service`, and `scope`, performs one `GET <realm>?service=…&scope=…` over HTTPS, accepts `token` or `access_token` from the JSON body (at most 64 KiB), and retries the original request once with `Authorization: Bearer <token>`. Exactly one token fetch and one retry per request. A second `401` is kind `permission` naming the registry and repository, with a hint about `docker login`. A challenge scheme other than `Bearer` or `Basic` is an error.
+- **Basic auth** is read from `~/.docker/config.json`, at most 1 MiB, and only from its `auths` object and only from each entry's `auth` field, which must be base64 of `user:password`. `credsStore`, `credHelpers`, and `identitytoken` are ignored with one warning naming the host. The lookup key is the normalized registry host, plus `https://index.docker.io/v1/` for `docker.io`. Credentials are used only over HTTPS, only against the matching host, are sent to a token realm only on that host's challenge, and are never written to any log, event, or error.
+- **Platform selection.** When the fetched document is an index or manifest list, Firestone selects the one manifest whose `platform.os` is `linux` and whose `platform.architecture` is `amd64` for an x86_64 host or `arm64` for an aarch64 host; on aarch64 a present `platform.variant` must be `v8`. Entries with `platform.os.features`, an `artifactType`, or an unknown `mediaType` are skipped. No match is an error listing every `os/architecture[/variant]` the index offers. Two matches take the first in document order.
+- **Digest verification.** Every manifest, index, config, and layer blob is streamed through SHA-256 and compared with the digest that referenced it before a byte of it is used; the tag-fetched top-level document is compared with the registry's `Docker-Content-Digest` when present, and always re-hashed to produce the recorded `manifest_digest`. A mismatch deletes every partial and returns kind `checksum`.
+- **Bounds.** An index or manifest document is at most 4 MiB, an image config at most 1 MiB, a manifest at most 128 layers, and the merged tree at most 64 GiB unpacked. Layer blobs stream to `images/.pull-<source-key>.layer<N>.partial` and emit §8.3's progress events, at most one per 1 MiB.
+- **Compression.** v0.2 decompresses gzip only: `application/vnd.oci.image.layer.v1.tar+gzip`, `application/vnd.docker.image.rootfs.diff.tar.gzip`, and the uncompressed `…tar` forms. A `+zstd` layer returns kind `dependency` with the message naming the media type and a hint that this Firestone release decompresses gzip layers only. Foreign/"nondistributable" layers are rejected the same way.
+- **`images.insecure_registries`** is a global-config list (§7.3) of `host:port` entries. Only a listed entry may be contacted over plain HTTP, and only for exactly that host and port; the port is mandatory and compared literally, no wildcards, no bare hosts, no scheme. `docker.io` and `registry-1.docker.io` may never be listed. The default is empty, and a plain-HTTP attempt against an unlisted host is kind `permission` naming the entry the user would have to add.
+
+**Layer merge rules.** Layers are applied in manifest order to one accumulated logical tree, and the merged result is serialized once as a canonical tar consumed by `mkfs.ext4 -d`:
+
+- `.wh.<name>` in a directory removes `<name>` and its whole subtree from the accumulated tree; the whiteout entry is never materialized.
+- `.wh..wh..opq` in a directory removes every entry accumulated under that directory from earlier layers before the rest of the current layer applies; the marker is never materialized.
+- Every member path is normalized and rejected unless it is relative, non-empty, free of `.` and `..` components, and resolves inside the root. A symlink or hard-link target that leaves the root, and a hard link to a member that does not exist in the accumulated tree, are rejected with kind `checksum` naming the entry.
+- Regular files, directories, symlinks and hard links are preserved with their mode, uid, gid and mtime. Character devices, block devices, FIFOs and sockets are dropped with one warning per kind and never created.
+- Extended attributes are limited by design to `security.capability` and `gnu.translator`, the pair the pinned `mkfs.ext4` tar input accepts. Every other xattr is dropped, including `security.selinux`: an SELinux-labeled image boots unlabeled, which is documented behavior, not a defect.
+- The canonical tar is deterministic for a given manifest: entries in sorted path order, one entry per path, no global or per-entry PAX records beyond the retained xattrs.
+
+**Rootfs packing.** The pinned static `mkfs.ext4` (e2fsprogs 1.47.3, §17.2) writes the canonical tar into a fresh raw ext4 image in one pass with `-d`, without a loop device, a mount, or any privilege. `firestone-init` is injected into that tree at `/sbin/firestone-init` before packing. The raw image is converted with the pinned `qemu-img` and published as an owned read-only qcow2 base through the §8.3 store lock, sidecar, mode and re-hash rules.
+
+**Base image sizing.** The ext4 image size is a pure function of the merged tree: `unpacked_bytes × 1.15 + 256 MiB`, rounded up to a 4 MiB multiple. `unpacked_bytes` is the sum of every regular file's size plus 4096 bytes for each directory, symlink and hard link in the merged tree. The multiplication is integer `bytes × 23 / 20`, so the same manifest always yields the same size on every host. The machine's own `disk` size still governs the overlay (§8.4) and is grown inside the guest by `firestone-init` (§10.5).
+
+**Sidecar metadata v2.** The image sidecar gains `version: 2`, a required `kind` of `"disk"` or `"oci"`, and a required `oci` object that is present exactly when `kind` is `"oci"` and JSON `null` otherwise:
+
+```json
+{"registry_ref": "docker.io/library/nginx:latest",
+ "manifest_digest": "sha256:…", "config_digest": "sha256:…",
+ "entrypoint": ["/docker-entrypoint.sh"], "cmd": ["nginx", "-g", "daemon off;"],
+ "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+ "workdir": "/", "user": "root", "boot": "firestone-init"}
+```
+
+`entrypoint`, `cmd` and `env` are arrays of strings and may be empty; `workdir` and `user` are strings or `null`; `boot` is `"firestone-init"` in v0.2. Every key is required, nullable values are explicit `null`, and the 64 KiB byte cap, atomic publication and validate-before-publish rules of §8.3 are unchanged. A `version: 1` sidecar remains readable and is interpreted as `kind: "disk"` with `oci: null`; it is never rewritten in place, and a `version: 1` sidecar carrying an `oci` object is corrupt.
+
+For an OCI image the stable id `image-<identity-sha256>` hashes length-framed sidecar version, canonical registry reference, manifest digest, and host architecture; there is no source file or source URL to digest. A cache hit therefore requires the identical canonical reference and manifest digest, so a moved `:latest` publishes a new id and leaves the pinned base of a running machine untouched, exactly as §8.3 specifies for a moved catalog URL.
+
 ---
 
 ## 9. Boot: firmware, VMM config, start/stop sequences
@@ -676,6 +747,28 @@ Ctrl‑C during steps 7–8 cancels the wait only; the VM keeps running and the 
 `restart` = `stop` then `start` under one lock acquisition.
 
 `rm` = `stop` (prompting if running and interactive; refusing without `--force` if non‑interactive and running) then delete the machine directory and runtime dir.
+
+### 9.5 Direct kernel boot for OCI machines (normative)
+
+An OCI machine (§8.5) does not boot a firmware. It boots the pinned Cloud Hypervisor kernel release directly, with `firestone-init` as PID 1 (§10.5).
+
+`PayloadConfig` gains a third field beside `firmware` and `kernel`:
+
+```json
+"payload": {
+  "kernel": "/home/u/.local/share/firestone/bin/bzImage-ch-release-v6.16.9-20260508",
+  "cmdline": "console=hvc0 console=ttyS0 root=/dev/vda rw init=/sbin/firestone-init"
+}
+```
+
+Rules:
+
+- The command line is fixed and byte-exact: `console=hvc0 console=ttyS0 root=/dev/vda rw init=/sbin/firestone-init`. Both consoles are listed so kernel output reaches the interactive virtio-console (`hvc0`, §11.6) and the captured serial file (`console.log`, §9.2). There is no `ip=` parameter; §10.5 explains why the guest runs a userspace DHCP client instead.
+- `payload.firmware` is absent on an OCI machine and `payload.cmdline` is absent on a firmware machine. Payload exclusivity is otherwise unchanged: `kernel` and `firmware` are still never both present.
+- `vmm.firmware` set to `rhf`, `edk2`, or a custom path on an OCI machine is a validation error (kind `invalid_spec`, `field` `vmm.firmware`) whose message names direct kernel boot and whose hint says to remove the key. `firmware = "auto"` is accepted and ignored.
+- **Overlay boundary.** Extending the §21 canonical-overlay invariant: `config_overlay` may not add, change, or remove `payload.cmdline`, and may not flip a machine between boot modes — it may not introduce `payload.firmware` on an OCI machine, nor `payload.kernel` or `payload.cmdline` on a firmware machine. A violation fails before `vm.create` with the existing overlay invariant error naming the offending pointer.
+- **Kernel installation.** Before `vmconfig.json` is published, start resolves `cloud-hypervisor-kernel` for the host architecture from `deps.toml` and publishes it through the same locked, no-follow, exact length/hash/mode, fsynced, no-replace publisher used for the selected firmware (§17.2). The kernel is data, not an executable: its published mode is 0644. Only the kernel is fetched for an OCI start; no firmware artifact is downloaded. A firmware machine never fetches the kernel.
+- **Explicit raw disk types.** Cloud Hypervisor v53 disables sector-0 writes on a raw disk image whose type it autodetected, which silently corrupts the first sector's writes. Every disk Firestone emits therefore declares `image_type` explicitly — `"Qcow2"` for the overlay, `"Raw"` for the config disk (§10.5) and for any raw auxiliary disk — and `config_overlay` may not remove an `image_type` field.
 
 ---
 
@@ -796,6 +889,53 @@ Notes:
 
 Only effective seed input bytes change the id. Changing user-data or network-config bytes, the effective de-duplicated key sequence, `user`, a rendered mount tuple, the Firestone identity key, `provisioning`, or the catalog `sshd_path` changes it. A different source pathname with the same bytes, a duplicate key, CPU/memory changes, or a host-only mount path change leaves it stable. A changed id makes cloud-init run its per-instance modules again. Because it also regenerates the guest's SSH host keys (`ssh_deletekeys` default), `start` deletes `machines/<name>/known_hosts` before accepting the new seed identity.
 
+### 10.5 `firestone-init` (normative)
+
+`firestone-init` replaces cloud-init on OCI machines. An OCI guest has no cloud-init, no NoCloud seed, no systemd, and no sshd; it has one static Firestone binary at `/sbin/firestone-init` running as PID 1 and the image's entrypoint running as its child.
+
+**Config disk.** The disk in the seed slot — `disks[1]` in §9.2 — is `machines/<name>/config.img`, attached `readonly: true` with an explicit `"image_type": "Raw"` (§9.5). It is a magic-framed, length-prefixed JSON document:
+
+```
+offset  0   8 bytes   ASCII magic "FSTNINIT"
+offset  8   4 bytes   little-endian u32 format version; 1 in v0.2
+offset 12   4 bytes   little-endian u32 JSON length in bytes; at most 65536
+offset 16   N bytes   the JSON document, UTF-8, no trailing NUL
+```
+
+The remaining bytes up to the image's 4 KiB-aligned size are zero. `firestone-init` refuses a wrong magic, an unknown format version, or a length above the cap, and prints the reason to the console before powering off. The document is:
+
+```json
+{
+  "hostname": "app",
+  "entrypoint": ["/docker-entrypoint.sh"],
+  "cmd": ["nginx", "-g", "daemon off;"],
+  "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+  "workdir": "/",
+  "user": "root",
+  "network": "dhcp",
+  "disk_size_bytes": 21474836480
+}
+```
+
+Every key is required. `entrypoint`, `cmd` and `env` are arrays of strings and may be empty; `workdir` and `user` are strings or `null`; `network` is `"dhcp"` or `"none"`; `disk_size_bytes` is the machine's configured disk size. The values default to the sidecar's `oci` object (§8.5) and are overridden per machine by the spec. `start` rewrites `config.img` only when its bytes change, exactly as step 4 of §9.3 rewrites `seed.img`, and the machine's identity digest covers those bytes the same way.
+
+**Boot sequence.** As PID 1, `firestone-init`, in order:
+
+1. mounts `proc` on `/proc`, `sysfs` on `/sys`, `devtmpfs` on `/dev`, `devpts` on `/dev/pts`, and `tmpfs` on `/tmp` and `/run`;
+2. brings `lo` up;
+3. grows the root filesystem: `/dev/vda` already presents the full virtual size, so init resizes the mounted ext4 root online with the `EXT4_IOC_RESIZE_FS` ioctl to `disk_size_bytes` divided by the filesystem block size. Kernel ext4 is builtin, so no `resize2fs` binary is required in the guest. A filesystem already at or above the target is a no-op;
+4. sets the hostname;
+5. when `network` is `"dhcp"`, runs a minimal userspace DHCP client on `eth0` with a short bounded timeout, then applies the address, netmask, gateway and resolvers and writes `/etc/resolv.conf`. A timeout prints one warning to the console and boot continues; `"none"` skips the step entirely;
+6. spawns `entrypoint ++ cmd` as a direct child in its own new process group, with `env` as the child's complete environment, `workdir` as its working directory, and `user` resolved through the image's own `/etc/passwd` when it is not `root`.
+
+**Staying PID 1.** `firestone-init` does not `exec` the entrypoint. It remains PID 1 for the life of the machine so that it can: reap every orphaned process the guest leaves behind; forward `SIGTERM` and `SIGINT` to the child's process group rather than dying itself; and, when the direct child exits, print its exit status to the console, `sync()`, and issue `reboot(RB_POWER_OFF)` so Cloud Hypervisor exits and Firestone observes a clean, attributable machine exit instead of a hang.
+
+**Verified kernel facts** (pinned `ch-release-v6.16.9-20260508`, §17.2). The kernel has no loadable-module support at all, so everything the guest needs is builtin, and nothing else can be added at runtime. Builtin: `EXT4`, `VIRTIO_BLK`, `VIRTIO_NET`, `VIRTIO_CONSOLE`, `VSOCKETS` with `VIRTIO_VSOCKETS`, `PACKET`, `IP_PNP` with `IP_PNP_DHCP`, `DEVTMPFS` with `DEVTMPFS_MOUNT`, `TMPFS`, `UNIX`, `PROC_FS` with `SYSFS`, `OVERLAY_FS`, `VFAT`, and `VIRTIO_FS`. squashfs is absent, so no image may depend on it.
+
+`IP_PNP_DHCP` being builtin does not make kernel `ip=dhcp` usable: with no server answering, the in-kernel client retries for about 176 s, which would dominate the boot of every `network.mode = "none"` machine and of any machine whose passt start is slow. Firestone therefore never puts `ip=` on the command line (§9.5) and runs its own client in userspace with a short timeout; builtin `CONFIG_PACKET` is what makes that client possible without a module.
+
+**Cloud-init inputs are refused.** Any `[cloud_init]` input from §7.1 on an OCI machine is a validation error (kind `invalid_spec`, with `field` naming the offending key) whose hint points at the config-disk keys above. The failure happens during validation, before any registry request, image pull, or boot — never as a silently ignored file.
+
 ---
 
 ## 11. Shell, console, logs
@@ -856,6 +996,15 @@ Because ssh runs over vsock, `ssh -L`/`-R` work with `network.mode = "none"`. No
 ### 11.7 `logs`
 
 `firestone logs <name> [-f] [--source console|vmm|shim|passt|virtiofsd-N] [-n LINES]` opens only the selected current-user-owned mode-0600 regular file with no-follow and nonblocking flags. It prints the last 200 lines by default; `LINES` is 0 through 100,000. The reverse tail scan is capped at 8 MiB and refuses an individual or requested tail beyond that bound instead of truncating it. Follow reopens a safely rotated path, reads at most 256 KiB per pass, and sleeps 100 ms between passes. `SIGINT` cancels within one polling interval and returns the shared interrupted error without a terminal `Result`. Over REST: `GET /v1/machines/{name}/logs?source=&follow=`.
+
+### 11.8 OCI machines (normative)
+
+An OCI guest (§8.5, §10.5) runs `firestone-init` and the image's entrypoint. It has no sshd, no vsock SSH listener, and no guest SSH host key, so every SSH-dependent surface is unavailable rather than merely failing to connect:
+
+- `firestone shell <name>` and `firestone ssh-config <name>` on an OCI machine return a usage error (kind `usage`, exit code 2) stating that the machine has no sshd and naming `firestone console <name>` and `firestone logs <name>`. Over REST the same actions return `400` with the same message and hint. Both fail before any connection attempt, so there is no timeout to wait through.
+- `firestone run` on an OCI machine performs create and start and then reports that same usage error instead of attaching a shell; the machine is left running.
+- `console` and `logs` work unchanged. The entrypoint's stdout and stderr reach `hvc0` and `console.log`, so the console is the interactive surface and `logs` is the durable one.
+- **Readiness.** Steps 7 and 8 of §9.3 do not apply. `start --wait` on an OCI machine is ready when the shim reports `running` after `vm.boot` — the shim is running and the VM was created and booted — not when SSH answers. `Result.status` is `running` and no `ssh` step is emitted. `[start].timeout` and `--timeout` still bound steps 2 through 6.
 
 ---
 
@@ -1174,6 +1323,9 @@ The single exception is `POST /ui/machines`, which layers a form submission into
 | `virtiofsd` | shared folders | virtio-fs/virtiofsd releases (static) | vendored, pinned |
 | `passt` | networking | Firestone static helper release from pinned commit `a1e48a02ff3550eb7875a7df6726086e9b3a1213` | x86_64 musl payload embedded in Firestone, checksum-verified and materialized on first use; no host package |
 | `qemu-img` | overlays, raw→qcow2 | Firestone static helper release from signed QEMU 8.2.2 source | x86_64 musl payload embedded in Firestone, checksum-verified and materialized on first use; no host package |
+| `bzImage-x86_64` / `Image-arm64` | direct-boot kernel for OCI machines (§9.5) | cloud-hypervisor/linux release `ch-release-v6.16.9-20260508` | vendored, pinned; downloaded and published mode 0644 on the first OCI start, never embedded |
+| `mkfs.ext4` | packs the merged OCI rootfs (§8.5) | Firestone static helper release built from e2fsprogs 1.47.3 | vendored, pinned; downloaded and published on the first OCI pull, never embedded |
+| `firestone-init` | guest PID 1 for OCI machines (§10.5) | built from this repository | static musl payload embedded in Firestone, checksum-verified and injected into the packed rootfs at `/sbin/firestone-init` |
 | `ssh`, `ssh-keygen` | shell | distro package (`openssh-client`) | system |
 
 Pins live in `deps.toml` in the repository (name, version, runtime architectures, immutable URL, sha256, source and license provenance). Checksums come from real downloaded or twice-built bytes. The x86_64 release build downloads and verifies Cloud Hypervisor, passt, and qemu-img before Cargo, then `build.rs` independently matches all three to `deps.toml` and embeds them with `include_bytes!`; a strict release build fails when any payload or hash is absent. First use publishes a versioned `<data>/bin/<name>-<version>` executable under a current-user lock with no-follow validation, exact length/hash/mode readback, fsync, and no-replace publication. A verified literal root-owned passt copy installed for AppArmor takes precedence. Development and compile-only aarch64 builds retain their existing installed/PATH/download fallbacks; the x86_64 standalone release requires no host VMM, passt, or qemu-img package.
@@ -1327,6 +1479,11 @@ Do these in the first milestone, against the pinned versions, and record results
 | 18 | open | The CI runner exposes `/dev/kvm` | `ls -l /dev/kvm` in a workflow |
 | 19 | resolved | pinned passt and qemu-img sources produce reproducible static x86_64 helper payloads with complete corresponding source and license provenance | Native x86_64 double build from digest-pinned Alpine and a 91-APK hash lock produced byte-identical passt SHA-256 `40e59201765c60a0a5bbd0f2caae1aae3fd8f9a9a0628a835159fb2f17ff7025` (322,144 bytes) and qemu-img SHA-256 `30bff329fe1001635cafcfebddc68a1c824d25110c66f968b428c4cf4785d75d` (3,065,192 bytes), both without PT_INTERP, DT_NEEDED, or build-id; corresponding-source SHA-256 `e0195a3ea6c7448e6de07e829347dee2e49eb86f9ff529b49e852ea8a1a38fac` |
 | 20 | resolved | the literal root-owned passt AppArmor profile permits passt userns on Ubuntu 24.04 without granting userns to a user-writable path | On bare-metal `w` (Ubuntu 24.04 x86_64, AppArmor enabled), the exact `abi <abi/4.0>,` profile parsed and loaded as `firestone-passt-2025_02_17.a1e48a0 (unconfined)` against the root-owned mode-0755 helper. With `kernel.apparmor_restrict_unprivileged_userns=1`, unprofiled passt run as uid 65534 exited 1 at `Failed to detach isolating namespaces`; the literal profiled copy passed that stage and remained running until the bounded 2 s timeout (124), with no mandatory-stage userns denial. The profile, helper, sockets and test files were removed, the sysctl restored to 0, and loaded-profile absence verified. |
+| 21 | resolved | the pinned direct-boot kernel carries every OCI guest device and filesystem as a builtin, with no loadable-module support | Probe of the pinned `ch-release-v6.16.9-20260508` image (x86_64 `bzImage-x86_64` SHA-256 `58088758f601a04ef85b09cf23db5530d51edc039ed47afbf2264c5b762cb568`, 8,385,024 bytes) confirmed builtin `EXT4`, `VIRTIO_BLK`, `VIRTIO_NET`, `VIRTIO_CONSOLE`, `VSOCKETS`+`VIRTIO_VSOCKETS`, `PACKET`, `IP_PNP`+`IP_PNP_DHCP`, `DEVTMPFS`+`DEVTMPFS_MOUNT`, `TMPFS`, `UNIX`, `PROC_FS`+`SYSFS`, `OVERLAY_FS`, `VFAT`, `VIRTIOFS`; no module support and no squashfs. Builtin ext4 is what lets `firestone-init` grow the root with `EXT4_IOC_RESIZE_FS` (§10.5) |
+| 22 | resolved | kernel `ip=dhcp` cannot be the OCI network path | Same probe: `IP_PNP_DHCP` is builtin, but with no server answering the in-kernel client retries for about 176 s before giving up, which would dominate every `network.mode = "none"` boot. Firestone omits `ip=` from the fixed cmdline (§9.5) and runs a short-timeout userspace client over builtin `CONFIG_PACKET` (§10.5) |
+| 23 | resolved | Cloud Hypervisor v53 disables sector-0 writes on an autodetected raw disk image | Pinned v53 disk source: autodetection marks the image so that writes to sector 0 are dropped. Every raw disk Firestone emits therefore declares `"image_type": "Raw"` explicitly and `config_overlay` may not remove it (§9.5) |
+| 24 | open | passt answers a guest DHCP request for an OCI machine | Probes observed kernel DHCP messages reaching a guest under passt, which is suggestive but not proof for the userspace client. Close it only with the `firestone-init` end-to-end run (M6-30) showing an OCI guest that leased an address and reached the network |
+| 25 | open | an OCI machine stops gracefully | v0.2's `firestone-init` installs no ACPI power-button handler, so `vm.power-button` is not answered and §9.4 falls through to the force path after the timeout. Close it by handling the Cloud Hypervisor power button inside init, or by accepting the documented behavior in §21 |
 
 ---
 
@@ -1334,6 +1491,17 @@ Do these in the first milestone, against the pinned versions, and record results
 
 | Decision | Chosen | Alternatives considered | Why |
 |---|---|---|---|
+| OCI registry client | Hand-rolled Registry V2 subset over the blocking `reqwest` client Firestone already uses for image pulls: three GET endpoints, one anonymous Bearer retry, `auths`-only basic auth, index platform selection, digest-verified blob streaming | the `oci-client` crate; `oci-distribution`; shelling out to `skopeo` or `crane` | Every OCI crate is async and pulls tokio into `firestone-core`, which the architecture rules forbid, and each adds a large transitive surface for three read-only endpoints. The hand-rolled client reuses the existing bounded HTTPS transport, its limits, and its error kinds, and stays auditable in a few hundred lines. |
+| OCI layer compression in v0.2 | gzip and uncompressed tar layers only; a `+zstd` layer is a clean `dependency` error naming the media type | add a zstd decompressor now; silently skip zstd layers; fall back to a `zstd` host binary | Registries overwhelmingly still publish gzip, and a partially applied layer set is a corrupt rootfs, not a degraded one. A named error tells the user exactly why their image is unsupported and leaves adding zstd a purely additive change. |
+| `mkfs.ext4` distribution | Firestone-owned static e2fsprogs 1.47.3 helper, pinned in `deps.toml` and downloaded on the first OCI pull | embed it in the binary like passt and qemu-img; require a host `e2fsprogs`; build ext4 images in Rust | Only OCI users need it, so embedding it would grow every standalone release for a feature most machines never touch. The same locked, hash-verified, no-replace publisher that installs firmware installs it, so laziness costs no integrity. |
+| Direct-boot kernel distribution | Pinned `ch-release-v6.16.9-20260508` kernels for both architectures in `deps.toml`, downloaded and published mode 0644 on the first OCI start | embed the kernel; build a kernel from source; reuse a host `/boot` kernel | An 8 MB x86_64 and 23 MB aarch64 image would dominate a 14 MB release for a feature only OCI machines use. Cloud Hypervisor publishes the kernels it tests against, which is exactly the configuration §10.5 depends on, and a host kernel has no guaranteed builtin set. |
+| `firestone-init` process model | Stay PID 1 for the life of the machine, spawn the entrypoint as a child in its own process group, reap orphans, forward `SIGTERM`/`SIGINT` to that group, then `sync` and `RB_POWER_OFF` on child exit | `exec` the entrypoint as PID 1; ship a real init such as tini or systemd; let the VM idle after the entrypoint exits | An `exec`ed container entrypoint is almost never signal- or reaper-aware, so zombies accumulate and `stop` cannot be delivered. Powering off on child exit is what makes a one-shot OCI machine terminate on its own and gives Firestone an attributable exit instead of a hang. |
+| OCI guest DHCP | A minimal userspace DHCP client on `eth0` with a short timeout, over builtin `CONFIG_PACKET` | kernel `ip=dhcp` via builtin `IP_PNP_DHCP`; a static address from the host; ship `udhcpc` in the rootfs | Verify 22: the in-kernel client retries for about 176 s when nothing answers, which would dominate every `network.mode = "none"` boot and any slow passt start. A bounded userspace client fails fast, warns, and lets the machine boot; shipping a third-party client would add a binary to every OCI rootfs. |
+| OCI guest configuration transport | A magic-framed, length-prefixed JSON document on a raw read-only disk in the existing seed slot | reuse the cloud-init NoCloud vfat seed; pass configuration on the kernel command line; a vsock handshake at boot | The guest has no cloud-init to read a NoCloud seed and `firestone-init` should not need a vfat parser. A framed length prefix makes truncation, a stale disk, and a future format version all detectable, and the command line is size-limited and world-readable in the guest. |
+| OCI rootfs xattrs | Preserve only `security.capability` and `gnu.translator`; drop everything else, SELinux labels included, and document it | preserve every xattr; fail an image that carries an unsupported xattr; relabel in the guest | Those two are what the pinned `mkfs.ext4` tar input accepts, so anything else cannot survive packing regardless of intent. An SELinux-labeled image boots unlabeled under a kernel with no SELinux policy anyway, so dropping labels is honest rather than lossy, and failing the pull would reject most distro base images. |
+| OCI base image sizing | `unpacked_bytes × 1.15 + 256 MiB`, rounded up to 4 MiB, computed from the merged tree with integer arithmetic | size to the exact unpacked bytes; a fixed size; ask the user for a size | ext4 metadata, the journal, and any first-boot writes need headroom that exact sizing does not leave, and a fixed size either wastes space or fails large images. Integer arithmetic over a deterministic merged tree makes the same manifest produce the same base size on every host, which the image identity depends on. |
+| Plain-HTTP registries | Opt-in only, through an `images.insecure_registries` list of exact `host:port` entries that can never include Docker Hub | allow plain HTTP whenever HTTPS fails; a global `--insecure` flag; refuse plain HTTP entirely | A silent HTTPS-to-HTTP fallback is a downgrade attack, and a per-invocation flag gets pasted into scripts. An exact host-and-port allowlist in the global config makes the exposure explicit, reviewable, and narrow, while still supporting the local development registries that need it. |
+| OCI stop semantics in v0.2 | `stop` sends `vm.power-button` as always, and, because `firestone-init` installs no ACPI handler, falls through §9.4's timeout to the force path; `stop --force` skips straight to it | claim graceful stop and hide the timeout; make `stop` force-only for OCI machines; block OCI boot until an ACPI handler exists | The existing stop sequence already degrades correctly and the guest syncs on its own entrypoint exit, so the force path is safe rather than merely tolerated. Recording it as verify 25 keeps the honest cost visible instead of advertising a graceful stop the guest cannot perform. |
 | M6 interface contracts frozen up front | Snapshot, clone, resize, metrics, prune, and terminal WS routes plus spec additions are fixed before implementation (route shapes recorded in the M6 milestone's feature sections as they land); UI work proceeds against the contracts in parallel | design each surface inside its implementation PR; a single serialized workstream | Parallel agents need a stable seam; freezing the action names, REST paths and payload shapes first lets core and UI land independently while the drift gate keeps `docs/openapi.json` honest. |
 | First-start pinned firmware | Before `vmconfig.json` publication, install only the effective built-in `auto`/`rhf`/`edk2` artifact through the shared locked, no-follow, exact hash/mode, fsynced, no-replace publisher; reverify it for VmConfig; never install or modify a custom firmware path | require a broad `doctor --fix` preflight; download every vendored artifact; trust an existing regular file; rewrite custom firmware | A direct first start from an empty home gets the one firmware it needs without unrelated host repair. The manifest identity and secure publisher keep VMM input inside Firestone's owned dependency boundary, while the custom path remains authoritative. |
 | Passt runtime isolation diagnosis | Probe the exact foreground, one-off vhost-user mode with repair disabled; classify both `Couldn't create user namespace` and `Failed to detach isolating namespaces` as fatal; offer the existing AppArmor repair when host facts support it; runtime selects only the verified literal root-owned pinned copy after repair | treat later detach failure as available because the first userns succeeded; use generic `unshare`; disable AppArmor or a sysctl; accept a user-writable profiled path | Passt cannot serve Cloud Hypervisor after either fatal exit. Matching runtime argv closes the false-ok gap, and verified literal-path selection proves the repair authorizes only the pinned binary. |
