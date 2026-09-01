@@ -184,10 +184,12 @@ impl Dispatcher for FakeDispatcher {
                     }),
                 ),
                 Action::Logs { .. } => {
-                    // Deliberately includes a control character and markup: the
-                    // UI must sanitize the first and escape the second.
+                    // Deliberately includes a control character, markup, an SGR
+                    // colour run and an OSC 52 clipboard write: the UI must
+                    // sanitize the first, escape the second, keep the third
+                    // verbatim and swallow the fourth.
                     events.emit(Event::Output {
-                        data: "boot ok\u{7}\n<script>alert(1)</script>\n".to_owned(),
+                        data: "boot ok\u{7}\n<script>alert(1)</script>\n\u{1b}[32mok\u{1b}[0m\n\u{1b}]52;c;ZXZpbA==\u{7}after\n".to_owned(),
                     })?;
                     (
                         "logs",
@@ -408,6 +410,31 @@ async fn log_text_is_sanitized_and_escaped() -> TestResult {
         "log markup was not escaped"
     );
     assert!(body.contains("&lt;script&gt;"), "expected escaped markup");
+    Ok(())
+}
+
+#[tokio::test]
+async fn log_sgr_colour_survives_while_other_sequences_are_neutralized() -> TestResult {
+    let router = app(FakeDispatcher::default())?;
+    let (status, _, body) = get_fragment(&router, "/ui/machines/web/tab/logs").await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("\u{1b}[32mok\u{1b}[0m"),
+        "the SGR colour run did not survive the logs surface"
+    );
+    assert!(
+        !body.contains("52;c;ZXZpbA=="),
+        "an OSC 52 clipboard payload reached the page"
+    );
+    assert!(
+        !body.contains("\u{1b}]"),
+        "an OSC introducer reached the page"
+    );
+    assert!(
+        body.contains("\u{fffd}after"),
+        "the swallowed OSC must leave exactly one replacement character"
+    );
     Ok(())
 }
 

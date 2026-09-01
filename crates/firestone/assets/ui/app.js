@@ -603,12 +603,10 @@
         if (chunk.done) {
           break;
         }
-        /* Bytes arrive already sanitized: newlines preserved, every other
-         * control character replaced with U+FFFD. Rendered as text, never
-         * as markup. */
-        view.appendChild(
-          document.createTextNode(decoder.decode(chunk.value, { stream: true }))
-        );
+        /* Bytes arrive already sanitized: newlines and SGR colour preserved,
+         * every other escape sequence replaced with U+FFFD. The renderer
+         * turns the surviving SGR into classes and text nodes, never markup. */
+        appendLogChunk(view, decoder.decode(chunk.value, { stream: true }));
         if (pinned) {
           view.scrollTop = view.scrollHeight;
         }
@@ -999,4 +997,420 @@
     syncThemeLabel();
     syncFollowState();
   });
+
+  /* =========================================================== ansi logs ==
+   *
+   * The server keeps exactly one escape family alive in log text: SGR, the
+   * ESC [ … m sequences that only paint. Everything else — cursor moves, OSC
+   * title and clipboard writes, DCS — is already one U+FFFD by the time these
+   * bytes exist, so this code never has to defend against an escape it does
+   * not understand. It turns the surviving colour into classes, because the
+   * served Content-Security-Policy forbids inline style attributes.
+   *
+   * Rendering is line-oriented. A completed line becomes an immutable node
+   * and is never touched again, so following a busy log stays cheap; only the
+   * partial trailing line is re-rendered as bytes arrive.
+   * ==================================================================== */
+
+  var ANSI_ESC = "\u001b";
+  /* A folded line wider than this is a runaway, not output someone reads. */
+  var ANSI_MAX_COLUMNS = 8192;
+
+  function freshSgrState() {
+    return {
+      bold: false,
+      dim: false,
+      italic: false,
+      underline: false,
+      invert: false,
+      strike: false,
+      fg: null,
+      bg: null
+    };
+  }
+
+  function copySgrState(state) {
+    return {
+      bold: state.bold,
+      dim: state.dim,
+      italic: state.italic,
+      underline: state.underline,
+      invert: state.invert,
+      strike: state.strike,
+      fg: state.fg,
+      bg: state.bg
+    };
+  }
+
+  /* Index of the final "m" when text[start] opens an SGR sequence, else -1. */
+  function sgrEnd(text, start) {
+    if (text.charAt(start) !== ANSI_ESC || text.charAt(start + 1) !== "[") {
+      return -1;
+    }
+    for (var i = start + 2; i < text.length; i++) {
+      var code = text.charCodeAt(i);
+      if (code === 109 /* m */) {
+        return i;
+      }
+      var digit = code >= 48 && code <= 57;
+      if (!digit && code !== 59 /* ; */) {
+        return -1;
+      }
+    }
+    return -1;
+  }
+
+  function sgrParams(body) {
+    if (!body) {
+      /* ESC[m is ESC[0m. */
+      return [0];
+    }
+    return body.split(";").map(function (part) {
+      return part === "" ? 0 : parseInt(part, 10);
+    });
+  }
+
+  /* Extended colour (38/48) is consumed and discarded: the palette is the
+   * sixteen themed tokens, and a truecolour triple has no token. Consuming it
+   * is what matters — otherwise its arguments would be read as attributes. */
+  function applySgr(state, params) {
+    for (var i = 0; i < params.length; i++) {
+      var code = params[i];
+      if (code === 38 || code === 48) {
+        var mode = params[i + 1];
+        i += mode === 5 ? 2 : mode === 2 ? 4 : 1;
+        continue;
+      }
+      if (code === 0) {
+        var cleared = freshSgrState();
+        state.bold = cleared.bold;
+        state.dim = cleared.dim;
+        state.italic = cleared.italic;
+        state.underline = cleared.underline;
+        state.invert = cleared.invert;
+        state.strike = cleared.strike;
+        state.fg = cleared.fg;
+        state.bg = cleared.bg;
+      } else if (code === 1) {
+        state.bold = true;
+      } else if (code === 2) {
+        state.dim = true;
+      } else if (code === 3) {
+        state.italic = true;
+      } else if (code === 4) {
+        state.underline = true;
+      } else if (code === 7) {
+        state.invert = true;
+      } else if (code === 9) {
+        state.strike = true;
+      } else if (code === 22) {
+        state.bold = false;
+        state.dim = false;
+      } else if (code === 23) {
+        state.italic = false;
+      } else if (code === 24) {
+        state.underline = false;
+      } else if (code === 27) {
+        state.invert = false;
+      } else if (code === 29) {
+        state.strike = false;
+      } else if (code === 39) {
+        state.fg = null;
+      } else if (code === 49) {
+        state.bg = null;
+      } else if (code >= 30 && code <= 37) {
+        state.fg = code - 30;
+      } else if (code >= 40 && code <= 47) {
+        state.bg = code - 40;
+      } else if (code >= 90 && code <= 97) {
+        state.fg = code - 90 + 8;
+      } else if (code >= 100 && code <= 107) {
+        state.bg = code - 100 + 8;
+      }
+    }
+  }
+
+  function sgrClasses(state) {
+    var classes = [];
+    if (state.bold) {
+      classes.push("fs-ansi-bold");
+    }
+    if (state.dim) {
+      classes.push("fs-ansi-dim");
+    }
+    if (state.italic) {
+      classes.push("fs-ansi-italic");
+    }
+    if (state.underline) {
+      classes.push("fs-ansi-underline");
+    }
+    if (state.strike) {
+      classes.push("fs-ansi-strike");
+    }
+    var fg = state.fg;
+    var bg = state.bg;
+    if (state.invert) {
+      /* Inverse is a swap, and CSS cannot swap two custom properties. It is
+       * done here; the class carries the default-on-default case. */
+      classes.push("fs-ansi-invert");
+      var swapped = fg;
+      fg = bg;
+      bg = swapped;
+    }
+    if (fg !== null) {
+      classes.push("fs-ansi-fg-" + fg);
+    }
+    if (bg !== null) {
+      classes.push("fs-ansi-bg-" + bg);
+    }
+    return classes;
+  }
+
+  /* Splits text into lines of runs, carrying attributes across lines the way
+   * a terminal does. `state` is mutated, so a caller streaming chunk by chunk
+   * can keep it between calls. */
+  function sgrScan(text, state) {
+    var lines = [];
+    var runs = [];
+    var buffer = "";
+    var classes = sgrClasses(state);
+
+    function flushRun() {
+      if (buffer !== "") {
+        runs.push({ text: buffer, classes: classes });
+        buffer = "";
+      }
+    }
+
+    function endLine() {
+      flushRun();
+      lines.push(runs);
+      runs = [];
+    }
+
+    var i = 0;
+    while (i < text.length) {
+      var character = text.charAt(i);
+      if (character === "\n") {
+        endLine();
+        i += 1;
+        continue;
+      }
+      if (character === ANSI_ESC) {
+        var end = sgrEnd(text, i);
+        if (end < 0) {
+          /* The server does not emit this; if it ever did, it would be shown
+           * the same way the server shows a sequence it refuses. */
+          buffer += "\ufffd";
+          i += 1;
+          continue;
+        }
+        flushRun();
+        applySgr(state, sgrParams(text.slice(i + 2, end)));
+        classes = sgrClasses(state);
+        i = end + 1;
+        continue;
+      }
+      buffer += character;
+      i += 1;
+    }
+    endLine();
+    return lines;
+  }
+
+  /* Pure: text in, per-line runs out. Each run is { text, classes }. */
+  function parseSgr(text) {
+    return sgrScan(text, freshSgrState());
+  }
+
+  function isSgrReset(params) {
+    for (var i = 0; i < params.length; i++) {
+      if (params[i] === 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /* Last writer wins, per column. A progress line rewrites itself with \r
+   * rather than a newline, so the raw text holds every intermediate state; a
+   * terminal shows only the final one, and so must this.
+   *
+   * SGR sequences occupy no column, so each written cell remembers the
+   * attributes in force when it was written and the folded line re-emits them
+   * only where they change. */
+  function foldCarriageReturns(line) {
+    if (line.indexOf("\r") < 0) {
+      return line;
+    }
+    var cells = [];
+    var column = 0;
+    var active = "";
+    var i = 0;
+    while (i < line.length) {
+      var character = line.charAt(i);
+      if (character === "\r") {
+        column = 0;
+        i += 1;
+        continue;
+      }
+      if (character === ANSI_ESC) {
+        var end = sgrEnd(line, i);
+        if (end >= 0) {
+          var sequence = line.slice(i, end + 1);
+          active = isSgrReset(sgrParams(line.slice(i + 2, end)))
+            ? sequence
+            : active + sequence;
+          i = end + 1;
+          continue;
+        }
+      }
+      if (column < ANSI_MAX_COLUMNS) {
+        cells[column] = { sgr: active, ch: character };
+      }
+      column += 1;
+      i += 1;
+    }
+
+    var out = "";
+    var previous = "";
+    for (var c = 0; c < cells.length; c++) {
+      var cell = cells[c] || { sgr: previous, ch: " " };
+      if (cell.sgr !== previous) {
+        out += ANSI_ESC + "[0m" + cell.sgr;
+        previous = cell.sgr;
+      }
+      out += cell.ch;
+    }
+    if (active !== previous) {
+      out += ANSI_ESC + "[0m" + active;
+    }
+    return out;
+  }
+
+  /* ------------------------------------------------------- log renderer -- */
+
+  var logRenderers = new WeakMap();
+
+  function runNode(run) {
+    if (!run.classes.length) {
+      return document.createTextNode(run.text);
+    }
+    var span = document.createElement("span");
+    span.className = run.classes.join(" ");
+    span.textContent = run.text;
+    return span;
+  }
+
+  function fillLine(node, runs) {
+    for (var i = 0; i < runs.length; i++) {
+      node.appendChild(runNode(runs[i]));
+    }
+  }
+
+  function createLogRenderer(view) {
+    /* Attributes in force at the start of the partial line. */
+    var state = freshSgrState();
+    var pendingText = "";
+    var pendingNode = null;
+
+    function ensurePending() {
+      if (!pendingNode || pendingNode.parentNode !== view) {
+        pendingNode = el("span", "fs-logline");
+        view.appendChild(pendingNode);
+      }
+    }
+
+    function renderPending() {
+      var folded = foldCarriageReturns(pendingText);
+      /* A progress line that never ends is one line for as long as it runs.
+       * The folded form is what it means, so keep that and drop the history
+       * of everything it overwrote. */
+      if (folded.length < pendingText.length) {
+        pendingText = folded;
+      }
+      /* A copy: the partial line is not finished, so it must not advance the
+       * state the next completed line starts from. */
+      var draft = copySgrState(state);
+      var runs = sgrScan(folded, draft)[0] || [];
+      pendingNode.textContent = "";
+      fillLine(pendingNode, runs);
+    }
+
+    function push(chunk) {
+      if (!chunk) {
+        return;
+      }
+      ensurePending();
+      var parts = (pendingText + chunk).split("\n");
+      pendingText = parts.pop();
+      for (var i = 0; i < parts.length; i++) {
+        var runs = sgrScan(foldCarriageReturns(parts[i]), state)[0] || [];
+        var line = el("span", "fs-logline");
+        fillLine(line, runs);
+        view.insertBefore(line, pendingNode);
+        view.insertBefore(document.createTextNode("\n"), pendingNode);
+      }
+      renderPending();
+    }
+
+    function reset(text) {
+      state = freshSgrState();
+      pendingText = "";
+      pendingNode = null;
+      view.textContent = "";
+      push(text);
+    }
+
+    return { push: push, reset: reset };
+  }
+
+  function logRendererFor(view) {
+    var renderer = logRenderers.get(view);
+    if (!renderer) {
+      renderer = createLogRenderer(view);
+      logRenderers.set(view, renderer);
+    }
+    return renderer;
+  }
+
+  /* The server renders the first screenful as plain text inside the <pre>.
+   * Read it once, clear it, and put it back through the same renderer the
+   * follow stream uses, so both paths produce identical DOM. */
+  function ensureLogViewRendered(view) {
+    if (logRenderers.has(view)) {
+      return;
+    }
+    var text = view.textContent;
+    logRendererFor(view).reset(text);
+  }
+
+  function appendLogChunk(view, chunk) {
+    ensureLogViewRendered(view);
+    logRendererFor(view).push(chunk);
+  }
+
+  function renderLogViews() {
+    var view = qs("[data-fs-logview]");
+    if (!view) {
+      return;
+    }
+    var wasPinned =
+      view.scrollHeight - view.scrollTop - view.clientHeight < 24 ||
+      view.scrollTop === 0;
+    ensureLogViewRendered(view);
+    if (wasPinned) {
+      view.scrollTop = view.scrollHeight;
+    }
+  }
+
+  document.addEventListener("DOMContentLoaded", renderLogViews);
+  document.body.addEventListener("htmx:afterSwap", renderLogViews);
+
+  /* Exposed for the sake of being testable in isolation; nothing else reads
+   * them. */
+  window.firestoneAnsi = {
+    parseSgr: parseSgr,
+    foldCarriageReturns: foldCarriageReturns
+  };
 })();

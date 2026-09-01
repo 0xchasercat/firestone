@@ -644,9 +644,19 @@ async fn logs_route_projects_query_and_sanitizes_text_chunks() -> TestResult {
     let dispatcher = Arc::new(RecordingDispatcher::success(
         "logs",
         json!({"lines":7}),
-        vec![Event::Output {
-            data: "ok\n\u{1b}[31m\tred".to_owned(),
-        }],
+        vec![
+            Event::Output {
+                data: "ok\n\u{1b}[31m\tred\u{1b}[0m\n".to_owned(),
+            },
+            // A colour sequence split between two Output events is still one
+            // sequence, and an OSC is destroyed whichever event carries it.
+            Event::Output {
+                data: "\u{1b}[3".to_owned(),
+            },
+            Event::Output {
+                data: "2mgreen\u{1b}[0m\u{1b}]0;title\u{7}end".to_owned(),
+            },
+        ],
     ));
     let response = send(
         &app(Arc::clone(&dispatcher)),
@@ -660,9 +670,12 @@ async fn logs_route_projects_query_and_sanitizes_text_chunks() -> TestResult {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(content_type(&response), Some(TEXT_CONTENT_TYPE));
     let body = response_bytes(response).await?;
-    assert_eq!(body.as_ref(), "ok\n�[31m�red".as_bytes());
-    assert!(!body.contains(&0x1b));
-    assert!(!body.contains(&b'\t'));
+    assert_eq!(
+        body.as_ref(),
+        "ok\n\u{1b}[31m\tred\u{1b}[0m\n\u{1b}[32mgreen\u{1b}[0m\u{fffd}end".as_bytes()
+    );
+    // SGR survives; the OSC introducer and its body do not.
+    assert!(!body.contains(&b']'));
     assert_eq!(
         dispatcher.actions()?,
         vec![Action::Logs {

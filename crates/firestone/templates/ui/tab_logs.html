@@ -21,8 +21,9 @@
       </button>
     </div>
 
-    {# Sanitized text/plain from the API: newlines preserved, every other
-       control character already replaced with U+FFFD. Inserted as text. #}
+    {# Sanitized text/plain from the API: newlines and SGR colour preserved,
+       every other escape sequence already replaced with U+FFFD. Inserted as
+       text; app.js then turns the surviving SGR into classed spans. #}
     <pre class="fs-logview"
          data-fs-logview
          data-fs-machine="{{ machine.name }}"
@@ -33,7 +34,7 @@
 
     <div class="fs-panel__foot">
       GET /v1/machines/{{ machine.name }}/logs?source={{ source }}&amp;follow={{ 'true' if follow else 'false' }}
-      · text/plain · control chars → U+FFFD
+      · text/plain · SGR color preserved; other control sequences replaced
     </div>
   </div>
 </div>

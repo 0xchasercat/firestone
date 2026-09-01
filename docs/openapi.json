@@ -806,10 +806,10 @@
         ],
         "operationId": "getMachineLogs",
         "summary": "Read machine logs",
-        "description": "Returns sanitized text chunks from the selected owned log. Newlines are preserved; every other Unicode control character is replaced with U+FFFD. A Result before Output yields an empty 200. An error before Output is JSON; an error after streaming begins closes the text stream without an error record. Request bodies are ignored.",
+        "description": "Returns sanitized text chunks from the selected owned log. Printable text, newline, carriage return and tab are preserved, and an SGR colour sequence (ESC [ followed by at most 16 bytes of [0-9;] then the final byte m) passes through verbatim. Every other escape sequence is swallowed whole and replaced with a single U+FFFD, including other CSI finals, OSC with either its BEL or ESC \\ terminator, DCS, APC and an overlong CSI; every other Unicode control character, bare C1 included, is replaced with U+FFFD. The filter is stateful across chunks, so a sequence split between chunks parses once and a sequence still open when the stream ends is flushed as one U+FFFD. A Result before Output yields an empty 200. An error before Output is JSON; an error after streaming begins closes the text stream without an error record. Request bodies are ignored.",
         "responses": {
           "200": {
-            "description": "Sanitized log bytes, streamed without an added delimiter.",
+            "description": "Sanitized log bytes with SGR colour preserved, streamed without an added delimiter.",
             "content": {
               "text/plain": {
                 "schema": {

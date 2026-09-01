@@ -1515,6 +1515,251 @@ pub(crate) fn write_safe_output<W: Write>(writer: &mut W, value: &str) -> io::Re
     writer.flush()
 }
 
+/* ----------------------------------------------------------- log colour -- */
+
+const ESCAPE: char = '\u{1b}';
+const REPLACEMENT: char = '\u{fffd}';
+/// A CSI parameter run longer than this is not colour, it is an attack or a
+/// corrupt stream. Sixteen bytes hold every SGR sequence a real program emits
+/// (`1;38;5;208` is ten) with room to spare.
+const MAX_CSI_PARAMETER_BYTES: usize = 16;
+
+/// Sanitises log output while letting SGR colour through.
+///
+/// `write_safe_output` replaces every control character, which is right for a
+/// CLI table cell and wrong for a boot log: systemd, the kernel and every
+/// service that colours its own output then arrive as a wall of U+FFFD. This
+/// sanitiser keeps the one escape family that only paints — `ESC [` params
+/// `m` — and destroys every other sequence, including the ones that can move
+/// the cursor, retitle the window, or drive an OSC 52 clipboard write.
+///
+/// The allowlist runs on the server, so every consumer of the logs route
+/// (`curl` and the web UI alike) receives the same already-safe bytes; no
+/// client is trusted to filter for itself.
+///
+/// It is a state machine rather than a regex because the stream arrives in
+/// arbitrary chunks: a sequence split across two `push` calls parses as one
+/// sequence, and `finish` flushes a sequence left dangling at end of stream as
+/// a single U+FFFD rather than leaking its bytes.
+#[derive(Debug, Default)]
+pub(crate) struct TerminalSanitizer {
+    state: SanitizerState,
+    parameters: String,
+}
+
+/// `Text`, `Esc` and `Csi` are the contract states. The three `…Discard`
+/// and string states exist because swallowing an OSC, DCS or overlong CSI as
+/// *one* U+FFFD requires consuming its body rather than falling back to text
+/// and printing the payload.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum SanitizerState {
+    #[default]
+    Text,
+    Esc,
+    Csi,
+    /// A CSI that can no longer be SGR: consume through its final byte.
+    CsiDiscard,
+    /// `ESC` followed by an intermediate byte, e.g. a charset designation.
+    EscIntermediate,
+    /// An OSC, DCS, APC, PM or SOS body, up to `BEL` or `ESC \`.
+    StringBody,
+    /// An `ESC` inside a string body: `\` makes it the ST terminator.
+    StringEsc,
+}
+
+impl TerminalSanitizer {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sanitises one chunk. Bytes belonging to a sequence that is still
+    /// incomplete are held in the sanitiser, not returned.
+    pub(crate) fn push(&mut self, chunk: &str) -> String {
+        let mut out = String::with_capacity(chunk.len());
+        for character in chunk.chars() {
+            self.step(character, &mut out);
+        }
+        out
+    }
+
+    /// Ends the stream. A sequence still open becomes one U+FFFD.
+    pub(crate) fn finish(&mut self) -> String {
+        self.parameters.clear();
+        if self.state == SanitizerState::Text {
+            return String::new();
+        }
+        self.state = SanitizerState::Text;
+        String::from(REPLACEMENT)
+    }
+
+    fn step(&mut self, character: char, out: &mut String) {
+        match self.state {
+            SanitizerState::Text => self.step_text(character, out),
+            SanitizerState::Esc => self.step_escape(character, out),
+            SanitizerState::Csi => self.step_csi(character, out),
+            SanitizerState::CsiDiscard => self.step_csi_discard(character, out),
+            SanitizerState::EscIntermediate => self.step_escape_intermediate(character, out),
+            SanitizerState::StringBody => self.step_string_body(character, out),
+            SanitizerState::StringEsc => self.step_string_escape(character, out),
+        }
+    }
+
+    fn step_text(&mut self, character: char, out: &mut String) {
+        match character {
+            ESCAPE => self.state = SanitizerState::Esc,
+            // Line structure is the log's own meaning; a tab is layout.
+            '\n' | '\r' | '\t' => out.push(character),
+            // C0 and, once decoded, the bare C1 range both land here.
+            _ if character.is_control() => out.push(REPLACEMENT),
+            _ => out.push(character),
+        }
+    }
+
+    fn step_escape(&mut self, character: char, out: &mut String) {
+        self.parameters.clear();
+        match character {
+            // The first ESC is dangling; the second opens a fresh sequence.
+            ESCAPE => out.push(REPLACEMENT),
+            '[' => self.state = SanitizerState::Csi,
+            ']' | 'P' | '_' | '^' | 'X' => self.state = SanitizerState::StringBody,
+            '\u{20}'..='\u{2f}' => self.state = SanitizerState::EscIntermediate,
+            _ if character.is_control() => {
+                self.state = SanitizerState::Text;
+                out.push(REPLACEMENT);
+                // A newline never belongs to the aborted sequence.
+                self.step_text(character, out);
+            }
+            _ => {
+                self.state = SanitizerState::Text;
+                out.push(REPLACEMENT);
+            }
+        }
+    }
+
+    fn step_csi(&mut self, character: char, out: &mut String) {
+        match character {
+            '0'..='9' | ';' if self.parameters.len() < MAX_CSI_PARAMETER_BYTES => {
+                self.parameters.push(character);
+            }
+            '0'..='9' | ';' => self.discard_csi(),
+            'm' => {
+                out.push(ESCAPE);
+                out.push('[');
+                out.push_str(&self.parameters);
+                out.push('m');
+                self.parameters.clear();
+                self.state = SanitizerState::Text;
+            }
+            // Any other final byte: a cursor move, an erase, a device query.
+            '\u{40}'..='\u{7e}' => {
+                self.parameters.clear();
+                self.state = SanitizerState::Text;
+                out.push(REPLACEMENT);
+            }
+            // A private marker or intermediate byte, e.g. `ESC [ ? 25 l`.
+            '\u{20}'..='\u{3f}' => self.discard_csi(),
+            ESCAPE => {
+                self.parameters.clear();
+                self.state = SanitizerState::Esc;
+                out.push(REPLACEMENT);
+            }
+            _ if character.is_control() => {
+                self.parameters.clear();
+                self.state = SanitizerState::Text;
+                out.push(REPLACEMENT);
+                self.step_text(character, out);
+            }
+            _ => self.discard_csi(),
+        }
+    }
+
+    fn discard_csi(&mut self) {
+        self.parameters.clear();
+        self.state = SanitizerState::CsiDiscard;
+    }
+
+    fn step_csi_discard(&mut self, character: char, out: &mut String) {
+        match character {
+            '\u{40}'..='\u{7e}' => {
+                self.state = SanitizerState::Text;
+                out.push(REPLACEMENT);
+            }
+            ESCAPE => {
+                self.state = SanitizerState::Esc;
+                out.push(REPLACEMENT);
+            }
+            _ if character.is_control() => {
+                self.state = SanitizerState::Text;
+                out.push(REPLACEMENT);
+                self.step_text(character, out);
+            }
+            _ => {}
+        }
+    }
+
+    fn step_escape_intermediate(&mut self, character: char, out: &mut String) {
+        match character {
+            '\u{20}'..='\u{2f}' => {}
+            ESCAPE => {
+                self.state = SanitizerState::Esc;
+                out.push(REPLACEMENT);
+            }
+            _ if character.is_control() => {
+                self.state = SanitizerState::Text;
+                out.push(REPLACEMENT);
+                self.step_text(character, out);
+            }
+            _ => {
+                self.state = SanitizerState::Text;
+                out.push(REPLACEMENT);
+            }
+        }
+    }
+
+    fn step_string_body(&mut self, character: char, out: &mut String) {
+        match character {
+            // BEL is xterm's OSC terminator.
+            '\u{7}' => {
+                self.state = SanitizerState::Text;
+                out.push(REPLACEMENT);
+            }
+            ESCAPE => self.state = SanitizerState::StringEsc,
+            // An unterminated string must not swallow the rest of the log.
+            _ if character.is_control() => {
+                self.state = SanitizerState::Text;
+                out.push(REPLACEMENT);
+                self.step_text(character, out);
+            }
+            _ => {}
+        }
+    }
+
+    fn step_string_escape(&mut self, character: char, out: &mut String) {
+        match character {
+            // ST.
+            '\\' => {
+                self.state = SanitizerState::Text;
+                out.push(REPLACEMENT);
+            }
+            ESCAPE => {}
+            _ if character.is_control() => {
+                self.state = SanitizerState::Text;
+                out.push(REPLACEMENT);
+                self.step_text(character, out);
+            }
+            _ => self.state = SanitizerState::StringBody,
+        }
+    }
+}
+
+/// Sanitises a complete, already-aggregated log body in one call.
+pub(crate) fn sanitize_terminal_output(value: &str) -> String {
+    let mut sanitizer = TerminalSanitizer::new();
+    let mut out = sanitizer.push(value);
+    out.push_str(&sanitizer.finish());
+    out
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TableWidths {
     name: usize,
@@ -2590,5 +2835,93 @@ mod tests {
         );
         assert!(stderr.is_empty());
         Ok(())
+    }
+
+    /* ------------------------------------------------------- log colour -- */
+
+    #[test]
+    fn terminal_sanitizer_allowlists_sgr_and_neutralizes_everything_else() {
+        let cases: &[(&str, &str)] = &[
+            // Plain text and line structure survive untouched.
+            ("boot ok\nnext\r\n\tindented", "boot ok\nnext\r\n\tindented"),
+            // SGR passes through verbatim, parameters and all.
+            ("\u{1b}[32mok\u{1b}[0m", "\u{1b}[32mok\u{1b}[0m"),
+            (
+                "\u{1b}[1;38;5;208mwarn\u{1b}[m",
+                "\u{1b}[1;38;5;208mwarn\u{1b}[m",
+            ),
+            ("\u{1b}[mreset", "\u{1b}[mreset"),
+            // Every other CSI final is one replacement, body included.
+            ("a\u{1b}[2Kb", "a\u{fffd}b"),
+            ("a\u{1b}[?25lb", "a\u{fffd}b"),
+            ("a\u{1b}[6nb", "a\u{fffd}b"),
+            // An OSC 52 clipboard write is swallowed whole.
+            ("a\u{1b}]52;c;ZXZpbA==\u{7}b", "a\u{fffd}b"),
+            // ESC ] 0 ; title BEL — the title text must not reach the reader.
+            ("\u{1b}]0;pwned\u{7}done", "\u{fffd}done"),
+            // The same OSC closed with ST rather than BEL.
+            ("\u{1b}]0;pwned\u{1b}\\done", "\u{fffd}done"),
+            // DCS and APC bodies are swallowed the same way.
+            ("a\u{1b}Pq#0\u{1b}\\b", "a\u{fffd}b"),
+            ("a\u{1b}_payload\u{1b}\\b", "a\u{fffd}b"),
+            // A bare C1 byte, decoded, is not an escape introducer here.
+            ("a\u{9b}31mb", "a\u{fffd}31mb"),
+            ("a\u{85}b", "a\u{fffd}b"),
+            // An overlong CSI parameter run is not colour, even ending in m.
+            ("a\u{1b}[00000000000000000000000000000031mb", "a\u{fffd}b"),
+            // A charset designation is two bytes and one replacement.
+            ("a\u{1b}(Bb", "a\u{fffd}b"),
+            // A lone ESC before an ordinary byte.
+            ("a\u{1b}Zb", "a\u{fffd}b"),
+            // Other control characters keep the old behaviour.
+            ("a\u{7}b\u{0}c", "a\u{fffd}b\u{fffd}c"),
+            // An unterminated OSC must not eat the rest of the log.
+            ("\u{1b}]0;title\nnext line", "\u{fffd}\nnext line"),
+            // An aborted CSI must not eat the newline either.
+            ("\u{1b}[31\nnext", "\u{fffd}\nnext"),
+        ];
+
+        for (input, expected) in cases {
+            let mut sanitizer = super::TerminalSanitizer::new();
+            let mut actual = sanitizer.push(input);
+            actual.push_str(&sanitizer.finish());
+            assert_eq!(&actual, expected, "input {input:?}");
+            assert_eq!(
+                super::sanitize_terminal_output(input),
+                *expected,
+                "one-shot input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_sanitizer_split_sequence_across_pushes_parses_as_one() {
+        let input = "\u{1b}[32mok\u{1b}[0m\n\u{1b}]0;title\u{7}tail\n";
+        let expected = "\u{1b}[32mok\u{1b}[0m\n\u{fffd}tail\n";
+
+        // Every split point must produce the same bytes as one push would.
+        for cut in 1..input.len() {
+            if !input.is_char_boundary(cut) {
+                continue;
+            }
+            let mut sanitizer = super::TerminalSanitizer::new();
+            let mut actual = sanitizer.push(&input[..cut]);
+            actual.push_str(&sanitizer.push(&input[cut..]));
+            actual.push_str(&sanitizer.finish());
+            assert_eq!(actual, expected, "split at {cut}");
+        }
+    }
+
+    #[test]
+    fn terminal_sanitizer_dangling_escape_at_end_of_stream_is_replaced() {
+        let mut sanitizer = super::TerminalSanitizer::new();
+        assert_eq!(sanitizer.push("tail\u{1b}"), "tail");
+        assert_eq!(sanitizer.finish(), "\u{fffd}");
+        // The sanitiser is reusable and reports nothing further.
+        assert_eq!(sanitizer.finish(), "");
+
+        let mut partial = super::TerminalSanitizer::new();
+        assert_eq!(partial.push("tail\u{1b}[3"), "tail");
+        assert_eq!(partial.finish(), "\u{fffd}");
     }
 }
