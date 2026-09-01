@@ -1,0 +1,1220 @@
+//! Request handlers for the embedded web UI.
+//!
+//! Every handler is a read of a shared action result rendered into HTML. The
+//! one exception is machine creation, which posts here rather than straight to
+//! `/v1/machines` so a rejected field can be answered next to that field
+//! instead of thrown as a notification.
+//!
+//! Lifecycle mutations are not routed here at all: start, stop, restart,
+//! delete and image pull go from the browser to the real `/v1` endpoints and
+//! render their NDJSON progress as it arrives. There is exactly one mutation
+//! surface, and it is the documented one.
+
+use std::collections::BTreeMap;
+
+use axum::{
+    Form,
+    body::Body,
+    extract::{Path, Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE},
+    response::Response,
+};
+use firestone_core::{
+    Action, CatalogEntrySummary, ErrorKind, FirestoneError, ImageRef, LogSource, MachineSpec,
+    MachineSpecPatch, MachineSummary, MachineView, NetMode, VersionResult,
+};
+use minijinja::{Value, context};
+use serde::Deserialize;
+
+use crate::{
+    api,
+    ui::{
+        UiState,
+        render::{render, urlencode},
+        view::{
+            CachedImage, CatalogCard, CheckInfo, HostInfo, MachineDetail, MachineRow,
+            OverviewMachine, VersionInfo, format_bytes, net_mode_token, stats,
+        },
+    },
+};
+
+/// Cap on how much log text one non-following read renders.
+const LOG_LINES: u32 = 400;
+
+/// Log sources the UI offers, with the labels an operator recognises.
+const LOG_SOURCES: &[(&str, &str)] = &[
+    ("console", "console"),
+    ("vmm", "cloud-hypervisor"),
+    ("shim", "shim"),
+    ("passt", "passt"),
+];
+
+// ------------------------------------------------------------------ pages --
+
+pub async fn overview(State(state): State<UiState>, headers: HeaderMap) -> Response {
+    match overview_body(&state).await {
+        Ok(body) => page(&state, headers, "overview", "Host overview", body).await,
+        Err(error) => failure(&state, headers, error).await,
+    }
+}
+
+async fn overview_body(state: &UiState) -> Result<String, FirestoneError> {
+    let machines = list_machines(state).await?;
+    let images = list_images(state).await?;
+    let report = state.doctor().await?;
+    let version = version_info(state).await?;
+
+    let checks: Vec<CheckInfo> = report.checks.iter().map(CheckInfo::from).collect();
+    let attention: Vec<&CheckInfo> = checks.iter().filter(|check| check.status != "ok").collect();
+    let overview_machines: Vec<OverviewMachine> =
+        machines.iter().map(OverviewMachine::from).collect();
+
+    render(
+        "ui/overview.html",
+        context! {
+            subtitle => subtitle(&version),
+            host => HostInfo::from(&report),
+            checks => checks,
+            attention => attention,
+            stats => stats(&machines, &images),
+            machines => overview_machines,
+            images => cached_image_rows(&images),
+            version => version,
+        },
+    )
+}
+
+pub async fn machines(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Query(query): Query<FilterQuery>,
+) -> Response {
+    match machines_body(&state, query.q.as_deref().unwrap_or_default()).await {
+        Ok(body) => page(&state, headers, "machines", "Machines", body).await,
+        Err(error) => failure(&state, headers, error).await,
+    }
+}
+
+async fn machines_body(state: &UiState, query: &str) -> Result<String, FirestoneError> {
+    let all = list_machines(state).await?;
+    let rows = filtered_rows(&all, query);
+    let running = all
+        .iter()
+        .filter(|machine| machine.status == "running")
+        .count();
+
+    render(
+        "ui/machines.html",
+        context! {
+            query => query,
+            machines => rows,
+            machine_count => all.len(),
+            subtitle => format!(
+                "{} {} · {running} running · desired state reconciled on start",
+                all.len(),
+                if all.len() == 1 { "machine" } else { "machines" },
+            ),
+        },
+    )
+}
+
+pub async fn detail(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Query(query): Query<TabQuery>,
+) -> Response {
+    match detail_body(&state, &name, &query).await {
+        Ok(body) => page(&state, headers, "machines", &name, body).await,
+        Err(error) => failure(&state, headers, error).await,
+    }
+}
+
+async fn detail_body(
+    state: &UiState,
+    name: &str,
+    query: &TabQuery,
+) -> Result<String, FirestoneError> {
+    let view = show_machine(state, name).await?;
+    let machine = MachineDetail::new(name, &view);
+    let tab = query.tab.as_deref().unwrap_or("spec");
+    let source = query.source.as_deref().unwrap_or("console");
+
+    let mut ctx = tab_context(state, name, &machine, tab, source, query.follow).await?;
+    ctx.insert("machine".to_owned(), Value::from_serialize(&machine));
+    ctx.insert("tabs".to_owned(), Value::from_serialize(tabs(name, tab)));
+    ctx.insert(
+        "tab_template".to_owned(),
+        Value::from(tab_template(tab).to_owned()),
+    );
+
+    render("ui/detail.html", Value::from_object(ctx))
+}
+
+pub async fn catalog(State(state): State<UiState>, headers: HeaderMap) -> Response {
+    match catalog_body(&state).await {
+        Ok(body) => page(&state, headers, "catalog", "Image catalog", body).await,
+        Err(error) => failure(&state, headers, error).await,
+    }
+}
+
+async fn catalog_body(state: &UiState) -> Result<String, FirestoneError> {
+    render(
+        "ui/catalog.html",
+        context! { entries => catalog_cards_data(state).await? },
+    )
+}
+
+// -------------------------------------------------------------- fragments --
+
+pub async fn host_pill(State(state): State<UiState>) -> Response {
+    match state.doctor().await {
+        Ok(report) => fragment(render(
+            "ui/_hostpill.html",
+            context! { host => HostInfo::from(&report) },
+        )),
+        Err(error) => fragment_error(error),
+    }
+}
+
+pub async fn overview_stats(State(state): State<UiState>) -> Response {
+    let result = async {
+        let machines = list_machines(&state).await?;
+        let images = list_images(&state).await?;
+        render(
+            "ui/_stats.html",
+            context! { stats => stats(&machines, &images) },
+        )
+    }
+    .await;
+    fragment(result)
+}
+
+pub async fn overview_machines(State(state): State<UiState>) -> Response {
+    let result = async {
+        let machines = list_machines(&state).await?;
+        let rows: Vec<OverviewMachine> = machines.iter().map(OverviewMachine::from).collect();
+        render("ui/_overview_machines.html", context! { machines => rows })
+    }
+    .await;
+    fragment(result)
+}
+
+pub async fn machine_rows(
+    State(state): State<UiState>,
+    Query(query): Query<FilterQuery>,
+) -> Response {
+    let result = async {
+        let all = list_machines(&state).await?;
+        let filter = query.q.as_deref().unwrap_or_default();
+        render(
+            "ui/_machine_rows.html",
+            context! {
+                machines => filtered_rows(&all, filter),
+                machine_count => all.len(),
+                query => filter,
+            },
+        )
+    }
+    .await;
+    fragment(result)
+}
+
+pub async fn machine_head(State(state): State<UiState>, Path(name): Path<String>) -> Response {
+    let result = async {
+        let view = show_machine(&state, &name).await?;
+        render(
+            "ui/_detail_head.html",
+            context! { machine => MachineDetail::new(&name, &view) },
+        )
+    }
+    .await;
+    fragment(result)
+}
+
+pub async fn machine_tab(
+    State(state): State<UiState>,
+    Path((name, tab)): Path<(String, String)>,
+    Query(query): Query<TabQuery>,
+) -> Response {
+    let result = async {
+        let view = show_machine(&state, &name).await?;
+        let machine = MachineDetail::new(&name, &view);
+        let source = query.source.as_deref().unwrap_or("console");
+        let mut ctx = tab_context(&state, &name, &machine, &tab, source, query.follow).await?;
+        ctx.insert("machine".to_owned(), Value::from_serialize(&machine));
+        render(tab_template(&tab), Value::from_object(ctx))
+    }
+    .await;
+    fragment(result)
+}
+
+pub async fn catalog_cards(State(state): State<UiState>) -> Response {
+    let result = async {
+        render(
+            "ui/_catalog_cards.html",
+            context! { entries => catalog_cards_data(&state).await? },
+        )
+    }
+    .await;
+    fragment(result)
+}
+
+pub async fn palette(State(state): State<UiState>, Query(query): Query<FilterQuery>) -> Response {
+    let result = async {
+        let needle = query.q.as_deref().unwrap_or_default().trim().to_lowercase();
+        let machines = list_machines(&state).await?;
+        let entries = list_catalog(&state).await?;
+        let images = list_images(&state).await?;
+
+        let matched_machines: Vec<OverviewMachine> = machines
+            .iter()
+            .filter(|machine| {
+                needle.is_empty()
+                    || machine.name.to_lowercase().contains(&needle)
+                    || machine.image.to_lowercase().contains(&needle)
+            })
+            .take(6)
+            .map(OverviewMachine::from)
+            .collect();
+
+        let cached = cached_by_reference(&images);
+        let matched_images: Vec<PaletteImage> = entries
+            .iter()
+            .filter(|entry| needle.is_empty() || entry.reference.to_lowercase().contains(&needle))
+            .take(6)
+            .map(|entry| PaletteImage {
+                reference: entry.reference.clone(),
+                cached: cached.contains_key(&entry.reference),
+                note: cached
+                    .get(&entry.reference)
+                    .map_or_else(|| "not cached".to_owned(), |size| format_bytes(*size)),
+            })
+            .collect();
+
+        render(
+            "ui/palette.html",
+            context! {
+                query => query.q.as_deref().unwrap_or_default(),
+                machines => matched_machines,
+                images => matched_images,
+            },
+        )
+    }
+    .await;
+    fragment(result)
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PaletteImage {
+    reference: String,
+    cached: bool,
+    note: String,
+}
+
+// ----------------------------------------------------------------- create --
+
+pub async fn create_form(State(state): State<UiState>) -> Response {
+    let result = async {
+        let entries = list_catalog(&state).await?;
+        let defaults = MachineSpec::from_layers(
+            &state.create_defaults,
+            &MachineSpecPatch::default(),
+            &MachineSpecPatch::default(),
+        )?;
+        render(
+            "ui/create.html",
+            context! {
+                form => CreateForm::from_defaults(&defaults),
+                errors => BTreeMap::<String, String>::new(),
+                catalog_refs => entries
+                    .iter()
+                    .map(|entry| entry.reference.clone())
+                    .collect::<Vec<_>>(),
+                net_modes => ["passt", "tap", "none"],
+            },
+        )
+    }
+    .await;
+    fragment(result)
+}
+
+pub async fn create_machine(
+    State(state): State<UiState>,
+    Form(form): Form<CreateForm>,
+) -> Response {
+    let patch = match form.to_patch() {
+        Ok(patch) => patch,
+        Err(errors) => return create_rejected(&state, &form, errors).await,
+    };
+
+    let spec = match MachineSpec::from_layers(
+        &state.create_defaults,
+        &MachineSpecPatch::default(),
+        &patch,
+    ) {
+        Ok(spec) => spec,
+        Err(error) => return create_rejected(&state, &form, field_errors(&error)).await,
+    };
+
+    let name = form.name.trim().to_owned();
+    match api::dispatch_payload(
+        &state.dispatcher,
+        Action::Create {
+            name: name.clone(),
+            spec,
+        },
+        "create",
+    )
+    .await
+    {
+        Ok(_) => created(&name),
+        Err(error) => create_rejected(&state, &form, field_errors(&error)).await,
+    }
+}
+
+/// Re-renders the dialog with the message attached to the offending field.
+/// A 400 or a 409 here is ordinary, expected input handling, not an incident.
+async fn create_rejected(
+    state: &UiState,
+    form: &CreateForm,
+    errors: BTreeMap<String, String>,
+) -> Response {
+    let entries = list_catalog(state).await.unwrap_or_default();
+    fragment(render(
+        "ui/create.html",
+        context! {
+            form => form,
+            errors => errors,
+            catalog_refs => entries
+                .iter()
+                .map(|entry| entry.reference.clone())
+                .collect::<Vec<_>>(),
+            net_modes => ["passt", "tap", "none"],
+        },
+    ))
+}
+
+fn created(name: &str) -> Response {
+    let mut response = Response::new(Body::empty());
+    let headers = response.headers_mut();
+    // Close the dialog, announce the result and land on the new machine, all
+    // through htmx's own response protocol rather than a client-side guess.
+    let trigger = serde_json::json!({
+        "fs:created": { "name": name, "sub": "POST /v1/machines 201" }
+    });
+    if let Ok(value) = HeaderValue::from_str(&ascii_json(&trigger)) {
+        headers.insert("HX-Trigger", value);
+    }
+    let location = serde_json::json!({
+        "path": format!("/machines/{}", urlencode(name)),
+        "target": "#fs-main-content",
+    });
+    if let Ok(value) = HeaderValue::from_str(&ascii_json(&location)) {
+        headers.insert("HX-Location", value);
+    }
+    response
+}
+
+/// Serializes to JSON with every non-ASCII scalar escaped as `\uXXXX`.
+///
+/// A header value may only carry visible ASCII. A machine name is arbitrary
+/// UTF-8, so serializing it directly would make `HeaderValue::from_str` fail
+/// and silently drop the completion the operator is waiting for.
+fn ascii_json(value: &serde_json::Value) -> String {
+    let raw = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_owned());
+    let mut escaped = String::with_capacity(raw.len());
+    for character in raw.chars() {
+        if character.is_ascii_graphic() || character == ' ' {
+            escaped.push(character);
+        } else {
+            for unit in character.encode_utf16(&mut [0u16; 2]) {
+                escaped.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    escaped
+}
+
+/// Attaches an error to the field it is about, falling back to a form-level
+/// notice when the message names nothing recognisable.
+fn field_errors(error: &FirestoneError) -> BTreeMap<String, String> {
+    let info = error.info();
+    let mut errors = BTreeMap::new();
+    let lowered = info.message.to_lowercase();
+
+    let field = if lowered.contains("name") || matches!(error.kind(), ErrorKind::AlreadyExists) {
+        "name"
+    } else if lowered.contains("image") {
+        "image"
+    } else if lowered.contains("cpus") || lowered.contains("vcpu") {
+        "cpus"
+    } else if lowered.contains("memory") {
+        "memory"
+    } else if lowered.contains("disk") {
+        "disk"
+    } else if lowered.contains("forward") || lowered.contains("port") {
+        "forward"
+    } else if lowered.contains("user") {
+        "user"
+    } else {
+        "form"
+    };
+
+    errors.insert(field.to_owned(), info.message.clone());
+    if let Some(hint) = info.hint.clone() {
+        errors.insert("hint".to_owned(), hint);
+    }
+    errors
+}
+
+/// The create dialog's fields, in both directions: rendered into the form and
+/// parsed back out of it.
+#[derive(Debug, Default, Clone, Deserialize, serde::Serialize)]
+pub struct CreateForm {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub image: String,
+    #[serde(default)]
+    pub cpus: String,
+    #[serde(default)]
+    pub memory: String,
+    #[serde(default)]
+    pub disk: String,
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub net_mode: String,
+    #[serde(default)]
+    pub forward: String,
+}
+
+impl CreateForm {
+    fn from_defaults(spec: &MachineSpec) -> Self {
+        Self {
+            name: String::new(),
+            image: spec.image.as_str().to_owned(),
+            cpus: spec.cpus.to_string(),
+            memory: spec.memory.to_string(),
+            disk: spec.disk.to_string(),
+            user: spec.user.clone(),
+            net_mode: net_mode_token(spec.network.mode).to_owned(),
+            forward: spec
+                .network
+                .forward
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        }
+    }
+
+    /// Turns the submitted text into a sparse patch, collecting every field
+    /// problem rather than stopping at the first: a form that reports one
+    /// error at a time makes the user pay a round trip per mistake.
+    fn to_patch(&self) -> Result<MachineSpecPatch, BTreeMap<String, String>> {
+        let mut errors = BTreeMap::new();
+        let mut patch = MachineSpecPatch::default();
+
+        if self.name.trim().is_empty() {
+            errors.insert("name".to_owned(), "a machine needs a name".to_owned());
+        }
+
+        match self.image.trim() {
+            "" => {
+                errors.insert(
+                    "image".to_owned(),
+                    "an image reference is required".to_owned(),
+                );
+            }
+            // ImageRef accepts any non-empty string here; catalog, URL and
+            // path forms are resolved and rejected by shared validation, so
+            // the UI does not grow a second, divergent parser.
+            value => patch.image = Some(ImageRef::new(value)),
+        }
+
+        if !self.cpus.trim().is_empty() {
+            match self.cpus.trim().parse::<u8>() {
+                Ok(cpus) if cpus >= 1 => patch.cpus = Some(cpus),
+                _ => {
+                    errors.insert("cpus".to_owned(), "cpus must be 1 through 255".to_owned());
+                }
+            }
+        }
+
+        parse_into(&self.memory, "memory", &mut errors, |value| {
+            patch.memory = Some(value);
+        });
+        parse_into(&self.disk, "disk", &mut errors, |value| {
+            patch.disk = Some(value);
+        });
+
+        if !self.user.trim().is_empty() {
+            patch.user = Some(self.user.trim().to_owned());
+        }
+
+        let mut network = firestone_core::NetworkSpecPatch::default();
+        match self.net_mode.trim() {
+            "" => {}
+            "passt" => network.mode = Some(NetMode::Passt),
+            "tap" => network.mode = Some(NetMode::Tap),
+            "none" => network.mode = Some(NetMode::None),
+            other => {
+                errors.insert(
+                    "net_mode".to_owned(),
+                    format!("{other} is not a network mode; use passt, tap or none"),
+                );
+            }
+        }
+
+        let forwards: Vec<&str> = self
+            .forward
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .collect();
+        if !forwards.is_empty() {
+            let mut parsed = Vec::with_capacity(forwards.len());
+            for value in forwards {
+                match value.parse() {
+                    Ok(forward) => parsed.push(forward),
+                    Err(error) => {
+                        errors.insert("forward".to_owned(), format!("{value}: {error}"));
+                    }
+                }
+            }
+            network.forward = Some(parsed);
+        }
+        patch.network = Some(network);
+
+        if errors.is_empty() {
+            Ok(patch)
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+fn parse_into<T, F>(raw: &str, field: &str, errors: &mut BTreeMap<String, String>, mut apply: F)
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+    F: FnMut(T),
+{
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    match trimmed.parse::<T>() {
+        Ok(value) => apply(value),
+        Err(error) => {
+            errors.insert(field.to_owned(), error.to_string());
+        }
+    }
+}
+
+// ------------------------------------------------------------------- tabs --
+
+fn tab_template(tab: &str) -> &'static str {
+    match tab {
+        "logs" => "ui/tab_logs.html",
+        "vmconfig" => "ui/tab_vmconfig.html",
+        _ => "ui/tab_spec.html",
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct Tab {
+    label: &'static str,
+    active: bool,
+    href: String,
+    fragment: String,
+}
+
+fn tabs(name: &str, active: &str) -> Vec<Tab> {
+    [
+        ("spec", "Spec"),
+        ("logs", "Logs"),
+        ("vmconfig", "VM Config"),
+    ]
+    .into_iter()
+    .map(|(id, label)| Tab {
+        label,
+        active: id == active || (active != "logs" && active != "vmconfig" && id == "spec"),
+        href: format!("/machines/{}?tab={id}", urlencode(name)),
+        fragment: format!("/ui/machines/{}/tab/{id}", urlencode(name)),
+    })
+    .collect()
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SourceChip {
+    label: &'static str,
+    active: bool,
+    href: String,
+    fragment: String,
+}
+
+async fn tab_context(
+    state: &UiState,
+    name: &str,
+    machine: &MachineDetail,
+    tab: &str,
+    source: &str,
+    follow: Option<bool>,
+) -> Result<BTreeMap<String, Value>, FirestoneError> {
+    let mut ctx = BTreeMap::new();
+    match tab {
+        "logs" => {
+            let parsed = source.parse::<LogSource>().map_err(|error| {
+                FirestoneError::new(ErrorKind::Usage, error.to_string())
+                    .with_hint("choose console, vmm, shim, or passt")
+            })?;
+            // Following only makes sense while something is writing. Default
+            // it on for a running machine and off otherwise, so opening the
+            // tab on a stopped machine does not leave a dead indicator
+            // pulsing.
+            let follow = follow.unwrap_or(machine.is_running) && machine.is_running;
+            let text = read_logs(state, name, parsed).await?;
+
+            ctx.insert("logs".to_owned(), Value::from(text));
+            ctx.insert("source".to_owned(), Value::from(source.to_owned()));
+            ctx.insert("follow".to_owned(), Value::from(follow));
+            ctx.insert("can_follow".to_owned(), Value::from(machine.is_running));
+            ctx.insert(
+                "sources".to_owned(),
+                Value::from_serialize(source_chips(name, source)),
+            );
+        }
+        "vmconfig" => {
+            let (config, unavailable) = read_vmconfig(state, name).await;
+            ctx.insert("vmconfig".to_owned(), Value::from(config));
+            ctx.insert("unavailable".to_owned(), Value::from(unavailable));
+        }
+        _ => {}
+    }
+    Ok(ctx)
+}
+
+fn source_chips(name: &str, active: &str) -> Vec<SourceChip> {
+    LOG_SOURCES
+        .iter()
+        .map(|(id, label)| SourceChip {
+            label,
+            active: *id == active,
+            href: format!("/machines/{}?tab=logs&source={id}", urlencode(name)),
+            fragment: format!("/ui/machines/{}/tab/logs?source={id}", urlencode(name)),
+        })
+        .collect()
+}
+
+// ------------------------------------------------------------ action reads --
+
+async fn list_machines(state: &UiState) -> Result<Vec<MachineSummary>, FirestoneError> {
+    decode(
+        api::dispatch_payload(&state.dispatcher, Action::List, "list").await?,
+        "machine list",
+    )
+}
+
+async fn list_images(state: &UiState) -> Result<Vec<CachedImage>, FirestoneError> {
+    decode(
+        api::dispatch_payload(&state.dispatcher, Action::ImageList, "images-ls").await?,
+        "image list",
+    )
+}
+
+async fn list_catalog(state: &UiState) -> Result<Vec<CatalogEntrySummary>, FirestoneError> {
+    decode(
+        api::dispatch_payload(&state.dispatcher, Action::CatalogList, "catalog").await?,
+        "catalog",
+    )
+}
+
+async fn show_machine(state: &UiState, name: &str) -> Result<MachineView, FirestoneError> {
+    decode(
+        api::dispatch_payload(
+            &state.dispatcher,
+            Action::Show {
+                name: name.to_owned(),
+                vmconfig: false,
+            },
+            "show",
+        )
+        .await?,
+        "machine",
+    )
+}
+
+async fn version_info(state: &UiState) -> Result<VersionInfo, FirestoneError> {
+    let result: VersionResult = decode(
+        api::dispatch_payload(&state.dispatcher, Action::Version, "version").await?,
+        "version",
+    )?;
+    Ok(VersionInfo::from(&result))
+}
+
+async fn read_logs(
+    state: &UiState,
+    name: &str,
+    source: LogSource,
+) -> Result<String, FirestoneError> {
+    let text = api::dispatch_output(
+        &state.dispatcher,
+        Action::Logs {
+            name: name.to_owned(),
+            source,
+            lines: LOG_LINES,
+            follow: false,
+        },
+        "logs",
+    )
+    .await?;
+    Ok(crate::api::sanitized_output(&text))
+}
+
+/// A machine that has never started has no published config. That is an
+/// ordinary state, not an error, so it renders as an explanation.
+async fn read_vmconfig(state: &UiState, name: &str) -> (String, String) {
+    match api::dispatch_payload(
+        &state.dispatcher,
+        Action::Show {
+            name: name.to_owned(),
+            vmconfig: true,
+        },
+        "show-vmconfig",
+    )
+    .await
+    {
+        Ok(value) => (
+            serde_json::to_string_pretty(&value).unwrap_or_default(),
+            String::new(),
+        ),
+        Err(error) => (String::new(), error.info().message),
+    }
+}
+
+async fn catalog_cards_data(state: &UiState) -> Result<Vec<CatalogCard>, FirestoneError> {
+    let entries = list_catalog(state).await?;
+    let images = list_images(state).await?;
+    let cached = cached_by_reference(&images);
+    let ids = cached_ids(&images);
+
+    Ok(entries
+        .iter()
+        .map(|entry| {
+            let size = cached.get(&entry.reference).copied();
+            CatalogCard {
+                reference: entry.reference.clone(),
+                cached: size.is_some(),
+                cached_id: ids.get(&entry.reference).cloned().unwrap_or_default(),
+                size: size.map(format_bytes).unwrap_or_default(),
+                chips: chips(entry),
+            }
+        })
+        .collect())
+}
+
+fn chips(entry: &CatalogEntrySummary) -> Vec<String> {
+    let mut chips: Vec<String> = entry
+        .aliases
+        .iter()
+        .map(|alias| format!("alias: {alias}"))
+        .collect();
+    for architecture in &entry.architectures {
+        chips.push(format!(
+            "{} · {}",
+            architecture.architecture,
+            serde_json::to_value(architecture.firmware)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "edk2".to_owned())
+        ));
+    }
+    chips
+}
+
+fn cached_by_reference(images: &[CachedImage]) -> BTreeMap<String, u64> {
+    let mut sizes = BTreeMap::new();
+    for image in images {
+        let entry = sizes
+            .entry(image.metadata.source_ref.clone())
+            .or_insert(0u64);
+        *entry = (*entry).max(image.metadata.size);
+    }
+    sizes
+}
+
+fn cached_ids(images: &[CachedImage]) -> BTreeMap<String, String> {
+    images
+        .iter()
+        .map(|image| (image.metadata.source_ref.clone(), image.metadata.id.clone()))
+        .collect()
+}
+
+fn cached_image_rows(images: &[CachedImage]) -> Vec<CachedImageRow> {
+    images
+        .iter()
+        .take(6)
+        .map(|image| CachedImageRow {
+            reference: image.metadata.source_ref.clone(),
+            id: image.metadata.id.clone(),
+            size: format_bytes(image.metadata.size),
+        })
+        .collect()
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CachedImageRow {
+    reference: String,
+    id: String,
+    size: String,
+}
+
+fn filtered_rows(machines: &[MachineSummary], query: &str) -> Vec<MachineRow> {
+    let needle = query.trim().to_lowercase();
+    machines
+        .iter()
+        .filter(|machine| {
+            needle.is_empty()
+                || machine.name.to_lowercase().contains(&needle)
+                || machine.image.to_lowercase().contains(&needle)
+                || machine.status.to_lowercase().contains(&needle)
+        })
+        .map(MachineRow::from)
+        .collect()
+}
+
+fn decode<T: serde::de::DeserializeOwned>(
+    value: serde_json::Value,
+    what: &'static str,
+) -> Result<T, FirestoneError> {
+    serde_json::from_value(value).map_err(|error| {
+        FirestoneError::new(
+            ErrorKind::Generic,
+            format!("the {what} result did not match the shared contract: {error}"),
+        )
+        .with_hint("this is a Firestone defect; report it with the version string")
+    })
+}
+
+// ------------------------------------------------------------- responses --
+
+/// Wraps a rendered body in the full document, unless htmx asked for the
+/// fragment alone. One handler serves both, so every screen is a real URL:
+/// deep links, reload and the back button all work without a second route.
+async fn page(
+    state: &UiState,
+    headers: HeaderMap,
+    nav: &str,
+    title: &str,
+    body: String,
+) -> Response {
+    if is_htmx_navigation(&headers) {
+        return html(StatusCode::OK, body);
+    }
+
+    // The frame degrades rather than fails. If version, doctor or the machine
+    // list is unavailable — a misconfigured host, a doctor that cannot run —
+    // the reader still gets navigable chrome around whatever did render,
+    // instead of an unstyled error with no way forward.
+    let version = version_info(state)
+        .await
+        .unwrap_or_else(|_| VersionInfo::unknown());
+    let host = state
+        .doctor()
+        .await
+        .map_or_else(|_| HostInfo::unknown(), |report| HostInfo::from(&report));
+    let machine_count = list_machines(state)
+        .await
+        .map_or(0, |machines| machines.len());
+
+    let shell = render(
+        "ui/shell.html",
+        context! {
+            title => title,
+            build => state.build.as_str(),
+            nav => nav,
+            version => version,
+            host => host,
+            machine_count => machine_count,
+            listener => state.listener_label.as_str(),
+            content => Value::from_safe_string(body),
+        },
+    );
+
+    match shell {
+        Ok(document) => html(StatusCode::OK, document),
+        Err(error) => html(
+            status_for(&error),
+            format!(
+                "<!doctype html><meta charset=\"utf-8\"><title>Firestone</title><pre>{}</pre>",
+                html_escape(&error.info().message)
+            ),
+        ),
+    }
+}
+
+/// htmx sets HX-Request on every ajax navigation, but also replays history
+/// entries with HX-History-Restore-Request, which needs the whole document.
+fn is_htmx_navigation(headers: &HeaderMap) -> bool {
+    headers.get("HX-Request").is_some() && headers.get("HX-History-Restore-Request").is_none()
+}
+
+async fn failure(state: &UiState, headers: HeaderMap, error: FirestoneError) -> Response {
+    let info = error.info();
+    let status = status_for(&error);
+    let body = render(
+        "ui/error.html",
+        context! {
+            title => match status {
+                StatusCode::NOT_FOUND => "Not found",
+                _ => "Something went wrong",
+            },
+            message => info.message.clone(),
+            hint => info.hint.clone(),
+        },
+    );
+
+    match body {
+        Ok(body) => {
+            let mut response = page(state, headers, "overview", "Error", body).await;
+            *response.status_mut() = status;
+            response
+        }
+        Err(_) => html(
+            status,
+            "<p>Firestone could not render this page.</p>".to_owned(),
+        ),
+    }
+}
+
+/// The UI's own 404, rendered in the shell so the reader can navigate out.
+pub(crate) async fn render_not_found(state: &UiState, headers: HeaderMap) -> Response {
+    failure(
+        state,
+        headers,
+        FirestoneError::new(ErrorKind::NotFound, "that page does not exist")
+            .with_hint("use the sidebar to reach Overview, Machines or Catalog"),
+    )
+    .await
+}
+
+fn fragment(result: Result<String, FirestoneError>) -> Response {
+    match result {
+        Ok(body) => html(StatusCode::OK, body),
+        Err(error) => fragment_error(error),
+    }
+}
+
+/// A failed fragment answers with its real status and a compact notice. The
+/// browser's htmx:responseError handler turns that into a toast, so a
+/// background poll that starts failing is visible rather than silent.
+fn fragment_error(error: FirestoneError) -> Response {
+    let info = error.info();
+    let status = status_for(&error);
+    let mut body = format!(
+        "<div class=\"fs-inline-notice fs-inline-notice--fail\" role=\"alert\"><span>{}</span>",
+        html_escape(&info.message)
+    );
+    if let Some(hint) = &info.hint {
+        body.push_str(&format!(
+            "<span class=\"fs-inline-notice__hint\">{}</span>",
+            html_escape(hint)
+        ));
+    }
+    body.push_str("</div>");
+    html(status, body)
+}
+
+fn html(status: StatusCode, body: String) -> Response {
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    response
+}
+
+fn status_for(error: &FirestoneError) -> StatusCode {
+    match error.kind() {
+        ErrorKind::NotFound => StatusCode::NOT_FOUND,
+        ErrorKind::Usage | ErrorKind::InvalidSpec => StatusCode::BAD_REQUEST,
+        ErrorKind::Conflict | ErrorKind::AlreadyRunning | ErrorKind::Busy => StatusCode::CONFLICT,
+        ErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        ErrorKind::Dependency => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn html_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn subtitle(version: &VersionInfo) -> String {
+    format!(
+        "Daemonless · {} · serving the same actions as the CLI",
+        version.identity
+    )
+}
+
+// ---------------------------------------------------------------- queries --
+
+#[derive(Debug, Default, Deserialize)]
+pub struct FilterQuery {
+    pub q: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct TabQuery {
+    pub tab: Option<String>,
+    pub source: Option<String>,
+    pub follow: Option<bool>,
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use firestone_core::{ErrorKind, FirestoneError};
+
+    use super::{CreateForm, field_errors, html_escape, tab_template, tabs, urlencode};
+
+    #[test]
+    fn urlencode_escapes_every_reserved_path_byte() {
+        assert_eq!(urlencode("web"), "web");
+        assert_eq!(urlencode("staging-db"), "staging-db");
+        assert_eq!(urlencode("a/b"), "a%2Fb");
+        assert_eq!(urlencode("a b"), "a%20b");
+        assert_eq!(urlencode("../etc"), "..%2Fetc");
+    }
+
+    #[test]
+    fn html_escape_neutralizes_markup() {
+        assert_eq!(
+            html_escape("<script>alert('x')</script>"),
+            "&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;"
+        );
+        assert_eq!(html_escape("a & b"), "a &amp; b");
+    }
+
+    #[test]
+    fn tab_template_falls_back_to_spec_for_unknown_names() {
+        assert_eq!(tab_template("logs"), "ui/tab_logs.html");
+        assert_eq!(tab_template("vmconfig"), "ui/tab_vmconfig.html");
+        assert_eq!(tab_template("spec"), "ui/tab_spec.html");
+        assert_eq!(tab_template("../../etc/passwd"), "ui/tab_spec.html");
+    }
+
+    #[test]
+    fn tabs_mark_exactly_one_active_for_any_input() {
+        for requested in ["spec", "logs", "vmconfig", "nonsense"] {
+            let active = tabs("web", requested)
+                .iter()
+                .filter(|tab| tab.active)
+                .count();
+            assert_eq!(active, 1, "tab {requested} did not select exactly one");
+        }
+    }
+
+    #[test]
+    fn create_form_collects_every_field_problem_at_once() {
+        let form = CreateForm {
+            name: String::new(),
+            image: String::new(),
+            cpus: "0".to_owned(),
+            memory: "not-a-size".to_owned(),
+            disk: "20G".to_owned(),
+            user: "ubuntu".to_owned(),
+            net_mode: "passt".to_owned(),
+            forward: "nonsense".to_owned(),
+        };
+        let errors = form.to_patch().expect_err("the form must be rejected");
+        for field in ["name", "image", "cpus", "memory", "forward"] {
+            assert!(errors.contains_key(field), "missing error for {field}");
+        }
+        assert!(!errors.contains_key("disk"), "disk was valid");
+    }
+
+    #[test]
+    fn create_form_accepts_a_complete_valid_submission() {
+        let form = CreateForm {
+            name: "web".to_owned(),
+            image: "ubuntu:24.04".to_owned(),
+            cpus: "4".to_owned(),
+            memory: "8G".to_owned(),
+            disk: "40G".to_owned(),
+            user: "ubuntu".to_owned(),
+            net_mode: "passt".to_owned(),
+            forward: "127.0.0.1:8080:80, udp:5353:5353".to_owned(),
+        };
+        let patch = form.to_patch().expect("the form must be accepted");
+        assert_eq!(patch.cpus, Some(4));
+        assert_eq!(
+            patch
+                .network
+                .as_ref()
+                .and_then(|network| network.forward.as_ref())
+                .map(Vec::len),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn create_form_leaves_blank_optional_fields_unset() {
+        let form = CreateForm {
+            name: "web".to_owned(),
+            image: "ubuntu:24.04".to_owned(),
+            ..CreateForm::default()
+        };
+        let patch = form.to_patch().expect("blanks inherit configured defaults");
+        assert_eq!(patch.cpus, None);
+        assert_eq!(patch.memory, None);
+        assert_eq!(patch.disk, None);
+        assert_eq!(patch.user, None);
+    }
+
+    #[test]
+    fn field_errors_route_a_message_to_the_field_it_names() {
+        let cases: [(ErrorKind, &str, &str); 4] = [
+            (
+                ErrorKind::AlreadyExists,
+                "machine web already exists",
+                "name",
+            ),
+            (
+                ErrorKind::InvalidSpec,
+                "image reference is not valid",
+                "image",
+            ),
+            (
+                ErrorKind::InvalidSpec,
+                "port forward is malformed",
+                "forward",
+            ),
+            (ErrorKind::Generic, "the host is on fire", "form"),
+        ];
+        for (kind, message, expected) in cases {
+            let errors: BTreeMap<String, String> =
+                field_errors(&FirestoneError::new(kind, message));
+            assert!(
+                errors.contains_key(expected),
+                "{message:?} should attach to {expected}"
+            );
+        }
+    }
+}

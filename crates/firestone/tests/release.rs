@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     env,
     error::Error,
     fs,
@@ -9,10 +10,17 @@ use std::{
 
 use firestone_core::Event;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Vendored web assets compiled into the binary, relative to the workspace root.
+const UI_ASSET_DIRECTORY: &str = "crates/firestone/assets/ui";
+
+/// Sources Firestone authors itself, so `web-assets.toml` does not pin them.
+const FIRST_PARTY_UI_FILES: [&str; 3] = ["app.css", "app.js", "theme.js"];
 
 fn command() -> Command {
     Command::new(env!("CARGO_BIN_EXE_firestone"))
@@ -87,6 +95,92 @@ fn dependency_pins() -> Vec<(&'static str, &'static str, &'static str)> {
         ],
         other => panic!("unsupported test architecture {other}"),
     }
+}
+
+fn workspace_root() -> Result<PathBuf, Box<dyn Error>> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .ok_or("crate manifest directory has no workspace root")?;
+    Ok(fs::canonicalize(root)?)
+}
+
+/// One `[asset.*]` entry of `web-assets.toml`.
+struct WebAssetPin {
+    name: String,
+    /// Workspace-relative path of the vendored file.
+    path: String,
+    sha256: String,
+}
+
+/// Every `[asset.*]` entry of `web-assets.toml`.
+fn web_asset_pins() -> Result<Vec<WebAssetPin>, Box<dyn Error>> {
+    let root = workspace_root()?;
+    let manifest: toml::Table = fs::read_to_string(root.join("web-assets.toml"))?.parse()?;
+    let manifest_version = manifest
+        .get("manifest_version")
+        .and_then(toml::Value::as_integer);
+    if manifest_version != Some(1) {
+        return Err("web-assets.toml manifest_version is not 1".into());
+    }
+    let assets = manifest
+        .get("asset")
+        .and_then(toml::Value::as_table)
+        .ok_or("web-assets.toml has no [asset] table")?;
+
+    let mut pins = Vec::with_capacity(assets.len());
+    for (name, entry) in assets {
+        let entry = entry
+            .as_table()
+            .ok_or_else(|| format!("[asset.{name}] is not a table"))?;
+        let field = |key: &str| -> Result<String, Box<dyn Error>> {
+            Ok(entry
+                .get(key)
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| format!("[asset.{name}] has no string {key}"))?
+                .to_owned())
+        };
+        // Required for provenance even though only the checksum is enforced below.
+        field("origin")?;
+        field("license")?;
+        pins.push(WebAssetPin {
+            name: name.clone(),
+            path: field("path")?,
+            sha256: field("sha256")?,
+        });
+    }
+    Ok(pins)
+}
+
+/// Third-party files actually vendored under `UI_ASSET_DIRECTORY`, workspace-relative.
+fn vendored_ui_files(root: &Path) -> Result<BTreeSet<String>, Box<dyn Error>> {
+    let mut pending = vec![root.join(UI_ASSET_DIRECTORY)];
+    let mut files = BTreeSet::new();
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or("vendored asset file name is not UTF-8")?;
+            if FIRST_PARTY_UI_FILES.contains(&name) {
+                continue;
+            }
+            let relative = path.strip_prefix(root)?;
+            files.insert(
+                relative
+                    .to_str()
+                    .ok_or("vendored asset path is not UTF-8")?
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(files)
 }
 
 fn expected_human_version(home: &Path) -> String {
@@ -289,5 +383,124 @@ fn completions_reject_incompatible_output_controls() -> TestResult {
             "hint:  remove output-control flags; completions writes only the shell script to stdout"
         ));
     }
+    Ok(())
+}
+
+/// Parses a `KEY=value` environment file, ignoring comments and blank lines.
+fn read_env_file(path: &Path) -> Result<BTreeMap<String, String>, Box<dyn Error>> {
+    let mut values = BTreeMap::new();
+    for line in fs::read_to_string(path)?.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| format!("{} has a line without '=': {line}", path.display()))?;
+        values.insert(key.to_owned(), value.to_owned());
+    }
+    Ok(values)
+}
+
+fn file_sha256(path: &Path) -> Result<String, Box<dyn Error>> {
+    let mut hasher = Sha256::new();
+    hasher.update(fs::read(path)?);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// The release version has one source of truth, and every other statement of
+/// it is a consequence.
+///
+/// The release workflow bumps `Cargo.toml`, `Cargo.lock` and `versions.env`
+/// together on a tagged run. Anything else that restates the version, or
+/// pins the bytes of a file the bump rewrites, silently goes stale the moment
+/// a release is cut — and the failure surfaces far away, in a reproducible
+/// build that verifies inputs it is not actually using. This runs on every
+/// change so that drift is caught here rather than in a release.
+#[test]
+fn release_inputs_agree_with_the_declared_workspace_version() -> TestResult {
+    let root = workspace_root()?;
+
+    let manifest: toml::Value = toml::from_str(&fs::read_to_string(root.join("Cargo.toml"))?)?;
+    let declared = manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get("package"))
+        .and_then(|package| package.get("version"))
+        .and_then(toml::Value::as_str)
+        .ok_or("Cargo.toml has no workspace.package.version")?;
+    assert_eq!(
+        declared, VERSION,
+        "Cargo.toml declares {declared} but this crate was built as {VERSION}"
+    );
+
+    let versions_env = root.join("build/firestone/versions.env");
+    let release_inputs = read_env_file(&versions_env)?;
+
+    assert_eq!(
+        release_inputs.get("FIRESTONE_VERSION").map(String::as_str),
+        Some(VERSION),
+        "build/firestone/versions.env FIRESTONE_VERSION disagrees with Cargo.toml; \
+         bump it with the version"
+    );
+
+    for (key, file) in [
+        ("CARGO_LOCK_SHA256", "Cargo.lock"),
+        ("DEPS_TOML_SHA256", "deps.toml"),
+    ] {
+        let actual = file_sha256(&root.join(file))?;
+        assert_eq!(
+            release_inputs.get(key).map(String::as_str),
+            Some(actual.as_str()),
+            "build/firestone/versions.env {key} does not match {file}; \
+             the reproducible build verifies inputs it is not using"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn web_assets_manifest_records_lowercase_sha256_of_every_vendored_file() -> TestResult {
+    let root = workspace_root()?;
+    let pins = web_asset_pins()?;
+    assert!(!pins.is_empty(), "web-assets.toml pins no asset");
+
+    for WebAssetPin { name, path, sha256 } in pins {
+        assert_eq!(
+            sha256.len(),
+            64,
+            "[asset.{name}] sha256 is not 64 characters"
+        );
+        assert!(
+            sha256
+                .chars()
+                .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase()),
+            "[asset.{name}] sha256 is not lowercase hexadecimal"
+        );
+        let bytes = fs::read(root.join(&path))
+            .map_err(|error| format!("[asset.{name}] cannot read {path}: {error}"))?;
+        assert_eq!(
+            format!("{:x}", Sha256::digest(bytes)),
+            sha256,
+            "[asset.{name}] checksum does not match {path}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn web_assets_manifest_entries_match_vendored_third_party_files() -> TestResult {
+    let root = workspace_root()?;
+    let pins = web_asset_pins()?;
+    let pinned: BTreeSet<String> = pins.iter().map(|pin| pin.path.clone()).collect();
+    assert_eq!(
+        pinned.len(),
+        pins.len(),
+        "web-assets.toml pins the same path twice"
+    );
+    assert_eq!(
+        pinned,
+        vendored_ui_files(&root)?,
+        "web-assets.toml does not match {UI_ASSET_DIRECTORY}: pin every vendored third-party file and drop pins whose file was removed"
+    );
     Ok(())
 }

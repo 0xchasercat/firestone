@@ -1,0 +1,2012 @@
+/* Firestone web UI.
+ *
+ * One stylesheet, no build step, no inline style attributes: the served
+ * Content-Security-Policy has no 'unsafe-inline', so every visual decision
+ * lives here as a class or a custom property. Values that genuinely vary per
+ * element at runtime (progress width, log height) are set through the CSSOM
+ * by app.js, which CSP permits.
+ */
+
+/* ---------------------------------------------------------------- fonts -- */
+
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/ui/static/fonts/ibm-plex-sans-latin-400.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/ui/static/fonts/ibm-plex-sans-latin-500.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("/ui/static/fonts/ibm-plex-sans-latin-600.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/ui/static/fonts/ibm-plex-mono-latin-400.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/ui/static/fonts/ibm-plex-mono-latin-500.woff2") format("woff2");
+}
+
+/* --------------------------------------------------------------- tokens -- */
+
+:root {
+  --bg: #efece7;
+  --surface: #fbfaf8;
+  --panel: #ffffff;
+  --panel2: #f6f4f0;
+  --line: #e7e3dc;
+  --line2: #d8d3cb;
+  --text: #1b1713;
+  --text2: #6d665d;
+  --text3: #9d968c;
+  --btn: #211c17;
+  --btn-fg: #f7f4f0;
+  --chip: rgba(224, 73, 31, 0.08);
+  --ok: #178a4c;
+  --ok-bg: rgba(23, 138, 76, 0.1);
+  --warn: #b07508;
+  --warn-bg: rgba(176, 117, 8, 0.11);
+  --fail: #cf3b22;
+  --fail-bg: rgba(207, 59, 34, 0.09);
+  --idle: #837c72;
+  --idle-bg: rgba(131, 124, 114, 0.1);
+  --ember: #e0491f;
+  --shadow: 0 1px 2px rgba(27, 23, 19, 0.04), 0 4px 16px rgba(27, 23, 19, 0.03);
+  --shadow-lift: 0 8px 30px rgba(27, 23, 19, 0.14);
+  --btn-shadow: 0 1px 2px rgba(27, 23, 19, 0.18);
+  --pulse: rgba(23, 138, 76, 0.35);
+  --pulse-0: rgba(23, 138, 76, 0);
+  --terminal: #161210;
+  --terminal-dim: #8f867b;
+  --terminal-fg: #cfc8bd;
+  --terminal-ok: #63c98a;
+
+  --sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo,
+    Consolas, "Liberation Mono", monospace;
+
+  color-scheme: light;
+}
+
+/* The dark palette applies when the viewer chose dark, or when they left the
+ * choice to the system and the system says dark. Every token is redefined in
+ * both blocks so neither can leave a colour undefined. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f0d0b;
+    --surface: #171411;
+    --panel: #1e1a17;
+    --panel2: #242019;
+    --line: #2b2620;
+    --line2: #3a332b;
+    --text: #efeae3;
+    --text2: #a49b8f;
+    --text3: #6e675e;
+    --btn: #efe9e2;
+    --btn-fg: #1b1713;
+    --chip: rgba(255, 92, 43, 0.12);
+    --ok: #3fb673;
+    --ok-bg: rgba(63, 182, 115, 0.13);
+    --warn: #d99b2b;
+    --warn-bg: rgba(217, 155, 43, 0.12);
+    --fail: #ef6547;
+    --fail-bg: rgba(239, 101, 71, 0.12);
+    --idle: #8d857a;
+    --idle-bg: rgba(141, 133, 122, 0.13);
+    --ember: #ff5c2b;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.2), 0 4px 16px rgba(0, 0, 0, 0.15);
+    --shadow-lift: 0 8px 30px rgba(0, 0, 0, 0.4);
+    --btn-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+    --pulse: rgba(63, 182, 115, 0.35);
+    --pulse-0: rgba(63, 182, 115, 0);
+
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #0f0d0b;
+  --surface: #171411;
+  --panel: #1e1a17;
+  --panel2: #242019;
+  --line: #2b2620;
+  --line2: #3a332b;
+  --text: #efeae3;
+  --text2: #a49b8f;
+  --text3: #6e675e;
+  --btn: #efe9e2;
+  --btn-fg: #1b1713;
+  --chip: rgba(255, 92, 43, 0.12);
+  --ok: #3fb673;
+  --ok-bg: rgba(63, 182, 115, 0.13);
+  --warn: #d99b2b;
+  --warn-bg: rgba(217, 155, 43, 0.12);
+  --fail: #ef6547;
+  --fail-bg: rgba(239, 101, 71, 0.12);
+  --idle: #8d857a;
+  --idle-bg: rgba(141, 133, 122, 0.13);
+  --ember: #ff5c2b;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.2), 0 4px 16px rgba(0, 0, 0, 0.15);
+  --shadow-lift: 0 8px 30px rgba(0, 0, 0, 0.4);
+  --btn-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --pulse: rgba(63, 182, 115, 0.35);
+  --pulse-0: rgba(63, 182, 115, 0);
+
+  color-scheme: dark;
+}
+
+/* --------------------------------------------------------------- motion -- */
+
+@keyframes fs-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes fs-toast {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes fs-pulse {
+  0% {
+    box-shadow: 0 0 0 0 var(--pulse);
+  }
+  70% {
+    box-shadow: 0 0 0 5px var(--pulse-0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 var(--pulse-0);
+  }
+}
+
+@keyframes fs-shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: -100% 0;
+  }
+}
+
+@keyframes fs-out {
+  to {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+}
+
+/* ---------------------------------------------------------------- reset -- */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--ember);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+/* A single visible focus treatment everywhere. Keyboard users get a real ring;
+ * pointer users never see it. */
+:focus-visible {
+  outline: 2px solid var(--ember);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+.fs-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* --------------------------------------------------------------- layout -- */
+
+.fs-app {
+  display: flex;
+  align-items: stretch;
+  min-height: 100vh;
+}
+
+.fs-sidebar {
+  width: 232px;
+  flex: 0 0 232px;
+  display: flex;
+  flex-direction: column;
+  padding: 22px 16px 18px;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+}
+
+.fs-brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 2px 6px 20px;
+}
+
+.fs-brand__mark {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: var(--chip);
+  border: 1px solid var(--line);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+
+.fs-brand__mark img {
+  width: 24px;
+  height: 24px;
+}
+
+.fs-brand__name {
+  font-weight: 600;
+  font-size: 15.5px;
+  letter-spacing: -0.01em;
+}
+
+.fs-brand__meta {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text3);
+}
+
+.fs-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.fs-nav__item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 11px;
+  border-radius: 9px;
+  cursor: pointer;
+  font-weight: 500;
+  font-size: 14px;
+  color: var(--text2);
+  background: transparent;
+  border: 1px solid transparent;
+  text-decoration: none;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.fs-nav__item:hover {
+  background: var(--panel2);
+  text-decoration: none;
+}
+
+.fs-nav__item.is-active {
+  color: var(--text);
+  background: var(--panel);
+  border-color: var(--line);
+  box-shadow: var(--shadow);
+}
+
+.fs-nav__label {
+  flex: 1;
+  min-width: 0;
+}
+
+.fs-nav__count {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text3);
+  font-variant-numeric: tabular-nums;
+}
+
+.fs-sidebar__spacer {
+  flex: 1;
+}
+
+.fs-sidebar__socket {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text3);
+  padding: 14px 8px 12px;
+  word-break: break-all;
+  line-height: 1.45;
+}
+
+.fs-theme-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  color: var(--text2);
+  font-size: 12.5px;
+  font-weight: 500;
+  border: 1px solid var(--line);
+  background: transparent;
+  transition: background 0.15s ease;
+}
+
+.fs-theme-toggle:hover {
+  background: var(--panel2);
+}
+
+.fs-theme-toggle__value {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.fs-frame {
+  flex: 1;
+  min-width: 0;
+  padding: 12px 12px 12px 0;
+  display: flex;
+  height: 100vh;
+  position: sticky;
+  top: 0;
+}
+
+.fs-main {
+  flex: 1;
+  min-width: 0;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.fs-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 32px;
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+  background: var(--surface);
+  z-index: 10;
+  border-radius: 16px 16px 0 0;
+}
+
+.fs-content {
+  flex: 1;
+  padding: 28px 32px 56px;
+  width: 100%;
+  max-width: 1280px;
+}
+
+.fs-screen {
+  animation: fs-in 0.18s ease both;
+}
+
+/* --------------------------------------------------------------- search -- */
+
+.fs-search {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text3);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 7px 12px;
+  width: 250px;
+  font-size: 12.5px;
+  cursor: text;
+  background: var(--panel);
+  transition: border-color 0.15s ease;
+}
+
+.fs-search:hover,
+.fs-search:focus-within {
+  border-color: var(--line2);
+}
+
+.fs-search input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.fs-search input::placeholder {
+  color: var(--text3);
+}
+
+.fs-search__label {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fs-kbd {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 1px 5px;
+  color: var(--text3);
+  flex: 0 0 auto;
+}
+
+/* ------------------------------------------------------------- host pill -- */
+
+.fs-hostpill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 6px 13px;
+  cursor: pointer;
+  background: var(--panel);
+  color: inherit;
+  text-decoration: none;
+  transition: border-color 0.15s ease;
+}
+
+.fs-hostpill:hover {
+  border-color: var(--line2);
+  text-decoration: none;
+}
+
+/* The pill refreshes itself on a slow cadence, so its contents live in a
+ * swap target. display:contents keeps that wrapper out of the flex layout. */
+.fs-hostpill__inner {
+  display: contents;
+}
+
+.fs-hostpill__label {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.fs-hostpill__counts {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text3);
+}
+
+/* --------------------------------------------------------------- status -- */
+
+/* One status vocabulary, driven by a data-status attribute so the server never
+ * emits a colour. `transitional` covers starting and stopping. */
+.fs-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: var(--idle);
+}
+
+.fs-dot--sm {
+  width: 6px;
+  height: 6px;
+}
+
+.fs-dot--xs {
+  width: 7px;
+  height: 7px;
+}
+
+[data-status="running"] .fs-dot,
+.fs-dot[data-status="running"] {
+  background: var(--ok);
+  animation: fs-pulse 2s infinite;
+}
+
+[data-status="starting"] .fs-dot,
+[data-status="stopping"] .fs-dot,
+.fs-dot[data-status="starting"],
+.fs-dot[data-status="stopping"] {
+  background: var(--warn);
+  animation: fs-pulse 2s infinite;
+}
+
+[data-status="failed"] .fs-dot,
+.fs-dot[data-status="failed"] {
+  background: var(--fail);
+}
+
+[data-status="ok"] .fs-dot,
+.fs-dot[data-status="ok"] {
+  background: var(--ok);
+}
+
+[data-status="warn"] .fs-dot,
+.fs-dot[data-status="warn"] {
+  background: var(--warn);
+}
+
+[data-status="fail"] .fs-dot,
+.fs-dot[data-status="fail"] {
+  background: var(--fail);
+}
+
+.fs-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.fs-status__text {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--idle);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+[data-status="running"] .fs-status__text {
+  color: var(--ok);
+}
+
+[data-status="starting"] .fs-status__text,
+[data-status="stopping"] .fs-status__text {
+  color: var(--warn);
+}
+
+[data-status="failed"] .fs-status__text {
+  color: var(--fail);
+}
+
+.fs-status--pill {
+  border-radius: 999px;
+  padding: 4px 12px;
+  background: var(--idle-bg);
+}
+
+.fs-status--pill[data-status="running"] {
+  background: var(--ok-bg);
+}
+
+.fs-status--pill[data-status="starting"],
+.fs-status--pill[data-status="stopping"] {
+  background: var(--warn-bg);
+}
+
+.fs-status--pill[data-status="failed"] {
+  background: var(--fail-bg);
+}
+
+.fs-status--pill .fs-status__text {
+  font-weight: 600;
+}
+
+/* -------------------------------------------------------------- buttons -- */
+
+.fs-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  background: var(--panel);
+  border: 1px solid var(--line2);
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+  text-decoration: none;
+  transition: border-color 0.15s ease, opacity 0.15s ease, background 0.15s ease;
+}
+
+.fs-btn:hover:not(:disabled) {
+  border-color: var(--text3);
+  text-decoration: none;
+}
+
+.fs-btn:disabled,
+.fs-btn[aria-busy="true"] {
+  opacity: 0.62;
+  cursor: default;
+}
+
+.fs-btn--primary {
+  background: var(--btn);
+  color: var(--btn-fg);
+  border: none;
+  border-radius: 9px;
+  padding: 9px 16px;
+  font-size: 13.5px;
+  box-shadow: var(--btn-shadow);
+}
+
+.fs-btn--primary:hover:not(:disabled) {
+  opacity: 0.88;
+}
+
+.fs-btn--danger {
+  color: var(--fail);
+}
+
+.fs-btn--danger:hover:not(:disabled) {
+  border-color: var(--fail);
+}
+
+.fs-btn--sm {
+  border-radius: 7px;
+  padding: 5px 9px;
+  font-size: 12px;
+}
+
+.fs-btn--row {
+  justify-self: end;
+  min-width: 56px;
+}
+
+.fs-btn__spinner {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--warn);
+  animation: fs-pulse 2s infinite;
+  flex: 0 0 auto;
+}
+
+.fs-link {
+  font-size: 12.5px;
+  color: var(--ember);
+  cursor: pointer;
+  font-weight: 500;
+  background: none;
+  border: 0;
+  padding: 0;
+}
+
+/* --------------------------------------------------------------- panels -- */
+
+.fs-panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  min-width: 0;
+}
+
+.fs-panel--clip {
+  overflow: hidden;
+}
+
+.fs-panel__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 20px 8px;
+}
+
+.fs-panel__title {
+  font-weight: 600;
+  font-size: 14.5px;
+}
+
+.fs-panel__note,
+.fs-note {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text3);
+}
+
+.fs-note--footer {
+  display: block;
+  margin-top: 14px;
+}
+
+.fs-page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 24px;
+}
+
+.fs-page-head__title {
+  font-size: 22px;
+}
+
+.fs-page-head__sub {
+  color: var(--text2);
+  margin-top: 4px;
+  font-size: 13.5px;
+}
+
+.fs-page-head__actions {
+  display: flex;
+  gap: 10px;
+  flex: 0 0 auto;
+}
+
+/* ---------------------------------------------------------------- stats -- */
+
+.fs-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 14px;
+  margin-bottom: 24px;
+}
+
+.fs-stat {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  padding: 16px 18px;
+  box-shadow: var(--shadow);
+  min-width: 0;
+}
+
+.fs-stat__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.fs-stat__icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  background: var(--chip);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ember);
+  flex: 0 0 auto;
+}
+
+.fs-stat__label {
+  font-size: 11px;
+  color: var(--text3);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.fs-stat__value {
+  font-size: 23px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  margin-top: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.fs-stat__sub {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text3);
+  margin-top: 3px;
+}
+
+/* --------------------------------------------------------------- doctor -- */
+
+.fs-checks {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 8px;
+  padding: 14px 20px 18px;
+}
+
+.fs-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 10px;
+  background: transparent;
+  text-align: left;
+  cursor: help;
+}
+
+.fs-check[data-status="warn"] {
+  background: var(--warn-bg);
+}
+
+.fs-check[data-status="fail"] {
+  background: var(--fail-bg);
+}
+
+.fs-check__id {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fs-check-detail {
+  border-top: 1px solid var(--line);
+  padding: 10px 20px;
+  font-size: 12.5px;
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.fs-check-detail[data-status="warn"] {
+  color: var(--warn);
+}
+
+.fs-check-detail[data-status="fail"] {
+  color: var(--fail);
+}
+
+.fs-check-detail__id {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  flex: 0 0 auto;
+}
+
+.fs-check-detail__reason {
+  color: var(--text2);
+}
+
+/* A failing host is a standing condition, never a transient toast. */
+.fs-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  border: 1px solid var(--fail);
+  background: var(--fail-bg);
+  border-radius: 12px;
+  padding: 13px 18px;
+  margin-bottom: 20px;
+}
+
+.fs-banner__title {
+  font-weight: 600;
+  font-size: 13.5px;
+  color: var(--fail);
+}
+
+.fs-banner__body {
+  font-size: 12.5px;
+  color: var(--text2);
+  margin-top: 2px;
+}
+
+/* ---------------------------------------------------------------- lists -- */
+
+.fs-split {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  gap: 14px;
+}
+
+@media (max-width: 1080px) {
+  .fs-split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.fs-minirow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 20px;
+  border-top: 1px solid var(--line);
+  cursor: pointer;
+  color: inherit;
+  text-decoration: none;
+  transition: background 0.15s ease;
+}
+
+.fs-minirow:hover {
+  background: var(--panel2);
+  text-decoration: none;
+}
+
+.fs-minirow__name {
+  font-weight: 600;
+  font-size: 13.5px;
+  width: 100px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fs-minirow__image {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text2);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fs-minirow__note {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text3);
+  flex: 0 0 auto;
+}
+
+.fs-activity {
+  padding: 10px 20px;
+  border-top: 1px solid var(--line);
+}
+
+.fs-activity__head {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.fs-activity__time {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text3);
+  flex: 0 0 auto;
+}
+
+.fs-activity__text {
+  font-size: 13px;
+}
+
+.fs-activity__json {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text3);
+  margin-top: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------- machines -- */
+
+/* Every track is minmax(min, fr): no column can collapse to zero width, and
+ * every cell clips with an ellipsis rather than pushing the grid wider. */
+.fs-table {
+  --fs-cols: minmax(74px, 1.1fr) minmax(70px, 0.9fr) minmax(80px, 1.1fr)
+    minmax(96px, 1.2fr) minmax(70px, 1.4fr) minmax(46px, 0.7fr) 64px;
+}
+
+.fs-table__head,
+.fs-row {
+  display: grid;
+  grid-template-columns: var(--fs-cols);
+  gap: 8px;
+}
+
+.fs-table__head {
+  padding: 10px 14px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text3);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+.fs-table__head span {
+  overflow: hidden;
+}
+
+.fs-row {
+  padding: 13px 14px;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+  color: inherit;
+  text-decoration: none;
+  transition: background 0.15s ease;
+}
+
+.fs-row:last-child {
+  border-bottom: none;
+}
+
+.fs-row:hover {
+  background: var(--panel2);
+  text-decoration: none;
+}
+
+.fs-row.is-leaving {
+  animation: fs-out 0.18s ease both;
+}
+
+.fs-cell {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.fs-cell--name {
+  font-weight: 600;
+  font-size: 13.5px;
+}
+
+.fs-cell--mono {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.fs-cell--muted {
+  color: var(--text2);
+}
+
+.fs-cell--small {
+  font-size: 11.5px;
+}
+
+/* The name cell is a real anchor, so the row is keyboard-reachable,
+ * middle-clickable and its target is copyable. app.js replays it for clicks
+ * elsewhere in the row, which is what keeps text selection working. */
+.fs-row__link {
+  color: inherit;
+  font-weight: 600;
+  font-size: 13.5px;
+  text-decoration: none;
+}
+
+.fs-row__link:hover {
+  text-decoration: none;
+}
+
+.fs-empty {
+  padding: 44px 20px 48px;
+  text-align: center;
+}
+
+.fs-empty__title {
+  font-weight: 600;
+  font-size: 14.5px;
+}
+
+.fs-empty__body {
+  color: var(--text2);
+  font-size: 13px;
+  margin: 6px auto 16px;
+  max-width: 44ch;
+}
+
+/* ------------------------------------------------------------- skeleton -- */
+
+.fs-skeleton {
+  border-radius: 6px;
+  background: linear-gradient(
+    90deg,
+    var(--line) 25%,
+    var(--panel2) 37%,
+    var(--line) 63%
+  );
+  background-size: 300% 100%;
+  animation: fs-shimmer 1.4s linear infinite;
+  height: 11px;
+  color: transparent;
+}
+
+.fs-skeleton--wide {
+  width: 100%;
+}
+
+/* --------------------------------------------------------------- detail -- */
+
+.fs-crumbs {
+  font-size: 12.5px;
+  color: var(--text3);
+  margin-bottom: 14px;
+}
+
+.fs-crumbs a {
+  color: var(--text2);
+  font-weight: 500;
+}
+
+.fs-crumbs__sep {
+  margin: 0 6px;
+}
+
+.fs-crumbs__current {
+  color: var(--text);
+}
+
+.fs-detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 20px;
+  flex-wrap: wrap;
+}
+
+.fs-detail-head__ident {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.fs-detail-head__title {
+  font-size: 24px;
+}
+
+.fs-tag {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 4px 12px;
+  white-space: nowrap;
+}
+
+.fs-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, max-content));
+  gap: 14px 28px;
+  justify-content: start;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 14px 20px;
+  margin-bottom: 22px;
+  box-shadow: var(--shadow);
+}
+
+.fs-meta__key {
+  font-size: 11px;
+  color: var(--text3);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.fs-meta__value {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fs-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 20px;
+}
+
+.fs-tab {
+  padding: 9px 14px;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  color: var(--text2);
+  border: 0;
+  background: none;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  text-decoration: none;
+  transition: color 0.15s ease;
+}
+
+.fs-tab:hover {
+  color: var(--text);
+  text-decoration: none;
+}
+
+.fs-tab.is-active {
+  color: var(--text);
+  border-bottom-color: var(--ember);
+}
+
+.fs-tabpanel {
+  animation: fs-in 0.18s ease both;
+}
+
+.fs-spec-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 14px;
+}
+
+.fs-spec__title {
+  padding: 14px 18px 6px;
+  font-weight: 600;
+  font-size: 13.5px;
+}
+
+.fs-spec__rows {
+  padding: 4px 18px 14px;
+}
+
+.fs-spec__row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 6px 0;
+  border-top: 1px solid var(--line);
+}
+
+.fs-spec__key {
+  font-size: 12.5px;
+  color: var(--text2);
+  flex: 0 0 auto;
+}
+
+.fs-spec__value {
+  font-family: var(--mono);
+  font-size: 12px;
+  text-align: right;
+  word-break: break-all;
+  min-width: 0;
+}
+
+/* -------------------------------------------------------- stream drawer -- */
+
+.fs-stream {
+  background: var(--terminal);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 16px;
+  margin-bottom: 22px;
+  animation: fs-in 0.18s ease both;
+}
+
+.fs-stream__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.fs-stream__head-text {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--terminal-dim);
+}
+
+.fs-stream__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--warn);
+  animation: fs-pulse 2s infinite;
+  flex: 0 0 auto;
+}
+
+.fs-stream__line {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--terminal-fg);
+  word-break: break-all;
+}
+
+.fs-stream__line--ok {
+  color: var(--terminal-ok);
+}
+
+.fs-stream__line--fail {
+  color: #ef6547;
+}
+
+/* ----------------------------------------------------------------- logs -- */
+
+.fs-logbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+
+.fs-chip {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  padding: 5px 11px;
+  border-radius: 999px;
+  cursor: pointer;
+  border: 1px solid var(--line);
+  color: var(--text2);
+  background: transparent;
+  text-decoration: none;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.fs-chip:hover {
+  border-color: var(--line2);
+  text-decoration: none;
+}
+
+.fs-chip.is-active {
+  color: var(--text);
+  border-color: var(--line2);
+  background: var(--panel2);
+}
+
+.fs-logbar__spacer {
+  flex: 1;
+}
+
+.fs-follow {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text3);
+  cursor: pointer;
+  border: 0;
+  background: none;
+  padding: 0;
+}
+
+.fs-follow__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text3);
+  flex: 0 0 auto;
+}
+
+.fs-follow.is-on {
+  color: var(--ok);
+}
+
+.fs-follow.is-on .fs-follow__dot {
+  background: var(--ok);
+  animation: fs-pulse 2s infinite;
+}
+
+.fs-logview {
+  background: var(--terminal);
+  padding: 16px 18px;
+  max-height: 420px;
+  overflow: auto;
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--terminal-fg);
+}
+
+.fs-logview:empty::before {
+  content: "no output yet";
+  color: var(--terminal-dim);
+}
+
+.fs-panel__foot {
+  padding: 9px 16px;
+  border-top: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text3);
+  word-break: break-all;
+}
+
+.fs-code {
+  margin: 0;
+  padding: 18px 20px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow: auto;
+  max-height: 480px;
+  color: var(--text);
+}
+
+/* -------------------------------------------------------------- catalog -- */
+
+.fs-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 14px;
+}
+
+.fs-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 18px 20px;
+  box-shadow: var(--shadow);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.fs-card__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.fs-card__ref {
+  font-family: var(--mono);
+  font-size: 14.5px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 0 1 auto;
+}
+
+.fs-card__spacer {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.fs-badge {
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ember);
+  border: 1px solid var(--ember);
+  border-radius: 999px;
+  padding: 2px 8px;
+  opacity: 0.85;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.fs-cached {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ok);
+  background: var(--ok-bg);
+  border-radius: 999px;
+  padding: 4px 11px;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.fs-cached .fs-dot {
+  background: var(--ok);
+  animation: none;
+}
+
+.fs-chips {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.fs-tagchip {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text2);
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 3px 8px;
+}
+
+.fs-card__source {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fs-pullstate {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ember);
+  white-space: nowrap;
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.fs-progress {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.fs-progress__bar {
+  height: 100%;
+  width: 0;
+  background: linear-gradient(90deg, #ff7a2f, #e33d1d);
+  border-radius: 999px;
+  transition: width 0.18s ease;
+}
+
+.fs-progress__bar.is-indeterminate {
+  width: 100%;
+  opacity: 0.6;
+}
+
+/* --------------------------------------------------------------- inputs -- */
+
+.fs-input {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: var(--text);
+  outline: none;
+  width: 100%;
+  transition: border-color 0.15s ease;
+}
+
+.fs-input:hover {
+  border-color: var(--line2);
+}
+
+.fs-input:focus {
+  border-color: var(--ember);
+}
+
+.fs-input--mono {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.fs-input--inline {
+  width: 190px;
+}
+
+.fs-input--ref {
+  width: 260px;
+}
+
+.fs-input[aria-invalid="true"] {
+  border-color: var(--fail);
+}
+
+.fs-form {
+  display: grid;
+  gap: 16px;
+}
+
+.fs-form__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 14px;
+}
+
+.fs-field__label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text2);
+  margin-bottom: 5px;
+}
+
+.fs-field__hint {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text3);
+  margin-top: 5px;
+}
+
+.fs-field__error {
+  font-size: 12px;
+  color: var(--fail);
+  margin-top: 5px;
+}
+
+/* An inline conflict notice sits next to the action that caused it. Amber,
+ * never a toast: the user is looking straight at it. */
+.fs-inline-notice {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--warn);
+  background: var(--warn-bg);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-top: 10px;
+}
+
+.fs-inline-notice--fail {
+  color: var(--fail);
+  background: var(--fail-bg);
+}
+
+.fs-inline-notice__hint {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text2);
+}
+
+/* --------------------------------------------------------------- dialog -- */
+
+.fs-dialog {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 0;
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: var(--shadow-lift);
+  width: min(560px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px);
+}
+
+.fs-dialog::backdrop {
+  background: rgba(15, 13, 11, 0.42);
+}
+
+.fs-dialog[open] {
+  animation: fs-in 0.18s ease both;
+}
+
+.fs-dialog__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 22px 0;
+}
+
+.fs-dialog__title {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.fs-dialog__body {
+  padding: 16px 22px;
+  overflow: auto;
+}
+
+.fs-dialog__foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 14px 22px 18px;
+  border-top: 1px solid var(--line);
+}
+
+.fs-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 12.5px;
+  color: var(--text2);
+  cursor: pointer;
+}
+
+.fs-checkbox input {
+  accent-color: var(--ember);
+  margin: 0;
+}
+
+/* -------------------------------------------------------------- palette -- */
+
+.fs-palette {
+  width: min(560px, calc(100vw - 32px));
+  padding: 0;
+  border: 1px solid var(--line2);
+  border-radius: 14px;
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: var(--shadow-lift);
+}
+
+.fs-palette::backdrop {
+  background: rgba(15, 13, 11, 0.42);
+}
+
+.fs-palette[open] {
+  animation: fs-in 0.18s ease both;
+}
+
+.fs-palette__input {
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 14px 14px 0 0;
+  background: transparent;
+  padding: 15px 18px;
+  font-size: 14.5px;
+  outline: none;
+  color: var(--text);
+}
+
+.fs-palette__input::placeholder {
+  color: var(--text3);
+}
+
+.fs-palette__results {
+  max-height: 340px;
+  overflow: auto;
+  padding: 6px;
+}
+
+.fs-palette__group {
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text3);
+  padding: 10px 12px 4px;
+}
+
+.fs-palette__item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  color: inherit;
+  text-decoration: none;
+  font-size: 13.5px;
+}
+
+.fs-palette__item:hover,
+.fs-palette__item.is-active {
+  background: var(--panel2);
+  text-decoration: none;
+}
+
+.fs-palette__item-meta {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text3);
+  flex: 0 0 auto;
+}
+
+.fs-palette__empty {
+  padding: 22px 14px 26px;
+  text-align: center;
+  color: var(--text3);
+  font-size: 13px;
+}
+
+.fs-palette__foot {
+  border-top: 1px solid var(--line);
+  padding: 8px 14px;
+  display: flex;
+  gap: 14px;
+  font-size: 11px;
+  color: var(--text3);
+}
+
+/* --------------------------------------------------------------- toasts -- */
+
+.fs-toasts {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  z-index: 50;
+}
+
+.fs-toast {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px 16px;
+  box-shadow: var(--shadow-lift);
+  width: 330px;
+  animation: fs-toast 0.22s cubic-bezier(0.2, 0.8, 0.3, 1) both;
+}
+
+.fs-toast.is-leaving {
+  animation: fs-out 0.18s ease both;
+}
+
+.fs-toast__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.fs-toast__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* The raw terminal record. Showing the actual bytes is the point: it is what
+ * makes the UI trustworthy rather than merely reassuring. */
+.fs-toast__sub {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text3);
+  margin-top: 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------ utilities -- */
+
+.fs-mono {
+  font-family: var(--mono);
+}
+
+.fs-mb-22 {
+  margin-bottom: 22px;
+}
+
+.fs-mb-24 {
+  margin-bottom: 24px;
+}
+
+.htmx-indicator {
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.htmx-request .htmx-indicator,
+.htmx-request.htmx-indicator {
+  opacity: 1;
+}
+
+/* ---------------------------------------------------------- narrow view -- */
+
+@media (max-width: 860px) {
+  .fs-app {
+    flex-direction: column;
+  }
+
+  .fs-sidebar {
+    width: auto;
+    flex: 0 0 auto;
+    height: auto;
+    position: static;
+    padding: 16px 16px 8px;
+  }
+
+  .fs-nav {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+
+  .fs-sidebar__spacer,
+  .fs-sidebar__socket {
+    display: none;
+  }
+
+  .fs-frame {
+    height: auto;
+    position: static;
+    padding: 12px;
+  }
+
+  .fs-content {
+    padding: 20px 18px 44px;
+  }
+
+  .fs-topbar {
+    padding: 12px 18px;
+  }
+
+  .fs-search {
+    width: auto;
+    flex: 1;
+  }
+
+  /* Drop the two least load-bearing columns rather than let any track
+   * collapse. */
+  .fs-table {
+    --fs-cols: minmax(74px, 1.2fr) minmax(70px, 1fr) minmax(80px, 1.1fr)
+      minmax(96px, 1.2fr) 64px;
+  }
+
+  .fs-cell--forwards,
+  .fs-cell--uptime,
+  .fs-table__head span.fs-cell--forwards,
+  .fs-table__head span.fs-cell--uptime {
+    display: none;
+  }
+}
+
+/* -------------------------------------------------------- reduced motion -- */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}

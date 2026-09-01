@@ -1,0 +1,100 @@
+{% import "ui/_macros.html" as m %}
+<div class="fs-screen">
+  {% if host.status == "fail" %}
+  {# A failing host requirement is a standing condition, not a transient
+     notification. It stays on screen until the host actually changes. #}
+  <div class="fs-banner" role="alert">
+    <span class="fs-dot fs-dot--xs" data-status="fail"></span>
+    <span>
+      <span class="fs-banner__title">{{ host.fail_count }} host {{ host.fail_noun }} failing</span>
+      <span class="fs-banner__body">
+        Machines cannot start until this is resolved. Run <code class="fs-mono">firestone doctor --fix</code>
+        for the repairs Firestone can make without elevation.
+      </span>
+    </span>
+  </div>
+  {% endif %}
+
+  <div class="fs-page-head">
+    <div>
+      <h1 class="fs-page-head__title">Host overview</h1>
+      <div class="fs-page-head__sub">{{ subtitle }}</div>
+    </div>
+    <div class="fs-page-head__actions">
+      <button type="button" class="fs-btn fs-btn--primary"
+              hx-get="/ui/machines/new" hx-target="#fs-dialog-slot" hx-swap="innerHTML">New machine</button>
+    </div>
+  </div>
+
+  <div class="fs-stats" id="fs-stats"
+       hx-get="/ui/overview/stats" hx-trigger="every 5s, fs:refresh from:body"
+       hx-target="this" hx-swap="morph:innerHTML">
+    {% include "ui/_stats.html" %}
+  </div>
+
+  <div class="fs-panel fs-mb-24">
+    <div class="fs-panel__head">
+      <div class="fs-panel__title">Host checks</div>
+      <div class="fs-panel__note">GET /v1/doctor · {{ checks | length }} checks · inspect-only</div>
+    </div>
+    <div class="fs-checks">
+      {% for check in checks %}
+      <div class="fs-check" data-status="{{ check.status }}" title="{{ check.reason }}">
+        <span class="fs-dot fs-dot--sm" data-status="{{ check.status }}"></span>
+        <span class="fs-check__id">{{ check.id }}</span>
+      </div>
+      {% endfor %}
+    </div>
+    {% for check in attention %}
+    <div class="fs-check-detail" data-status="{{ check.status }}">
+      <span class="fs-check-detail__id">{{ check.id }}</span>
+      <span class="fs-check-detail__reason">{{ check.reason }}</span>
+      {% if check.hint %}<span class="fs-note">{{ check.hint }}</span>{% endif %}
+    </div>
+    {% endfor %}
+  </div>
+
+  <div class="fs-split">
+    <div class="fs-panel">
+      <div class="fs-panel__head">
+        <div class="fs-panel__title">Machines</div>
+        <a class="fs-link" href="/machines" hx-get="/machines"
+           hx-target="#fs-main-content" hx-push-url="true">View all</a>
+      </div>
+      <div id="fs-overview-machines"
+           hx-get="/ui/overview/machines" hx-trigger="every 5s, fs:refresh from:body"
+           hx-target="this" hx-swap="morph:innerHTML">
+        {% include "ui/_overview_machines.html" %}
+      </div>
+    </div>
+
+    <div class="fs-panel">
+      <div class="fs-panel__head">
+        <div class="fs-panel__title">Image cache</div>
+        <a class="fs-link" href="/catalog" hx-get="/catalog"
+           hx-target="#fs-main-content" hx-push-url="true">Catalog</a>
+      </div>
+      {% for image in images %}
+      <div class="fs-minirow">
+        <span class="fs-dot fs-dot--xs" data-status="ok"></span>
+        <span class="fs-minirow__name">{{ image.reference }}</span>
+        <span class="fs-minirow__image" title="{{ image.id }}">{{ image.id }}</span>
+        <span class="fs-minirow__note">{{ image.size }}</span>
+      </div>
+      {% else %}
+      <div class="fs-empty">
+        <div class="fs-empty__title">No images cached</div>
+        <div class="fs-empty__body">
+          Pull one from the catalog, or create a machine and Firestone will fetch
+          its image on first start.
+        </div>
+        <a class="fs-btn" href="/catalog" hx-get="/catalog"
+           hx-target="#fs-main-content" hx-push-url="true">Open catalog</a>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <span class="fs-note fs-note--footer">{{ version.identity }}</span>
+</div>
+<div id="fs-dialog-slot"></div>

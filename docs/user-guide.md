@@ -11,9 +11,12 @@ You need Linux x86_64, hardware virtualization, a kernel KVM driver, at least 5 
 Install the published standalone executable in your user account, make sure `$HOME/.local/bin` is on `PATH`, then check its identity:
 
 ```sh
-install -Dm0755 firestone-v0.1.0-x86_64-unknown-linux-musl "$HOME/.local/bin/firestone"
+install -Dm0755 firestone-v*-x86_64-unknown-linux-musl "$HOME/.local/bin/firestone"
 firestone version
 ```
+
+The published asset is named for its release, so substitute the version you
+downloaded if the glob matches more than one file.
 
 The version report identifies the embedded passt `2025_02_17.a1e48a0` and qemu-img `8.2.2` payload hashes. Firestone verifies those bytes again before first-use materialization under its private data directory.
 
@@ -340,7 +343,48 @@ kill "$serve_pid"
 wait "$serve_pid"
 ```
 
-The socket mode is 0600. Possession of the same user account grants API authority. There is no TCP listener or bearer-token mode in the MVP.
+The socket mode is 0600. Possession of the same user account grants API authority.
+
+A browser cannot open a Unix socket, so `serve` also accepts a loopback TCP listener. It must be loopback and it must carry a token; Firestone refuses anything else before it binds:
+
+```sh
+firestone serve --listen tcp:127.0.0.1:8642 --token ~/.local/share/firestone/api-token
+```
+
+The token file is created mode 0600 if it does not exist. Authenticate with it as a bearer token:
+
+```sh
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer $(cat ~/.local/share/firestone/api-token)" \
+  http://127.0.0.1:8642/v1/machines
+```
+
+## The web UI
+
+`firestone ui` serves the same API and an embedded web interface on an ephemeral loopback port, then opens your browser:
+
+```sh
+firestone ui
+```
+
+It prints the URL, which carries a fresh session token generated for this run only:
+
+```
+Firestone UI   http://127.0.0.1:47318/?token=<64 hex>
+Press Ctrl-C to stop.
+```
+
+The first page load exchanges the token for an `HttpOnly`, `SameSite=Strict` cookie and rewrites the address bar, so the token does not linger in browser history. The token lives only in the process; stopping `firestone ui` invalidates it.
+
+Use `--no-open` on a headless host and open the printed URL from a machine that can reach it — over an SSH tunnel, not by binding a routable address, which Firestone refuses:
+
+```sh
+firestone ui --no-open
+```
+
+`--print-url` prints the URL and nothing else, which is convenient in a script. Add `--json` for a machine-readable record of the address, port and URL.
+
+The UI covers the host overview and doctor report, the machine list and detail (spec, logs, generated VM config), the image catalog, and machine creation. Lifecycle actions call the same `/v1` endpoints you would call with curl and render their NDJSON progress as it arrives, so what you see in the browser is the same event stream the CLI prints. Everything it needs is compiled into the binary: no CDN, no network access, no second process.
 
 ## Paths, state, and recovery
 
@@ -444,6 +488,8 @@ Firestone avoids privilege escalation, but it still runs a hypervisor and gives 
 
 - Firestone runs as your user. `doctor --fix` never performs privileged host changes.
 - The REST Unix socket, runtime sockets, console, SSH identity, machine disks, logs, and state are user authority. Firestone rejects unsafe owners, modes, file types, and symlinks instead of repairing them silently.
+- A TCP listener is loopback-only and always authenticated; Firestone refuses a routable or wildcard bind, and refuses TCP without a token, before it creates the listener. Requests are checked against a `Host` allowlist before the token is compared, which is what stops a rebound DNS name from spending the cookie your browser would attach for it. The transport is plaintext, so anything with local root can still read it — loopback TCP is a convenience for the browser, not a replacement for the 0600 socket.
+- The web UI performs no privileged action of its own. It renders the same action results the CLI does and calls the same `/v1` endpoints for every mutation, so it holds exactly the authority your user already has.
 - Catalog downloads use vendor checksum documents. Direct HTTPS downloads are unchecked unless you supply `--sha256`.
 - Firestone uses key-only SSH with per-machine known-hosts files. Never replace that with `StrictHostKeyChecking=no`.
 - A passt forward without a bind address listens on all host addresses. Bind sensitive services to `127.0.0.1`.
@@ -453,4 +499,4 @@ Firestone avoids privilege escalation, but it still runs a hypervisor and gives 
 - `vmm.binary`, `vmm.extra_args`, and `vmm.config_overlay` are advanced authority. A custom executable runs as your user. The MVP validates ordinary binaries and wrappers but does not claim containment against a hostile wrapper.
 - The console has root autologin after Firestone provisioning. Its socket is private to the Firestone user; anyone controlling that user already controls the VM.
 
-The Linux x86_64 scope is deliberate. aarch64 runtime, macOS or Windows hosts, non-Linux guests, remote hosts, TCP REST, graphics, snapshots, live migration, and cross-architecture emulation are not half-supported. They are deferred.
+The Linux x86_64 scope is deliberate. aarch64 runtime, macOS or Windows hosts, non-Linux guests, remote hosts, TCP REST, graphics, snapshots, live migration, and cross-architecture emulation are not half-supported. They are deferred. A routable or unauthenticated TCP listener stays deferred with them.

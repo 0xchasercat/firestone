@@ -694,8 +694,15 @@ fn dispatch_channel(
     action: Action,
     expected_result: &'static str,
 ) -> mpsc::Receiver<DispatchMessage> {
+    spawn_dispatch(Arc::clone(&state.dispatcher), action, expected_result)
+}
+
+fn spawn_dispatch(
+    dispatcher: Arc<dyn Dispatcher>,
+    action: Action,
+    expected_result: &'static str,
+) -> mpsc::Receiver<DispatchMessage> {
     let (sender, receiver) = mpsc::channel(EVENT_BUFFER_CAPACITY);
-    let dispatcher = Arc::clone(&state.dispatcher);
     drop(tokio::task::spawn_blocking(move || {
         let mut events = ChannelEventSink::new(sender, expected_result);
         let outcome = catch_unwind(AssertUnwindSafe(|| {
@@ -728,6 +735,62 @@ async fn collect_action(
             }
             Some(DispatchMessage::Event(event)) => events.push(event),
             Some(DispatchMessage::Error(error)) => return Err(error),
+            None => {
+                return Err(dispatch_contract_error(
+                    "the dispatcher ended without a terminal event",
+                ));
+            }
+        }
+    }
+}
+
+/// Runs one action to completion and returns its terminal `Result` payload.
+///
+/// The web UI renders the same shared results the REST routes serialize, so it
+/// reuses this dispatch path rather than growing a second one: identical
+/// blocking-worker isolation, identical panic containment, and the identical
+/// "exactly one expected terminal Result" contract check.
+pub(crate) async fn dispatch_payload(
+    dispatcher: &Arc<dyn Dispatcher>,
+    action: Action,
+    expected_result: &'static str,
+) -> Result<serde_json::Value, FirestoneError> {
+    let mut receiver = spawn_dispatch(Arc::clone(dispatcher), action, expected_result);
+    loop {
+        match receiver.recv().await {
+            Some(DispatchMessage::Event(Event::Result { payload, .. })) => return Ok(payload),
+            Some(DispatchMessage::Event(_)) => {}
+            Some(DispatchMessage::Error(error)) => return Err(error),
+            None => {
+                return Err(dispatch_contract_error(
+                    "the dispatcher ended without a terminal event",
+                ));
+            }
+        }
+    }
+}
+
+/// Runs one action and returns everything it wrote as `Output`.
+///
+/// Used by the web UI's non-following log read, which needs the log text
+/// rather than the terminal metadata payload.
+pub(crate) async fn dispatch_output(
+    dispatcher: &Arc<dyn Dispatcher>,
+    action: Action,
+    expected_result: &'static str,
+) -> Result<String, FirestoneError> {
+    let mut receiver = spawn_dispatch(Arc::clone(dispatcher), action, expected_result);
+    let mut output = String::new();
+    loop {
+        match receiver.recv().await {
+            Some(DispatchMessage::Event(Event::Output { data })) => output.push_str(&data),
+            Some(DispatchMessage::Event(Event::Result { .. })) => return Ok(output),
+            Some(DispatchMessage::Event(_)) => {}
+            Some(DispatchMessage::Error(error)) => return Err(error),
+            // A read that produced output and then ended without a terminal
+            // record still has usable bytes; returning them beats discarding
+            // the log the operator asked for.
+            None if !output.is_empty() => return Ok(output),
             None => {
                 return Err(dispatch_contract_error(
                     "the dispatcher ended without a terminal event",
@@ -1038,6 +1101,16 @@ fn encode_error_ndjson(error: &FirestoneError) -> Bytes {
         }
         Err(_) => Bytes::from_static(INTERNAL_ERROR_NDJSON),
     }
+}
+
+/// Applies the same control-character sanitisation to a whole string.
+///
+/// The web UI renders log text into HTML rather than streaming it as
+/// `text/plain`, and must not be the one surface where a raw control byte
+/// survives.
+pub(crate) fn sanitized_output(data: &str) -> String {
+    let bytes = safe_output_chunk(data);
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn safe_output_chunk(data: &str) -> Bytes {

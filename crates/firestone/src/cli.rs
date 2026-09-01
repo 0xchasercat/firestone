@@ -1,5 +1,6 @@
 use std::{
     ffi::OsString,
+    net::SocketAddr,
     path::{Path, PathBuf},
 };
 
@@ -108,8 +109,11 @@ pub enum Command {
     /// Print Firestone, pinned dependency, and resolved path versions.
     Version,
 
-    /// Run the stateless REST API over a private Unix socket.
+    /// Run the stateless REST API over a private Unix socket or loopback port.
     Serve(ServeArgs),
+
+    /// Open the Firestone web interface on a loopback port.
+    Ui(UiArgs),
 }
 /// Arguments accepted by firestone completions.
 #[derive(Debug, Args)]
@@ -119,24 +123,66 @@ pub struct CompletionsArgs {
     pub shell: Shell,
 }
 
+/// Where `firestone serve` publishes its listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListenAddress {
+    /// A Unix socket inside Firestone's private runtime directory.
+    Unix(PathBuf),
+    /// A loopback TCP address. Only `127.0.0.1` and `::1` are accepted.
+    Tcp(SocketAddr),
+}
+
 /// Arguments accepted by firestone serve.
 #[derive(Debug, Args)]
 pub struct ServeArgs {
-    /// Listen at a Unix socket inside Firestone's private runtime directory.
-    #[arg(long, value_name = "unix:PATH", value_parser = parse_unix_listener)]
-    pub listen: Option<PathBuf>,
+    /// Listen at a private Unix socket, or at a loopback TCP address.
+    #[arg(
+        long,
+        value_name = "unix:PATH|tcp:HOST:PORT",
+        value_parser = parse_listen_address
+    )]
+    pub listen: Option<ListenAddress>,
+
+    /// File holding the 64-hexadecimal-character session token. TCP only.
+    #[arg(long, value_name = "FILE")]
+    pub token: Option<PathBuf>,
 }
 
-fn parse_unix_listener(value: &str) -> Result<PathBuf, String> {
-    let Some(path) = value.strip_prefix("unix:") else {
-        return Err(
-            "listener must use the unix:PATH form; TCP is not available in v0.1".to_owned(),
-        );
-    };
-    if path.is_empty() {
-        return Err("unix listener path cannot be empty".to_owned());
+/// Arguments accepted by firestone ui.
+#[derive(Debug, Args)]
+pub struct UiArgs {
+    /// Loopback port to bind. Zero asks the kernel for any free port.
+    #[arg(long, value_name = "PORT", default_value_t = 0)]
+    pub port: u16,
+
+    /// Do not launch a browser; print the URL only.
+    #[arg(long)]
+    pub no_open: bool,
+
+    /// Print the URL and never launch a browser. Implies --no-open.
+    #[arg(long)]
+    pub print_url: bool,
+}
+
+fn parse_listen_address(value: &str) -> Result<ListenAddress, String> {
+    if let Some(path) = value.strip_prefix("unix:") {
+        if path.is_empty() {
+            return Err("unix listener path cannot be empty".to_owned());
+        }
+        return Ok(ListenAddress::Unix(PathBuf::from(path)));
     }
-    Ok(PathBuf::from(path))
+    let Some(address) = value.strip_prefix("tcp:") else {
+        return Err("listener must use the unix:PATH or tcp:HOST:PORT form".to_owned());
+    };
+    let address: SocketAddr = address.parse().map_err(|_| {
+        "tcp listener must be an IP literal and port, such as tcp:127.0.0.1:8080".to_owned()
+    })?;
+    if !address.ip().is_loopback() {
+        return Err(format!(
+            "tcp listener address '{address}' is not a loopback address; use tcp:127.0.0.1:PORT"
+        ));
+    }
+    Ok(ListenAddress::Tcp(address))
 }
 
 /// Arguments accepted by firestone run.
@@ -861,11 +907,11 @@ mod tests {
     }
 
     #[test]
-    fn serve_grammar_accepts_only_unix_listener_addresses() -> Result<(), clap::Error> {
+    fn serve_grammar_accepts_unix_and_loopback_tcp_listener_addresses() -> Result<(), clap::Error> {
         let default = Cli::try_parse_from(["firestone", "serve"])?;
         assert!(matches!(
             default.command,
-            Command::Serve(arguments) if arguments.listen.is_none()
+            Command::Serve(arguments) if arguments.listen.is_none() && arguments.token.is_none()
         ));
 
         let selected =
@@ -873,16 +919,121 @@ mod tests {
         assert!(matches!(
             selected.command,
             Command::Serve(arguments)
-                if arguments.listen == Some(PathBuf::from("private.sock"))
+                if arguments.listen
+                    == Some(crate::cli::ListenAddress::Unix(PathBuf::from("private.sock")))
         ));
 
-        let tcp = Cli::try_parse_from(["firestone", "serve", "--listen", "tcp:127.0.0.1:8080"])
-            .expect_err("TCP must remain unavailable");
-        assert_eq!(tcp.kind(), ErrorKind::ValueValidation);
+        let tcp = Cli::try_parse_from([
+            "firestone",
+            "serve",
+            "--listen",
+            "tcp:127.0.0.1:8080",
+            "--token",
+            "/run/firestone.token",
+        ])?;
+        assert!(matches!(
+            tcp.command,
+            Command::Serve(arguments)
+                if arguments.listen
+                    == Some(crate::cli::ListenAddress::Tcp(
+                        "127.0.0.1:8080".parse().expect("loopback address")
+                    ))
+                    && arguments.token == Some(PathBuf::from("/run/firestone.token"))
+        ));
 
-        let token = Cli::try_parse_from(["firestone", "serve", "--token", "secret"])
-            .expect_err("token flags must remain unavailable");
-        assert_eq!(token.kind(), ErrorKind::UnknownArgument);
+        let ipv6 = Cli::try_parse_from([
+            "firestone",
+            "serve",
+            "--listen",
+            "tcp:[::1]:8080",
+            "--token",
+            "/run/firestone.token",
+        ])?;
+        assert!(matches!(
+            ipv6.command,
+            Command::Serve(arguments)
+                if arguments.listen
+                    == Some(crate::cli::ListenAddress::Tcp(
+                        "[::1]:8080".parse().expect("loopback address")
+                    ))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn serve_grammar_rejects_routable_and_wildcard_tcp_listener_addresses() {
+        for address in [
+            "tcp:0.0.0.0:8080",
+            "tcp:[::]:8080",
+            "tcp:192.168.1.10:8080",
+            "tcp:localhost:8080",
+            "tcp:127.0.0.1",
+            "http:127.0.0.1:8080",
+        ] {
+            let error = Cli::try_parse_from([
+                "firestone",
+                "serve",
+                "--listen",
+                address,
+                "--token",
+                "/run/firestone.token",
+            ])
+            .expect_err("only loopback IP literals may be bound");
+            assert_eq!(error.kind(), ErrorKind::ValueValidation, "{address}");
+        }
+    }
+
+    #[test]
+    fn serve_grammar_parses_token_flag_for_later_listener_validation() -> Result<(), clap::Error> {
+        // The token/listener pairing is a semantic rule, not a clap rule, so
+        // both mismatched forms must parse and be refused with a usage error
+        // by the command wiring instead.
+        let unix_with_token = Cli::try_parse_from([
+            "firestone",
+            "serve",
+            "--listen",
+            "unix:private.sock",
+            "--token",
+            "/run/firestone.token",
+        ])?;
+        assert!(matches!(
+            unix_with_token.command,
+            Command::Serve(arguments) if arguments.token.is_some()
+        ));
+
+        let tcp_without_token =
+            Cli::try_parse_from(["firestone", "serve", "--listen", "tcp:127.0.0.1:8080"])?;
+        assert!(matches!(
+            tcp_without_token.command,
+            Command::Serve(arguments) if arguments.token.is_none()
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn ui_grammar_defaults_to_an_ephemeral_port_and_opens_a_browser() -> Result<(), clap::Error> {
+        let default = Cli::try_parse_from(["firestone", "ui"])?;
+        assert!(matches!(
+            default.command,
+            Command::Ui(arguments)
+                if arguments.port == 0 && !arguments.no_open && !arguments.print_url
+        ));
+
+        let selected = Cli::try_parse_from(["firestone", "ui", "--port", "8080", "--no-open"])?;
+        assert!(matches!(
+            selected.command,
+            Command::Ui(arguments) if arguments.port == 8080 && arguments.no_open
+        ));
+
+        let printed = Cli::try_parse_from(["firestone", "ui", "--print-url"])?;
+        assert!(matches!(
+            printed.command,
+            Command::Ui(arguments) if arguments.print_url
+        ));
+
+        let overflow = Cli::try_parse_from(["firestone", "ui", "--port", "70000"])
+            .expect_err("a port must fit in sixteen bits");
+        assert_eq!(overflow.kind(), ErrorKind::ValueValidation);
         Ok(())
     }
     #[test]
@@ -1117,7 +1268,7 @@ mod tests {
     }
 
     #[test]
-    fn command_help_contracts_include_unix_only_serve() {
+    fn command_help_contracts_include_serve_and_ui() {
         let command = Cli::command();
         let names = command
             .get_subcommands()
@@ -1140,6 +1291,7 @@ mod tests {
             "images",
             "doctor",
             "serve",
+            "ui",
         ] {
             assert!(names.contains(name), "missing {name} command");
         }

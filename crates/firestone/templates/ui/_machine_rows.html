@@ -1,0 +1,22 @@
+{% import "ui/_macros.html" as m %}
+{% for mach in machines %}{{ m.machine_row(mach) }}{% else %}
+<div class="fs-empty">
+  <div class="fs-empty__title">
+    {% if query %}Nothing matches “{{ query }}”{% else %}No machines yet{% endif %}
+  </div>
+  <div class="fs-empty__body">
+    {% if query %}
+      Clear the filter to see all {{ machine_count }}.
+    {% else %}
+      A machine is a spec plus its reconciled state. Create one and Firestone
+      resolves the image, builds a cloud-init seed and supervises the VMM.
+    {% endif %}
+  </div>
+  {% if not query %}
+  <button type="button" class="fs-btn fs-btn--primary"
+          hx-get="/ui/machines/new" hx-target="#fs-dialog-slot" hx-swap="innerHTML">New machine</button>
+  {% endif %}
+</div>
+{% endfor %}
+{# Keeps the sidebar count honest without a second request. #}
+<span id="fs-nav-count" class="fs-nav__count" hx-swap-oob="true">{{ machine_count }}</span>

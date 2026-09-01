@@ -48,19 +48,26 @@ MAX_RELEASE_ARTIFACT_BYTES = 256 * 1024 * 1024
 MAX_REPOSITORY_ARCHIVE_BYTES = 128 * 1024 * 1024
 KVM_GET_API_VERSION = 0xAE00
 KVM_API_VERSION = 12
-RELEASE_ARTIFACT_NAME = "firestone-v0.1.0-x86_64-unknown-linux-musl"
+RELEASE_ARTIFACT_TARGET = "x86_64-unknown-linux-musl"
 RELEASE_CHECKSUM_NAME = "SHA256SUMS"
 ACCEPTANCE_MANIFEST_NAME = "acceptance.json"
 ACCEPTANCE_CHECKSUM_NAME = "SHA256SUMS"
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+RELEASE_VERSION_PATTERN = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\Z")
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
 INTERRUPTED_SIGNAL: int | None = None
 HANDLED_SIGNALS = frozenset({signal.SIGINT, signal.SIGTERM, signal.SIGHUP})
 FINAL_SIGNAL_MASK: set[signal.Signals] | None = None
 
+# Inputs whose bytes are fixed independently of the release version.
+#
+# Cargo.lock and build/firestone/versions.env are deliberately absent: the
+# release workflow rewrites both on every version bump, so a literal here would
+# be stale the moment a release is cut. validate_pins checks the properties
+# those hashes stood in for instead — that versions.env agrees with Cargo.toml
+# and with the actual Cargo.lock — which is strictly stronger, because a fixed
+# literal cannot catch a lock edited without updating its pin.
 EXPECTED_FILE_HASHES = {
-    "Cargo.lock": "e95d68163dd015cf1e98e8b6f03fd82b05afe5d49f6e56d575eb44cf8830d5f5",
-    "build/firestone/versions.env": "b9262638c59f83a5eeb400f8663d8855080af6e4ba063d749a8a14f2a22c5a3a",
     "catalog/images.toml": "89f3e1827ed143e02da6d90e8c18bc28f273fcaba9cc301db663dac9cc4d3acf",
     "deps.toml": "4d58a7623e083da70bf02de702b17d3840ba99fdccffc7ebf110a4ccc9801a65",
     "docs/verification/doctor-matrix.md": "c3254636863e741ae237f61b86b1fca0bbc8d097f1f40f799d090325e4eeb844",
@@ -99,15 +106,16 @@ EXPECTED_RELEASE_DEPENDENCIES = {
     },
 }
 
+# FIRESTONE_VERSION and CARGO_LOCK_SHA256 are absent for the same reason: both
+# are consequences of the release version, and validate_pins derives and checks
+# them against Cargo.toml and Cargo.lock rather than pinning a literal.
 EXPECTED_BUILD_VALUES = {
-    "FIRESTONE_VERSION": "0.1.0",
     "RUST_VERSION": "1.85.0",
     "RUSTC_COMMIT": "4d91de4e48198da2e33413efdcd9cd2cc0c46688",
     "CARGO_COMMIT": "d73d2caf9e41a39daf2a8d6ce60ec80bf354d2a7",
     "RUST_IMAGE": "rust@sha256:bea885d2711087e67a9f7a7cd1a164976f4c35389478512af170730014d2452a",
     "GCC_VERSION": "14.2.0",
     "BINUTILS_VERSION": "2.43.1",
-    "CARGO_LOCK_SHA256": EXPECTED_FILE_HASHES["Cargo.lock"],
     "DEPS_TOML_SHA256": EXPECTED_FILE_HASHES["deps.toml"],
     "MUSL_HEADERS_VERSION": "1.2.5-r11",
     "MUSL_HEADERS_X86_64_SHA256": "d3b5ab01046a92b9a168b790f516606e320f015cbd4deeb584c5e115a02124ba",
@@ -790,6 +798,33 @@ def prepare_repository_snapshot(work_root: Path, expected_commit: str) -> Path:
     return snapshot
 
 
+def release_artifact_name(version: str) -> str:
+    return f"firestone-v{version}-{RELEASE_ARTIFACT_TARGET}"
+
+
+def resolve_release_version(root: Path) -> str:
+    """Reads the release version from its single source of truth.
+
+    Cargo.toml's [workspace.package] version is what the release workflow
+    bumps and what the built executable reports through env!("CARGO_PKG_VERSION"),
+    so every other statement of the version in the tree is a consequence of
+    this one and is checked against it rather than pinned separately.
+    """
+    document = tomllib.loads(
+        read_regular_bytes(root / "Cargo.toml", limit=64 * 1024).decode("utf-8")
+    )
+    workspace = document.get("workspace")
+    require(isinstance(workspace, dict), "Cargo.toml has no workspace table")
+    package = workspace.get("package")
+    require(isinstance(package, dict), "Cargo.toml has no workspace.package table")
+    version = package.get("version")
+    require(
+        isinstance(version, str) and RELEASE_VERSION_PATTERN.fullmatch(version) is not None,
+        f"workspace version {version!r} is not MAJOR.MINOR.PATCH",
+    )
+    return version
+
+
 def validate_snapshot_hashes(root: Path) -> dict[str, str]:
     observed: dict[str, str] = {}
     for relative, expected in EXPECTED_FILE_HASHES.items():
@@ -818,6 +853,23 @@ def validate_pins(root: Path = REPO_ROOT) -> dict[str, Any]:
     build_values = parse_env_file(root / "build/firestone/versions.env")
     for key, expected in EXPECTED_BUILD_VALUES.items():
         require(build_values.get(key) == expected, f"release pin {key} changed")
+
+    # Everything below is version-relative. Rather than pin literals that die
+    # at the next release, require the tree to agree with itself: the release
+    # inputs must describe the version and the lock file that are actually
+    # present, or the reproducible build would verify inputs it is not using.
+    version = resolve_release_version(root)
+    require(
+        build_values.get("FIRESTONE_VERSION") == version,
+        f"versions.env FIRESTONE_VERSION is {build_values.get('FIRESTONE_VERSION')!r}, "
+        f"but Cargo.toml declares {version!r}",
+    )
+    cargo_lock_sha256 = sha256_regular(root / "Cargo.lock")
+    require(
+        build_values.get("CARGO_LOCK_SHA256") == cargo_lock_sha256,
+        f"versions.env CARGO_LOCK_SHA256 is {build_values.get('CARGO_LOCK_SHA256')!r}, "
+        f"but Cargo.lock hashes to {cargo_lock_sha256}",
+    )
 
     dependencies_document = tomllib.loads(
         read_regular_bytes(root / "deps.toml", limit=1024 * 1024).decode("utf-8")
@@ -857,9 +909,14 @@ def validate_pins(root: Path = REPO_ROOT) -> dict[str, Any]:
         require(isinstance(x86, dict), f"{name}.x86_64 is missing")
         require(x86.get("sha256") == release_expected["sha256"], f"{name}.x86_64 SHA-256 changed")
 
+    release_inputs = {key: build_values[key] for key in EXPECTED_BUILD_VALUES}
+    release_inputs["FIRESTONE_VERSION"] = version
+    release_inputs["CARGO_LOCK_SHA256"] = cargo_lock_sha256
+
     return {
         "files": observed_files,
-        "release_inputs": {key: build_values[key] for key in EXPECTED_BUILD_VALUES},
+        "version": version,
+        "release_inputs": release_inputs,
         "dependencies": recorded_dependencies,
         "passt": {
             "version": "2025_02_17.a1e48a0",
@@ -906,10 +963,12 @@ def stage_release_artifact(
     source: Path,
     work_root: Path,
     expected_sha256: str,
+    version: str,
 ) -> tuple[Path, dict[str, Any]]:
+    artifact_name = release_artifact_name(version)
     require(source.is_absolute(), "release artifact path must be absolute")
     require(source.parent.resolve(strict=True) == source.parent, "release artifact parent must not contain symlinks")
-    require(source.name == RELEASE_ARTIFACT_NAME, f"release artifact must be named {RELEASE_ARTIFACT_NAME}")
+    require(source.name == artifact_name, f"release artifact must be named {artifact_name}")
     require(SHA256_PATTERN.fullmatch(expected_sha256) is not None, "expected release SHA-256 must be lowercase 64-hex")
     descriptor, metadata = open_regular(source, exact_mode=0o755)
     try:
@@ -923,7 +982,7 @@ def stage_release_artifact(
 
         checksum_path = source.parent / RELEASE_CHECKSUM_NAME
         checksum_bytes = read_regular_bytes(checksum_path, limit=64 * 1024)
-        expected_line = f"{digest}  {RELEASE_ARTIFACT_NAME}\n".encode("ascii")
+        expected_line = f"{digest}  {artifact_name}\n".encode("ascii")
         require(checksum_bytes == expected_line, "release SHA256SUMS does not exactly match the artifact")
 
         release_root = work_root / "release"
@@ -952,7 +1011,7 @@ def stage_release_artifact(
     require(sha256_regular(staged) == digest, "staged release artifact changed bytes")
     checksum_sha = sha256_regular(source.parent / RELEASE_CHECKSUM_NAME)
     return staged, {
-        "name": RELEASE_ARTIFACT_NAME,
+        "name": artifact_name,
         "sha256": digest,
         "bytes": metadata.st_size,
         "mode": "0755",
@@ -966,10 +1025,19 @@ def stage_release_artifact(
     }
 
 
-def validate_release_identity(binary: Path, work_root: Path, expected_commit: str) -> None:
-    version = run_small([binary, "--version"], timeout=10)
-    require(version.stdout == b"firestone 0.1.0\n", "release --version output changed")
-    require(version.stderr == b"", "release --version wrote stderr")
+def validate_release_identity(
+    binary: Path,
+    work_root: Path,
+    expected_commit: str,
+    expected_version: str,
+) -> None:
+    reported = run_small([binary, "--version"], timeout=10)
+    expected_line = f"firestone {expected_version}\n".encode("ascii")
+    require(
+        reported.stdout == expected_line,
+        f"release --version printed {reported.stdout!r}, expected {expected_line!r}",
+    )
+    require(reported.stderr == b"", "release --version wrote stderr")
 
     home = work_root / "release-version-home"
     home.mkdir(mode=0o700)
@@ -986,11 +1054,17 @@ def validate_release_identity(binary: Path, work_root: Path, expected_commit: st
     require(record.get("type") == "Result" and record.get("action") == "version", "release version Result changed")
     payload = record.get("payload")
     require(isinstance(payload, dict), "release version payload is not an object")
-    require(payload.get("version") == "0.1.0", "release version payload changed")
+    require(
+        payload.get("version") == expected_version,
+        f"release version payload is {payload.get('version')!r}, expected {expected_version!r}",
+    )
     require(payload.get("architecture") == "x86_64", "release architecture is not x86_64")
     identity = payload.get("identity")
     require(isinstance(identity, dict), "release identity is missing")
-    require(identity.get("release") == "v0.1.0", "release name changed")
+    require(
+        identity.get("release") == f"v{expected_version}",
+        f"release name is {identity.get('release')!r}, expected 'v{expected_version}'",
+    )
     require(identity.get("git_commit") == expected_commit, "release commit does not match accepted main")
     require(payload.get("dependencies") == EXPECTED_RELEASE_DEPENDENCIES, "release dependency identities changed")
     shutil.rmtree(home)
@@ -2461,8 +2535,11 @@ def run_gate(args: argparse.Namespace) -> tuple[bool, Path | None, str | None]:
             args.release_artifact,
             work_root,
             args.expected_release_sha256,
+            pins["version"],
         )
-        validate_release_identity(staged_binary, work_root, args.expected_commit)
+        validate_release_identity(
+            staged_binary, work_root, args.expected_commit, pins["version"]
+        )
         require_not_interrupted()
 
         evidence_dir = args.evidence_dir

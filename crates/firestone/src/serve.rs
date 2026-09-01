@@ -4,16 +4,19 @@ use std::{
     fs::{self, File, OpenOptions},
     future::Future,
     io,
+    net::{IpAddr, SocketAddr},
     os::unix::{
         fs::{MetadataExt, OpenOptionsExt},
         net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream},
     },
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         Arc, Condvar, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
     },
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -38,13 +41,17 @@ use nix::{
     unistd::{UnlinkatFlags, unlinkat},
 };
 use tokio::{
-    net::{UnixListener, UnixStream},
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::{TcpListener, TcpStream, UnixListener, UnixStream},
     sync::watch,
     task::JoinSet,
 };
 use tower::ServiceExt as _;
 
-use crate::api;
+use crate::{
+    api,
+    ui::auth::{self, UiAuth},
+};
 
 const GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const ACTION_SAFE_POINT_TIMEOUT: Duration = Duration::from_secs(3_610);
@@ -54,23 +61,49 @@ const INTERNAL_ERROR_BODY: &str = concat!(
     "\"hint\":\"retry the request; if it fails again, report a Firestone bug\"}}"
 );
 
-/// Runs the stateless REST adapter on one securely published Unix socket.
+/// Where the stateless adapter should publish itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServeListener {
+    /// A securely published Unix socket inside the private runtime directory.
+    Unix(PathBuf),
+    /// A loopback TCP port. Only `127.0.0.1` and `::1` are bindable.
+    Loopback { addr: SocketAddr },
+}
+
+/// The listener as it actually exists after a successful bind.
+///
+/// A value of this type can only be produced by a bind that succeeded, so the
+/// `ready` callback can never announce a URL for a listener that is not there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundListener {
+    /// The published Unix socket path.
+    Unix(PathBuf),
+    /// The resolved loopback address, including a kernel-chosen port.
+    Loopback(SocketAddr),
+}
+
+/// Called once after a successful bind and before the first accept.
+pub type ReadyCallback<'a> = &'a mut dyn FnMut(&BoundListener) -> Result<(), FirestoneError>;
+
+/// Runs the stateless REST and UI adapter on one listener.
+///
+/// `ready` runs after the listener is bound and before the accept loop starts,
+/// so a printed URL is always reachable and is never printed for a failed bind.
 pub fn run(
     paths: &Paths,
-    socket_path: &Path,
+    listener: ServeListener,
     dispatcher: Arc<dyn Dispatcher>,
     config: &GlobalConfig,
+    auth: UiAuth,
+    ready: Option<ReadyCallback<'_>>,
 ) -> Result<(), FirestoneError> {
     let signals = ShutdownSignals::register()?;
     let shutdown = signals.flag();
-    let mut bound = BoundSocket::bind(paths, socket_path)?;
-    let listener = bound.take_listener()?;
     let activity = Arc::new(DispatchActivity::default());
     let tracked: Arc<dyn Dispatcher> = Arc::new(TrackedDispatcher {
         inner: dispatcher,
         activity: Arc::clone(&activity),
     });
-    let app = api::router(tracked, config);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -85,26 +118,100 @@ pub fn run(
             .with_source(source)
         })?;
 
-    let server_result = runtime.block_on(async move {
-        let listener = UnixListener::from_std(listener).map_err(|source| {
-            listener_error(
-                ErrorKind::Generic,
-                "cannot attach the Unix listener to the Tokio runtime",
-                source,
-            )
-        })?;
-        serve_until_shutdown(
-            listener,
-            app,
-            wait_for_shutdown(shutdown),
-            GRACEFUL_DRAIN_TIMEOUT,
-        )
-        .await
-    });
+    let mut socket = None;
+    let (accepted, bound) = match listener {
+        ServeListener::Unix(path) => {
+            if !auth.is_trusted() {
+                return Err(FirestoneError::new(
+                    ErrorKind::Usage,
+                    "a session token cannot be used with a unix: listener",
+                )
+                .with_hint("a Unix socket is authenticated by its mode 0600; drop --token"));
+            }
+            let mut bound = BoundSocket::bind(paths, &path)?;
+            let listener = bound.take_listener()?;
+            let guard = runtime.enter();
+            let listener = UnixListener::from_std(listener).map_err(|source| {
+                listener_error(
+                    ErrorKind::Generic,
+                    "cannot attach the Unix listener to the Tokio runtime",
+                    source,
+                )
+            })?;
+            drop(guard);
+            socket = Some(bound);
+            (Listener::Unix(listener), BoundListener::Unix(path))
+        }
+        ServeListener::Loopback { addr } => {
+            if auth.is_trusted() {
+                return Err(FirestoneError::new(
+                    ErrorKind::Usage,
+                    "a loopback TCP listener always requires a session token",
+                )
+                .with_hint("pass --token FILE, or use `firestone ui`"));
+            }
+            let addr = require_loopback(addr)?;
+            let listener = runtime
+                .block_on(async move { TcpListener::bind(addr).await })
+                .map_err(|source| {
+                    let kind = if source.kind() == io::ErrorKind::AddrInUse {
+                        ErrorKind::Conflict
+                    } else {
+                        ErrorKind::Dependency
+                    };
+                    FirestoneError::new(
+                        kind,
+                        format!("cannot bind the loopback listener at '{addr}'"),
+                    )
+                    .with_hint("choose a free loopback port, or pass port 0 for any free port")
+                    .with_source(source)
+                })?;
+            let local = listener.local_addr().map_err(|source| {
+                FirestoneError::new(
+                    ErrorKind::Generic,
+                    "cannot read back the bound loopback address",
+                )
+                .with_hint("retry; if it fails again, report a Firestone bug")
+                .with_source(source)
+            })?;
+            (Listener::Tcp(listener), BoundListener::Loopback(local))
+        }
+    };
+
+    let gate = match &bound {
+        BoundListener::Unix(_) => None,
+        BoundListener::Loopback(address) => auth.gate(*address),
+    };
+    let app = auth::secured(
+        merged_router(
+            api::router(Arc::clone(&tracked), config),
+            crate::ui::router(tracked, config, paths),
+        ),
+        gate,
+    );
+
+    if let Some(ready) = ready {
+        if let Err(error) = ready(&bound) {
+            if let Some(socket) = socket.as_mut() {
+                let _ = socket.cleanup();
+            }
+            return Err(error);
+        }
+    }
+
+    let server_result = runtime.block_on(serve_until_shutdown(
+        accepted,
+        app,
+        wait_for_shutdown(shutdown),
+        GRACEFUL_DRAIN_TIMEOUT,
+    ));
 
     let actions_drained = activity.wait_until_idle(ACTION_SAFE_POINT_TIMEOUT);
     runtime.shutdown_timeout(RUNTIME_TASK_DRAIN_TIMEOUT);
-    let cleanup_result = bound.cleanup();
+    let cleanup_result = match socket.as_mut() {
+        Some(socket) => socket.cleanup(),
+        None => Ok(()),
+    };
 
     server_result?;
     if !actions_drained {
@@ -115,6 +222,49 @@ pub fn run(
         .with_hint("inspect the machine and image state before restarting serve"));
     }
     cleanup_result
+}
+
+/// Rejects every bind address that is not a loopback literal.
+///
+/// This is a hard security boundary: no flag may bypass it, because a
+/// routable bind would expose the token-gated UI and the whole `/v1` surface
+/// to the local network.
+fn require_loopback(addr: SocketAddr) -> Result<SocketAddr, FirestoneError> {
+    let loopback = match addr.ip() {
+        IpAddr::V4(address) => address.is_loopback(),
+        IpAddr::V6(address) => address.is_loopback(),
+    };
+    if loopback {
+        return Ok(addr);
+    }
+    Err(FirestoneError::new(
+        ErrorKind::Usage,
+        format!("serve listener address '{addr}' is not a loopback address"),
+    )
+    .with_hint(
+        "use tcp:127.0.0.1:PORT or tcp:[::1]:PORT; Firestone never binds a routable address",
+    ))
+}
+
+/// Joins the REST and UI routers while keeping both 404 contracts.
+///
+/// `Router::merge` cannot be used: both routers set their own fallback, and
+/// merging two fallbacks panics. Instead every request enters a fallback
+/// service that picks the router by path prefix, so `/v1` keeps the JSON
+/// `ErrorEnvelope` 404 and every other path keeps the UI's own fallback.
+fn merged_router(api: Router, ui: Router) -> Router {
+    Router::new().fallback_service(tower::service_fn(move |request: Request<Body>| {
+        let api = api.clone();
+        let ui = ui.clone();
+        async move {
+            let path = request.uri().path();
+            if path == "/v1" || path.starts_with("/v1/") {
+                api.oneshot(request).await
+            } else {
+                ui.oneshot(request).await
+            }
+        }
+    }))
 }
 
 struct ShutdownSignals {
@@ -165,15 +315,125 @@ async fn wait_for_shutdown(triggered: Arc<AtomicBool>) -> Result<(), FirestoneEr
     Ok(())
 }
 
-async fn serve_until_shutdown<F>(
-    listener: UnixListener,
+/// One bound listener the shared accept loop can drive.
+enum Listener {
+    Unix(UnixListener),
+    Tcp(TcpListener),
+}
+
+impl From<UnixListener> for Listener {
+    fn from(listener: UnixListener) -> Self {
+        Self::Unix(listener)
+    }
+}
+
+impl From<TcpListener> for Listener {
+    fn from(listener: TcpListener) -> Self {
+        Self::Tcp(listener)
+    }
+}
+
+impl Listener {
+    async fn accept(&self) -> io::Result<Connection> {
+        match self {
+            Self::Unix(listener) => listener
+                .accept()
+                .await
+                .map(|(stream, _)| Connection::Unix(stream)),
+            Self::Tcp(listener) => listener.accept().await.map(|(stream, _)| {
+                // Nagle would stall the small NDJSON frames the UI polls for.
+                let _ = stream.set_nodelay(true);
+                Connection::Tcp(stream)
+            }),
+        }
+    }
+
+    const fn accept_failure(&self) -> &'static str {
+        match self {
+            Self::Unix(_) => "the Unix listener failed while accepting a request",
+            Self::Tcp(_) => "the loopback listener failed while accepting a request",
+        }
+    }
+}
+
+/// One accepted connection, on either transport.
+///
+/// Both variants are `Unpin`, so the delegating projections below need no
+/// pin projection helper and no `unsafe` block.
+enum Connection {
+    Unix(UnixStream),
+    Tcp(TcpStream),
+}
+
+impl AsyncRead for Connection {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Unix(stream) => Pin::new(stream).poll_read(context, buffer),
+            Self::Tcp(stream) => Pin::new(stream).poll_read(context, buffer),
+        }
+    }
+}
+
+impl AsyncWrite for Connection {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Unix(stream) => Pin::new(stream).poll_write(context, buffer),
+            Self::Tcp(stream) => Pin::new(stream).poll_write(context, buffer),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Unix(stream) => Pin::new(stream).poll_flush(context),
+            Self::Tcp(stream) => Pin::new(stream).poll_flush(context),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Unix(stream) => Pin::new(stream).poll_shutdown(context),
+            Self::Tcp(stream) => Pin::new(stream).poll_shutdown(context),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffers: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Unix(stream) => Pin::new(stream).poll_write_vectored(context, buffers),
+            Self::Tcp(stream) => Pin::new(stream).poll_write_vectored(context, buffers),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Unix(stream) => stream.is_write_vectored(),
+            Self::Tcp(stream) => stream.is_write_vectored(),
+        }
+    }
+}
+
+async fn serve_until_shutdown<L, F>(
+    listener: L,
     app: Router,
     shutdown: F,
     drain_timeout: Duration,
 ) -> Result<(), FirestoneError>
 where
+    L: Into<Listener>,
     F: Future<Output = Result<(), FirestoneError>> + Send,
 {
+    let listener = listener.into();
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
     let mut connections = JoinSet::new();
     tokio::pin!(shutdown);
@@ -184,18 +444,24 @@ where
             result = &mut shutdown => break result,
             accepted = listener.accept() => {
                 match accepted {
-                    Ok((stream, _)) => {
+                    Ok(stream) => {
                         connections.spawn(serve_connection(
                             stream,
                             app.clone(),
                             shutdown_receiver.clone(),
                         ));
                     }
-                    Err(source) if source.kind() == io::ErrorKind::Interrupted => {}
+                    Err(source)
+                        if matches!(
+                            source.kind(),
+                            io::ErrorKind::Interrupted
+                                | io::ErrorKind::ConnectionAborted
+                                | io::ErrorKind::ConnectionReset
+                        ) => {}
                     Err(source) => {
                         break Err(listener_error(
                             ErrorKind::Generic,
-                            "the Unix listener failed while accepting a request",
+                            listener.accept_failure(),
                             source,
                         ));
                     }
@@ -223,7 +489,7 @@ where
     outcome
 }
 
-async fn serve_connection(stream: UnixStream, app: Router, mut shutdown: watch::Receiver<bool>) {
+async fn serve_connection(stream: Connection, app: Router, mut shutdown: watch::Receiver<bool>) {
     let service = service_fn(move |request: Request<Incoming>| {
         dispatch_request(app.clone(), request.map(Body::new))
     });
@@ -791,8 +1057,8 @@ mod tests {
         task::JoinHandle,
     };
 
-    use super::serve_until_shutdown;
-    use crate::api;
+    use super::{merged_router, require_loopback, serve_until_shutdown};
+    use crate::{api, ui::auth::UiAuth};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -932,6 +1198,171 @@ mod tests {
                 })
             })
         }
+    }
+
+    struct QuietDispatcher;
+
+    impl Dispatcher for QuietDispatcher {
+        fn run<'a>(&'a self, _action: Action, events: &'a mut dyn EventSink) -> DispatchFuture<'a> {
+            Box::pin(async move {
+                events.emit(Event::Result {
+                    action: "version".to_owned(),
+                    payload: json!({"ok":true}),
+                })
+            })
+        }
+    }
+
+    #[test]
+    fn require_loopback_accepts_only_loopback_literals() -> TestResult {
+        for accepted in ["127.0.0.1:0", "127.0.0.1:8080", "[::1]:8080", "127.9.9.9:1"] {
+            let address: std::net::SocketAddr = accepted.parse()?;
+            assert_eq!(require_loopback(address)?, address, "{accepted}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn require_loopback_rejects_wildcard_and_routable_addresses() -> TestResult {
+        for rejected in [
+            "0.0.0.0:8080",
+            "[::]:8080",
+            "192.168.1.10:8080",
+            "8.8.8.8:80",
+            "[::ffff:127.0.0.1]:8080",
+        ] {
+            let address: std::net::SocketAddr = rejected.parse()?;
+            let error =
+                require_loopback(address).expect_err("only loopback addresses may be bound");
+            assert_eq!(error.kind(), firestone_core::ErrorKind::Usage);
+            assert!(error.to_string().contains(rejected), "{rejected}");
+            assert!(
+                error
+                    .info()
+                    .hint
+                    .is_some_and(|hint| hint.contains("127.0.0.1")),
+                "{rejected}"
+            );
+        }
+        Ok(())
+    }
+
+    fn stub_ui_router() -> axum::Router {
+        axum::Router::new()
+            .route("/", axum::routing::get(|| async { "firestone ui" }))
+            .fallback(|| async { (axum::http::StatusCode::NOT_FOUND, "ui not found") })
+    }
+
+    async fn merged_probe(uri: &str) -> TestResult<(axum::http::StatusCode, Vec<u8>)> {
+        use axum::body::Body;
+        use tower::ServiceExt as _;
+
+        let dispatcher: Arc<dyn Dispatcher> = Arc::new(QuietDispatcher);
+        let app = merged_router(
+            api::router(dispatcher, &GlobalConfig::default()),
+            stub_ui_router(),
+        );
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())?;
+        let response = app.oneshot(request).await?;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await?;
+        Ok((status, body.to_vec()))
+    }
+
+    #[tokio::test]
+    async fn merged_router_keeps_the_rest_json_not_found_envelope() -> TestResult {
+        let (status, body) = merged_probe("/v1/nope").await?;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)?,
+            json!({
+                "error": {
+                    "kind": "not_found",
+                    "message": "no REST route matches this request",
+                    "hint": "check the HTTP method and the /v1 route path"
+                }
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn merged_router_routes_the_ui_prefix_to_its_own_fallback() -> TestResult {
+        let (status, body) = merged_probe("/ui/nope").await?;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(body, b"ui not found");
+
+        let (status, body) = merged_probe("/").await?;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body, b"firestone ui");
+
+        let (status, _) = merged_probe("/v1/version").await?;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn merged_router_sends_a_v1_prefixed_but_unrelated_path_to_the_ui() -> TestResult {
+        // '/v1foo' is not inside the REST namespace, so it belongs to the UI.
+        let (status, body) = merged_probe("/v1foo").await?;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(body, b"ui not found");
+        Ok(())
+    }
+
+    #[test]
+    fn run_refuses_a_token_on_a_unix_listener_before_binding() -> TestResult {
+        use firestone_core::{PathInputs, Paths};
+
+        let directory = tempfile::tempdir()?;
+        let inputs = PathInputs {
+            firestone_home: Some(directory.path().to_path_buf()),
+            ..PathInputs::capture()?
+        };
+        let paths = Paths::from_inputs(&inputs)?;
+        let dispatcher: Arc<dyn Dispatcher> = Arc::new(QuietDispatcher);
+        let token = crate::ui::auth::SessionToken::generate()?;
+        let error = super::run(
+            &paths,
+            super::ServeListener::Unix(paths.serve_socket()),
+            dispatcher,
+            &GlobalConfig::default(),
+            UiAuth::token(token),
+            None,
+        )
+        .expect_err("a Unix socket never takes a session token");
+        assert_eq!(error.kind(), firestone_core::ErrorKind::Usage);
+        assert!(!paths.runtime_dir().exists());
+        Ok(())
+    }
+
+    #[test]
+    fn run_refuses_an_untokened_loopback_listener_before_binding() -> TestResult {
+        use firestone_core::{PathInputs, Paths};
+
+        let directory = tempfile::tempdir()?;
+        let inputs = PathInputs {
+            firestone_home: Some(directory.path().to_path_buf()),
+            ..PathInputs::capture()?
+        };
+        let paths = Paths::from_inputs(&inputs)?;
+        let dispatcher: Arc<dyn Dispatcher> = Arc::new(QuietDispatcher);
+        let error = super::run(
+            &paths,
+            super::ServeListener::Loopback {
+                addr: "127.0.0.1:0".parse()?,
+            },
+            dispatcher,
+            &GlobalConfig::default(),
+            UiAuth::trusted(),
+            None,
+        )
+        .expect_err("a loopback listener is never unauthenticated");
+        assert_eq!(error.kind(), firestone_core::ErrorKind::Usage);
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,0 +1,23 @@
+<div class="fs-tabpanel">
+  <div class="fs-panel fs-panel--clip">
+    <div class="fs-logbar">
+      <span class="fs-panel__title">Generated Cloud Hypervisor config</span>
+      <div class="fs-logbar__spacer"></div>
+      <span class="fs-panel__note">canonical persisted VmConfig · v53 · read-only</span>
+    </div>
+    {% if vmconfig %}
+    <pre class="fs-code">{{ vmconfig }}</pre>
+    {% else %}
+    <div class="fs-empty">
+      <div class="fs-empty__title">No config published yet</div>
+      <div class="fs-empty__body">
+        Firestone writes the canonical VmConfig when the machine first starts.
+        {% if unavailable %}<br><span class="fs-mono">{{ unavailable }}</span>{% endif %}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+  <span class="fs-note fs-note--footer">
+    validated vmm.config_overlay may extend this document · max 51,200 bytes
+  </span>
+</div>

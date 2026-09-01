@@ -1,0 +1,18 @@
+<div class="fs-screen">
+  <div class="fs-page-head">
+    <div>
+      <h1 class="fs-page-head__title">{{ title }}</h1>
+      <div class="fs-page-head__sub">{{ message }}</div>
+    </div>
+    <div class="fs-page-head__actions">
+      <a class="fs-btn fs-btn--primary" href="/" hx-get="/"
+         hx-target="#fs-main-content" hx-push-url="true">Back to overview</a>
+    </div>
+  </div>
+  {% if hint %}
+  <div class="fs-panel">
+    <div class="fs-panel__head"><div class="fs-panel__title">What to try</div></div>
+    <div class="fs-spec__rows"><div class="fs-spec__row"><span class="fs-spec__key">{{ hint }}</span></div></div>
+  </div>
+  {% endif %}
+</div>

@@ -1,0 +1,35 @@
+{% if machines %}
+<div class="fs-palette__group">Machines</div>
+{% for mach in machines %}
+<a class="fs-palette__item" role="option" data-fs-palette-item
+   href="/machines/{{ mach.name | urlencode }}"
+   hx-get="/machines/{{ mach.name | urlencode }}"
+   hx-target="#fs-main-content" hx-push-url="true"
+   data-fs-dialog-close>
+  <span class="fs-dot fs-dot--xs" data-status="{{ mach.status }}"></span>
+  <span>{{ mach.name }}</span>
+  <span class="fs-palette__item-meta">{{ mach.image }}</span>
+</a>
+{% endfor %}
+{% endif %}
+
+{% if images %}
+<div class="fs-palette__group">Images</div>
+{% for image in images %}
+<a class="fs-palette__item" role="option" data-fs-palette-item
+   href="/catalog"
+   hx-get="/catalog"
+   hx-target="#fs-main-content" hx-push-url="true"
+   data-fs-dialog-close>
+  <span class="fs-dot fs-dot--xs" data-status="{{ 'ok' if image.cached else 'idle' }}"></span>
+  <span class="fs-mono">{{ image.reference }}</span>
+  <span class="fs-palette__item-meta">{{ image.note }}</span>
+</a>
+{% endfor %}
+{% endif %}
+
+{% if not machines and not images %}
+<div class="fs-palette__empty">
+  {% if query %}Nothing matches “{{ query }}”{% else %}Type to search machines and images{% endif %}
+</div>
+{% endif %}

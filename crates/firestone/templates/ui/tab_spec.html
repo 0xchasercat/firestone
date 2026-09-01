@@ -1,0 +1,9 @@
+{% import "ui/_macros.html" as m %}
+<div class="fs-tabpanel">
+  <div class="fs-spec-grid">
+    {% for group in machine.spec_groups %}{{ m.spec_group(group) }}{% endfor %}
+  </div>
+  <span class="fs-note fs-note--footer">
+    effective spec · PATCH /v1/machines/{{ machine.name }} layers over global defaults
+  </span>
+</div>

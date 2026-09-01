@@ -1,0 +1,31 @@
+<div class="fs-screen">
+  <div class="fs-page-head">
+    <div>
+      <h1 class="fs-page-head__title">Image catalog</h1>
+      <div class="fs-page-head__sub">Merged built-in + user catalog, independent of the local image cache</div>
+    </div>
+    <div class="fs-page-head__actions" data-fs-notice-slot>
+      <input class="fs-input fs-input--mono fs-input--ref"
+             id="fs-pull-ref"
+             type="text"
+             autocomplete="off"
+             spellcheck="false"
+             placeholder="ubuntu:24.04, https://…, or local path"
+             aria-label="Image reference to pull">
+      <button type="button" class="fs-btn fs-btn--primary" data-fs-pull-input>Pull</button>
+    </div>
+  </div>
+
+  <div class="fs-cards" id="fs-catalog-cards"
+       hx-get="/ui/catalog/cards"
+       hx-trigger="fs:refresh from:body"
+       hx-target="this"
+       hx-swap="morph:innerHTML">
+    {% include "ui/_catalog_cards.html" %}
+  </div>
+
+  <span class="fs-note fs-note--footer">
+    GET /v1/catalog · POST /v1/images/pull streams resolve → download → verify → convert
+  </span>
+</div>
+<div id="fs-dialog-slot"></div>

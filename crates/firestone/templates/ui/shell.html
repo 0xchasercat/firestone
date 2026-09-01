@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>{{ title }} · Firestone</title>
+<link rel="icon" href="/ui/static/logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/ui/static/app.css?v={{ build }}">
+{# Blocking, in head, before first paint: a dark-theme viewer must never see
+   a light flash. Its own file because the CSP forbids inline script. #}
+<script src="/ui/static/theme.js?v={{ build }}"></script>
+<script src="/ui/static/htmx.min.js?v={{ build }}" defer></script>
+{# Registers the htmx "morph" extension. Must follow htmx: it calls
+   htmx.defineExtension at parse time. #}
+<script src="/ui/static/idiomorph-ext.min.js?v={{ build }}" defer></script>
+<script src="/ui/static/app.js?v={{ build }}" defer></script>
+</head>
+<body hx-ext="morph">
+<div class="fs-app">
+  {% include "ui/_sidebar.html" %}
+
+  <div class="fs-frame">
+    <main class="fs-main" id="fs-main">
+      {% include "ui/_topbar.html" %}
+      <div class="fs-content" id="fs-main-content">
+        {{ content }}
+      </div>
+    </main>
+  </div>
+</div>
+
+<div class="fs-toasts" id="fs-toasts" role="status" aria-live="polite" aria-atomic="false"></div>
+
+<dialog class="fs-palette" id="fs-palette" aria-label="Search machines and images">
+  <input class="fs-palette__input"
+         id="fs-palette-input"
+         type="search"
+         autocomplete="off"
+         spellcheck="false"
+         placeholder="Search machines, images…"
+         aria-label="Search machines and images"
+         hx-get="/ui/palette"
+         hx-trigger="load"
+         hx-target="#fs-palette-results"
+         hx-swap="innerHTML">
+  <div class="fs-palette__results" id="fs-palette-results" role="listbox"></div>
+  <div class="fs-palette__foot">
+    <span>↑↓ to move</span><span>↵ to open</span><span>esc to close</span>
+  </div>
+</dialog>
+
+<dialog class="fs-dialog" id="fs-confirm" aria-labelledby="fs-confirm-title">
+  <form method="dialog">
+    <div class="fs-dialog__head">
+      <div class="fs-dialog__title" id="fs-confirm-title">Delete machine</div>
+    </div>
+    <div class="fs-dialog__body">
+      <p>
+        This permanently removes <strong data-fs-confirm-name></strong>, its overlay
+        disk and every file under its machine directory. It cannot be undone.
+      </p>
+      <label class="fs-checkbox">
+        <input type="checkbox" id="fs-confirm-force">
+        <span>Force — stop it first if it is still running</span>
+      </label>
+    </div>
+    <div class="fs-dialog__foot">
+      <button class="fs-btn" value="cancel">Cancel</button>
+      <button class="fs-btn fs-btn--danger" value="confirm">Delete</button>
+    </div>
+  </form>
+</dialog>
+</body>
+</html>

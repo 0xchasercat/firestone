@@ -1,0 +1,43 @@
+{% import "ui/_macros.html" as m %}
+<div class="fs-screen">
+  <div class="fs-page-head">
+    <div>
+      <h1 class="fs-page-head__title">Machines</h1>
+      <div class="fs-page-head__sub">{{ subtitle }}</div>
+    </div>
+    <div class="fs-page-head__actions">
+      <input class="fs-input fs-input--inline" id="fs-machine-filter" type="search" name="q"
+             value="{{ query }}" placeholder="Filter machines…" aria-label="Filter machines"
+             autocomplete="off"
+             hx-get="/ui/machines/rows"
+             hx-trigger="input changed delay:150ms, search"
+             hx-target="#fs-machine-rows"
+             hx-swap="morph:innerHTML">
+      <button type="button" class="fs-btn fs-btn--primary"
+              hx-get="/ui/machines/new" hx-target="#fs-dialog-slot" hx-swap="innerHTML">New machine</button>
+    </div>
+  </div>
+
+  <div class="fs-panel fs-panel--clip fs-table">
+    <div class="fs-table__head" role="row">
+      <span>Name</span><span>Status</span><span>Image</span><span>Resources</span>
+      <span class="fs-cell--forwards">Forwards</span>
+      <span class="fs-cell--uptime">Uptime</span>
+      <span><span class="fs-visually-hidden">Action</span></span>
+    </div>
+    {# Morph, not innerHTML: a five-second replace would destroy hover, focus
+       and any text the user had selected — most visibly on the one row that
+       is mid-transition. #}
+    <div id="fs-machine-rows"
+         hx-get="/ui/machines/rows"
+         hx-trigger="every 5s, fs:refresh from:body"
+         hx-target="this"
+         hx-swap="morph:innerHTML"
+         hx-include="#fs-machine-filter">
+      {% include "ui/_machine_rows.html" %}
+    </div>
+  </div>
+
+  <span class="fs-note fs-note--footer">GET /v1/machines · mutations stream application/x-ndjson</span>
+</div>
+<div id="fs-dialog-slot"></div>

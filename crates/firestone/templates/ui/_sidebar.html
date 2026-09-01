@@ -1,0 +1,43 @@
+<aside class="fs-sidebar">
+  <a class="fs-brand" href="/" hx-get="/" hx-target="#fs-main-content" hx-push-url="true">
+    <span class="fs-brand__mark"><img src="/ui/static/logo.svg" alt="" width="24" height="24"></span>
+    <span>
+      <span class="fs-brand__name">Firestone</span>
+      <span class="fs-brand__meta">v{{ version.version }} · {{ version.architecture }}</span>
+    </span>
+  </a>
+
+  <nav class="fs-nav" id="fs-nav" aria-label="Sections">
+    <a class="fs-nav__item{% if nav == 'overview' %} is-active{% endif %}"
+       href="/" hx-get="/" hx-target="#fs-main-content" hx-push-url="true"
+       {% if nav == 'overview' %}aria-current="page"{% endif %}>
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+           stroke-width="1.5" aria-hidden="true"><rect x="1.5" y="1.5" width="5.4" height="5.4" rx="1.2"></rect><rect x="9.1" y="1.5" width="5.4" height="5.4" rx="1.2"></rect><rect x="1.5" y="9.1" width="5.4" height="5.4" rx="1.2"></rect><rect x="9.1" y="9.1" width="5.4" height="5.4" rx="1.2"></rect></svg>
+      <span class="fs-nav__label">Overview</span>
+    </a>
+    <a class="fs-nav__item{% if nav == 'machines' %} is-active{% endif %}"
+       href="/machines" hx-get="/machines" hx-target="#fs-main-content" hx-push-url="true"
+       {% if nav == 'machines' %}aria-current="page"{% endif %}>
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+           stroke-width="1.5" aria-hidden="true"><rect x="1.5" y="3" width="13" height="10" rx="1.5"></rect><circle cx="4.5" cy="10.2" r="0.9" fill="currentColor" stroke="none"></circle><path d="M1.5 7.5h13"></path></svg>
+      <span class="fs-nav__label">Machines</span>
+      <span class="fs-nav__count" id="fs-nav-count">{{ machine_count }}</span>
+    </a>
+    <a class="fs-nav__item{% if nav == 'catalog' %} is-active{% endif %}"
+       href="/catalog" hx-get="/catalog" hx-target="#fs-main-content" hx-push-url="true"
+       {% if nav == 'catalog' %}aria-current="page"{% endif %}>
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+           stroke-width="1.5" aria-hidden="true"><path d="M8 1.8 14 5 8 8.2 2 5Z"></path><path d="M2 8l6 3.2L14 8"></path><path d="M2 11l6 3.2L14 11"></path></svg>
+      <span class="fs-nav__label">Catalog</span>
+    </a>
+  </nav>
+
+  <div class="fs-sidebar__spacer"></div>
+
+  <div class="fs-sidebar__socket" title="{{ version.paths.runtime }}">{{ listener }}</div>
+
+  <button type="button" class="fs-theme-toggle" data-fs-theme aria-label="Switch colour theme">
+    <span>Theme</span>
+    <span class="fs-theme-toggle__value">auto</span>
+  </button>
+</aside>

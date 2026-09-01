@@ -287,17 +287,37 @@ fn serve_cli_help_and_incompatible_flags_fail_usage_before_binding() -> TestResu
     assert!(help.stderr.is_empty());
     let help_text = String::from_utf8(help.stdout)?;
     assert!(help_text.contains("Usage: firestone serve [OPTIONS]"));
-    assert!(help_text.contains("--listen <unix:PATH>"));
-    assert!(!help_text.contains("--token"));
-    assert!(!help_text.contains("tcp:"));
+    assert!(help_text.contains("--listen <unix:PATH|tcp:HOST:PORT>"));
+    assert!(help_text.contains("--token <FILE>"));
 
+    // SPEC 16.1 reserves exactly `--listen tcp:HOST:PORT --token FILE`, so a
+    // TCP listener without a token file is a usage error before any bind.
     let mut tcp = fixture.command();
     tcp.args(["serve", "--listen", "tcp:127.0.0.1:8080"]);
     let tcp = run_bounded(tcp, COMMAND_TIMEOUT)?;
     assert_eq!(tcp.status.code(), Some(2));
     assert!(tcp.stdout.is_empty());
     assert_clean_text(&tcp.stderr);
+    assert!(String::from_utf8_lossy(&tcp.stderr).contains("--token"));
     assert!(!fixture.home.join("run").exists());
+
+    // A Unix socket is authenticated by its mode 0600, so a token there is a
+    // usage error too, and neither form may name a routable address.
+    let mut unix_token = fixture.command();
+    unix_token.args(["serve", "--token", "/dev/null"]);
+    let unix_token = run_bounded(unix_token, COMMAND_TIMEOUT)?;
+    assert_eq!(unix_token.status.code(), Some(2));
+    assert!(!fixture.home.join("run").exists());
+
+    for address in ["tcp:0.0.0.0:8080", "tcp:[::]:8080", "tcp:192.168.1.10:8080"] {
+        let mut routable = fixture.command();
+        routable.args(["serve", "--listen", address, "--token", "/dev/null"]);
+        let routable = run_bounded(routable, COMMAND_TIMEOUT)?;
+        assert_eq!(routable.status.code(), Some(2), "{address}");
+        assert!(routable.stdout.is_empty(), "{address}");
+        assert_clean_text(&routable.stderr);
+        assert!(!fixture.home.join("run").exists(), "{address}");
+    }
 
     let mut yes = fixture.command();
     yes.args(["--json", "--yes", "serve"]);
@@ -713,5 +733,473 @@ fn serve_conflict_tty_stderr_has_no_progress_or_escape_bytes() -> TestResult {
         String::from_utf8_lossy(&bytes)
     );
     assert!(server.signal(Signal::SIGTERM)?.status.success());
+    Ok(())
+}
+
+/// A `firestone ui` process plus everything its printed URL announced.
+struct UiServer {
+    child: Option<Child>,
+    lines: Vec<String>,
+    port: u16,
+    token: String,
+}
+
+impl UiServer {
+    fn spawn(fixture: &Fixture, globals: &[&str], lines: usize) -> TestResult<Self> {
+        let mut command = fixture.command();
+        command.args(globals).arg("ui").arg("--print-url");
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn()?;
+        let stdout = child.stdout.take().ok_or("ui stdout was not piped")?;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut collected = Vec::new();
+            for _ in 0..lines {
+                let mut line = String::new();
+                if std::io::BufRead::read_line(&mut reader, &mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                collected.push(line);
+            }
+            let _ = sender.send(collected);
+        });
+        let collected = match receiver.recv_timeout(START_TIMEOUT) {
+            Ok(collected) if collected.len() == lines => collected,
+            other => {
+                let _ = child.kill();
+                let mut stderr = String::new();
+                if let Some(mut stream) = child.stderr.take() {
+                    let _ = stream.read_to_string(&mut stderr);
+                }
+                let _ = child.wait();
+                return Err(format!("ui did not announce its URL: {other:?}: {stderr}").into());
+            }
+        };
+        let mut server = Self {
+            child: Some(child),
+            lines: collected,
+            port: 0,
+            token: String::new(),
+        };
+        let url = server.announced_url()?;
+        let (address, token) = url
+            .strip_prefix("http://127.0.0.1:")
+            .and_then(|rest| rest.split_once("/?token="))
+            .ok_or("ui announced an unexpected URL shape")?;
+        server.port = address.parse()?;
+        server.token = token.to_owned();
+        Ok(server)
+    }
+
+    fn announced_url(&self) -> TestResult<String> {
+        let first = self.lines.first().ok_or("ui printed no URL line")?;
+        if let Some(url) = first.trim_end().strip_prefix("Firestone UI   ") {
+            return Ok(url.to_owned());
+        }
+        let record: serde_json::Value = serde_json::from_str(first.trim_end())?;
+        Ok(record["url"]
+            .as_str()
+            .ok_or("ui JSON record has no url field")?
+            .to_owned())
+    }
+
+    fn stop(mut self) -> TestResult<Output> {
+        let child = self.child.as_mut().ok_or("ui process already collected")?;
+        let pid = Pid::from_raw(i32::try_from(child.id())?);
+        kill(pid, Signal::SIGTERM)?;
+        if child.wait_timeout(STOP_TIMEOUT)?.is_none() {
+            child.kill()?;
+            let _ = child.wait();
+            return Err("ui did not exit after SIGTERM".into());
+        }
+        let child = self.child.take().ok_or("ui process already collected")?;
+        Ok(child.wait_with_output()?)
+    }
+}
+
+impl Drop for UiServer {
+    fn drop(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn tcp_raw(port: u16, request: &[u8]) -> TestResult<Vec<u8>> {
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(request)?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    Ok(response)
+}
+
+fn tcp_get(port: u16, path: &str, headers: &[(&str, &str)]) -> TestResult<Vec<u8>> {
+    tcp_request(port, "GET", path, headers, b"")
+}
+
+fn tcp_request(
+    port: u16,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> TestResult<Vec<u8>> {
+    let mut request = format!("{method} {path} HTTP/1.1\r\n");
+    let mut host_supplied = false;
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("host") {
+            host_supplied = true;
+        }
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    if !host_supplied {
+        request.push_str(&format!("Host: 127.0.0.1:{port}\r\n"));
+    }
+    request.push_str(&format!(
+        "Connection: close\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    ));
+    let mut bytes = request.into_bytes();
+    bytes.extend_from_slice(body);
+    tcp_raw(port, &bytes)
+}
+
+fn response_header(response: &[u8], name: &str) -> TestResult<Option<String>> {
+    let end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or("HTTP response has no header terminator")?;
+    let text = std::str::from_utf8(&response[..end])?;
+    for line in text.split("\r\n").skip(1) {
+        if let Some((key, value)) = line.split_once(':') {
+            if key.eq_ignore_ascii_case(name) {
+                return Ok(Some(value.trim().to_owned()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+const EXPECTED_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; \
+form-action 'self'; frame-ancestors 'none'";
+
+#[test]
+fn ui_binds_an_ephemeral_loopback_port_and_announces_a_reachable_url() -> TestResult {
+    let fixture = Fixture::new()?;
+    let server = UiServer::spawn(&fixture, &[], 2)?;
+    assert_ne!(server.port, 0, "the kernel must choose a real port");
+    assert_eq!(server.token.len(), 64);
+    assert!(server.token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert!(server.token.bytes().all(|byte| !byte.is_ascii_uppercase()));
+    assert_eq!(
+        server.lines[0],
+        format!(
+            "Firestone UI   http://127.0.0.1:{}/?token={}\n",
+            server.port, server.token
+        )
+    );
+    assert_eq!(server.lines[1], "Press Ctrl-C to stop.\n");
+
+    let authorization = format!("Bearer {}", server.token);
+    let version = tcp_get(
+        server.port,
+        "/v1/version",
+        &[("Authorization", authorization.as_str())],
+    )?;
+    assert_eq!(response_status(&version)?, 200);
+    assert_eq!(
+        response_json(&version)?["version"],
+        env!("CARGO_PKG_VERSION")
+    );
+
+    // The REST 404 contract is unchanged by the merged UI router.
+    let missing = tcp_get(
+        server.port,
+        "/v1/nope",
+        &[("Authorization", authorization.as_str())],
+    )?;
+    assert_eq!(response_status(&missing)?, 404);
+    assert_eq!(
+        response_header(&missing, "content-type")?.as_deref(),
+        Some("application/json")
+    );
+    assert_eq!(
+        response_json(&missing)?,
+        serde_json::json!({
+            "error": {
+                "kind": "not_found",
+                "message": "no REST route matches this request",
+                "hint": "check the HTTP method and the /v1 route path"
+            }
+        })
+    );
+
+    // Security headers are on the JSON surface and on the UI surface alike.
+    for response in [
+        &version,
+        &tcp_get(
+            server.port,
+            "/",
+            &[("Authorization", authorization.as_str())],
+        )?,
+    ] {
+        assert_eq!(
+            response_header(response, "content-security-policy")?.as_deref(),
+            Some(EXPECTED_CSP)
+        );
+        assert_eq!(
+            response_header(response, "referrer-policy")?.as_deref(),
+            Some("no-referrer")
+        );
+        assert_eq!(
+            response_header(response, "x-content-type-options")?.as_deref(),
+            Some("nosniff")
+        );
+        assert_eq!(
+            response_header(response, "cross-origin-opener-policy")?.as_deref(),
+            Some("same-origin")
+        );
+        assert_eq!(
+            response_header(response, "cross-origin-resource-policy")?.as_deref(),
+            Some("same-origin")
+        );
+    }
+
+    let output = server.stop()?;
+    assert!(output.status.success());
+    Ok(())
+}
+
+#[test]
+fn ui_loopback_transport_refuses_every_unauthenticated_or_rebound_request() -> TestResult {
+    let fixture = Fixture::new()?;
+    let server = UiServer::spawn(&fixture, &[], 2)?;
+    let port = server.port;
+    let token = server.token.clone();
+
+    let absent = tcp_get(port, "/v1/version", &[])?;
+    assert_eq!(response_status(&absent)?, 401);
+    assert_eq!(response_json(&absent)?["error"]["kind"], "usage");
+    assert_eq!(response_header(&absent, "www-authenticate")?, None);
+
+    let mut flipped = token.clone();
+    let last = flipped.pop().ok_or("token was empty")?;
+    flipped.push(if last == '0' { '1' } else { '0' });
+    for wrong in [flipped.as_str(), &"0".repeat(64), "short"] {
+        let response = tcp_get(
+            port,
+            "/v1/version",
+            &[("Authorization", &format!("Bearer {wrong}"))],
+        )?;
+        assert_eq!(response_status(&response)?, 401, "{wrong}");
+        assert!(
+            !String::from_utf8_lossy(&response).contains(&token),
+            "an error response must never echo the real token"
+        );
+    }
+
+    // DNS rebinding: the attacker's name resolves to 127.0.0.1 but the Host
+    // header still names the attacker.
+    for host in [
+        format!("evil.example.com:{port}"),
+        format!("firestone.attacker.test:{port}"),
+    ] {
+        let response = tcp_get(
+            port,
+            "/v1/version",
+            &[
+                ("Host", host.as_str()),
+                ("Authorization", &format!("Bearer {token}")),
+            ],
+        )?;
+        assert_eq!(response_status(&response)?, 403, "{host}");
+        assert_eq!(response_json(&response)?["error"]["kind"], "usage");
+    }
+
+    // A cookie is accepted wherever it appears in the header.
+    let cookie = format!("theme=dark; firestone_session={token}; consent=1");
+    let response = tcp_get(port, "/v1/version", &[("Cookie", cookie.as_str())])?;
+    assert_eq!(response_status(&response)?, 200);
+
+    // The bootstrap moves the token out of the URL bar.
+    let bootstrap = tcp_get(port, &format!("/?token={token}"), &[])?;
+    assert_eq!(response_status(&bootstrap)?, 303);
+    assert_eq!(
+        response_header(&bootstrap, "location")?.as_deref(),
+        Some("/")
+    );
+    assert_eq!(
+        response_header(&bootstrap, "set-cookie")?.as_deref(),
+        Some(
+            format!("firestone_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400")
+                .as_str()
+        )
+    );
+    let wrong_bootstrap = tcp_get(port, &format!("/?token={}", "0".repeat(64)), &[])?;
+    assert_eq!(response_status(&wrong_bootstrap)?, 401);
+    assert_eq!(response_header(&wrong_bootstrap, "set-cookie")?, None);
+
+    // Cross-origin mutation defense.
+    let cross = tcp_request(
+        port,
+        "POST",
+        "/v1/machines",
+        &[
+            ("Authorization", &format!("Bearer {token}")),
+            ("Sec-Fetch-Site", "cross-site"),
+            ("Content-Type", "application/json"),
+        ],
+        br#"{"name":"demo","spec":{"image":"ubuntu:24.04"}}"#,
+    )?;
+    assert_eq!(response_status(&cross)?, 403);
+
+    let foreign = tcp_request(
+        port,
+        "POST",
+        "/v1/machines",
+        &[
+            ("Authorization", &format!("Bearer {token}")),
+            ("Origin", "http://evil.example.com"),
+            ("Content-Type", "application/json"),
+        ],
+        br#"{"name":"demo","spec":{"image":"ubuntu:24.04"}}"#,
+    )?;
+    assert_eq!(response_status(&foreign)?, 403);
+
+    let same_origin = tcp_request(
+        port,
+        "POST",
+        "/v1/machines",
+        &[
+            ("Authorization", &format!("Bearer {token}")),
+            ("Sec-Fetch-Site", "same-origin"),
+            ("Content-Type", "application/json"),
+        ],
+        br#"{"name":"demo","spec":{"image":"ubuntu:24.04"}}"#,
+    )?;
+    assert_eq!(response_status(&same_origin)?, 201);
+
+    assert!(server.stop()?.status.success());
+    Ok(())
+}
+
+#[test]
+fn ui_json_mode_announces_one_machine_readable_record() -> TestResult {
+    let fixture = Fixture::new()?;
+    // The human form is two lines; the JSON form is exactly one record.
+    let server = UiServer::spawn(&fixture, &["--json"], 1)?;
+    let record: serde_json::Value = serde_json::from_str(server.lines[0].trim_end())?;
+    assert_eq!(
+        record,
+        serde_json::json!({
+            "url": format!("http://127.0.0.1:{}/?token={}", server.port, server.token),
+            "address": format!("127.0.0.1:{}", server.port),
+            "port": server.port,
+        })
+    );
+    assert!(server.stop()?.status.success());
+    Ok(())
+}
+
+#[test]
+fn ui_rejects_the_global_yes_flag_before_binding() -> TestResult {
+    let fixture = Fixture::new()?;
+    let mut yes = fixture.command();
+    yes.args(["--json", "--yes", "ui", "--print-url"]);
+    let yes = run_bounded(yes, COMMAND_TIMEOUT)?;
+    assert_eq!(yes.status.code(), Some(2));
+    assert!(yes.stderr.is_empty());
+    assert_clean_text(&yes.stdout);
+    let error: serde_json::Value = serde_json::from_slice(&yes.stdout)?;
+    assert_eq!(error["error"]["kind"], "usage");
+    assert_eq!(
+        error["error"]["message"],
+        "--yes is not valid with firestone ui"
+    );
+    Ok(())
+}
+
+fn free_loopback_port() -> TestResult<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
+}
+
+fn wait_for_tcp(port: u16, token: &str, timeout: Duration) -> TestResult<Vec<u8>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(response) = tcp_get(
+            port,
+            "/v1/machines",
+            &[("Authorization", &format!("Bearer {token}"))],
+        ) {
+            if response_status(&response).ok() == Some(200) {
+                return Ok(response);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err("serve did not answer on loopback before the deadline".into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn serve_reserved_tcp_form_creates_a_private_token_file_and_gates_requests() -> TestResult {
+    let fixture = Fixture::new()?;
+    let port = free_loopback_port()?;
+    let token_file = fixture.home.join("serve.token");
+    let listen = format!("tcp:127.0.0.1:{port}");
+    let mut command = fixture.command();
+    command
+        .args(["serve", "--listen", &listen, "--token"])
+        .arg(&token_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+
+    wait_for_file(&token_file, START_TIMEOUT)?;
+    let metadata = fs::symlink_metadata(&token_file)?;
+    assert_eq!(metadata.mode() & 0o7777, 0o600);
+    assert_eq!(metadata.uid(), getuid().as_raw());
+    let token = fs::read_to_string(&token_file)?.trim().to_owned();
+    assert_eq!(token.len(), 64);
+    assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+    wait_for_tcp(port, &token, START_TIMEOUT)?;
+
+    let absent = tcp_get(port, "/v1/machines", &[])?;
+    assert_eq!(response_status(&absent)?, 401);
+
+    // The published Unix socket is untouched by a TCP listener.
+    assert!(!fixture.socket.exists());
+
+    kill(Pid::from_raw(i32::try_from(child.id())?), Signal::SIGTERM)?;
+    let status = child
+        .wait_timeout(STOP_TIMEOUT)?
+        .ok_or("serve did not exit after SIGTERM")?;
+    assert!(status.success());
+    let output = child.wait_with_output()?;
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains(&token),
+        "the token must never be printed"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains(&token),
+        "the token must never be logged"
+    );
     Ok(())
 }

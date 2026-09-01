@@ -3,12 +3,14 @@ mod cli;
 mod render;
 mod serve;
 mod store;
+mod ui;
 
 use std::{
     env,
     ffi::{OsStr, OsString},
     fs, io,
     io::{IsTerminal, Write as _},
+    net::SocketAddr,
     os::unix::process::ExitStatusExt,
     path::Path,
     process::ExitCode,
@@ -32,11 +34,13 @@ use firestone_core::{
 
 use crate::{
     cli::{
-        Cli, Command, CreateDraft, CreateRequest, ImageCommand, RunArgs, ShellArgs,
-        derive_machine_name, parse_hidden_vsock_proxy,
+        Cli, Command, CreateDraft, CreateRequest, ImageCommand, ListenAddress, RunArgs, ShellArgs,
+        UiArgs, derive_machine_name, parse_hidden_vsock_proxy,
     },
     render::{RenderOptions, Renderer, error_exit_code},
+    serve::{BoundListener, ServeListener},
     store::LocalDispatcher,
+    ui::auth::{SessionToken, UiAuth, load_or_create_token_file},
 };
 
 fn main() -> ExitCode {
@@ -94,7 +98,7 @@ fn main() -> ExitCode {
         return run_completions(cli);
     }
 
-    let allow_live_progress = !matches!(&cli.command, Command::Serve(_));
+    let allow_live_progress = !matches!(&cli.command, Command::Serve(_) | Command::Ui(_));
     let options = render_options(
         cli.json,
         cli.quiet,
@@ -651,17 +655,153 @@ where
                 )
                 .with_hint("remove --yes; serve never prompts"));
             }
+            let (listener, auth) = resolve_serve_transport(&paths, &arguments)?;
             let (global, catalog) = load_user_configuration(&paths)?;
             let dispatcher = LocalDispatcher::new(paths.clone(), global.clone(), catalog)
                 .with_source_base(source_base);
-            let socket = match arguments.listen {
-                Some(path) if path.is_absolute() => path,
-                Some(path) => paths.runtime_dir().join(path),
-                None => paths.serve_socket(),
-            };
-            serve::run(&paths, &socket, Arc::new(dispatcher), &global)
+            serve::run(&paths, listener, Arc::new(dispatcher), &global, auth, None)
+        }
+        Command::Ui(arguments) => {
+            if yes {
+                return Err(FirestoneError::new(
+                    ErrorKind::Usage,
+                    "--yes is not valid with firestone ui",
+                )
+                .with_hint("remove --yes; ui never prompts"));
+            }
+            run_ui_command(arguments, paths, source_base, json)
         }
     }
+}
+
+/// Resolves `firestone serve --listen/--token` into a transport and its gate.
+///
+/// `--token` is required for a TCP listener and refused for a Unix one, so an
+/// unauthenticated TCP listener cannot be spelled at all.
+fn resolve_serve_transport(
+    paths: &Paths,
+    arguments: &cli::ServeArgs,
+) -> Result<(ServeListener, UiAuth), FirestoneError> {
+    match &arguments.listen {
+        Some(ListenAddress::Tcp(address)) => {
+            let Some(file) = arguments.token.as_deref() else {
+                return Err(FirestoneError::new(
+                    ErrorKind::Usage,
+                    "a tcp: listener requires --token FILE",
+                )
+                .with_hint("pass --token FILE, or omit --listen for the private Unix socket"));
+            };
+            let token = load_or_create_token_file(file, paths.uid())?;
+            Ok((
+                ServeListener::Loopback { addr: *address },
+                UiAuth::token(token),
+            ))
+        }
+        listen => {
+            if arguments.token.is_some() {
+                return Err(FirestoneError::new(
+                    ErrorKind::Usage,
+                    "--token is only valid with a tcp: listener",
+                )
+                .with_hint("a Unix socket is authenticated by its mode 0600; remove --token"));
+            }
+            let socket = match listen {
+                Some(ListenAddress::Unix(path)) if path.is_absolute() => path.clone(),
+                Some(ListenAddress::Unix(path)) => paths.runtime_dir().join(path),
+                _ => paths.serve_socket(),
+            };
+            Ok((ServeListener::Unix(socket), UiAuth::trusted()))
+        }
+    }
+}
+
+/// Serves the web interface on loopback with a per-invocation session token.
+///
+/// The token is generated fresh for every invocation and never written to
+/// disk: a secret that dies with the process cannot be replayed later.
+fn run_ui_command(
+    arguments: UiArgs,
+    paths: Paths,
+    source_base: std::path::PathBuf,
+    json: bool,
+) -> Result<(), FirestoneError> {
+    let (global, catalog) = load_user_configuration(&paths)?;
+    let dispatcher =
+        LocalDispatcher::new(paths.clone(), global.clone(), catalog).with_source_base(source_base);
+    let token = SessionToken::generate()?;
+    let secret = token.to_hex();
+    let address = SocketAddr::from(([127, 0, 0, 1], arguments.port));
+    let open_browser = !arguments.no_open && !arguments.print_url;
+
+    let mut ready = |bound: &BoundListener| -> Result<(), FirestoneError> {
+        let BoundListener::Loopback(address) = bound else {
+            return Err(FirestoneError::new(
+                ErrorKind::Generic,
+                "firestone ui bound a listener that is not a loopback address",
+            )
+            .with_hint("report a Firestone bug"));
+        };
+        let url = format!("http://127.0.0.1:{}/?token={secret}", address.port());
+        announce_ui(&url, *address, json)?;
+        if open_browser {
+            open_in_browser(&url);
+        }
+        Ok(())
+    };
+
+    serve::run(
+        &paths,
+        ServeListener::Loopback { addr: address },
+        Arc::new(dispatcher),
+        &global,
+        UiAuth::token(token),
+        Some(&mut ready),
+    )
+}
+
+/// Writes the reachable URL to stdout exactly once, after the bind succeeded.
+fn announce_ui(url: &str, address: SocketAddr, json: bool) -> Result<(), FirestoneError> {
+    let mut stdout = io::stdout();
+    let line = if json {
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "url": url,
+                "address": address.to_string(),
+                "port": address.port(),
+            })
+        )
+    } else {
+        format!("Firestone UI   {url}\nPress Ctrl-C to stop.\n")
+    };
+    stdout
+        .write_all(line.as_bytes())
+        .and_then(|()| stdout.flush())
+        .map_err(|source| {
+            FirestoneError::new(ErrorKind::Generic, "cannot write the Firestone UI address")
+                .with_hint("redirect stdout to a writable stream")
+                .with_source(source)
+        })
+}
+
+/// Opens the UI in the user's browser through the shared process wrapper.
+///
+/// The URL carries the session token, so it is passed as a secret argument and
+/// never reaches a process log. A failure here is never fatal: the URL has
+/// already been printed and the server is about to accept connections.
+fn open_in_browser(url: &str) {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = firestone_core::Cmd::new(opener)
+        .secret_arg(url)
+        .reduced_environment()
+        .stdin_null()
+        .timeout(Duration::from_secs(10))
+        .error_kind(ErrorKind::Dependency)
+        .run();
 }
 
 struct WithoutResults<'a> {

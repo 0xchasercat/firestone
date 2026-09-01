@@ -547,8 +547,27 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (serve)
 _arguments "${_arguments_options[@]}" : \
-'--listen=[Listen at a Unix socket inside Firestone'\''s private runtime directory]:unix:PATH:_files' \
+'--listen=[Listen at a private Unix socket, or at a loopback TCP address]:unix:PATH|tcp:HOST:PORT:_default' \
+'--token=[File holding the 64-hexadecimal-character session token. TCP only]:FILE:_files' \
 '--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(ui)
+_arguments "${_arguments_options[@]}" : \
+'--port=[Loopback port to bind. Zero asks the kernel for any free port]:PORT:_default' \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--no-open[Do not launch a browser; print the URL only]' \
+'--print-url[Print the URL and never launch a browser. Implies --no-open]' \
 '--json[Print events as newline-delimited JSON and disable human output]' \
 '-q[Print only errors and command results]' \
 '--quiet[Print only errors and command results]' \
@@ -681,6 +700,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(ui)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -717,7 +740,8 @@ _firestone_commands() {
 'doctor:Check host requirements and optional safe repairs' \
 'completions:Generate a shell completion script on stdout' \
 'version:Print Firestone, pinned dependency, and resolved path versions' \
-'serve:Run the stateless REST API over a private Unix socket' \
+'serve:Run the stateless REST API over a private Unix socket or loopback port' \
+'ui:Open the Firestone web interface on a loopback port' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'firestone commands' commands "$@"
@@ -773,7 +797,8 @@ _firestone__subcmd__help_commands() {
 'doctor:Check host requirements and optional safe repairs' \
 'completions:Generate a shell completion script on stdout' \
 'version:Print Firestone, pinned dependency, and resolved path versions' \
-'serve:Run the stateless REST API over a private Unix socket' \
+'serve:Run the stateless REST API over a private Unix socket or loopback port' \
+'ui:Open the Firestone web interface on a loopback port' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'firestone help commands' commands "$@"
@@ -903,6 +928,11 @@ _firestone__subcmd__help__subcmd__start_commands() {
 _firestone__subcmd__help__subcmd__stop_commands() {
     local commands; commands=()
     _describe -t commands 'firestone help stop commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__ui_commands] )) ||
+_firestone__subcmd__help__subcmd__ui_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help ui commands' commands "$@"
 }
 (( $+functions[_firestone__subcmd__help__subcmd__version_commands] )) ||
 _firestone__subcmd__help__subcmd__version_commands() {
@@ -1042,6 +1072,11 @@ _firestone__subcmd__start_commands() {
 _firestone__subcmd__stop_commands() {
     local commands; commands=()
     _describe -t commands 'firestone stop commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__ui_commands] )) ||
+_firestone__subcmd__ui_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone ui commands' commands "$@"
 }
 (( $+functions[_firestone__subcmd__version_commands] )) ||
 _firestone__subcmd__version_commands() {

@@ -1,0 +1,37 @@
+{% import "ui/_macros.html" as m %}
+<div class="fs-screen">
+  <div class="fs-crumbs">
+    <a href="/machines" hx-get="/machines" hx-target="#fs-main-content" hx-push-url="true">Machines</a>
+    <span class="fs-crumbs__sep">/</span>
+    <span class="fs-crumbs__current">{{ machine.name }}</span>
+  </div>
+
+  {# Head and meta are one live region. The stream drawer deliberately sits
+     outside it: a poll must never wipe records the user is watching arrive. #}
+  <div id="fs-detail-live"
+       hx-get="/ui/machines/{{ machine.name | urlencode }}/head"
+       hx-trigger="every 5s, fs:refresh from:body"
+       hx-target="this"
+       hx-swap="morph:innerHTML">
+    {% include "ui/_detail_head.html" %}
+  </div>
+
+  <div data-fs-stream-host="{{ machine.name }}"></div>
+
+  <div class="fs-tabs" role="tablist">
+    {% for t in tabs %}
+    <a class="fs-tab{% if t.active %} is-active{% endif %}"
+       role="tab" aria-selected="{{ 'true' if t.active else 'false' }}"
+       href="{{ t.href }}"
+       hx-get="{{ t.fragment }}"
+       hx-target="#fs-tabpanel"
+       hx-swap="innerHTML"
+       hx-push-url="{{ t.href }}">{{ t.label }}</a>
+    {% endfor %}
+  </div>
+
+  <div id="fs-tabpanel" role="tabpanel">
+    {% include tab_template %}
+  </div>
+</div>
+<div id="fs-dialog-slot"></div>

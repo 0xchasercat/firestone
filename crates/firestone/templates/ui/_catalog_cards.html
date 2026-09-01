@@ -1,0 +1,31 @@
+{% for e in entries %}
+<div class="fs-card" data-fs-card data-fs-notice-slot>
+  <div class="fs-card__head">
+    <span class="fs-card__ref" title="{{ e.reference }}">{{ e.reference }}</span>
+    <span class="fs-card__spacer"></span>
+    {% if e.cached %}
+    <span class="fs-cached" title="{{ e.cached_id }}">
+      <span class="fs-dot fs-dot--sm"></span>
+      <span>{{ e.size }}</span>
+    </span>
+    {% else %}
+    <button type="button" class="fs-btn fs-btn--sm"
+            data-fs-pull="{{ e.reference }}">Pull</button>
+    {% endif %}
+  </div>
+  <div class="fs-chips">
+    {% for chip in e.chips %}<span class="fs-tagchip">{{ chip }}</span>{% endfor %}
+  </div>
+  {% if e.cached %}
+  <div class="fs-card__source" title="{{ e.cached_id }}">{{ e.cached_id }}</div>
+  {% endif %}
+</div>
+{% else %}
+<div class="fs-empty">
+  <div class="fs-empty__title">The catalog is empty</div>
+  <div class="fs-empty__body">
+    Firestone ships a built-in catalog. If this is empty, a user catalog at
+    <span class="fs-mono">~/.config/firestone/images.toml</span> may be overriding it.
+  </div>
+</div>
+{% endfor %}

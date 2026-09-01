@@ -1,0 +1,67 @@
+{#
+  Shared fragments. Status colour is never emitted by the server: every
+  variant is expressed as a data-status attribute and resolved in app.css,
+  which is what lets the served Content-Security-Policy forbid inline styles.
+#}
+
+{% macro status(value, pill) -%}
+<span class="fs-status{% if pill %} fs-status--pill{% endif %}" data-status="{{ value }}">
+  <span class="fs-dot"></span>
+  <span class="fs-status__text">{{ value }}</span>
+</span>
+{%- endmacro %}
+
+{% macro machine_row(m) -%}
+<div class="fs-row" data-fs-row="{{ m.name }}" data-fs-notice-slot>
+  <span class="fs-cell fs-cell--name">
+    <a class="fs-row__link"
+       data-fs-row-link
+       href="/machines/{{ m.name | urlencode }}"
+       hx-get="/machines/{{ m.name | urlencode }}"
+       hx-target="#fs-main-content"
+       hx-push-url="true">{{ m.name }}</a>
+  </span>
+  {{ status(m.status, false) }}
+  <span class="fs-cell fs-cell--mono fs-cell--muted" title="{{ m.image }}">{{ m.image }}</span>
+  <span class="fs-cell fs-cell--mono">{{ m.resources }}</span>
+  <span class="fs-cell fs-cell--mono fs-cell--muted fs-cell--small fs-cell--forwards"
+        title="{{ m.forwards_text }}">{{ m.forwards_text }}</span>
+  <span class="fs-cell fs-cell--mono fs-cell--muted fs-cell--uptime">{{ m.uptime }}</span>
+  {% if m.action %}
+  <button type="button"
+          class="fs-btn fs-btn--sm fs-btn--row"
+          data-fs-action="{{ m.action }}"
+          data-fs-machine="{{ m.name }}">{{ m.action_label }}</button>
+  {% else %}
+  <span class="fs-cell fs-cell--mono fs-cell--muted">···</span>
+  {% endif %}
+</div>
+{%- endmacro %}
+
+{% macro stat(s) -%}
+<div class="fs-stat">
+  <div class="fs-stat__head">
+    <span class="fs-stat__icon" aria-hidden="true">
+      <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+           stroke-width="1.4" stroke-linejoin="round"><path d="{{ s.icon }}"></path></svg>
+    </span>
+    <span class="fs-stat__label">{{ s.label }}</span>
+  </div>
+  <div class="fs-stat__value">{{ s.value }}</div>
+  <div class="fs-stat__sub">{{ s.sub }}</div>
+</div>
+{%- endmacro %}
+
+{% macro spec_group(group) -%}
+<div class="fs-panel">
+  <div class="fs-spec__title">{{ group.title }}</div>
+  <div class="fs-spec__rows">
+    {% for row in group.rows %}
+    <div class="fs-spec__row">
+      <span class="fs-spec__key">{{ row.key }}</span>
+      <span class="fs-spec__value">{{ row.value }}</span>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{%- endmacro %}

@@ -79,7 +79,7 @@ class FinalLinuxMvpGateTests(unittest.TestCase):
                         "--expected-commit",
                         "1" * 40,
                         "--release-artifact",
-                        "/tmp/firestone-v0.1.0-x86_64-unknown-linux-musl",
+                        f"/tmp/{GATE.release_artifact_name('0.1.0')}",
                         "--evidence-dir",
                         "/tmp/firestone-evidence",
                     ]
@@ -174,6 +174,65 @@ class FinalLinuxMvpGateTests(unittest.TestCase):
             )
             self.assertEqual(stat.S_IMODE(snapshot.stat().st_mode), 0o700)
 
+    def test_release_pins_must_agree_with_the_declared_version(self) -> None:
+        """The version is an input, so its consequences are checked, not pinned.
+
+        This is the drift that a literal pin cannot catch: bump the version and
+        a hardcoded expectation is simply wrong, while a stale versions.env
+        would let the reproducible build verify inputs it is not using.
+        """
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+            check=True,
+        ).stdout.strip()
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary) / "work"
+            work.mkdir(mode=0o700)
+            snapshot = GATE.prepare_repository_snapshot(work, head)
+
+            pins = GATE.validate_pins(snapshot)
+            version = GATE.resolve_release_version(snapshot)
+            self.assertEqual(pins["version"], version)
+            self.assertEqual(pins["release_inputs"]["FIRESTONE_VERSION"], version)
+            self.assertEqual(
+                pins["release_inputs"]["CARGO_LOCK_SHA256"],
+                GATE.sha256_regular(snapshot / "Cargo.lock"),
+            )
+            self.assertEqual(
+                GATE.release_artifact_name(version),
+                f"firestone-v{version}-x86_64-unknown-linux-musl",
+            )
+
+            versions_env = snapshot / "build/firestone/versions.env"
+            original = versions_env.read_text(encoding="utf-8")
+
+            versions_env.write_text(
+                original.replace(
+                    f"FIRESTONE_VERSION={version}", "FIRESTONE_VERSION=9.9.9"
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(GATE.GateError, "FIRESTONE_VERSION"):
+                GATE.validate_pins(snapshot)
+
+            lock_sha = GATE.sha256_regular(snapshot / "Cargo.lock")
+            versions_env.write_text(
+                original.replace(
+                    f"CARGO_LOCK_SHA256={lock_sha}", f"CARGO_LOCK_SHA256={'0' * 64}"
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(GATE.GateError, "CARGO_LOCK_SHA256"):
+                GATE.validate_pins(snapshot)
+
+            versions_env.write_text(original, encoding="utf-8")
+            self.assertEqual(GATE.validate_pins(snapshot)["version"], version)
+
     def test_checkpoint_contains_only_private_manifests_and_checksums(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             evidence = Path(temporary) / "evidence"
@@ -198,7 +257,12 @@ class FinalLinuxMvpGateTests(unittest.TestCase):
             "commit": commit,
             "gate_source": {"path": GATE.__file__, "sha256": "3" * 64},
         }
-        release = {"name": GATE.RELEASE_ARTIFACT_NAME, "sha256": release_sha}
+        release = {
+            "name": GATE.release_artifact_name(
+                GATE.resolve_release_version(REPO_ROOT)
+            ),
+            "sha256": release_sha,
+        }
         pins = {"files": {"deps.toml": GATE.EXPECTED_FILE_HASHES["deps.toml"]}}
         host = {"system": "Linux", "architecture": "x86_64"}
 

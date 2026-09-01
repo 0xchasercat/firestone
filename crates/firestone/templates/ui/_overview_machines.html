@@ -1,0 +1,20 @@
+{% for mach in machines %}
+<a class="fs-minirow" href="/machines/{{ mach.name | urlencode }}"
+   hx-get="/machines/{{ mach.name | urlencode }}"
+   hx-target="#fs-main-content" hx-push-url="true">
+  <span class="fs-dot fs-dot--xs" data-status="{{ mach.status }}"></span>
+  <span class="fs-minirow__name">{{ mach.name }}</span>
+  <span class="fs-minirow__image">{{ mach.image }}</span>
+  <span class="fs-minirow__note">{{ mach.note }}</span>
+</a>
+{% else %}
+<div class="fs-empty">
+  <div class="fs-empty__title">No machines yet</div>
+  <div class="fs-empty__body">
+    A machine is a spec plus its reconciled state. Create one and Firestone
+    resolves the image, builds a cloud-init seed and supervises the VMM.
+  </div>
+  <button type="button" class="fs-btn fs-btn--primary"
+          hx-get="/ui/machines/new" hx-target="#fs-dialog-slot" hx-swap="innerHTML">New machine</button>
+</div>
+{% endfor %}

@@ -2436,7 +2436,12 @@ esac
         let result = serde_json::from_value::<VersionResult>(payload.clone())?;
         let architecture = Arch::current().map_err(std::io::Error::other)?;
         assert_eq!(result.version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(result.identity.release, "v0.1.0");
+        // Derived, not pinned: the release workflow bumps the workspace
+        // version, and a literal here is wrong the moment it does.
+        assert_eq!(
+            result.identity.release,
+            format!("v{}", env!("CARGO_PKG_VERSION"))
+        );
         assert_eq!(
             result.identity.git_commit.as_deref(),
             option_env!("FIRESTONE_GIT_COMMIT")

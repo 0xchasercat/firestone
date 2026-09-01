@@ -1,0 +1,39 @@
+<div class="fs-tabpanel">
+  <div class="fs-panel fs-panel--clip">
+    <div class="fs-logbar">
+      {% for s in sources %}
+      <a class="fs-chip{% if s.active %} is-active{% endif %}"
+         href="{{ s.href }}"
+         hx-get="{{ s.fragment }}"
+         hx-target="#fs-tabpanel"
+         hx-swap="innerHTML"
+         hx-push-url="{{ s.href }}">{{ s.label }}</a>
+      {% endfor %}
+      <div class="fs-logbar__spacer"></div>
+      {# Following is only meaningful while there is a live writer. #}
+      <button type="button"
+              class="fs-follow{% if follow %} is-on{% endif %}"
+              data-fs-follow-toggle
+              aria-pressed="{{ 'true' if follow else 'false' }}"
+              {% if not can_follow %}disabled title="the machine is not running"{% endif %}>
+        <span class="fs-follow__dot"></span>
+        <span data-fs-follow-label>{{ 'following' if follow else 'follow off' }}</span>
+      </button>
+    </div>
+
+    {# Sanitized text/plain from the API: newlines preserved, every other
+       control character already replaced with U+FFFD. Inserted as text. #}
+    <pre class="fs-logview"
+         data-fs-logview
+         data-fs-machine="{{ machine.name }}"
+         data-fs-source="{{ source }}"
+         data-fs-follow="{{ 'true' if follow else 'false' }}"
+         tabindex="0"
+         aria-label="{{ source }} log for {{ machine.name }}">{{ logs }}</pre>
+
+    <div class="fs-panel__foot">
+      GET /v1/machines/{{ machine.name }}/logs?source={{ source }}&amp;follow={{ 'true' if follow else 'false' }}
+      · text/plain · control chars → U+FFFD
+    </div>
+  </div>
+</div>

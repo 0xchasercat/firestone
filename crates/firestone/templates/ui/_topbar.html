@@ -1,0 +1,19 @@
+<div class="fs-topbar">
+  <button type="button" class="fs-search" aria-label="Search machines and images (press ⌘K)">
+    <svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor"
+         stroke-width="1.5" aria-hidden="true"><circle cx="6" cy="6" r="4.4"></circle><path d="m9.4 9.4 3 3"></path></svg>
+    <span class="fs-search__label">Search machines, images…</span>
+    <span class="fs-kbd">⌘K</span>
+  </button>
+
+  {# The host pill keeps itself current on a slow cadence. Doctor runs real
+     host checks, so the report behind both this and the Overview panel is
+     served from one short-lived cache rather than re-probed per request. #}
+  <a class="fs-hostpill" id="fs-hostpill"
+     href="/" hx-get="/" hx-target="#fs-main-content" hx-push-url="true">
+    <span class="fs-hostpill__inner"
+          hx-get="/ui/host" hx-trigger="every 30s" hx-swap="innerHTML" hx-target="this">
+      {% include "ui/_hostpill.html" %}
+    </span>
+  </a>
+</div>

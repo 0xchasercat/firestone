@@ -1,0 +1,107 @@
+# Third-party web assets vendored under crates/firestone/assets/ui/ and compiled
+# into the executable. Firestone ships one file and the UI fetches nothing from a
+# CDN at runtime, so every vendored byte is pinned here and hash-checked by
+# crates/firestone/tests/release.rs.
+#
+# These pins do not belong in deps.toml: scripts/pin-deps.sh regenerates that
+# manifest byte-for-byte from a fixed template and compares the result with cmp,
+# so anything added there fails verification and is dropped by the next refresh.
+#
+# Web assets are architecture-independent, so each entry pins exactly one file
+# instead of the per-architecture subtables deps.toml uses.
+#
+# Every entry carries: origin, path, sha256, license.
+#   origin = "fetched"   also carries version, url, release_url, and the exact
+#                        upstream bytes are reachable at url.
+#   origin = "derived"   also carries derived_from and note, and is produced from
+#                        another Firestone asset rather than downloaded.
+#
+# The set of entries must equal the files present under crates/firestone/assets/ui/
+# minus the first-party sources Firestone authors itself: app.css, app.js, theme.js.
+# Vendoring a new third-party file without pinning it here fails the test suite,
+# and so does a pin whose file was deleted.
+#
+# Hashes are the SHA-256 of the file at path, lowercase hex, and were confirmed
+# against a fresh download from url on 2026-09-01.
+manifest_version = 1
+
+[asset.htmx]
+origin = "fetched"
+version = "2.0.10"
+release_url = "https://github.com/bigskysoftware/htmx/releases/tag/v2.0.10"
+url = "https://cdnjs.cloudflare.com/ajax/libs/htmx/2.0.10/htmx.min.js"
+path = "crates/firestone/assets/ui/htmx.min.js"
+sha256 = "71ea67185bfa8c98c39d31717c6fce5d852370fcdfd129db4543774d3145c0de"
+license = "0BSD"
+
+# The ext build bundles the Idiomorph core and registers the htmx "morph"
+# extension, so no separate idiomorph.min.js is vendored.
+[asset.idiomorph-ext]
+origin = "fetched"
+version = "0.7.4"
+release_url = "https://github.com/bigskysoftware/idiomorph/releases/tag/v0.7.4"
+url = "https://cdn.jsdelivr.net/npm/idiomorph@0.7.4/dist/idiomorph-ext.min.js"
+path = "crates/firestone/assets/ui/idiomorph-ext.min.js"
+sha256 = "a6437e55b1b6a07bc421f0d230266a39399b6826c6ed19e0ed9c63b707444a5f"
+license = "0BSD"
+
+[asset.ibm-plex-sans-400]
+origin = "fetched"
+version = "5.3.0"
+release_url = "https://www.npmjs.com/package/@fontsource/ibm-plex-sans/v/5.3.0"
+url = "https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-sans@5.3.0/files/ibm-plex-sans-latin-400-normal.woff2"
+path = "crates/firestone/assets/ui/fonts/ibm-plex-sans-latin-400.woff2"
+sha256 = "3b646991d30055a93a4ecc499713d4347953a74a947ecab435ab72070cbdab0e"
+license = "OFL-1.1"
+subset = "latin"
+
+[asset.ibm-plex-sans-500]
+origin = "fetched"
+version = "5.3.0"
+release_url = "https://www.npmjs.com/package/@fontsource/ibm-plex-sans/v/5.3.0"
+url = "https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-sans@5.3.0/files/ibm-plex-sans-latin-500-normal.woff2"
+path = "crates/firestone/assets/ui/fonts/ibm-plex-sans-latin-500.woff2"
+sha256 = "0717336fb31fcdcde4b8deb3675bb4a0f7f6d484864afcd6751ac29975962203"
+license = "OFL-1.1"
+subset = "latin"
+
+[asset.ibm-plex-sans-600]
+origin = "fetched"
+version = "5.3.0"
+release_url = "https://www.npmjs.com/package/@fontsource/ibm-plex-sans/v/5.3.0"
+url = "https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-sans@5.3.0/files/ibm-plex-sans-latin-600-normal.woff2"
+path = "crates/firestone/assets/ui/fonts/ibm-plex-sans-latin-600.woff2"
+sha256 = "8960851d691c054ed38e259bdcf1a6190d157b4203ed5bb32c632a863fb8ec2f"
+license = "OFL-1.1"
+subset = "latin"
+
+[asset.ibm-plex-mono-400]
+origin = "fetched"
+version = "5.3.0"
+release_url = "https://www.npmjs.com/package/@fontsource/ibm-plex-mono/v/5.3.0"
+url = "https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-mono@5.3.0/files/ibm-plex-mono-latin-400-normal.woff2"
+path = "crates/firestone/assets/ui/fonts/ibm-plex-mono-latin-400.woff2"
+sha256 = "08949f728dc52d528e69b1667d15c89a5686a4ee9a296ff90983985f99c380f7"
+license = "OFL-1.1"
+subset = "latin"
+
+[asset.ibm-plex-mono-500]
+origin = "fetched"
+version = "5.3.0"
+release_url = "https://www.npmjs.com/package/@fontsource/ibm-plex-mono/v/5.3.0"
+url = "https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-mono@5.3.0/files/ibm-plex-mono-latin-500-normal.woff2"
+path = "crates/firestone/assets/ui/fonts/ibm-plex-mono-latin-500.woff2"
+sha256 = "01d285447409c8a588692162439a038b8cbd7871309ee20267b0d2d91c6e8e22"
+license = "OFL-1.1"
+subset = "latin"
+
+# Firestone's own mark, not a third-party dependency. It is pinned here because
+# it is vendored bytes rather than an authored source file, so the test suite
+# treats it the same way as everything else under assets/ui/.
+[asset.logo]
+origin = "derived"
+derived_from = "firestone-ui/assets/logo.svg"
+path = "crates/firestone/assets/ui/logo.svg"
+sha256 = "a33d725f63af33e93af05c76f3477a1fec1edb717a91a0b84eb93899ca325379"
+license = "NOASSERTION"
+note = "Byte-identical to the source except the <metadata> C2PA manifest element and the now-unused xmlns:c2pa attribute are removed, dropping 36119 bytes to 8361. NOASSERTION because the repository ships no LICENSE file; the artwork is Firestone's own and carries no upstream terms."

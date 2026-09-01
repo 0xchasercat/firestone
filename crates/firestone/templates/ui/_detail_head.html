@@ -1,0 +1,33 @@
+{% import "ui/_macros.html" as m %}
+<div class="fs-detail-head" data-fs-row="{{ machine.name }}" data-fs-notice-slot>
+  <div class="fs-detail-head__ident">
+    <h1 class="fs-detail-head__title">{{ machine.name }}</h1>
+    {{ m.status(machine.status, true) }}
+    <span class="fs-tag">{{ machine.image }}</span>
+    {% if machine.degraded %}
+    <span class="fs-tag" title="{{ machine.degraded }}">degraded</span>
+    {% endif %}
+  </div>
+  <div class="fs-page-head__actions">
+    {% if machine.action %}
+    <button type="button" class="fs-btn fs-btn--primary"
+            data-fs-action="{{ machine.action }}"
+            data-fs-machine="{{ machine.name }}">{{ machine.action_label_long }}</button>
+    {% endif %}
+    <button type="button" class="fs-btn"
+            data-fs-action="restart"
+            data-fs-machine="{{ machine.name }}">Restart</button>
+    <button type="button" class="fs-btn fs-btn--danger"
+            data-fs-action="delete"
+            data-fs-machine="{{ machine.name }}">Delete</button>
+  </div>
+</div>
+
+<div class="fs-meta">
+  {% for kv in machine.meta %}
+  <div>
+    <div class="fs-meta__key">{{ kv.key }}</div>
+    <div class="fs-meta__value" title="{{ kv.value }}">{{ kv.value }}</div>
+  </div>
+  {% endfor %}
+</div>
