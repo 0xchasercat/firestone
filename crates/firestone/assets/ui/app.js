@@ -1322,10 +1322,17 @@
     }
 
     function renderPending() {
+      var folded = foldCarriageReturns(pendingText);
+      /* A progress line that never ends is one line for as long as it runs.
+       * The folded form is what it means, so keep that and drop the history
+       * of everything it overwrote. */
+      if (folded.length < pendingText.length) {
+        pendingText = folded;
+      }
       /* A copy: the partial line is not finished, so it must not advance the
        * state the next completed line starts from. */
       var draft = copySgrState(state);
-      var runs = sgrScan(foldCarriageReturns(pendingText), draft)[0] || [];
+      var runs = sgrScan(folded, draft)[0] || [];
       pendingNode.textContent = "";
       fillLine(pendingNode, runs);
     }
