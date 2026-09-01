@@ -79,6 +79,10 @@ pub use network::{
     ReadinessCancellation, SocketReadiness, SocketReadinessPlan, TapHost, TapOwnership, TapPlan,
     forwards_differ, passt_forward_argument, prepare_network, validate_tap,
 };
+pub use oci::registry::{
+    AuthChallenge, AuthScheme, BasicCredential, DockerCredentials, LayerDescriptor, RegistryClient,
+    RegistryOptions, ResolvedManifest,
+};
 pub use oci::{OciClassification, OciReference, OciTagOrDigest};
 pub use paths::{PathInputs, Paths};
 pub use pty::{PtyPair, set_window_size};
