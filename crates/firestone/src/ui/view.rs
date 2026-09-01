@@ -319,6 +319,8 @@ pub struct OverviewMachine {
     pub status: String,
     pub image: String,
     pub note: String,
+    /// Whether this row carries the client-side CPU poll (§16.5).
+    pub metrics: bool,
 }
 
 impl From<&MachineSummary> for OverviewMachine {
@@ -331,8 +333,38 @@ impl From<&MachineSummary> for OverviewMachine {
                 ("running", Some(uptime)) => format!("up {uptime}"),
                 (status, _) => status.to_owned(),
             },
+            metrics: false,
         }
     }
+}
+
+/// How many overview rows may poll `GET /v1/machines/{name}/metrics`.
+///
+/// Every polling row is one request every five seconds, so an unbounded fleet
+/// would turn a glance at the overview into steady load on the very host the
+/// numbers describe. Eight is the cap; the rest of the fleet reports status
+/// and uptime only, and the detail page reports the whole picture for one
+/// machine. Normative in SPEC §16.5.
+pub const OVERVIEW_METRICS_CAP: usize = 8;
+
+/// Builds the overview rows, marking the first `OVERVIEW_METRICS_CAP` running
+/// machines as the ones that poll for utilization.
+///
+/// The order is the order the list action returned, so the same machines are
+/// marked on every poll rather than rotating under the reader.
+pub fn overview_machines(machines: &[MachineSummary]) -> Vec<OverviewMachine> {
+    let mut remaining = OVERVIEW_METRICS_CAP;
+    machines
+        .iter()
+        .map(|summary| {
+            let mut row = OverviewMachine::from(summary);
+            if row.status == "running" && remaining > 0 {
+                row.metrics = true;
+                remaining -= 1;
+            }
+            row
+        })
+        .collect()
 }
 
 /// A key/value pair in the detail meta strip or a spec group.
@@ -742,6 +774,43 @@ mod tests {
         assert_eq!(row_action("failed"), (Some("start"), "Start"));
         assert_eq!(row_action("starting").0, None);
         assert_eq!(row_action("stopping").0, None);
+    }
+
+    #[test]
+    fn overview_machines_mark_only_the_first_running_rows_for_metrics() {
+        use super::{OVERVIEW_METRICS_CAP, overview_machines};
+        use firestone_core::MachineSummary;
+
+        let summary = |name: &str, status: &str| MachineSummary {
+            name: name.to_owned(),
+            status: status.to_owned(),
+            image: "ubuntu:24.04".to_owned(),
+            cpus: 2,
+            memory: "2G".to_owned(),
+            uptime: None,
+            forwards: Vec::new(),
+            forwards_pending: false,
+        };
+
+        let mut fleet = vec![summary("idle", "stopped"), summary("busy", "starting")];
+        for index in 0..OVERVIEW_METRICS_CAP + 3 {
+            fleet.push(summary(&format!("node-{index}"), "running"));
+        }
+
+        let rows = overview_machines(&fleet);
+        assert_eq!(rows.len(), fleet.len(), "no machine may be dropped");
+        assert_eq!(
+            rows.iter().filter(|row| row.metrics).count(),
+            OVERVIEW_METRICS_CAP
+        );
+        // Neither a stopped nor a transitioning machine has counters to read.
+        assert!(!rows[0].metrics);
+        assert!(!rows[1].metrics);
+        assert!(rows[2].metrics, "the first running machine must poll");
+        assert!(
+            !rows[2 + OVERVIEW_METRICS_CAP].metrics,
+            "the row past the cap must not poll"
+        );
     }
 
     #[test]

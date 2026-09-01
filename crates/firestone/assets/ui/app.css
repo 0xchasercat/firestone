@@ -2410,3 +2410,175 @@ textarea {
 .fs-advanced__body {
   padding-bottom: 12px;
 }
+
+/* ==========================================================================
+ * SECTION: live utilization                                         (M6-25)
+ * ==========================================================================
+ *
+ * Sparklines are hand-drawn <polyline> elements, not a chart library. Their
+ * geometry arrives as a `points` attribute written by app.js; everything
+ * visual — stroke, fill, width — is here, because the served CSP has no
+ * 'unsafe-inline' and the page may not carry a style attribute. The one value
+ * that genuinely varies per element, the meter fill, is an SVG `width`
+ * attribute for the same reason.
+ */
+
+.fs-metrics {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  box-shadow: var(--shadow);
+  margin-bottom: 20px;
+  overflow: hidden;
+}
+
+.fs-metrics__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 18px 0;
+}
+
+.fs-metrics__title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text3);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.fs-metrics__note {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text3);
+  text-align: right;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fs-metrics__tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 1px;
+  padding: 14px 0 0;
+}
+
+.fs-tile {
+  padding: 4px 18px 14px;
+  min-width: 0;
+  border-left: 1px solid var(--line);
+}
+
+.fs-tile:first-child {
+  border-left: 0;
+}
+
+.fs-tile__label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text3);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.fs-tile__value {
+  font-size: 23px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  margin-top: 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Two figures in one tile read at a size that still fits a narrow column. */
+.fs-tile__value--pair {
+  font-size: 16px;
+}
+
+.fs-tile__sub {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text3);
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------ sparkline -- */
+
+.fs-spark {
+  display: block;
+  width: 100%;
+  height: 30px;
+  margin-top: 10px;
+  overflow: visible;
+}
+
+.fs-spark__line {
+  fill: none;
+  stroke: var(--ember);
+  stroke-width: 1.4;
+  /* The viewBox is stretched to the tile width, so the stroke must not be. */
+  vector-effect: non-scaling-stroke;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.fs-spark__line--alt {
+  stroke: var(--text3);
+  stroke-dasharray: 3 2;
+}
+
+/* ---------------------------------------------------------------- meter -- */
+
+.fs-meter {
+  display: block;
+  width: 100%;
+  height: 4px;
+  margin-top: 10px;
+  border-radius: 2px;
+  background: var(--panel2);
+  overflow: hidden;
+}
+
+.fs-meter__fill {
+  fill: var(--ember);
+}
+
+/* Until two samples exist there is no rate to draw, so the strip says
+ * "collecting…" and the lines stay out of the way rather than showing a
+ * single point as if it were a trend. */
+.fs-metrics[data-fs-collecting] .fs-spark,
+.fs-metrics[data-fs-collecting] .fs-meter {
+  opacity: 0.35;
+}
+
+.fs-metrics[data-fs-collecting] .fs-metrics__note {
+  color: var(--text2);
+}
+
+/* ------------------------------------------------- overview cpu figures -- */
+
+.fs-minirow__cpu {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text2);
+  font-variant-numeric: tabular-nums;
+  flex: 0 0 auto;
+  min-width: 62px;
+  text-align: right;
+}
+
+@media (max-width: 640px) {
+  .fs-tile {
+    border-left: 0;
+    border-top: 1px solid var(--line);
+  }
+
+  .fs-tile:first-child {
+    border-top: 0;
+  }
+}

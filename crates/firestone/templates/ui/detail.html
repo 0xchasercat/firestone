@@ -18,6 +18,8 @@
 
   <div data-fs-stream-host="{{ machine.name }}"></div>
 
+  {% if machine.is_running %}{% include "ui/_detail_metrics.html" %}{% endif %}
+
   <div class="fs-tabs" role="tablist">
     {% for t in tabs %}
     <a class="fs-tab{% if t.active %} is-active{% endif %}"

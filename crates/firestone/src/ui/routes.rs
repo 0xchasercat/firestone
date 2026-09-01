@@ -33,7 +33,8 @@ use crate::{
         render::{render, urlencode},
         view::{
             CachedImage, CatalogCard, CheckInfo, HostInfo, MachineDetail, MachineRow,
-            OverviewMachine, VersionInfo, format_bytes, net_mode_token, stats,
+            OverviewMachine, VersionInfo, format_bytes, net_mode_token,
+            overview_machines as overview_machine_rows, stats,
         },
     },
 };
@@ -66,8 +67,7 @@ async fn overview_body(state: &UiState) -> Result<String, FirestoneError> {
 
     let checks: Vec<CheckInfo> = report.checks.iter().map(CheckInfo::from).collect();
     let attention: Vec<&CheckInfo> = checks.iter().filter(|check| check.status != "ok").collect();
-    let overview_machines: Vec<OverviewMachine> =
-        machines.iter().map(OverviewMachine::from).collect();
+    let overview_rows: Vec<OverviewMachine> = overview_machine_rows(&machines);
 
     render(
         "ui/overview.html",
@@ -77,7 +77,7 @@ async fn overview_body(state: &UiState) -> Result<String, FirestoneError> {
             checks => checks,
             attention => attention,
             stats => stats(&machines, &images),
-            machines => overview_machines,
+            machines => overview_rows,
             images => cached_image_rows(&images),
             version => version,
         },
@@ -193,7 +193,7 @@ pub async fn overview_stats(State(state): State<UiState>) -> Response {
 pub async fn overview_machines(State(state): State<UiState>) -> Response {
     let result = async {
         let machines = list_machines(&state).await?;
-        let rows: Vec<OverviewMachine> = machines.iter().map(OverviewMachine::from).collect();
+        let rows: Vec<OverviewMachine> = overview_machine_rows(&machines);
         render("ui/_overview_machines.html", context! { machines => rows })
     }
     .await;

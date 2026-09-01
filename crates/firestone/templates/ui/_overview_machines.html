@@ -5,6 +5,12 @@
   <span class="fs-dot fs-dot--xs" data-status="{{ mach.status }}"></span>
   <span class="fs-minirow__name">{{ mach.name }}</span>
   <span class="fs-minirow__image">{{ mach.image }}</span>
+  {# app.js fills this from two metrics samples; the server never guesses at a
+     rate it has not measured. Only the first few running machines carry the
+     attribute, which is what bounds the poll fan-out (SPEC §16.5). #}
+  {% if mach.metrics %}
+  <span class="fs-minirow__cpu" data-fs-cpu="{{ mach.name }}">—</span>
+  {% endif %}
   <span class="fs-minirow__note">{{ mach.note }}</span>
 </a>
 {% else %}
