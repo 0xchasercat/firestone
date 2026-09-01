@@ -424,6 +424,10 @@ fn create_context(
         memory => SizeField::split(&form.memory),
         disk => SizeField::split(&form.disk),
         net_modes => ["passt", "tap", "none"],
+        // The password itself never reaches a template — `CreateForm` does not
+        // serialize it — so the dialog says it was dropped rather than letting
+        // the user submit a machine with a credential they thought they typed.
+        password_cleared => !form.password.is_empty(),
     }
 }
 
@@ -558,6 +562,17 @@ fn field_errors(error: &FirestoneError) -> BTreeMap<String, String> {
         "disk"
     } else if lowered.contains("forward") || lowered.contains("port") {
         "forward"
+    // The cloud-init branches sit ahead of the plain "user" branch on purpose:
+    // "cloud_init.user_data_inline …" contains "user", and would otherwise be
+    // answered beside the guest-user field.
+    } else if lowered.contains("user_data") || lowered.contains("user-data") {
+        "user_data_inline"
+    } else if lowered.contains("ssh_authorized_keys") || lowered.contains("public key") {
+        "ssh_authorized_keys"
+    } else if lowered.contains("password") {
+        "password"
+    } else if lowered.contains("provisioning") {
+        "provisioning"
     } else if lowered.contains("user") {
         "user"
     } else if lowered.contains("mount") || lowered.contains("share") {
@@ -579,7 +594,11 @@ fn field_errors(error: &FirestoneError) -> BTreeMap<String, String> {
 
 /// The create dialog's fields, in both directions: rendered into the form and
 /// parsed back out of it.
-#[derive(Debug, Default, Clone, Deserialize, serde::Serialize)]
+///
+/// `Debug` is written by hand rather than derived: this struct carries a guest
+/// password and inline cloud-init, and SPEC §10.5 forbids either reaching a log
+/// line, a trace, or a panic message.
+#[derive(Default, Clone, Deserialize, serde::Serialize)]
 pub struct CreateForm {
     #[serde(default)]
     pub name: String,
@@ -604,6 +623,70 @@ pub struct CreateForm {
     /// Newline-separated `HOST:GUEST[:ro]`, the grammar `--mount` already uses.
     #[serde(default)]
     pub mounts: String,
+    /// Inline cloud-init user-data, verbatim except for CRLF normalisation.
+    #[serde(default)]
+    pub user_data_inline: String,
+    /// One OpenSSH public key per line.
+    #[serde(default)]
+    pub ssh_authorized_keys: String,
+    /// The guest password, write-only.
+    ///
+    /// `skip_serializing` is the mechanism, not a convention: the template
+    /// context is built from this struct, so a field that cannot serialize
+    /// cannot be echoed back into the dialog by any template, present or
+    /// future. A rejected submission says the password was cleared instead.
+    #[serde(default, skip_serializing)]
+    pub password: String,
+    /// `on` when the checkbox was ticked, empty otherwise.
+    #[serde(default)]
+    pub ssh_pwauth: String,
+    /// `on` when the checkbox was ticked, empty otherwise.
+    #[serde(default)]
+    pub provisioning: String,
+    /// Set by the hidden marker the provisioning section carries.
+    ///
+    /// An unticked checkbox submits nothing, so without this a submission from
+    /// a form that never offered the section is indistinguishable from one
+    /// where both boxes were cleared, and `provisioning` would silently flip to
+    /// false. The marker makes the two checkbox fields meaningful only when the
+    /// section that owns them was actually rendered.
+    #[serde(default)]
+    pub provisioning_section: String,
+}
+
+/// Redacts the same two leaves [`firestone_core::CloudInitSpec`] redacts.
+impl std::fmt::Debug for CreateForm {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CreateForm")
+            .field("name", &self.name)
+            .field("image", &self.image)
+            .field("cpus", &self.cpus)
+            .field("memory", &self.memory)
+            .field("disk", &self.disk)
+            .field("user", &self.user)
+            .field("net_mode", &self.net_mode)
+            .field("forward", &self.forward)
+            .field("tap", &self.tap)
+            .field("mac", &self.mac)
+            .field("mounts", &self.mounts)
+            .field("user_data_inline", &redacted_len(&self.user_data_inline))
+            .field("ssh_authorized_keys", &self.ssh_authorized_keys)
+            .field("password", &redacted_len(&self.password))
+            .field("ssh_pwauth", &self.ssh_pwauth)
+            .field("provisioning", &self.provisioning)
+            .field("provisioning_section", &self.provisioning_section)
+            .finish()
+    }
+}
+
+/// A secret's shape without its bytes: empty, or a byte count.
+fn redacted_len(value: &str) -> String {
+    if value.is_empty() {
+        "\"\"".to_owned()
+    } else {
+        format!("<redacted, {} bytes>", value.len())
+    }
 }
 
 impl CreateForm {
@@ -636,6 +719,15 @@ impl CreateForm {
                 .map(mount_line)
                 .collect::<Vec<_>>()
                 .join("\n"),
+            // Configured inline user-data is offered back for editing: it is
+            // the user's own configuration being shown back to them, which
+            // §10.5 allows. The password is not, and is never rendered.
+            user_data_inline: spec.cloud_init.user_data_inline.clone().unwrap_or_default(),
+            ssh_authorized_keys: spec.cloud_init.ssh_authorized_keys.join("\n"),
+            password: String::new(),
+            ssh_pwauth: checkbox(spec.cloud_init.ssh_pwauth),
+            provisioning: checkbox(spec.cloud_init.provisioning),
+            provisioning_section: "1".to_owned(),
         }
     }
 
@@ -753,12 +845,79 @@ impl CreateForm {
             errors.insert("mounts".to_owned(), mount_errors.join("; "));
         }
 
+        patch.cloud_init = self.cloud_init_patch();
+
         if errors.is_empty() {
             Ok(patch)
         } else {
             Err(errors)
         }
     }
+
+    /// The provisioning section as a sparse cloud-init patch, or `None` when
+    /// the section contributed nothing.
+    ///
+    /// Nothing here validates. The 32 KiB inline cap, the OpenSSH key grammar
+    /// and the password rules all live in shared validation, which the CLI and
+    /// REST already answer to; a second parser here would be a second contract.
+    /// The dialog's byte counter is a courtesy, not a check.
+    fn cloud_init_patch(&self) -> Option<firestone_core::CloudInitSpecPatch> {
+        let mut cloud_init = firestone_core::CloudInitSpecPatch::default();
+
+        // A browser submits a textarea with CRLF line endings. Cloud-init
+        // user-data is YAML that will be written to a file and read by the
+        // guest, so the carriage returns are normalised out rather than
+        // shipped into the seed image.
+        let user_data = self.user_data_inline.replace("\r\n", "\n");
+        if !user_data.trim().is_empty() {
+            cloud_init.user_data_inline = Some(user_data);
+        }
+
+        let keys: Vec<String> = self
+            .ssh_authorized_keys
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        if !keys.is_empty() {
+            cloud_init.ssh_authorized_keys = Some(keys);
+        }
+
+        // Not trimmed: a password is bytes the user chose, and trimming one
+        // would set a credential the guest will never accept.
+        if !self.password.is_empty() {
+            cloud_init.password = Some(self.password.clone());
+        }
+
+        // The two checkboxes speak only when the section that owns them was
+        // rendered; see `provisioning_section`.
+        if !self.provisioning_section.trim().is_empty() {
+            cloud_init.ssh_pwauth = Some(is_checked(&self.ssh_pwauth));
+            cloud_init.provisioning = Some(is_checked(&self.provisioning));
+        }
+
+        if cloud_init == firestone_core::CloudInitSpecPatch::default() {
+            None
+        } else {
+            Some(cloud_init)
+        }
+    }
+}
+
+/// Renders a boolean as the value a checked checkbox submits, so the form
+/// round-trips a spec through the same string the browser would have sent.
+fn checkbox(value: bool) -> String {
+    if value {
+        "on".to_owned()
+    } else {
+        String::new()
+    }
+}
+
+/// A checkbox submits its `value` when ticked and nothing at all when not.
+fn is_checked(value: &str) -> bool {
+    !value.trim().is_empty()
 }
 
 /// Renders one mount back into the `HOST:GUEST[:ro]` grammar it was parsed
@@ -1321,6 +1480,7 @@ mod tests {
             tap: String::new(),
             mac: "not-a-mac".to_owned(),
             mounts: "/srv:/work\nbroken\nalso-broken".to_owned(),
+            ..CreateForm::default()
         };
         let errors = form.to_patch().expect_err("the form must be rejected");
         for field in [
@@ -1350,6 +1510,7 @@ mod tests {
             tap: "tap0".to_owned(),
             mac: "52:54:00:9a:1f:c3".to_owned(),
             mounts: "/srv/project:/work:ro\n\n~/code:/code\n".to_owned(),
+            ..CreateForm::default()
         };
         let patch = form.to_patch().expect("the form must be accepted");
         assert_eq!(patch.cpus, Some(4));
@@ -1476,6 +1637,127 @@ mod tests {
             assert!(
                 errors.contains_key(expected),
                 "{message:?} should attach to {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_form_round_trips_the_provisioning_section_into_the_patch() {
+        let form = CreateForm {
+            name: "web".to_owned(),
+            image: "ubuntu:24.04".to_owned(),
+            // A browser posts a textarea with CRLF endings; the seed must not
+            // inherit them.
+            user_data_inline: "#cloud-config\r\npackages:\r\n  - jq\r\n".to_owned(),
+            ssh_authorized_keys: "  ssh-ed25519 AAAAC3 one@host  \n\n\tssh-rsa AAAAB3 two@host\n"
+                .to_owned(),
+            password: "  hunter2  ".to_owned(),
+            ssh_pwauth: "on".to_owned(),
+            provisioning: "on".to_owned(),
+            provisioning_section: "1".to_owned(),
+            ..CreateForm::default()
+        };
+
+        let patch = form.to_patch().expect("the form must be accepted");
+        let cloud_init = patch.cloud_init.as_ref().expect("a cloud-init patch");
+
+        assert_eq!(
+            cloud_init.user_data_inline.as_deref(),
+            Some("#cloud-config\npackages:\n  - jq\n"),
+            "carriage returns must not reach the seed"
+        );
+        let keys = cloud_init
+            .ssh_authorized_keys
+            .as_ref()
+            .expect("an authorized-key patch");
+        assert_eq!(
+            keys,
+            &["ssh-ed25519 AAAAC3 one@host", "ssh-rsa AAAAB3 two@host"],
+            "one key per line, trimmed, blank lines dropped"
+        );
+        // A password is bytes the user chose: trimming one would set a
+        // credential the guest will never accept.
+        assert_eq!(cloud_init.password.as_deref(), Some("  hunter2  "));
+        assert_eq!(cloud_init.ssh_pwauth, Some(true));
+        assert_eq!(cloud_init.provisioning, Some(true));
+    }
+
+    #[test]
+    fn create_form_cleared_checkboxes_turn_provisioning_off() {
+        // An unticked checkbox submits nothing at all, so the section marker is
+        // what makes the absence mean false rather than "not offered".
+        let form = CreateForm {
+            name: "web".to_owned(),
+            image: "ubuntu:24.04".to_owned(),
+            provisioning_section: "1".to_owned(),
+            ..CreateForm::default()
+        };
+        let patch = form.to_patch().expect("the form must be accepted");
+        let cloud_init = patch.cloud_init.as_ref().expect("a cloud-init patch");
+        assert_eq!(cloud_init.provisioning, Some(false));
+        assert_eq!(cloud_init.ssh_pwauth, Some(false));
+        assert!(cloud_init.user_data_inline.is_none());
+        assert!(cloud_init.password.is_none());
+    }
+
+    #[test]
+    fn create_form_without_the_provisioning_section_leaves_cloud_init_untouched() {
+        // A submission from a form that never rendered the section must not
+        // flip provisioning off behind the user's back.
+        let form = CreateForm {
+            name: "web".to_owned(),
+            image: "ubuntu:24.04".to_owned(),
+            ..CreateForm::default()
+        };
+        let patch = form.to_patch().expect("the form must be accepted");
+        assert!(
+            patch.cloud_init.is_none(),
+            "an unrendered section must contribute no patch"
+        );
+    }
+
+    #[test]
+    fn create_form_debug_never_prints_a_password_or_inline_user_data() {
+        let form = CreateForm {
+            user_data_inline: "#cloud-config\nruncmd: [id]".to_owned(),
+            password: "hunter2".to_owned(),
+            ..CreateForm::default()
+        };
+        let rendered = format!("{form:?}");
+        assert!(!rendered.contains("hunter2"), "a password was formatted");
+        assert!(
+            !rendered.contains("runcmd"),
+            "inline user-data was formatted"
+        );
+        assert!(rendered.contains("<redacted, 7 bytes>"));
+    }
+
+    #[test]
+    fn field_errors_route_a_cloud_init_message_to_its_own_field() {
+        let cases: [(&str, &str); 4] = [
+            (
+                "cloud_init.user_data_inline is 40000 bytes and exceeds 32 KiB",
+                "user_data_inline",
+            ),
+            (
+                "cloud_init.ssh_authorized_keys[1] is not an OpenSSH public key",
+                "ssh_authorized_keys",
+            ),
+            ("cloud_init.password must not be empty", "password"),
+            ("provisioning is disabled for this machine", "provisioning"),
+        ];
+        for (message, expected) in cases {
+            let errors: BTreeMap<String, String> =
+                field_errors(&FirestoneError::new(ErrorKind::InvalidSpec, message));
+            assert!(
+                errors.contains_key(expected),
+                "{message:?} should attach to {expected}, got {errors:?}"
+            );
+            // "user_data" contains "user": the guest-user field must not
+            // swallow a cloud-init message.
+            assert!(
+                !errors.contains_key("user") || expected == "user",
+                "{message:?} leaked onto the guest-user field"
             );
         }
     }

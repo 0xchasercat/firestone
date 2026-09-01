@@ -245,3 +245,100 @@
   </template>
 </div>
 {%- endmacro %}
+
+{#
+  Provisioning: the cloud-init leaves the UI is allowed to edit, in one
+  collapsible section so the create dialog opens on the fields most machines
+  need and this one stays out of the way until it is wanted.
+
+  Three rules are particular to this section:
+
+    - The password is a write-only field. It is submitted, never rendered
+      back: `CreateForm` does not serialize it, so no re-render of this macro
+      can echo it, and a rejected submission says so instead of silently
+      dropping what was typed.
+    - The checkboxes are only meaningful when this section was rendered, so a
+      hidden `provisioning_section` marker travels with them. Without it an
+      unchecked box is indistinguishable from a form that never offered one,
+      and `provisioning` would flip to false on every partial submission.
+    - Inline user-data is capped at 32 KiB by shared validation. The counter
+      here is a courtesy that warns before the round trip; it is not the
+      check, and it never blocks a submission the server has not seen.
+#}
+{% macro provisioning_fields(form, errors, password_cleared) -%}
+<details class="fs-advanced" data-fs-provisioning
+         {% if errors.user_data_inline or errors.ssh_authorized_keys or errors.password or errors.provisioning or password_cleared %} open{% endif %}>
+  <summary class="fs-advanced__summary">Provisioning</summary>
+  <div class="fs-advanced__body fs-form">
+    <input type="hidden" name="provisioning_section" value="1">
+
+    <div class="fs-field">
+      <label class="fs-checkbox">
+        <input type="checkbox" name="provisioning" value="on"
+               data-fs-provisioning-toggle{% if form.provisioning %} checked{% endif %}>
+        <span>Provision this machine with cloud-init</span>
+      </label>
+      <div class="fs-inline-notice" data-fs-provisioning-warning role="note"
+           {% if form.provisioning %}hidden{% endif %}>
+        <span>off: no SSH keys, no password, no <code>firestone shell</code> — the console is the only way in</span>
+      </div>
+      {% if errors.provisioning %}
+      <div class="fs-field__error">{{ errors.provisioning }}</div>
+      {% endif %}
+    </div>
+
+    <div class="fs-field" data-fs-userdata>
+      <div class="fs-field__head">
+        <label class="fs-field__label" for="fs-create-user-data">Inline user-data</label>
+        <span class="fs-field__hint" data-fs-userdata-count aria-live="polite"></span>
+      </div>
+      <textarea class="fs-input fs-input--mono" id="fs-create-user-data" name="user_data_inline"
+                rows="6" autocomplete="off" spellcheck="false"
+                placeholder="#cloud-config" data-fs-userdata-value
+                {% if errors.user_data_inline %}aria-invalid="true" aria-describedby="fs-create-user-data-error"{% endif %}>{{ form.user_data_inline }}</textarea>
+      <div class="fs-inline-notice" data-fs-userdata-over role="note" hidden>
+        <span>over 32 KiB · shared validation rejects this; move it to a <code>cloud_init.user_data</code> file</span>
+      </div>
+      {% if errors.user_data_inline %}
+      <div class="fs-field__error" id="fs-create-user-data-error">{{ errors.user_data_inline }}</div>
+      {% else %}
+      <div class="fs-field__hint">merged with Firestone's own part · 32 KiB max</div>
+      {% endif %}
+    </div>
+
+    <div class="fs-field">
+      <label class="fs-field__label" for="fs-create-ssh-keys">SSH public keys</label>
+      <textarea class="fs-input fs-input--mono" id="fs-create-ssh-keys" name="ssh_authorized_keys"
+                rows="3" autocomplete="off" spellcheck="false"
+                placeholder="ssh-ed25519 AAAA… you@host"
+                {% if errors.ssh_authorized_keys %}aria-invalid="true" aria-describedby="fs-create-ssh-keys-error"{% endif %}>{{ form.ssh_authorized_keys }}</textarea>
+      {% if errors.ssh_authorized_keys %}
+      <div class="fs-field__error" id="fs-create-ssh-keys-error">{{ errors.ssh_authorized_keys }}</div>
+      {% else %}
+      <div class="fs-field__hint">one OpenSSH public key per line</div>
+      {% endif %}
+    </div>
+
+    <div class="fs-field">
+      <label class="fs-field__label" for="fs-create-password">Guest password</label>
+      <input class="fs-input fs-input--mono" type="password" id="fs-create-password" name="password"
+             autocomplete="new-password" spellcheck="false" value=""
+             {% if errors.password %}aria-invalid="true" aria-describedby="fs-create-password-error"{% endif %}>
+      {% if password_cleared %}
+      <div class="fs-inline-notice" data-fs-password-cleared role="note">
+        <span>password cleared, re-enter it — a submitted password is never rendered back</span>
+      </div>
+      {% endif %}
+      <label class="fs-checkbox fs-checkbox--stacked">
+        <input type="checkbox" name="ssh_pwauth" value="on"{% if form.ssh_pwauth %} checked{% endif %}>
+        <span>allow password SSH</span>
+      </label>
+      {% if errors.password %}
+      <div class="fs-field__error" id="fs-create-password-error">{{ errors.password }}</div>
+      {% else %}
+      <div class="fs-field__hint">a password alone enables console login for the guest user · the checkbox additionally enables SSH password authentication</div>
+      {% endif %}
+    </div>
+  </div>
+</details>
+{%- endmacro %}

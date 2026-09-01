@@ -2410,3 +2410,37 @@ textarea {
 .fs-advanced__body {
   padding-bottom: 12px;
 }
+
+/* ---------------------------------------------------------- provisioning -- */
+
+/* The create dialog's Provisioning section. It reuses .fs-advanced for the
+ * disclosure and .fs-form for the field rhythm, so only the pieces that are
+ * genuinely new live here. */
+
+.fs-advanced__body.fs-form {
+  padding-top: 4px;
+}
+
+/* The byte counter sits opposite the label in the field head and must not
+ * shift the layout as it counts up. */
+.fs-field__head [data-fs-userdata-count] {
+  margin-top: 0;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* A checkbox that follows a field rather than standing on its own row. */
+.fs-checkbox--stacked {
+  margin-top: 9px;
+}
+
+/* Field names inside a notice read as field names. */
+.fs-inline-notice code {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.fs-inline-notice[data-fs-password-cleared],
+.fs-inline-notice[data-fs-userdata-over] {
+  margin-top: 8px;
+}

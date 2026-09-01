@@ -1061,3 +1061,175 @@ async fn the_ui_never_offers_a_second_mutation_surface() -> TestResult {
     }
     Ok(())
 }
+
+// ------------------------------------------------------- provisioning (M6-27) --
+
+/// The same view with cloud-init actually configured, so the spec tab can be
+/// held to the redaction rule rather than to an empty section.
+fn machine_view_with_cloud_init(name: &str, status: &str) -> Value {
+    let mut view = machine_view(name, status);
+    view["spec"]["cloud_init"] = json!({
+        "user_data": null,
+        "user_data_inline": "#cloud-config\nruncmd:\n  - [touch, /tmp/SECRET-MARKER]\n",
+        "network_config": null,
+        "ssh_keys": [],
+        "ssh_authorized_keys": [
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 one@host",
+            "ssh-rsa AAAAB3NzaC1yc2E two@host"
+        ],
+        "password": "hunter2-SECRET",
+        "ssh_pwauth": true,
+        "provisioning": true
+    });
+    view
+}
+
+#[tokio::test]
+async fn the_provisioning_section_offers_every_credential_field() -> TestResult {
+    let router = app(FakeDispatcher::default())?;
+    let (status, _, body) = get_fragment(&router, "/ui/machines/new").await?;
+    assert_eq!(status, StatusCode::OK);
+
+    // The section is collapsible and carries the marker that makes its
+    // checkboxes meaningful.
+    assert!(body.contains("data-fs-provisioning"));
+    assert!(body.contains(">Provisioning</summary>"));
+    assert!(body.contains(r#"name="provisioning_section" value="1""#));
+
+    for field in [
+        r#"name="user_data_inline""#,
+        r#"name="ssh_authorized_keys""#,
+        r#"name="password""#,
+        r#"name="ssh_pwauth""#,
+        r#"name="provisioning""#,
+    ] {
+        assert!(body.contains(field), "{field} is missing");
+    }
+
+    // A password field is a password field: it must never render as text, and
+    // must never be pre-filled.
+    assert!(body.contains(r#"type="password" id="fs-create-password""#));
+    assert!(body.contains(r#"name="password""#) && body.contains(r#"value="""#));
+
+    // Provisioning defaults on, and the consequences of turning it off are
+    // stated rather than implied.
+    assert!(body.contains(r#"data-fs-provisioning-toggle checked"#));
+    assert!(body.contains("the console is the only way in"));
+    // Help text explains the password/pwauth split.
+    assert!(body.contains("enables console login"));
+    assert!(body.contains("SSH password authentication"));
+    // The soft cap is a courtesy warning, hidden until it applies.
+    assert!(body.contains("data-fs-userdata-over role=\"note\" hidden"));
+    assert!(body.contains("32 KiB"));
+    // Visibility is the hidden attribute, never a style; the CSP forbids one.
+    assert!(!body.contains(" style=\""), "the dialog emitted a style");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_rejected_create_blanks_the_password_and_keeps_every_other_field() -> TestResult {
+    let router = app(FakeDispatcher::default())?;
+    let (status, _, body) = request(
+        &router,
+        Request::builder()
+            .method("POST")
+            .uri("/ui/machines")
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(
+                "name=&image=&cpus=0&memory=nope&forward=bad\
+                 &user_data_inline=%23cloud-config%0Aruncmd%3A+%5Bid%5D\
+                 &ssh_authorized_keys=ssh-ed25519+AAAAC3+me%40host\
+                 &password=hunter2&ssh_pwauth=on&provisioning=on&provisioning_section=1",
+            ))?,
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::OK, "the dialog is re-rendered");
+
+    // Every field problem is still collected in one pass while the new fields
+    // ride along.
+    for field in ["name", "image"] {
+        assert!(
+            body.contains(&format!(r#"id="fs-create-{field}-error""#)),
+            "{field} lost its error"
+        );
+    }
+    assert!(body.contains("cpus must be 1 through 255"));
+
+    // The password is gone from the response entirely, and the dialog says so
+    // rather than letting the user submit a machine without it.
+    assert!(!body.contains("hunter2"), "the password was echoed back");
+    assert!(body.contains("data-fs-password-cleared"));
+    assert!(body.contains("password cleared, re-enter it"));
+    assert!(!body.contains("fs:toast"), "a field problem is not a toast");
+
+    // Everything that is not a credential comes back verbatim.
+    assert!(body.contains("runcmd: [id]"), "inline user-data was lost");
+    assert!(
+        body.contains("ssh-ed25519 AAAAC3 me@host"),
+        "keys were lost"
+    );
+    assert!(body.contains(r#"name="ssh_pwauth" value="on" checked"#));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_submitted_provisioning_section_reaches_the_create_action() -> TestResult {
+    let router = app(FakeDispatcher::default())?;
+    let (status, _, body) = request(
+        &router,
+        Request::builder()
+            .method("POST")
+            .uri("/ui/machines")
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(
+                "name=web&image=ubuntu%3A24.04\
+                 &user_data_inline=%23cloud-config%0D%0Apackages%3A+%5Bjq%5D\
+                 &ssh_authorized_keys=ssh-ed25519+AAAAC3+me%40host%0A%0A\
+                 &password=hunter2&ssh_pwauth=on&provisioning=on&provisioning_section=1",
+            ))?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.is_empty(), "a valid submission renders no dialog");
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_detail_spec_reports_cloud_init_by_shape_and_never_by_value() -> TestResult {
+    let router = app(FakeDispatcher {
+        machine: machine_view_with_cloud_init("web", "running"),
+        ..FakeDispatcher::default()
+    })?;
+    let (_, _, spec) = get_fragment(&router, "/ui/machines/web/tab/spec").await?;
+
+    // Inline user-data is reported by size. Its content — and the password —
+    // must not appear anywhere in the rendered fragment.
+    assert!(
+        !spec.contains("SECRET-MARKER"),
+        "inline user-data content reached the page"
+    );
+    assert!(
+        !spec.contains("hunter2"),
+        "the guest password reached the page"
+    );
+    assert!(spec.contains("54 bytes"), "no byte count was reported");
+
+    // Keys are a count, not a list, and the password is a state, not a value.
+    assert!(spec.contains("2 keys"), "the key count is missing");
+    assert!(
+        !spec.contains("AAAAC3NzaC1lZDI1NTE5"),
+        "an authorized key was listed"
+    );
+    assert!(spec.contains("password"));
+    assert!(spec.contains("set"));
+    assert!(spec.contains("ssh_pwauth"));
+
+    // An unconfigured machine reports the same rows, emptily rather than not
+    // at all.
+    let bare = app(FakeDispatcher::default())?;
+    let (_, _, empty) = get_fragment(&bare, "/ui/machines/web/tab/spec").await?;
+    assert!(empty.contains("user_data_inline") && empty.contains("null"));
+    assert!(empty.contains("unset"), "an unset password must say so");
+    Ok(())
+}

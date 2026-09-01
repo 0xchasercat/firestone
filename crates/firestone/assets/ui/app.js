@@ -1907,3 +1907,105 @@
     }
   });
 })();
+
+/* Provisioning section (M6-27).
+ *
+ * A self-contained runtime for the create dialog's Provisioning fields, kept
+ * apart from the block above so it survives that block being reorganised.
+ *
+ * It does two things, and deliberately nothing else:
+ *
+ *   1. Counts the bytes of the inline user-data as it is typed and warns past
+ *      32 KiB. This is a courtesy, not a check: shared validation owns the
+ *      real limit, the warning never blocks a submission, and the server's
+ *      answer is what lands beside the field.
+ *   2. Reveals the "provisioning off" warning when the toggle is cleared,
+ *      through the hidden attribute, because the CSP forbids inline styles.
+ *
+ * The password field is untouched here. Nothing in this file reads it, stores
+ * it, or copies it anywhere.
+ */
+(function () {
+  "use strict";
+
+  var SOFT_CAP_BYTES = 32 * 1024;
+
+  function bytesOf(text) {
+    /* The cap is a byte cap, not a character cap, so the counter measures the
+     * UTF-8 the server will actually receive. */
+    if (typeof TextEncoder === "function") {
+      return new TextEncoder().encode(text).length;
+    }
+    return unescape(encodeURIComponent(text)).length;
+  }
+
+  function formatBytes(count) {
+    if (count < 1024) {
+      return count + " B";
+    }
+    return (count / 1024).toFixed(count < 10240 ? 1 : 0) + " KiB";
+  }
+
+  function syncUserData(field) {
+    var input = field.querySelector("[data-fs-userdata-value]");
+    var note = field.querySelector("[data-fs-userdata-count]");
+    var over = field.querySelector("[data-fs-userdata-over]");
+    if (!input) {
+      return;
+    }
+    var bytes = bytesOf(input.value);
+    if (note) {
+      note.textContent = bytes === 0 ? "" : formatBytes(bytes) + " of 32 KiB";
+    }
+    if (over) {
+      over.hidden = bytes <= SOFT_CAP_BYTES;
+    }
+  }
+
+  function syncProvisioning(section) {
+    var toggle = section.querySelector("[data-fs-provisioning-toggle]");
+    var warning = section.querySelector("[data-fs-provisioning-warning]");
+    if (toggle && warning) {
+      warning.hidden = toggle.checked;
+    }
+  }
+
+  function sync(root) {
+    var sections = (root || document).querySelectorAll("[data-fs-provisioning]");
+    Array.prototype.forEach.call(sections, function (section) {
+      syncProvisioning(section);
+      var field = section.querySelector("[data-fs-userdata]");
+      if (field) {
+        syncUserData(field);
+      }
+    });
+  }
+
+  document.addEventListener("DOMContentLoaded", function () {
+    sync(document);
+  });
+
+  document.body.addEventListener("htmx:afterSwap", function () {
+    sync(document);
+  });
+
+  document.addEventListener("input", function (event) {
+    var field =
+      event.target.closest && event.target.closest("[data-fs-userdata]");
+    if (field) {
+      syncUserData(field);
+    }
+  });
+
+  document.addEventListener("change", function (event) {
+    if (!event.target.closest) {
+      return;
+    }
+    if (event.target.closest("[data-fs-provisioning-toggle]")) {
+      var section = event.target.closest("[data-fs-provisioning]");
+      if (section) {
+        syncProvisioning(section);
+      }
+    }
+  });
+})();
