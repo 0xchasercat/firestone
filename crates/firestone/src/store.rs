@@ -29,6 +29,9 @@ use firestone_core::{
 };
 
 const SPEC_TEMPLATE: &str = include_str!("../../../templates/firestone.toml");
+/// `firestone.toml` may hold a plaintext guest password (§10.5), so it is
+/// published owner-read/write only rather than at the process umask.
+const MACHINE_SPEC_FILE_MODE: u32 = 0o600;
 const MAX_VMCONFIG_BYTES: u64 = 51_200;
 const MAX_LOG_LINES: u32 = 100_000;
 const MAX_LOG_TAIL_BYTES: u64 = 8 * 1024 * 1024;
@@ -166,7 +169,7 @@ impl LocalDispatcher {
         let observed_state = self.read_live_state_locked(name, &lock)?;
         let original = read_file(&spec_path, "machine spec", ErrorKind::NotFound)?;
         let candidate = spec_path.with_extension("toml.edit");
-        atomic::write(&candidate, &original)?;
+        atomic::write_with_mode(&candidate, &original, MACHINE_SPEC_FILE_MODE)?;
 
         let pinned_image_ref = if observed_state.state.image.id.is_some()
             && observed_state.state.image.sha256.is_some()
@@ -233,7 +236,7 @@ impl LocalDispatcher {
                 pinned_image_ref,
             ) {
                 Ok(loaded) => {
-                    atomic::write(spec_path, &candidate_bytes)?;
+                    atomic::write_with_mode(spec_path, &candidate_bytes, MACHINE_SPEC_FILE_MODE)?;
                     return Ok(SpecResult {
                         spec: loaded.spec,
                         warnings: loaded
@@ -300,7 +303,7 @@ impl LocalDispatcher {
             let spec_path = self.paths.machine_spec(name)?;
             let candidate = spec_path.with_extension("toml.edit");
             let original = read_file(&spec_path, "machine spec", ErrorKind::Generic)?;
-            atomic::write(&candidate, &original)?;
+            atomic::write_with_mode(&candidate, &original, MACHINE_SPEC_FILE_MODE)?;
             let edited =
                 self.edit_candidate(name, &machine_dir, &candidate, &spec_path, None, events);
             let cleanup = remove_candidate(&candidate);
@@ -416,7 +419,11 @@ impl LocalDispatcher {
         let state = self.created_state(name, &spec)?;
         spec.image = state.image.r#ref.clone().into();
         let spec_document = render_spec(&spec)?;
-        atomic::write(&self.paths.machine_spec(name)?, spec_document.as_bytes())?;
+        atomic::write_with_mode(
+            &self.paths.machine_spec(name)?,
+            spec_document.as_bytes(),
+            MACHINE_SPEC_FILE_MODE,
+        )?;
         StateStore::new(self.paths.machine_state(name)?).write_from_locked_action(&state, lock)?;
         Ok(MachineRecord {
             name: name.to_owned(),
@@ -524,7 +531,11 @@ impl LocalDispatcher {
         let pinned_image_ref = pinned_image_reference(&observed_state.state);
         let warnings = self.validate_action_spec(&mut spec, pinned_image_ref)?;
         let document = render_spec(&spec)?;
-        atomic::write(&self.paths.machine_spec(name)?, document.as_bytes())?;
+        atomic::write_with_mode(
+            &self.paths.machine_spec(name)?,
+            document.as_bytes(),
+            MACHINE_SPEC_FILE_MODE,
+        )?;
         emit_running_spec_warning(&observed_state.state, events)?;
         emit_spec_warnings(&warnings, events)?;
         emit_result(events, "edit", &SpecResult { spec, warnings })
@@ -569,7 +580,11 @@ impl LocalDispatcher {
             .map(SpecWarningPayload::from)
             .collect::<Vec<_>>();
         let document = render_spec(&loaded.spec)?;
-        atomic::write(&self.paths.machine_spec(name)?, document.as_bytes())?;
+        atomic::write_with_mode(
+            &self.paths.machine_spec(name)?,
+            document.as_bytes(),
+            MACHINE_SPEC_FILE_MODE,
+        )?;
         emit_running_spec_warning(&observed_state.state, events)?;
         emit_spec_warnings(&warnings, events)?;
         emit_result(

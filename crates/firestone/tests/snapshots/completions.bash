@@ -278,7 +278,7 @@ _firestone() {
             return 0
             ;;
         firestone__subcmd__create)
-            opts="-f -p -q -v -y -h --image --file --edit --arch --cpus --memory --disk --user --net --forward --tap --network-mac --mount --user-data --cloud-init-network-config --ssh-key --no-provisioning --vmm-binary --vmm-firmware --vmm-arg --vmm-config --clear --json --quiet --verbose --no-color --yes --home --help"
+            opts="-f -p -q -v -y -h --image --file --edit --arch --cpus --memory --disk --user --net --forward --tap --network-mac --mount --user-data --user-data-inline --cloud-init-network-config --ssh-key --ssh-authorized-key --password-file --ssh-pwauth --no-provisioning --vmm-binary --vmm-firmware --vmm-arg --vmm-config --clear --json --quiet --verbose --no-color --yes --home --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -344,11 +344,23 @@ _firestone() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
+                --user-data-inline)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 --cloud-init-network-config)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
                 --ssh-key)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --ssh-authorized-key)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --password-file)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1088,7 +1100,7 @@ _firestone() {
             return 0
             ;;
         firestone__subcmd__run)
-            opts="-p -q -v -y -h --name --rm --arch --cpus --memory --disk --user --net --forward --tap --network-mac --mount --user-data --cloud-init-network-config --ssh-key --no-provisioning --vmm-binary --vmm-firmware --vmm-arg --vmm-config --clear --json --quiet --verbose --no-color --yes --home --help"
+            opts="-p -q -v -y -h --name --rm --arch --cpus --memory --disk --user --net --forward --tap --network-mac --mount --user-data --user-data-inline --cloud-init-network-config --ssh-key --ssh-authorized-key --password-file --ssh-pwauth --no-provisioning --vmm-binary --vmm-firmware --vmm-arg --vmm-config --clear --json --quiet --verbose --no-color --yes --home --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1146,11 +1158,23 @@ _firestone() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
+                --user-data-inline)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 --cloud-init-network-config)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
                 --ssh-key)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --ssh-authorized-key)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --password-file)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

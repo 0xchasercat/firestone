@@ -214,8 +214,12 @@ pub struct MountSpec {
 
 pub struct CloudInitSpec {
     pub user_data: Option<PathBuf>,      // relative to the machine dir, or absolute
+    pub user_data_inline: Option<String>,// the same user part carried in the spec; excludes user_data
     pub network_config: Option<PathBuf>,
     pub ssh_keys: Vec<PathBuf>,          // public key files; contents appended to authorized keys
+    pub ssh_authorized_keys: Vec<String>,// inline OpenSSH public keys; deduplicated with ssh_keys
+    pub password: Option<String>,        // plaintext guest password for `user` (§10.5)
+    pub ssh_pwauth: bool,                // default false; true enables guest SSH password auth
     pub provisioning: bool,              // default true; false = firestone injects nothing (§10.3)
 }
 
@@ -420,10 +424,14 @@ forward = []               # ["8080:80", "udp:5353:53", "127.0.0.1:2222:22", "80
 # tag      = "share0"      # default "share<i>"
 
 [cloud_init]
-# user_data      = "user-data.yaml"     # relative to the machine dir or absolute; #cloud-config or #!script
-# network_config = "network-config.yaml"
-ssh_keys     = []                        # ["~/.ssh/id_ed25519.pub"]; contents appended to authorized keys of `user`
-provisioning = true                      # false: firestone injects nothing; shell/console will not work
+# user_data        = "user-data.yaml"   # relative to the machine dir or absolute; #cloud-config or #!script
+# user_data_inline = "#cloud-config\n…" # the same user part inline, max 32 KiB; excludes user_data
+# network_config   = "network-config.yaml"
+ssh_keys            = []                 # ["~/.ssh/id_ed25519.pub"]; contents appended to authorized keys of `user`
+ssh_authorized_keys = []                 # ["ssh-ed25519 AAAA… me@host"]; inline keys, deduplicated with ssh_keys
+# password          = "…"                # plaintext password for `user`, applied through chpasswd (§10.5)
+ssh_pwauth          = false              # true enables guest SSH password authentication
+provisioning        = true               # false: firestone injects nothing; shell/console will not work
 
 [vmm]
 # binary       = "/usr/local/bin/cloud-hypervisor"   # default: embedded pinned VMM on x86_64
@@ -452,6 +460,9 @@ Validation runs on every load. Errors carry the TOML key path.
 - `cloud_init.user_data`: a symlink to a regular file is allowed. Firestone opens the target once with nonblocking regular-file checks and reads at most 1 MiB. The bytes must be UTF-8 and the first line must be `#cloud-config` or start with `#!`; otherwise error with hint (`provisioning = false` plus a raw user-data script is the escape hatch, see §10.2).
 - `cloud_init.network_config`: a symlink to a regular file is allowed. Firestone opens the target once with nonblocking regular-file checks and reads at most 1 MiB of UTF-8 bytes.
 - `cloud_init.ssh_keys`: each target may be a symlink to a regular file, is opened once with nonblocking regular-file checks, and is limited to 64 KiB; all configured key files together are limited to 256 KiB. Non-comment lines must parse as OpenSSH public keys.
+- `cloud_init.user_data_inline`: at most 32 KiB of UTF-8 whose first line is `#cloud-config` or starts with `#!`, exactly as for a user-data file. Setting it together with `cloud_init.user_data` is an error that names both keys; neither value appears in the message.
+- `cloud_init.ssh_authorized_keys`: each entry is exactly one non-comment OpenSSH public-key line of at most 64 KiB, parsed by the same `ssh-key` implementation as file-loaded keys. Surrounding whitespace is trimmed. The failing entry's index is reported; its bytes are not.
+- `cloud_init.password`: 1 to 256 bytes of UTF-8 with no control characters. Errors report the length or the class of violation and never the value.
 - `user`: `[a-z_][a-z0-9_-]*`.
 - `vmm.firmware = "edk2"` on x86_64 uses `CLOUDHV.fd`; on aarch64 `CLOUDHV_EFI.fd`; a custom path must identify a readable regular file.
 - `vmm.binary`, when set, must identify a bounded regular file executable by the current user, owned by root or the current uid, and not writable by group or other. Start imports the bytes from one no-follow descriptor into the machine-owned mode-0700 `vmm.bin` before hashing or execution. ELF binaries, shebang scripts, and wrappers remain valid; supervision records the actual post-`exec` executable and argv together with the immutable launch artifact and hash.
@@ -491,7 +502,11 @@ Generated from `MachineSpecPatch`. Rule: `a.b` → `--a-b`; vectors are repeatab
 | `network.tap` | `--tap DEV` |
 | `mount[]` | `--mount HOST:GUEST[:ro]` (repeatable) |
 | `cloud_init.user_data` | `--user-data FILE` |
+| `cloud_init.user_data_inline` | `--user-data-inline TEXT` |
 | `cloud_init.ssh_keys[]` | `--ssh-key FILE` (repeatable) |
+| `cloud_init.ssh_authorized_keys[]` | `--ssh-authorized-key KEY` (repeatable) |
+| `cloud_init.password` | `--password-file FILE` (contents, minus one trailing newline; never an argv value) |
+| `cloud_init.ssh_pwauth=true` | `--ssh-pwauth` |
 | `cloud_init.provisioning=false` | `--no-provisioning` |
 | `vmm.extra_args[]` | `--vmm-arg ARG` (repeatable) |
 | `vmm.config_overlay` | `--vmm-config JSON` |
@@ -698,7 +713,7 @@ Except for `provisioning = false` with no user part, the user-data written to th
 
 Parts, in order:
 
-1. **The user's part**, if `cloud_init.user_data` is set: `text/cloud-config` if the file starts with `#cloud-config`, `text/x-shellscript` if it starts with `#!`. Content is passed byte‑for‑byte; firestone never edits it.
+1. **The user's part**, if `cloud_init.user_data` or `cloud_init.user_data_inline` is set: `text/cloud-config` if the content starts with `#cloud-config`, `text/x-shellscript` if it starts with `#!`. Content is passed byte‑for‑byte; firestone never edits it. The two keys are mutually exclusive, and identical bytes produce an identical part and instance id whichever key carried them, so a UI form and a file are the same input.
 2. **Firestone's part** (`text/cloud-config`), only if `provisioning = true`. It declares its own merge behavior so that it is merged *into* the user's config without overriding anything the user set:
 
 ```yaml
@@ -717,7 +732,13 @@ Escape hatches: `provisioning = false` writes only the user's part (or an empty 
 merge_how: "list(append)+dict(recurse_dict,recurse_list,no_replace)+str()"
 hostname: {{ name }}
 disable_root: false
-ssh_pwauth: false
+ssh_pwauth: {{ "true" if ssh_pwauth else "false" }}
+{%- if chpasswd_entry %}
+chpasswd:
+  expire: false
+  list:
+    - {{ chpasswd_entry }}          # JSON-quoted "<user>:<password>"
+{%- endif %}
 ssh_authorized_keys:            # applies to the image's default user
   - {{ firestone_pubkey }}
 {%- for key in user_keys %}
@@ -784,7 +805,9 @@ Notes:
 
 - Root login works because `disable_root: false` plus a key while `ssh_pwauth: false` keeps it key-only (`PermitRootLogin prohibit-password`/`without-password`, `PasswordAuthentication no`). The image's default user receives the same Firestone and user keys.
 - Firestone opens its own public identity key with no symlink following, requires current-user ownership and exact mode 0644, and reads at most 16 KiB. Private-key bytes never enter seed rendering.
-- User key files and lines are traversed in configuration order. Blank and comment lines are ignored. Duplicate key material, including a user entry equal to Firestone's identity key or the same key with a different comment, is omitted while the first spelling and order are preserved.
+- User key files and lines are traversed in configuration order, then `cloud_init.ssh_authorized_keys` entries in configuration order. Blank and comment lines are ignored. Duplicate key material, including a user entry equal to Firestone's identity key or the same key with a different comment, is omitted while the first spelling and order are preserved. Deduplication compares key data across both sources, so the same key supplied as a file and inline is rendered once.
+- `chpasswd` is emitted only when `cloud_init.password` is set, with `expire: false` so the guest is not forced to change the password at first login. `list` is used rather than `users` for compatibility with the cloud-init releases in the catalog images. The entry is one JSON-quoted `"<user>:<password>"` scalar, so a password containing `:`, `"`, `#`, or a backslash cannot change the document's structure.
+- A password alone does not enable SSH password authentication: `ssh_pwauth` stays `false` unless `cloud_init.ssh_pwauth` is set, and the password reaches console and local login through `chpasswd`.
 - On guests with systemd ≥ 256, the generated `/run/systemd/generator/sshd-vsock.socket` owns vsock port 22. `firestone-sshd.socket` is ordered after it and has the inverse path condition, so the Firestone socket starts only when the native unit is absent. The final `is-active` command requires one listener; unrelated bind/start failures remain failures **[verify 11]**.
 - The per-connection service owns and preserves `/run/sshd`, which stock OpenSSH requires before `sshd -i`; its `ExecStart` is not failure-prefixed.
 - The `sshd` path differs between distros only rarely (`/usr/sbin/sshd` on Debian/Ubuntu/Fedora); the typed catalog entry may override `sshd_path`, which must be a safe absolute POSIX executable path.
@@ -795,6 +818,23 @@ Notes:
 `identity-digest` preserves the M1 formula when `network-config` is absent: `SHA-256(user-data)`. When `network-config` is present it is `SHA-256(b"firestone-instance-v1" || 0x00 || be64(len(user-data)) || user-data || be64(len(network-config)) || network-config)`. Length framing and a versioned domain separate the two byte strings and distinguish an absent network file from a present empty file.
 
 Only effective seed input bytes change the id. Changing user-data or network-config bytes, the effective de-duplicated key sequence, `user`, a rendered mount tuple, the Firestone identity key, `provisioning`, or the catalog `sshd_path` changes it. A different source pathname with the same bytes, a duplicate key, CPU/memory changes, or a host-only mount path change leaves it stable. A changed id makes cloud-init run its per-instance modules again. Because it also regenerates the guest's SSH host keys (`ssh_deletekeys` default), `start` deletes `machines/<name>/known_hosts` before accepting the new seed identity.
+
+`cloud_init.password` and `cloud_init.ssh_pwauth` render into Firestone's part, so they are ordinary user-data bytes: changing, adding, or removing a password changes the instance id and re-provisions the guest on the next start. No separate credential-change mechanism exists.
+
+### 10.5 Credentials and secret handling (normative)
+
+`cloud_init.password` is the plaintext guest password for `user`. Firestone stores it as typed, in `machines/<name>/firestone.toml`, and renders it into `machines/<name>/seed/user-data` and the CIDATA image. It is not hashed: cloud-init's `chpasswd` list accepts a plaintext value, and a hash computed by Firestone would pin one crypt scheme and still be recoverable from the same files. The protection is filesystem permissions, and it is enforced rather than assumed:
+
+- `machines/<name>/firestone.toml`, including the `firestone.toml.edit` candidate `edit` opens in an editor, is published with mode 0600 regardless of the caller's umask.
+- `seed/meta-data`, `seed/user-data`, `seed/network-config` and `seed.img` are published with mode 0600 inside the mode-0700 seed directory.
+- The machine directory and its ancestors are already current-user owned and non-group/world-writable (§6.1).
+
+Redaction rule: a password and inline user-data never reach a log line, an event, an error message, a hint, or a process argument list.
+
+- `CloudInitSpec` and `CloudInitSpecPatch` implement `Debug` manually and print `Some("<redacted>")` for `password` and `user_data_inline`, so any spec formatted into a trace or panic message is safe by construction.
+- Validation and rendering errors report an index, a byte length, or a violated rule, never the offending bytes.
+- `--password-file FILE` is the only CLI spelling: the value is read from the file, not from `argv`, which is world-readable on Linux.
+- The values remain visible where the user's own configuration is being shown back: `firestone show`, `GET /v1/machines/{name}`, `PUT`/`PATCH` responses, and the `create` `Result` payload serialize the effective `MachineSpec`. That is the same data as the machine file the user owns; the boundary is the 0600 file and the 0600 socket, not selective serialization, because a redacted spec would not round-trip back into `firestone.toml`.
 
 ---
 
@@ -1137,6 +1177,8 @@ Action routes respond with `Content-Type: application/x-ndjson` and stream `Even
 
 HTTP status by kind: `usage`/`invalid_spec` 400, `not_found` 404, `conflict`/`already_running`/`busy` 409, `timeout` 504, `dependency` 503, `checksum` 502, everything else 500.
 
+`ErrorInfo` carries one more optional member, `field`: the dotted spec path the failure belongs to (`memory`, `network.forward`, `mount[0].host`, `cloud_init.password`, …). It is omitted entirely when the error is not about one spec leaf, so existing bodies are unchanged. Every §7.2 spec-validation error carries it; the same envelope is used for JSON responses and for the terminal error record of an NDJSON stream. This is the form-error contract: the web UI answers beside the offending input instead of parsing messages. CLI rendering ignores `field` and keeps printing the message and hint.
+
 ### 16.5 Web UI (normative)
 
 The same axum application serves an embedded web UI beside `/v1`. Templates, stylesheet, scripts and fonts are compiled into the executable: Firestone still ships one file, and a host with no outbound network renders the UI exactly as designed.
@@ -1334,6 +1376,8 @@ Do these in the first milestone, against the pinned versions, and record results
 
 | Decision | Chosen | Alternatives considered | Why |
 |---|---|---|---|
+| Guest password storage and exposure | Store `cloud_init.password` as plaintext in the spec and rendered user-data, and defend it with enforced mode 0600 on `firestone.toml`, its edit candidate, and every seed artifact inside the mode-0700 seed directory; render `chpasswd` with `expire: false` and a JSON-quoted `"<user>:<password>"` scalar; keep `ssh_pwauth` false unless explicitly set; redact the value from `Debug`, logs, events, errors and argv, and expose it on the CLI only through `--password-file` | hash the password in Firestone; keep the umask mode and rely on the 0700 machine directory; redact the password from `show`/REST spec payloads; enable `ssh_pwauth` implicitly whenever a password is set; accept `--password VALUE` | cloud-init's `chpasswd` list takes a plaintext value, and any Firestone-side hash would pin one crypt scheme while remaining recoverable from the same 0600 files, so permissions are the real boundary and must not depend on the caller's umask. Redacting the spec payloads would break `firestone.toml` round-tripping, while quoting, `--password-file`, and the explicit `ssh_pwauth` opt-in remove the exposures that are not the user reading back their own configuration. |
+| Structured spec field errors | `ErrorInfo` gains an optional `field` carrying the dotted spec path, populated by the single `invalid()` constructor in `spec/validation.rs`, serialized only when present, surfaced by the REST envelope and ignored by CLI rendering | parse the key out of the existing `invalid '<key>': …` message; add a separate validation-error type or a `Vec<FieldError>` result; give every error kind a field | One constructor already owns every §7.2 failure, so one builder call makes the whole matrix field-addressed with no per-site churn. An optional member keeps existing bodies byte-identical and keeps one error type across CLI, config and REST, while message parsing would make a human string a machine contract. |
 | M6 interface contracts frozen up front | Snapshot, clone, resize, metrics, prune, and terminal WS routes plus spec additions are fixed before implementation (route shapes recorded in the M6 milestone's feature sections as they land); UI work proceeds against the contracts in parallel | design each surface inside its implementation PR; a single serialized workstream | Parallel agents need a stable seam; freezing the action names, REST paths and payload shapes first lets core and UI land independently while the drift gate keeps `docs/openapi.json` honest. |
 | First-start pinned firmware | Before `vmconfig.json` publication, install only the effective built-in `auto`/`rhf`/`edk2` artifact through the shared locked, no-follow, exact hash/mode, fsynced, no-replace publisher; reverify it for VmConfig; never install or modify a custom firmware path | require a broad `doctor --fix` preflight; download every vendored artifact; trust an existing regular file; rewrite custom firmware | A direct first start from an empty home gets the one firmware it needs without unrelated host repair. The manifest identity and secure publisher keep VMM input inside Firestone's owned dependency boundary, while the custom path remains authoritative. |
 | Passt runtime isolation diagnosis | Probe the exact foreground, one-off vhost-user mode with repair disabled; classify both `Couldn't create user namespace` and `Failed to detach isolating namespaces` as fatal; offer the existing AppArmor repair when host facts support it; runtime selects only the verified literal root-owned pinned copy after repair | treat later detach failure as available because the first userns succeeded; use generic `unshare`; disable AppArmor or a sysctl; accept a user-writable profiled path | Passt cannot serve Cloud Hypervisor after either fatal exit. Matching runtime argv closes the false-ok gap, and verified literal-path selection proves the repair authorizes only the pinned binary. |

@@ -27,6 +27,13 @@ const VOLUME_ID: u32 = 0x4653_0001;
 const FIRESTONE_PUBLIC_KEY_MODE: u32 = 0o644;
 const MAX_FIRESTONE_PUBLIC_KEY_BYTES: u64 = 16 * 1024;
 pub(crate) const MAX_USER_DATA_BYTES: u64 = 1024 * 1024;
+/// Inline user-data travels through specs, patches and REST bodies, so it is
+/// bounded far below the 1 MiB file limit.
+pub(crate) const MAX_INLINE_USER_DATA_BYTES: u64 = 32 * 1024;
+pub(crate) const MAX_PASSWORD_BYTES: u64 = 256;
+/// Rendered user-data can carry a guest password, so seed artifacts are
+/// published owner-read/write only inside the mode-0700 seed directory.
+const SEED_FILE_MODE: u32 = 0o600;
 pub(crate) const MAX_NETWORK_CONFIG_BYTES: u64 = 1024 * 1024;
 pub(crate) const MAX_SSH_KEY_FILE_BYTES: u64 = 64 * 1024;
 const MAX_RENDERED_SSH_KEYS_BYTES: usize = 256 * 1024;
@@ -160,12 +167,26 @@ fn render_cloud_init_inner(
     let machine_dir = paths.machine_dir(name)?;
     validate_guest_user(&spec.user)?;
 
-    let user_data = match &spec.cloud_init.user_data {
-        Some(path) => {
+    let user_data = match (
+        &spec.cloud_init.user_data,
+        &spec.cloud_init.user_data_inline,
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(FirestoneError::new(
+                ErrorKind::InvalidSpec,
+                "invalid 'cloud_init.user_data_inline': 'cloud_init.user_data' and 'cloud_init.user_data_inline' are both set",
+            )
+            .with_hint(
+                "keep one user part: clear 'cloud_init.user_data' or 'cloud_init.user_data_inline'",
+            )
+            .with_field("cloud_init.user_data_inline"));
+        }
+        (Some(path), None) => {
             let path = paths.resolve_input_path(path, &machine_dir, "cloud_init.user_data")?;
             Some(read_user_data_file(&path)?)
         }
-        None => None,
+        (None, Some(inline)) => Some(read_inline_user_data(inline)?),
+        (None, None) => None,
     };
     let network_config = match &spec.cloud_init.network_config {
         Some(path) => {
@@ -175,7 +196,11 @@ fn render_cloud_init_inner(
         None => None,
     };
     let user_keys = if spec.cloud_init.provisioning {
-        read_user_public_keys(paths, &machine_dir, &spec.cloud_init.ssh_keys)?
+        let mut keys = read_user_public_keys(paths, &machine_dir, &spec.cloud_init.ssh_keys)?;
+        keys.extend(parse_inline_public_keys(
+            &spec.cloud_init.ssh_authorized_keys,
+        )?);
+        keys
     } else {
         Vec::new()
     };
@@ -211,6 +236,8 @@ fn render_cloud_init_bytes(
             &user_keys,
             &mounts,
             sshd_path,
+            spec.cloud_init.password.as_deref(),
+            spec.cloud_init.ssh_pwauth,
         )?)
     } else {
         None
@@ -289,23 +316,29 @@ fn publish_rendered_seed(
     ensure_seed_directory(&seed_dir)?;
     paths.validate_machine_data_directory(name)?;
 
-    atomic::write(
+    atomic::write_with_mode(
         &paths.machine_seed_file(name, "meta-data")?,
         &rendered.meta_data,
+        SEED_FILE_MODE,
     )?;
-    atomic::write(
+    atomic::write_with_mode(
         &paths.machine_seed_file(name, "user-data")?,
         &rendered.user_data,
+        SEED_FILE_MODE,
     )?;
 
     let network_path = paths.machine_seed_file(name, "network-config")?;
     match &rendered.network_config {
-        Some(network_config) => atomic::write(&network_path, network_config)?,
+        Some(network_config) => {
+            atomic::write_with_mode(&network_path, network_config, SEED_FILE_MODE)?;
+        }
         None => remove_optional_file(&network_path)?,
     }
 
     let seed_image = paths.machine_seed_image(name)?;
-    atomic::write_stream(&seed_image, |file| write_seed_image(file, &rendered))?;
+    atomic::write_stream_with_mode(&seed_image, SEED_FILE_MODE, |file| {
+        write_seed_image(file, &rendered)
+    })?;
     Ok(rendered)
 }
 
@@ -318,6 +351,55 @@ fn read_user_data_file(path: &Path) -> Result<UserDataPart, FirestoneError> {
         "correct the path or reduce the user-data file to 1 MiB or less",
     )?;
     parse_user_data(bytes, &format!("file '{}'", path.display()))
+}
+
+/// Turns spec-supplied inline user-data into the multipart user part.
+///
+/// The value never reaches an error message: only its size does.
+fn read_inline_user_data(inline: &str) -> Result<UserDataPart, FirestoneError> {
+    if inline.len() as u64 > MAX_INLINE_USER_DATA_BYTES {
+        return Err(FirestoneError::new(
+            ErrorKind::InvalidSpec,
+            format!(
+                "cloud_init.user_data_inline is {} bytes and exceeds 32 KiB",
+                inline.len()
+            ),
+        )
+        .with_hint("reduce inline user-data to 32 KiB or move it to a 'cloud_init.user_data' file")
+        .with_field("cloud_init.user_data_inline"));
+    }
+    parse_user_data(inline.as_bytes().to_vec(), "inline value")
+}
+
+/// Parses inline OpenSSH public keys exactly like file-loaded key lines.
+fn parse_inline_public_keys(keys: &[String]) -> Result<Vec<ParsedPublicKey>, FirestoneError> {
+    let mut parsed = Vec::with_capacity(keys.len());
+    for (index, key) in keys.iter().enumerate() {
+        let field = format!("cloud_init.ssh_authorized_keys[{index}]");
+        let line = key.trim();
+        if line.is_empty() || line.starts_with('#') || line.lines().count() != 1 {
+            return Err(FirestoneError::new(
+                ErrorKind::InvalidSpec,
+                format!("{field} is not a single OpenSSH public-key line"),
+            )
+            .with_hint("supply exactly one OpenSSH public key per entry")
+            .with_field(field));
+        }
+        let public_key = PublicKey::from_openssh(line).map_err(|source| {
+            FirestoneError::new(
+                ErrorKind::InvalidSpec,
+                format!("{field} is not a valid OpenSSH public key"),
+            )
+            .with_hint("replace the entry with an OpenSSH public key")
+            .with_field(field.clone())
+            .with_source(source)
+        })?;
+        parsed.push(ParsedPublicKey {
+            rendered: line.to_owned(),
+            parsed: public_key,
+        });
+    }
+    Ok(parsed)
 }
 
 fn parse_user_data(bytes: Vec<u8>, source_label: &str) -> Result<UserDataPart, FirestoneError> {
@@ -614,6 +696,7 @@ fn deduplicate_user_keys(firestone_key: &PublicKey, keys: Vec<ParsedPublicKey>) 
     unique.into_iter().map(|key| key.rendered).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_firestone_part(
     name: &str,
     user: &str,
@@ -621,10 +704,17 @@ fn render_firestone_part(
     user_keys: &[String],
     mounts: &[TemplateMount],
     sshd_path: &SshdPath,
+    password: Option<&str>,
+    ssh_pwauth: bool,
 ) -> Result<Vec<u8>, FirestoneError> {
     let name = json_string(name)?;
     let firestone_pubkey = json_string(firestone_pubkey)?;
     let sshd_path = sshd_path.as_str();
+    // One pre-quoted scalar keeps a password with YAML metacharacters from
+    // changing the document's structure.
+    let chpasswd_entry = password
+        .map(|password| json_string(&format!("{user}:{password}")))
+        .transpose()?;
     let user_keys = user_keys
         .iter()
         .map(|key| json_string(key))
@@ -644,6 +734,8 @@ fn render_firestone_part(
             user_keys,
             mounts,
             sshd_path,
+            chpasswd_entry,
+            ssh_pwauth,
         })
         .map_err(template_error)?
         .into_bytes();
@@ -847,10 +939,10 @@ mod tests {
     use crate::{ErrorKind, MachineSpec, MountSpec, PathInputs, Paths, SshdPath};
 
     use super::{
-        MAX_NETWORK_CONFIG_BYTES, MAX_SSH_KEY_FILE_BYTES, MAX_USER_DATA_BYTES, SEED_IMAGE_SIZE,
-        VOLUME_ID, ensure_seed_directory, parse_public_keys, parse_user_data, publish_seed,
-        publish_seed_with_sshd_path, render_cloud_init, render_cloud_init_bytes,
-        render_cloud_init_with_guest_ssh,
+        MAX_INLINE_USER_DATA_BYTES, MAX_NETWORK_CONFIG_BYTES, MAX_SSH_KEY_FILE_BYTES,
+        MAX_USER_DATA_BYTES, SEED_IMAGE_SIZE, VOLUME_ID, ensure_seed_directory, parse_public_keys,
+        parse_user_data, publish_seed, publish_seed_with_sshd_path, render_cloud_init,
+        render_cloud_init_bytes, render_cloud_init_with_guest_ssh,
     };
 
     const FIRESTONE_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKg0J8YPh7wARkZSlBzFAoJez6gssTQUuPu4Qy3z8T1P firestone@test\n";
@@ -862,6 +954,8 @@ mod tests {
     const GOLDEN_USER_MULTIPART: &[u8] = include_bytes!("../testdata/cloud-init-user.multipart");
     const GOLDEN_SCRIPT_MULTIPART: &[u8] =
         include_bytes!("../testdata/cloud-init-script.multipart");
+    const GOLDEN_PASSWORD_MULTIPART: &[u8] =
+        include_bytes!("../testdata/cloud-init-password.multipart");
     const GOLDEN_SEED_SHA256: &str =
         "eddaac95d6ca1cb7ecb174c67788df8d19b06f51dda0ab9c15df72c79f14771d";
 
@@ -1526,6 +1620,216 @@ mod tests {
         let clean = render_cloud_init(&fixture.paths, "demo", &spec)?;
         assert_eq!(rendered, clean);
         assert_eq!(rendered.instance_id, "iid-demo-82b55541fe2b");
+        Ok(())
+    }
+
+    #[test]
+    fn inline_user_data_renders_the_same_part_as_an_identical_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(true)?;
+        let machine_dir = fixture.paths.machine_dir("demo")?;
+        fs::write(machine_dir.join("user.pub"), USER_KEY)?;
+        let mut spec = layered_spec(PathBuf::from("user.pub"));
+        spec.cloud_init.user_data_inline = Some(USER_CLOUD_CONFIG.to_owned());
+
+        let rendered = render_cloud_init(&fixture.paths, "demo", &spec)?;
+
+        assert_eq!(rendered.user_data, GOLDEN_USER_MULTIPART);
+        assert_eq!(rendered.instance_id, "iid-demo-331c6c041fc0");
+        Ok(())
+    }
+
+    #[test]
+    fn inline_shell_script_user_data_selects_the_shellscript_part()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let mut spec = MachineSpec::default();
+        spec.cloud_init.provisioning = false;
+        spec.cloud_init.user_data_inline = Some(SCRIPT_USER_DATA.to_owned());
+
+        let rendered = render_cloud_init(&fixture.paths, "demo", &spec)?;
+
+        assert_eq!(rendered.user_data, GOLDEN_SCRIPT_MULTIPART);
+        assert_eq!(rendered.instance_id, "iid-demo-bb5567ea0d31");
+        Ok(())
+    }
+
+    #[test]
+    fn inline_and_file_user_data_together_names_both_keys_without_contents()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(true)?;
+        let machine_dir = fixture.paths.machine_dir("demo")?;
+        fs::write(machine_dir.join("user-data.yaml"), USER_CLOUD_CONFIG)?;
+        let mut spec = MachineSpec::default();
+        spec.cloud_init.user_data = Some(PathBuf::from("user-data.yaml"));
+        spec.cloud_init.user_data_inline = Some("#cloud-config\nsecret: value\n".to_owned());
+
+        let error = render_cloud_init(&fixture.paths, "demo", &spec)
+            .err()
+            .ok_or("both user parts should fail")?;
+
+        assert_eq!(error.kind(), ErrorKind::InvalidSpec);
+        assert!(error.message().contains("cloud_init.user_data"));
+        assert!(error.message().contains("cloud_init.user_data_inline"));
+        assert!(!error.message().contains("secret: value"));
+        assert_eq!(error.field(), Some("cloud_init.user_data_inline"));
+        assert!(error.hint().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn inline_user_data_over_the_limit_reports_size_without_contents()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(true)?;
+        let mut inline = String::from("#cloud-config\n# ");
+        inline.push_str(&"secret".repeat(MAX_INLINE_USER_DATA_BYTES as usize / 6));
+        let mut spec = MachineSpec::default();
+        spec.cloud_init.user_data_inline = Some(inline);
+
+        let error = render_cloud_init(&fixture.paths, "demo", &spec)
+            .err()
+            .ok_or("oversized inline user-data should fail")?;
+
+        assert_eq!(error.kind(), ErrorKind::InvalidSpec);
+        assert!(error.message().contains("exceeds 32 KiB"));
+        assert!(!error.message().contains("secret"));
+        assert_eq!(error.field(), Some("cloud_init.user_data_inline"));
+        Ok(())
+    }
+
+    #[test]
+    fn inline_authorized_key_invalid_entry_is_rejected_without_echoing_material()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(true)?;
+        let mut spec = MachineSpec::default();
+        spec.cloud_init.ssh_authorized_keys = vec![
+            USER_KEY.trim().to_owned(),
+            "ssh-ed25519 AAAAnope".to_owned(),
+        ];
+
+        let error = render_cloud_init(&fixture.paths, "demo", &spec)
+            .err()
+            .ok_or("invalid inline key should fail")?;
+
+        assert_eq!(error.kind(), ErrorKind::InvalidSpec);
+        assert_eq!(error.field(), Some("cloud_init.ssh_authorized_keys[1]"));
+        assert!(!error.message().contains("AAAAnope"));
+        assert!(error.hint().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn inline_and_file_keys_deduplicate_across_both_sources()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(true)?;
+        let machine_dir = fixture.paths.machine_dir("demo")?;
+        let user_blob = public_key_blob(USER_KEY)?;
+        let second_blob = public_key_blob(SECOND_USER_KEY)?;
+        let firestone_blob = public_key_blob(FIRESTONE_KEY)?;
+        fs::write(
+            machine_dir.join("user.pub"),
+            format!("ssh-ed25519 {user_blob} from file\n"),
+        )?;
+        let mut spec = MachineSpec::default();
+        spec.cloud_init.ssh_keys = vec![PathBuf::from("user.pub")];
+        spec.cloud_init.ssh_authorized_keys = vec![
+            format!("ssh-ed25519 {user_blob} duplicate inline"),
+            format!("ssh-ed25519 {second_blob} second inline"),
+            format!("ssh-ed25519 {firestone_blob} duplicate identity"),
+            format!("ssh-ed25519 {second_blob} duplicate second"),
+        ];
+
+        let rendered = render_cloud_init(&fixture.paths, "demo", &spec)?;
+        let text = std::str::from_utf8(&rendered.user_data)?;
+
+        assert_eq!(text.matches(user_blob).count(), 2);
+        assert_eq!(text.matches(second_blob).count(), 2);
+        assert_eq!(text.matches(firestone_blob).count(), 2);
+        assert!(text.contains("from file"));
+        assert!(!text.contains("duplicate inline"));
+        assert!(!text.contains("duplicate identity"));
+        assert!(!text.contains("duplicate second"));
+        assert!(
+            text.find(user_blob).ok_or("missing file key")?
+                < text.find(second_blob).ok_or("missing inline key")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn password_renders_chpasswd_and_pwauth_only_when_requested()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(true)?;
+        let mut spec = MachineSpec {
+            user: "ubuntu".to_owned(),
+            ..MachineSpec::default()
+        };
+
+        let baseline = render_cloud_init(&fixture.paths, "demo", &spec)?;
+        assert!(std::str::from_utf8(&baseline.user_data)?.contains("ssh_pwauth: false\n"));
+        assert!(!std::str::from_utf8(&baseline.user_data)?.contains("chpasswd"));
+
+        spec.cloud_init.password = Some("s3cret: \"quoted\"".to_owned());
+        let with_password = render_cloud_init(&fixture.paths, "demo", &spec)?;
+        let text = std::str::from_utf8(&with_password.user_data)?;
+        assert!(text.contains("chpasswd:\n  expire: false\n  list:\n"));
+        assert!(text.contains("    - \"ubuntu:s3cret: \\\"quoted\\\"\"\n"));
+        assert!(text.contains("ssh_pwauth: false\n"));
+        assert_ne!(with_password.instance_id, baseline.instance_id);
+
+        spec.cloud_init.ssh_pwauth = true;
+        let with_pwauth = render_cloud_init(&fixture.paths, "demo", &spec)?;
+        let pwauth_text = std::str::from_utf8(&with_pwauth.user_data)?;
+        assert!(pwauth_text.contains("ssh_pwauth: true\n"));
+        assert!(pwauth_text.contains("chpasswd:\n"));
+        assert_ne!(with_pwauth.instance_id, with_password.instance_id);
+        assert_eq!(with_pwauth.user_data, GOLDEN_PASSWORD_MULTIPART);
+
+        let repeated = render_cloud_init(&fixture.paths, "demo", &spec)?;
+        assert_eq!(repeated, with_pwauth);
+        Ok(())
+    }
+
+    #[test]
+    fn password_change_reprovisions_through_the_instance_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(true)?;
+        let mut spec = MachineSpec::default();
+        spec.cloud_init.password = Some("first".to_owned());
+        let first = render_cloud_init(&fixture.paths, "demo", &spec)?;
+
+        spec.cloud_init.password = Some("second".to_owned());
+        let second = render_cloud_init(&fixture.paths, "demo", &spec)?;
+
+        assert_ne!(first.instance_id, second.instance_id);
+        assert_ne!(first.user_data, second.user_data);
+        assert!(
+            std::str::from_utf8(&second.meta_data)?.contains(&second.instance_id),
+            "meta-data carries the changed instance id"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn published_seed_artifacts_are_owner_only() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(true)?;
+        let machine_dir = fixture.paths.machine_dir("demo")?;
+        fs::write(machine_dir.join("network-config.yaml"), "version: 2\n")?;
+        let mut spec = MachineSpec::default();
+        spec.cloud_init.password = Some("s3cret".to_owned());
+        spec.cloud_init.network_config = Some(PathBuf::from("network-config.yaml"));
+
+        publish_seed(&fixture.paths, "demo", &spec)?;
+
+        for path in [
+            fixture.paths.machine_seed_file("demo", "meta-data")?,
+            fixture.paths.machine_seed_file("demo", "user-data")?,
+            fixture.paths.machine_seed_file("demo", "network-config")?,
+            fixture.paths.machine_seed_image("demo")?,
+        ] {
+            let mode = fs::metadata(&path)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{} mode {mode:04o}", path.display());
+        }
         Ok(())
     }
 

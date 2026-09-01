@@ -1631,6 +1631,7 @@ mod tests {
                 kind: ErrorKind::Timeout,
                 message: "timed out".to_owned(),
                 hint: None,
+                field: None,
             },
         )?;
         drop(progress);
@@ -1827,6 +1828,7 @@ mod tests {
                     kind: ErrorKind::Generic,
                     message: "failed".to_owned(),
                     hint: Some("retry".to_owned()),
+                    field: None,
                 },
             },
             Event::Log {
@@ -2027,6 +2029,7 @@ mod tests {
                 kind: ErrorKind::Generic,
                 message: "disk failed".to_owned(),
                 hint: None,
+                field: None,
             },
         })?;
         renderer.emit(Event::Result {

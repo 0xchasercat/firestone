@@ -9,4 +9,16 @@
 #
 # Add `[[mount]]` tables for shared directories. Cloud-init paths are resolved
 # relative to this file. `vmm.config_overlay` is an advanced JSON merge patch.
+#
+# Cloud-init takes one user part: either `cloud_init.user_data` (a file) or
+# `cloud_init.user_data_inline` (up to 32 KiB inline). Both start with
+# `#cloud-config` or `#!`. `ssh_keys` lists public key files and
+# `ssh_authorized_keys` lists key lines; duplicates across both are dropped.
+#
+# `cloud_init.password` is the plaintext login password for `user`, applied
+# with cloud-init `chpasswd`. This file is written mode 0600 because of it.
+# Console and local login accept it; guest SSH password authentication stays
+# off until `cloud_init.ssh_pwauth = true`. Changing either re-provisions the
+# guest on the next start.
+#
 # The effective values for this machine follow.

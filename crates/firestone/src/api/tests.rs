@@ -903,6 +903,59 @@ async fn concurrent_conflicting_actions_return_shared_409_error() -> TestResult 
     Ok(())
 }
 
+/// Fails with the structured spec-field error the web-UI form contract needs.
+struct FieldErrorDispatcher;
+
+impl Dispatcher for FieldErrorDispatcher {
+    fn run<'a>(&'a self, _action: Action, _events: &'a mut dyn EventSink) -> DispatchFuture<'a> {
+        Box::pin(async move {
+            Err(
+                FirestoneError::new(ErrorKind::InvalidSpec, "invalid 'cloud_init.password'")
+                    .with_hint("use a password without control characters")
+                    .with_field("cloud_init.password"),
+            )
+        })
+    }
+}
+
+#[tokio::test]
+async fn spec_field_error_reaches_the_rest_envelope_as_a_field() -> TestResult {
+    let json = send(
+        &app(Arc::new(FieldErrorDispatcher)),
+        json_request(
+            Method::POST,
+            "/v1/machines",
+            &json!({"name":"dev","spec":{}}),
+        )?,
+    )
+    .await?;
+    assert_eq!(json.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&response_bytes(json).await?)?,
+        json!({"error":{
+            "kind":"invalid_spec",
+            "message":"invalid 'cloud_init.password'",
+            "hint":"use a password without control characters",
+            "field":"cloud_init.password"
+        }})
+    );
+
+    let stream = send(
+        &app(Arc::new(FieldErrorDispatcher)),
+        request(Method::POST, "/v1/machines/dev/start", Body::empty())?,
+    )
+    .await?;
+    assert_eq!(stream.status(), StatusCode::BAD_REQUEST);
+    let body = response_bytes(stream).await?;
+    let record: Value = serde_json::from_slice(
+        body.split(|byte| *byte == b'\n')
+            .next()
+            .ok_or("missing ndjson record")?,
+    )?;
+    assert_eq!(record["error"]["field"], "cloud_init.password");
+    Ok(())
+}
+
 #[tokio::test]
 async fn every_shared_error_kind_maps_to_exact_http_status_and_json() -> TestResult {
     let cases = [

@@ -52,8 +52,11 @@ _arguments "${_arguments_options[@]}" : \
 '--network-mac=[Set a fixed guest network MAC address]:MAC:_default' \
 '*--mount=[Share a host directory with the guest; repeat as needed]:HOST:GUEST[:ro]:_default' \
 '--user-data=[Add a cloud-init user-data file]:FILE:_files' \
+'--user-data-inline=[Set cloud-init user-data inline instead of from a file]:TEXT:_default' \
 '--cloud-init-network-config=[Add a cloud-init network-config file]:FILE:_files' \
 '*--ssh-key=[Add an OpenSSH public-key file; repeat as needed]:FILE:_files' \
+'*--ssh-authorized-key=[Add an inline OpenSSH public key; repeat as needed]:KEY:_default' \
+'--password-file=[Read the guest password for --user from a file]:FILE:_default' \
 '--vmm-binary=[Use a custom cloud-hypervisor executable]:FILE:_files' \
 '--vmm-firmware=[Select auto, rhf, edk2, or a firmware file]:FIRMWARE:_default' \
 '*--vmm-arg=[Append one cloud-hypervisor argument; repeat as needed]:ARG:_default' \
@@ -61,6 +64,7 @@ _arguments "${_arguments_options[@]}" : \
 '*--clear=[Clear an inherited optional field; repeat as needed]:FIELD:_default' \
 '--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
 '--rm[Remove a machine created by this invocation after SSH exits]' \
+'--ssh-pwauth[Allow SSH password authentication in the guest]' \
 '--no-provisioning[Disable Firestone'\''s built-in guest provisioning]' \
 '--json[Print events as newline-delimited JSON and disable human output]' \
 '-q[Print only errors and command results]' \
@@ -93,8 +97,11 @@ _arguments "${_arguments_options[@]}" : \
 '--network-mac=[Set a fixed guest network MAC address]:MAC:_default' \
 '*--mount=[Share a host directory with the guest; repeat as needed]:HOST:GUEST[:ro]:_default' \
 '--user-data=[Add a cloud-init user-data file]:FILE:_files' \
+'--user-data-inline=[Set cloud-init user-data inline instead of from a file]:TEXT:_default' \
 '--cloud-init-network-config=[Add a cloud-init network-config file]:FILE:_files' \
 '*--ssh-key=[Add an OpenSSH public-key file; repeat as needed]:FILE:_files' \
+'*--ssh-authorized-key=[Add an inline OpenSSH public key; repeat as needed]:KEY:_default' \
+'--password-file=[Read the guest password for --user from a file]:FILE:_default' \
 '--vmm-binary=[Use a custom cloud-hypervisor executable]:FILE:_files' \
 '--vmm-firmware=[Select auto, rhf, edk2, or a firmware file]:FIRMWARE:_default' \
 '*--vmm-arg=[Append one cloud-hypervisor argument; repeat as needed]:ARG:_default' \
@@ -102,6 +109,7 @@ _arguments "${_arguments_options[@]}" : \
 '*--clear=[Clear an inherited optional field; repeat as needed]:FIELD:_default' \
 '--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
 '--edit[Open the generated specification in the configured editor]' \
+'--ssh-pwauth[Allow SSH password authentication in the guest]' \
 '--no-provisioning[Disable Firestone'\''s built-in guest provisioning]' \
 '--json[Print events as newline-delimited JSON and disable human output]' \
 '-q[Print only errors and command results]' \

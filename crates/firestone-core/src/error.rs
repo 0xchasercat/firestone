@@ -55,6 +55,9 @@ pub struct ErrorInfo {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// Dotted spec path the error belongs to, for form-level field reporting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
 }
 
 /// The error type returned by core operations.
@@ -64,6 +67,7 @@ pub struct FirestoneError {
     kind: ErrorKind,
     message: String,
     hint: Option<String>,
+    field: Option<String>,
     #[source]
     source: Option<Box<dyn Error + Send + Sync + 'static>>,
 }
@@ -74,6 +78,7 @@ impl FirestoneError {
             kind,
             message: message.into(),
             hint: None,
+            field: None,
             source: None,
         }
     }
@@ -81,6 +86,16 @@ impl FirestoneError {
     #[must_use]
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
+        self
+    }
+
+    /// Attaches the dotted spec path this error belongs to.
+    ///
+    /// Field-addressed surfaces (the web UI form, REST clients) answer beside
+    /// the offending input; the CLI ignores it and keeps its message and hint.
+    #[must_use]
+    pub fn with_field(mut self, field: impl Into<String>) -> Self {
+        self.field = Some(field.into());
         self
     }
 
@@ -106,6 +121,11 @@ impl FirestoneError {
     }
 
     #[must_use]
+    pub fn field(&self) -> Option<&str> {
+        self.field.as_deref()
+    }
+
+    #[must_use]
     pub fn info(&self) -> ErrorInfo {
         ErrorInfo::from(self)
     }
@@ -117,6 +137,7 @@ impl From<&FirestoneError> for ErrorInfo {
             kind: error.kind,
             message: error.message.clone(),
             hint: error.hint.clone(),
+            field: error.field.clone(),
         }
     }
 }
@@ -151,7 +172,32 @@ mod tests {
                 kind: ErrorKind::Dependency,
                 message: "cannot open /dev/kvm".to_owned(),
                 hint: Some("run firestone doctor".to_owned()),
+                field: None,
             }
         );
+    }
+
+    #[test]
+    fn error_without_field_omits_the_serialized_key() -> Result<(), serde_json::Error> {
+        let error = FirestoneError::new(ErrorKind::InvalidSpec, "invalid 'memory'");
+
+        assert_eq!(error.field(), None);
+        assert_eq!(
+            serde_json::to_string(&error.info())?,
+            r#"{"kind":"invalid_spec","message":"invalid 'memory'"}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn error_with_field_serializes_the_dotted_spec_path() -> Result<(), serde_json::Error> {
+        let error = FirestoneError::new(ErrorKind::InvalidSpec, "invalid 'cloud_init.password'")
+            .with_hint("set a password without control characters")
+            .with_field("cloud_init.password");
+
+        assert_eq!(error.field(), Some("cloud_init.password"));
+        let value: serde_json::Value = serde_json::to_value(error.info())?;
+        assert_eq!(value["field"], "cloud_init.password");
+        Ok(())
     }
 }
