@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::sync::mpsc;
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
-use crate::render::write_safe_output;
+use crate::render::{TerminalSanitizer, sanitize_terminal_output};
 
 const MAX_JSON_BODY_BYTES: usize = 1024 * 1024;
 const MAX_TIMEOUT_SECONDS: u64 = 60 * 60;
@@ -574,10 +574,14 @@ async fn conditional_delete_response(
 
 async fn logs_response(state: &ApiState, action: Action) -> Response {
     let mut receiver = dispatch_channel(state, action, "logs");
+    // One sanitiser per follow stream: a colour sequence split across two
+    // Output events is still one sequence.
+    let mut sanitizer = TerminalSanitizer::new();
     loop {
         match receiver.recv().await {
             Some(DispatchMessage::Event(Event::Output { data })) => {
-                return text_stream_response(safe_output_chunk(&data), receiver);
+                let first = Bytes::from(sanitizer.push(&data));
+                return text_stream_response(first, receiver, sanitizer);
             }
             Some(DispatchMessage::Event(Event::Result { .. })) => {
                 return text_response(StatusCode::OK, Bytes::new());
@@ -1066,13 +1070,41 @@ fn ndjson_stream_response(first: Event, receiver: mpsc::Receiver<DispatchMessage
     )
 }
 
-fn text_stream_response(first: Bytes, receiver: mpsc::Receiver<DispatchMessage>) -> Response {
+/// Streams the rest of a log through the sanitiser that produced `first`.
+///
+/// The sanitiser travels with the stream rather than being applied per chunk,
+/// so a sequence straddling two Output events parses once, and the dangling
+/// tail of a truncated sequence is flushed when the stream ends.
+fn text_stream_response(
+    first: Bytes,
+    receiver: mpsc::Receiver<DispatchMessage>,
+    sanitizer: TerminalSanitizer,
+) -> Response {
     let first = tokio_stream::iter([Ok::<Bytes, Infallible>(first)]);
-    let rest = ReceiverStream::new(receiver).filter_map(|message| match message {
-        DispatchMessage::Event(Event::Output { data }) => {
-            Some(Ok::<Bytes, Infallible>(safe_output_chunk(&data)))
+    let rest = futures_util::stream::unfold(Some((receiver, sanitizer)), |carried| async move {
+        let (mut receiver, mut sanitizer) = carried?;
+        loop {
+            match receiver.recv().await {
+                Some(DispatchMessage::Event(Event::Output { data })) => {
+                    let chunk = sanitizer.push(&data);
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    return Some((
+                        Ok::<Bytes, Infallible>(Bytes::from(chunk)),
+                        Some((receiver, sanitizer)),
+                    ));
+                }
+                Some(DispatchMessage::Event(_) | DispatchMessage::Error(_)) => continue,
+                None => {
+                    let tail = sanitizer.finish();
+                    if tail.is_empty() {
+                        return None;
+                    }
+                    return Some((Ok(Bytes::from(tail)), None));
+                }
+            }
         }
-        DispatchMessage::Event(_) | DispatchMessage::Error(_) => None,
     });
     response_with_content_type(
         StatusCode::OK,
@@ -1103,22 +1135,14 @@ fn encode_error_ndjson(error: &FirestoneError) -> Bytes {
     }
 }
 
-/// Applies the same control-character sanitisation to a whole string.
+/// Applies the same log sanitisation to a whole aggregated string.
 ///
 /// The web UI renders log text into HTML rather than streaming it as
 /// `text/plain`, and must not be the one surface where a raw control byte
-/// survives.
+/// survives. It sees exactly what the streaming path emits: SGR colour kept,
+/// every other escape sequence replaced.
 pub(crate) fn sanitized_output(data: &str) -> String {
-    let bytes = safe_output_chunk(data);
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
-fn safe_output_chunk(data: &str) -> Bytes {
-    let mut bytes = Vec::with_capacity(data.len());
-    if write_safe_output(&mut bytes, data).is_err() {
-        return Bytes::new();
-    }
-    Bytes::from(bytes)
+    sanitize_terminal_output(data)
 }
 
 fn contract_error_response() -> Response {

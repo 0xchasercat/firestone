@@ -2010,3 +2010,214 @@ textarea {
     transition: none !important;
   }
 }
+
+/* ------------------------------------------------------------- ansi logs -- */
+
+/* The sixteen ANSI colours, as tokens rather than literals, because the log
+ * pane is the one surface where the guest picks the colour and Firestone only
+ * decides what that colour looks like.
+ *
+ * The pane keeps its dark ground in both themes (--terminal is not redefined
+ * for dark), so both palettes are tuned against it: the light set is the more
+ * restrained one, and the dark set lifts saturation and value the way a bright
+ * variant does, to hold its own beside the brighter surrounding chrome.
+ *
+ * Colour 0 is not #000: black on a near-black terminal is an invisible line,
+ * and losing a log line is worse than being imprecise about "black". */
+:root {
+  --fs-ansi-0: #55504a;
+  --fs-ansi-1: #e06c5a;
+  --fs-ansi-2: #63c98a;
+  --fs-ansi-3: #d9a441;
+  --fs-ansi-4: #6f9fe0;
+  --fs-ansi-5: #c48ad6;
+  --fs-ansi-6: #58bfc4;
+  --fs-ansi-7: #cfc8bd;
+  --fs-ansi-8: #7d766c;
+  --fs-ansi-9: #ff8a72;
+  --fs-ansi-10: #86e0a6;
+  --fs-ansi-11: #f0c264;
+  --fs-ansi-12: #97bdf5;
+  --fs-ansi-13: #dcabec;
+  --fs-ansi-14: #7fdbe0;
+  --fs-ansi-15: #f2ede5;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --fs-ansi-0: #5f594f;
+    --fs-ansi-1: #ef6547;
+    --fs-ansi-2: #55c98d;
+    --fs-ansi-3: #d99b2b;
+    --fs-ansi-4: #7fadea;
+    --fs-ansi-5: #cf9ae0;
+    --fs-ansi-6: #63cbd0;
+    --fs-ansi-7: #ddd6cb;
+    --fs-ansi-8: #8d857a;
+    --fs-ansi-9: #ff9c85;
+    --fs-ansi-10: #96ecb5;
+    --fs-ansi-11: #ffd07a;
+    --fs-ansi-12: #a9cbff;
+    --fs-ansi-13: #e8bcf5;
+    --fs-ansi-14: #92eaef;
+    --fs-ansi-15: #fbf7f0;
+  }
+}
+
+:root[data-theme="dark"] {
+  --fs-ansi-0: #5f594f;
+  --fs-ansi-1: #ef6547;
+  --fs-ansi-2: #55c98d;
+  --fs-ansi-3: #d99b2b;
+  --fs-ansi-4: #7fadea;
+  --fs-ansi-5: #cf9ae0;
+  --fs-ansi-6: #63cbd0;
+  --fs-ansi-7: #ddd6cb;
+  --fs-ansi-8: #8d857a;
+  --fs-ansi-9: #ff9c85;
+  --fs-ansi-10: #96ecb5;
+  --fs-ansi-11: #ffd07a;
+  --fs-ansi-12: #a9cbff;
+  --fs-ansi-13: #e8bcf5;
+  --fs-ansi-14: #92eaef;
+  --fs-ansi-15: #fbf7f0;
+}
+
+/* One completed log line: rendered once, then never touched again. */
+.fs-logline {
+  white-space: inherit;
+}
+
+.fs-ansi-bold {
+  font-weight: 600;
+}
+
+.fs-ansi-dim {
+  opacity: 0.62;
+}
+
+.fs-ansi-italic {
+  font-style: italic;
+}
+
+.fs-ansi-underline {
+  text-decoration: underline;
+}
+
+.fs-ansi-strike {
+  text-decoration: line-through;
+}
+
+.fs-ansi-underline.fs-ansi-strike {
+  text-decoration: underline line-through;
+}
+
+/* Inverse with both colours left at their defaults. When either side is a real
+ * ANSI colour, app.js swaps the indices and the rules below win on order. */
+.fs-ansi-invert {
+  color: var(--terminal);
+  background: var(--terminal-fg);
+}
+
+.fs-ansi-fg-0 {
+  color: var(--fs-ansi-0);
+}
+.fs-ansi-fg-1 {
+  color: var(--fs-ansi-1);
+}
+.fs-ansi-fg-2 {
+  color: var(--fs-ansi-2);
+}
+.fs-ansi-fg-3 {
+  color: var(--fs-ansi-3);
+}
+.fs-ansi-fg-4 {
+  color: var(--fs-ansi-4);
+}
+.fs-ansi-fg-5 {
+  color: var(--fs-ansi-5);
+}
+.fs-ansi-fg-6 {
+  color: var(--fs-ansi-6);
+}
+.fs-ansi-fg-7 {
+  color: var(--fs-ansi-7);
+}
+.fs-ansi-fg-8 {
+  color: var(--fs-ansi-8);
+}
+.fs-ansi-fg-9 {
+  color: var(--fs-ansi-9);
+}
+.fs-ansi-fg-10 {
+  color: var(--fs-ansi-10);
+}
+.fs-ansi-fg-11 {
+  color: var(--fs-ansi-11);
+}
+.fs-ansi-fg-12 {
+  color: var(--fs-ansi-12);
+}
+.fs-ansi-fg-13 {
+  color: var(--fs-ansi-13);
+}
+.fs-ansi-fg-14 {
+  color: var(--fs-ansi-14);
+}
+.fs-ansi-fg-15 {
+  color: var(--fs-ansi-15);
+}
+
+.fs-ansi-bg-0 {
+  background: var(--fs-ansi-0);
+}
+.fs-ansi-bg-1 {
+  background: var(--fs-ansi-1);
+}
+.fs-ansi-bg-2 {
+  background: var(--fs-ansi-2);
+}
+.fs-ansi-bg-3 {
+  background: var(--fs-ansi-3);
+}
+.fs-ansi-bg-4 {
+  background: var(--fs-ansi-4);
+}
+.fs-ansi-bg-5 {
+  background: var(--fs-ansi-5);
+}
+.fs-ansi-bg-6 {
+  background: var(--fs-ansi-6);
+}
+.fs-ansi-bg-7 {
+  background: var(--fs-ansi-7);
+}
+.fs-ansi-bg-8 {
+  background: var(--fs-ansi-8);
+}
+.fs-ansi-bg-9 {
+  background: var(--fs-ansi-9);
+}
+.fs-ansi-bg-10 {
+  background: var(--fs-ansi-10);
+}
+.fs-ansi-bg-11 {
+  background: var(--fs-ansi-11);
+}
+.fs-ansi-bg-12 {
+  background: var(--fs-ansi-12);
+}
+.fs-ansi-bg-13 {
+  background: var(--fs-ansi-13);
+}
+.fs-ansi-bg-14 {
+  background: var(--fs-ansi-14);
+}
+.fs-ansi-bg-15 {
+  background: var(--fs-ansi-15);
+}
+
+/* A coloured background reads as a block, not as text with a tinted halo. */
+.fs-logview [class*="fs-ansi-bg-"] {
+  padding: 1px 0;
+}
