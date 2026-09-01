@@ -35,8 +35,8 @@ Build it twice into separate target directories and require the two outputs to b
 - `firestone-init` compiles for `x86_64-unknown-linux-musl` and for the host. Every Linux-only path is behind `cfg(target_os = "linux")`, so the workspace gate — `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` — passes on macOS with the pure modules fully covered, exactly as `shim.rs` does.
 - Unsafe is confined to `crates/firestone-init/src/ffi.rs`, which denies `unsafe_op_in_unsafe_fn` and documents every block. `firestone-initproto` forbids `unsafe` outright.
 - `crates/firestone-core/build.rs` already verifies and embeds a `firestone-init` asset when — and only when — `deps.toml` carries a `[dependency.firestone-init]` entry **and** `FIRESTONE_EMBEDDED_HELPERS_DIR` holds the named asset. Half a pin is a build failure; neither half is an ordinary development build.
-- Until then, `firestone_core::firestone_init_payload()` returns kind `dependency` with a hint naming the missing release, so the OCI pull pipeline cannot inject nothing by accident.
-- The OCI pull pipeline (M6-15) calls that feed **before** it contacts the registry, and re-reports its failure as `cannot pull OCI image '<ref>': the firestone-init guest payload is unavailable` with a hint naming both the standalone release and the `deps.toml` pin. So on a plain `cargo build`, `firestone images pull docker.io/library/alpine:3.20` fails in milliseconds with that message rather than after downloading layers; this is the exact limitation this runbook closes.
+- `firestone_core::firestone_init_payload()` prefers that embedded payload and, since the release below was pinned, falls back to downloading the pinned artifact. With neither available it returns kind `dependency` naming both ways out, so the OCI pull pipeline cannot inject nothing by accident.
+- The OCI pull pipeline (M6-15) calls that feed **before** it contacts the registry, through the store's own pinned-artifact publisher, and re-reports a failure as `cannot pull OCI image '<ref>': the firestone-init guest payload is unavailable`, carrying the feed's own hint. So a plain `cargo build` pulls an OCI image by downloading the pinned payload once on first use, and an offline build with no embed fails in milliseconds rather than after downloading layers.
 
 ## Release runbook (orchestrator)
 
@@ -75,3 +75,18 @@ Neither the injection nor the boot can be exercised without KVM and a real regis
 3. On a `network.mode = "passt"` machine, `firestone-init: eth0 configured with <address>` appears within the 5 s budget, and `/etc/resolv.conf` exists.
 4. On a `network.mode = "none"` machine, no DHCP warning appears at all and boot reaches the entrypoint measurably sooner.
 5. `firestone stop` reaches the entrypoint as `SIGTERM` on its own process group, and the machine's `last_exit` records a clean exit rather than a timeout — that is the `reboot(RB_POWER_OFF)` path working.
+
+## Published release (orchestrator record)
+
+`firestone-init-v0.1.0-firestone.1` was built at commit `4dc0af6` inside the pinned `build/firestone` container with the two-pass command above, and the two passes were byte-identical:
+
+| Asset | SHA-256 | Bytes |
+|---|---|---|
+| `firestone-init-v0.1.0-x86_64-unknown-linux-musl` | `1018c2dceecbf8d761d20ac40a07f28baada0e3cf2c3322af24fe7bb96b67d11` | 681,240 |
+
+The release tag deviates from step 3 above, which suggested uploading the asset to the Firestone version release. That ordering is circular — the version release is the one that would embed the payload, and the payload has to be pinned before it can be embedded — so the asset follows the `virtiofsd` pattern instead and carries its own lifecycle tag. SPEC §21 records the decision.
+
+`deps.toml` now carries `[dependency.firestone-init]` for x86_64, regenerated with `scripts/pin-deps.sh refresh --arch all` and checked with `scripts/pin-deps.sh verify --arch all`. Two consequences of the pin are load-bearing:
+
+- The x86_64 standalone release build must stage the asset into `FIRESTONE_EMBEDDED_HELPERS_DIR`; `scripts/build-release.sh` downloads it from the manifest alongside `cloud-hypervisor`, `passt` and `qemu-img`, and `build.rs` fails the build if it is absent or mismatched. That is step 5 above, now done.
+- A build that embeds nothing resolves the payload from the pin at run time, downloading it once on first OCI use through the same publisher as the direct-boot kernel (SPEC §17.2). A plain `cargo build` can therefore pull an OCI image; only the guest-side checks of the previous section still need KVM.

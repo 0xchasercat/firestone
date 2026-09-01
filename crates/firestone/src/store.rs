@@ -4868,7 +4868,9 @@ esac
         );
         assert_eq!(result.architecture, architecture.as_str());
         let expected_dependencies = match architecture {
-            Arch::X86_64 => 8,
+            // x86_64 additionally carries passt, qemu-img, mkfs-ext4 and the
+            // firestone-init guest payload; aarch64 pins none of the four.
+            Arch::X86_64 => 9,
             Arch::Aarch64 => 5,
         };
         assert_eq!(result.dependencies.len(), expected_dependencies);

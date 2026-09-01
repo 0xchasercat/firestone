@@ -31,7 +31,7 @@ use crate::{
     Unit, atomic,
     bounded::{self, BoundedReadError},
     catalog::{SshdPath, parse_https_url},
-    embedded_helpers::install_pinned_artifact_with,
+    embedded_helpers::{PinnedArtifactInstaller, install_pinned_artifact_with},
     oci::{
         OciClassification, OciReference,
         layers::{FileLayer, LayerSource, MergeLimits, MergeRequest, OciImageConfig, merge_layers},
@@ -765,6 +765,17 @@ impl HttpSource for ReqwestHttpSource {
     }
 }
 
+/// The pinned-artifact publisher used by the `firestone-init` payload fallback
+/// (SPEC §10.5, §17.2): one strict HTTPS transport, one locked publisher.
+impl PinnedArtifactInstaller for ImageStore {
+    fn install_pinned_artifact(
+        &self,
+        artifact: &DependencyArtifact,
+    ) -> Result<PathBuf, FirestoneError> {
+        self.ensure_pinned_artifact(artifact)
+    }
+}
+
 /// Owned image cache, verification, conversion, removal, and overlay APIs.
 pub struct ImageStore {
     paths: Paths,
@@ -784,13 +795,27 @@ pub struct ImageStore {
 
 /// Supplies the `firestone-init` bytes injected into a merged OCI rootfs.
 ///
-/// Production reads the payload embedded in a standalone release; the tests
-/// install their own so both the success and the missing-payload paths are
-/// exercised on every build configuration.
-type InitPayloadSource = Arc<dyn Fn() -> Result<Vec<u8>, FirestoneError> + Send + Sync>;
+/// Production resolves the payload through [`firestone_init_payload`], which
+/// prefers a standalone release's embedded bytes and otherwise installs the
+/// `deps.toml` pin through the store's own locked publisher; the tests install
+/// their own so both the success and the missing-payload paths are exercised
+/// on every build configuration. The store is passed in because that fallback
+/// needs its paths, its architecture, and its pinned-artifact installer.
+///
+/// [`firestone_init_payload`]: crate::embedded_helpers::firestone_init_payload
+type InitPayloadSource = Arc<dyn Fn(&ImageStore) -> Result<Vec<u8>, FirestoneError> + Send + Sync>;
 
 fn embedded_init_payload_source() -> InitPayloadSource {
-    Arc::new(|| crate::embedded_helpers::firestone_init_payload().map(<[u8]>::to_vec))
+    Arc::new(|store: &ImageStore| {
+        let manifest = DependencyManifest::bundled()?;
+        crate::embedded_helpers::firestone_init_payload(
+            &store.paths,
+            &manifest,
+            store.architecture.as_str(),
+            store,
+        )
+        .map(std::borrow::Cow::into_owned)
+    })
 }
 
 impl ImageStore {
@@ -1754,20 +1779,37 @@ impl ImageStore {
     }
 
     /// The `firestone-init` bytes injected at `/sbin/firestone-init` (§8.5).
+    ///
+    /// The payload comes from the embed when a standalone release carries one
+    /// and otherwise from the `deps.toml` pin, downloaded once through this
+    /// store's locked publisher. Either way it is resolved before the registry
+    /// is contacted, so a build that cannot produce a bootable image says so
+    /// in milliseconds rather than after gigabytes of discarded layers.
     fn firestone_init_bytes(&self, reference: &OciReference) -> Result<Vec<u8>, FirestoneError> {
-        match (self.init_payload)() {
+        match (self.init_payload)(self) {
             Ok(bytes) => Ok(bytes),
-            Err(error) => Err(FirestoneError::new(
-                error.kind(),
-                format!(
-                    "cannot pull OCI image '{reference}': the firestone-init guest payload is unavailable"
-                ),
-            )
-            .with_hint(
-                "this build embeds no firestone-init: pull with an x86_64 standalone release that \
-                 embeds it, or publish the firestone-init release asset and pin it in deps.toml",
-            )
-            .with_source(error)),
+            Err(error) => {
+                // The feed already distinguishes "no pin to fall back to" from
+                // "the pinned download failed", and its hint names the way out
+                // of each; only add one when it carried none.
+                let hint = error.hint().map_or_else(
+                    || {
+                        "OCI machines need the guest init: use an x86_64 standalone release that \
+                         embeds it, or retry with network access to the pinned firestone-init \
+                         release"
+                            .to_owned()
+                    },
+                    ToOwned::to_owned,
+                );
+                Err(FirestoneError::new(
+                    error.kind(),
+                    format!(
+                        "cannot pull OCI image '{reference}': the firestone-init guest payload is unavailable"
+                    ),
+                )
+                .with_hint(hint)
+                .with_source(error))
+            }
         }
     }
 
@@ -4820,16 +4862,33 @@ mod tests {
     const MKFS_FAILURE_MARKER: &str = "mkfs.fail";
 
     fn test_init_payload_source() -> InitPayloadSource {
-        Arc::new(|| Ok(TEST_INIT_PAYLOAD.to_vec()))
+        Arc::new(|_| Ok(TEST_INIT_PAYLOAD.to_vec()))
     }
 
-    /// A build that carries no `firestone-init`, which every plain `cargo
-    /// build` is until the standalone release embeds one.
+    /// The hint `firestone_init_payload` raises when a build embeds no payload
+    /// and the manifest carries no pin to fall back to.
+    const MISSING_INIT_PAYLOAD_HINT: &str = "OCI machines need the guest init: use an x86_64 standalone release, or build the \
+         `firestone-init` release asset and pin it in deps.toml";
+
+    /// A build that carries no `firestone-init` and cannot fall back to the
+    /// pinned release either, reported exactly as the real feed reports it.
     fn missing_init_payload_source() -> InitPayloadSource {
-        Arc::new(|| {
+        Arc::new(|_| {
             Err(FirestoneError::new(
                 ErrorKind::Dependency,
                 "this build carries no embedded firestone-init payload",
+            )
+            .with_hint(MISSING_INIT_PAYLOAD_HINT))
+        })
+    }
+
+    /// A payload feed that fails without saying what to do about it, so the
+    /// pull has to supply its own hint.
+    fn unhinted_init_payload_source() -> InitPayloadSource {
+        Arc::new(|_| {
+            Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                "the pinned firestone-init download failed",
             ))
         })
     }
@@ -8523,15 +8582,28 @@ sshd_path = "{}"
         assert_eq!(error.kind(), ErrorKind::Dependency);
         assert!(error.message().contains("firestone-init"));
         assert!(error.message().contains(reference));
-        assert!(
-            error
-                .hint()
-                .is_some_and(|hint| hint.contains("standalone") && hint.contains("deps.toml")),
-            "the hint must name the release limitation: {:?}",
-            error.hint()
-        );
+        // The feed distinguishes "no pin to fall back to" from "the pinned
+        // download failed", so the pull carries its hint through rather than
+        // replacing it with a weaker one.
+        assert_eq!(error.hint(), Some(MISSING_INIT_PAYLOAD_HINT));
         assert!(fixture.mkfs_invocations()?.is_empty());
         assert_no_image_artifacts(&fixture.paths)?;
+
+        // A feed that raises no hint still leaves the operator something to
+        // act on.
+        fixture.store.init_payload = unhinted_init_payload_source();
+        let unhinted = fixture
+            .store
+            .pull(&oci_request(reference, &fixture.root), &mut Vec::new())
+            .err()
+            .ok_or("expected a failing firestone-init feed to fail the pull")?;
+        assert!(
+            unhinted
+                .hint()
+                .is_some_and(|hint| hint.contains("standalone") && hint.contains("pinned")),
+            "the fallback hint must name both ways out: {:?}",
+            unhinted.hint()
+        );
 
         // Nothing was requested: the queued replies still serve a full pull.
         fixture.store.init_payload = test_init_payload_source();

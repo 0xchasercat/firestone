@@ -47,8 +47,9 @@ pub use console::{
     console_plan, relay_console,
 };
 pub use deps::{
-    DIRECT_BOOT_KERNEL_DEPENDENCY, DependencyArtifact, DependencyManifest, MKFS_EXT4_DEPENDENCY,
-    PINNED_DIRECT_BOOT_KERNEL_VERSION, PINNED_MKFS_EXT4_VERSION,
+    DIRECT_BOOT_KERNEL_DEPENDENCY, DependencyArtifact, DependencyManifest,
+    FIRESTONE_INIT_DEPENDENCY, MKFS_EXT4_DEPENDENCY, PINNED_DIRECT_BOOT_KERNEL_VERSION,
+    PINNED_FIRESTONE_INIT_VERSION, PINNED_MKFS_EXT4_VERSION,
 };
 pub use dispatcher::{DispatchFuture, Dispatcher, EventSink, block_on};
 pub use doctor::{
@@ -58,8 +59,8 @@ pub use doctor::{
     resolve_verified_apparmor_passt, run_doctor,
 };
 pub use embedded_helpers::{
-    EmbeddedHelper, InternalHelper, embedded_helper, firestone_init_payload,
-    materialize_embedded_helper,
+    EmbeddedHelper, InternalHelper, PinnedArtifactInstaller, embedded_helper,
+    firestone_init_payload, materialize_embedded_helper,
 };
 pub use error::{ErrorInfo, ErrorKind, FirestoneError};
 pub use event::{Event, Level, StepId, Unit};

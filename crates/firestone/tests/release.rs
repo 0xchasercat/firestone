@@ -56,6 +56,11 @@ fn dependency_pins() -> Vec<(&'static str, &'static str, &'static str)> {
                 "58088758f601a04ef85b09cf23db5530d51edc039ed47afbf2264c5b762cb568",
             ),
             (
+                "firestone-init",
+                "v0.1.0",
+                "1018c2dceecbf8d761d20ac40a07f28baada0e3cf2c3322af24fe7bb96b67d11",
+            ),
+            (
                 "mkfs-ext4",
                 "1.47.3",
                 "f1ed0b2b8b14a29e4edccf2bb44e2fb81e63a9bf74286746057915655795b987",
