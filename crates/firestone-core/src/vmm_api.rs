@@ -76,6 +76,20 @@ struct VmResizeRequest {
     desired_ram: Option<u64>,
 }
 
+/// Cloud Hypervisor's v53 `VmSnapshotConfig` body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+struct VmSnapshotRequest<'a> {
+    destination_url: &'a str,
+}
+
+/// Cloud Hypervisor's v53 `RestoreConfig` body, without the optional network
+/// file descriptors Firestone never passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+struct VmRestoreRequest<'a> {
+    source_url: &'a str,
+    prefault: bool,
+}
+
 /// A one-request-per-connection Cloud Hypervisor v53 API client.
 ///
 /// Each method uses one absolute deadline for connect, all partial writes, and
@@ -168,6 +182,76 @@ impl<'a> VmmApi<'a> {
             FirestoneError::new(
                 ErrorKind::Generic,
                 "cannot encode the VMM API vm.resize request body",
+            )
+            .with_hint("report this Firestone serialization bug")
+            .with_source(source)
+        })?;
+        if body.len() > MAX_CREATE_BODY_BYTES {
+            return Err(self.firestone_error(endpoint, ClientFailure::RequestBodyTooLarge));
+        }
+        self.request_inner(endpoint, Some(&body))
+            .map(|_| ())
+            .map_err(|failure| self.firestone_error(endpoint, failure))
+    }
+
+    /// Pauses every vCPU of a booted VM.
+    ///
+    /// Cloud Hypervisor v53 answers `PUT /api/v1/vm.pause` with 204 and no
+    /// body, and `vm.info` then reports `Paused`. A snapshot may only be taken
+    /// from that state (SPEC §23).
+    pub fn vm_pause(&self) -> Result<(), FirestoneError> {
+        self.empty_request(Endpoint::VmPause)
+    }
+
+    /// Resumes a paused VM.
+    ///
+    /// Cloud Hypervisor v53 answers `PUT /api/v1/vm.resume` with 204 and no
+    /// body. A restored VM comes back paused and needs this call too.
+    pub fn vm_resume(&self) -> Result<(), FirestoneError> {
+        self.empty_request(Endpoint::VmResume)
+    }
+
+    /// Writes the paused VM's state into an existing destination directory.
+    ///
+    /// Cloud Hypervisor v53 answers `PUT /api/v1/vm.snapshot` with 204 and no
+    /// body. The directory named by `destination_url` must already exist:
+    /// v53 fails the request with HTTP 500 and `Destination is not a
+    /// directory` otherwise, so Firestone pre-creates it (SPEC §23).
+    pub fn vm_snapshot(&self, destination_url: &str) -> Result<(), FirestoneError> {
+        self.json_request(
+            Endpoint::VmSnapshot,
+            &VmSnapshotRequest { destination_url },
+            "vm.snapshot",
+        )
+    }
+
+    /// Restores a VM from a directory previously written by `vm.snapshot`.
+    ///
+    /// Cloud Hypervisor v53 answers `PUT /api/v1/vm.restore` with 204 and no
+    /// body, and leaves the VM paused: the caller resumes it. The snapshot's
+    /// `config.json` bakes absolute host paths, so the machine's directory and
+    /// runtime layout must be unchanged.
+    pub fn vm_restore(&self, source_url: &str, prefault: bool) -> Result<(), FirestoneError> {
+        self.json_request(
+            Endpoint::VmRestore,
+            &VmRestoreRequest {
+                source_url,
+                prefault,
+            },
+            "vm.restore",
+        )
+    }
+
+    fn json_request<T: Serialize>(
+        &self,
+        endpoint: Endpoint,
+        request: &T,
+        label: &str,
+    ) -> Result<(), FirestoneError> {
+        let body = serde_json::to_vec(request).map_err(|source| {
+            FirestoneError::new(
+                ErrorKind::Generic,
+                format!("cannot encode the VMM API {label} request body"),
             )
             .with_hint("report this Firestone serialization bug")
             .with_source(source)
@@ -358,6 +442,10 @@ enum Endpoint {
     VmShutdown,
     VmmShutdown,
     VmResize,
+    VmPause,
+    VmResume,
+    VmSnapshot,
+    VmRestore,
 }
 
 impl Endpoint {
@@ -369,7 +457,11 @@ impl Endpoint {
             | Self::VmPowerButton
             | Self::VmShutdown
             | Self::VmmShutdown
-            | Self::VmResize => "PUT",
+            | Self::VmResize
+            | Self::VmPause
+            | Self::VmResume
+            | Self::VmSnapshot
+            | Self::VmRestore => "PUT",
         }
     }
 
@@ -384,6 +476,10 @@ impl Endpoint {
             Self::VmShutdown => "/api/v1/vm.shutdown",
             Self::VmmShutdown => "/api/v1/vmm.shutdown",
             Self::VmResize => "/api/v1/vm.resize",
+            Self::VmPause => "/api/v1/vm.pause",
+            Self::VmResume => "/api/v1/vm.resume",
+            Self::VmSnapshot => "/api/v1/vm.snapshot",
+            Self::VmRestore => "/api/v1/vm.restore",
         }
     }
 
@@ -394,7 +490,11 @@ impl Endpoint {
             | Self::VmBoot
             | Self::VmPowerButton
             | Self::VmShutdown
-            | Self::VmResize => 204,
+            | Self::VmResize
+            | Self::VmPause
+            | Self::VmResume
+            | Self::VmSnapshot
+            | Self::VmRestore => 204,
         }
     }
 
@@ -408,12 +508,19 @@ impl Endpoint {
             | Self::VmPowerButton
             | Self::VmShutdown
             | Self::VmmShutdown
-            | Self::VmResize => 0,
+            | Self::VmResize
+            | Self::VmPause
+            | Self::VmResume
+            | Self::VmSnapshot
+            | Self::VmRestore => 0,
         }
     }
 
     const fn has_request_body(self) -> bool {
-        matches!(self, Self::VmCreate | Self::VmResize)
+        matches!(
+            self,
+            Self::VmCreate | Self::VmResize | Self::VmSnapshot | Self::VmRestore
+        )
     }
 }
 
@@ -1303,6 +1410,80 @@ mod tests {
             expected.extend_from_slice(body);
             assert_eq!(server.finish()?, expected);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_lifecycle_endpoints_are_bodyless_or_json_puts_expecting_204()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (request, path) in [
+            (
+                Box::new(|api: VmmApi<'_>| api.vm_pause())
+                    as Box<dyn Fn(VmmApi<'_>) -> Result<(), crate::FirestoneError>>,
+                "/api/v1/vm.pause",
+            ),
+            (
+                Box::new(|api: VmmApi<'_>| api.vm_resume()),
+                "/api/v1/vm.resume",
+            ),
+        ] {
+            let server = FakeServer::spawn(vec![no_content_response()], false)?;
+            request(VmmApi::new(server.path(), TEST_TIMEOUT))?;
+            assert_eq!(
+                server.finish()?,
+                format!("PUT {path} HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n\r\n")
+                    .into_bytes()
+            );
+        }
+
+        let server = FakeServer::spawn(vec![no_content_response()], false)?;
+        VmmApi::new(server.path(), TEST_TIMEOUT).vm_snapshot("file:///data/vmstate")?;
+        let body = br#"{"destination_url":"file:///data/vmstate"}"#.as_slice();
+        let mut expected = format!(
+            "PUT /api/v1/vm.snapshot HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        expected.extend_from_slice(body);
+        assert_eq!(server.finish()?, expected);
+
+        let server = FakeServer::spawn(vec![no_content_response()], false)?;
+        VmmApi::new(server.path(), TEST_TIMEOUT).vm_restore("file:///data/vmstate", false)?;
+        let body = br#"{"source_url":"file:///data/vmstate","prefault":false}"#.as_slice();
+        let mut expected = format!(
+            "PUT /api/v1/vm.restore HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        expected.extend_from_slice(body);
+        assert_eq!(server.finish()?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn vm_snapshot_missing_destination_surfaces_the_body_preview()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server = FakeServer::spawn(
+            vec![response(
+                "500 Internal Server Error",
+                b"Destination is not a directory",
+            )],
+            false,
+        )?;
+        let error = require_error(
+            VmmApi::new(server.path(), TEST_TIMEOUT).vm_snapshot("file:///missing"),
+            "a non-204 snapshot must fail",
+        )?;
+        let _ = server.finish()?;
+        assert_eq!(error.kind(), ErrorKind::Generic);
+        assert!(
+            error
+                .message()
+                .contains("VMM API PUT /api/v1/vm.snapshot returned HTTP status 500"),
+            "{}",
+            error.message()
+        );
+        assert!(error.message().contains("Destination is not a directory"));
         Ok(())
     }
 

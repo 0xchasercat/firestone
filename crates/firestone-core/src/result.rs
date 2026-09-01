@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ByteSize, CatalogFirmware, LogSource, MachineSpec, MachineState, MachineStatus, SpecWarning,
-    Supervision,
+    Supervision, snapshot::SnapshotKind,
 };
 
 /// Effective firmware for one architecture offered by a catalog entry.
@@ -199,6 +199,53 @@ pub struct CloneResult {
     pub disk_bytes: u64,
 }
 
+/// One snapshot published by the snapshot create action (SPEC §23).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotResult {
+    pub name: String,
+    pub snapshot: String,
+    pub kind: SnapshotKind,
+    /// Virtual size of the copied overlay, or zero when the machine had none.
+    pub disk_bytes: u64,
+    /// Guest memory captured by a warm snapshot; absent for a cold one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
+}
+
+/// One row of the snapshot list, projected from the snapshot's metadata.json.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotSummary {
+    pub snapshot: String,
+    pub kind: SnapshotKind,
+    pub created_at: String,
+    pub image_id: Option<String>,
+    pub disk_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
+}
+
+/// Every published snapshot of one machine, ordered by identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotListResult {
+    pub snapshots: Vec<SnapshotSummary>,
+}
+
+/// One completed whole-machine rollback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotRestoreResult {
+    pub name: String,
+    pub snapshot: String,
+    /// True when the machine is running again after the restore.
+    pub started: bool,
+}
+
+/// One deleted snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotRemoveResult {
+    pub name: String,
+    pub snapshot: String,
+}
+
 /// Resolved process-wide roots exposed by the version action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionPaths {
@@ -209,7 +256,63 @@ pub struct VersionPaths {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunResult, ShellResult, SshConfigResult};
+    use super::{
+        RunResult, ShellResult, SnapshotListResult, SnapshotResult, SnapshotSummary,
+        SshConfigResult,
+    };
+    use crate::snapshot::SnapshotKind;
+
+    #[test]
+    fn snapshot_results_serialize_kind_as_a_stable_lowercase_word() -> Result<(), serde_json::Error>
+    {
+        let cold = SnapshotResult {
+            name: "dev".to_owned(),
+            snapshot: "snap-20260902-123456".to_owned(),
+            kind: SnapshotKind::Cold,
+            disk_bytes: 4096,
+            memory_bytes: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&cold)?,
+            serde_json::json!({
+                "name": "dev",
+                "snapshot": "snap-20260902-123456",
+                "kind": "cold",
+                "disk_bytes": 4096
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<SnapshotResult>(serde_json::to_value(&cold)?)?,
+            cold
+        );
+
+        let warm = SnapshotResult {
+            kind: SnapshotKind::Warm,
+            memory_bytes: Some(2_147_483_648),
+            ..cold
+        };
+        assert_eq!(serde_json::to_value(&warm)?["kind"], "warm");
+        assert_eq!(
+            serde_json::to_value(&warm)?["memory_bytes"],
+            2_147_483_648_u64
+        );
+
+        let list = SnapshotListResult {
+            snapshots: vec![SnapshotSummary {
+                snapshot: "snap-20260902-123456".to_owned(),
+                kind: SnapshotKind::Cold,
+                created_at: "2026-09-02T12:34:56Z".to_owned(),
+                image_id: None,
+                disk_bytes: 4096,
+                memory_bytes: None,
+            }],
+        };
+        assert_eq!(
+            serde_json::from_value::<SnapshotListResult>(serde_json::to_value(&list)?)?,
+            list
+        );
+        Ok(())
+    }
 
     #[test]
     fn m2_terminal_results_round_trip_without_key_material() -> Result<(), serde_json::Error> {

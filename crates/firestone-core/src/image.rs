@@ -1956,6 +1956,11 @@ impl ImageStore {
             let machine_dir = self.paths.machine_dir(&name)?;
             self.paths
                 .validate_owned_data_directory(&machine_dir, "machine directory", false)?;
+            // A snapshot pins its base image exactly like a live machine does,
+            // so images rm and images prune must see it too (SPEC §23).
+            for id in self.snapshot_image_references(&name)? {
+                references.entry(id).or_default().push(name.clone());
+            }
             let state_path = self.paths.machine_state(&name)?;
             if !path_exists_without_following(&state_path)? {
                 continue;
@@ -1971,6 +1976,65 @@ impl ImageStore {
             names.dedup();
         }
         Ok(references)
+    }
+
+    /// Stored image ids pinned by one machine's published snapshots.
+    ///
+    /// Partial and removal directories are skipped: they are named with a
+    /// leading dot and are never a published snapshot. A metadata document
+    /// Firestone cannot read is a hard error, because silently dropping a
+    /// reference would let `images rm` delete a base a snapshot still needs.
+    fn snapshot_image_references(&self, name: &str) -> Result<Vec<String>, FirestoneError> {
+        let snapshots_dir = self.paths.machine_snapshots_dir(name)?;
+        if !path_exists_without_following(&snapshots_dir)? {
+            return Ok(Vec::new());
+        }
+        self.paths.validate_owned_data_directory(
+            &snapshots_dir,
+            "machine snapshots directory",
+            false,
+        )?;
+        let mut entries = fs::read_dir(&snapshots_dir)
+            .map_err(|source| {
+                FirestoneError::new(
+                    ErrorKind::Generic,
+                    format!(
+                        "cannot read snapshots directory '{}'",
+                        snapshots_dir.display()
+                    ),
+                )
+                .with_hint("check the machine directory permissions")
+                .with_source(source)
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| directory_entry_error(&snapshots_dir, source))?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+
+        let mut ids = Vec::new();
+        for entry in entries {
+            let Some(snapshot) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+                continue;
+            };
+            if snapshot.starts_with('.') {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|source| {
+                image_file_error("inspect snapshot directory entry", &entry.path(), source)
+            })?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                continue;
+            }
+            let snapshot_dir = self.paths.machine_snapshot_dir(name, &snapshot)?;
+            let metadata_path = Paths::snapshot_metadata(&snapshot_dir);
+            if !path_exists_without_following(&metadata_path)? {
+                continue;
+            }
+            if let Some(id) = crate::snapshot::read_snapshot_metadata(&metadata_path)?.image_id {
+                validate_image_id(&id)?;
+                ids.push(id);
+            }
+        }
+        Ok(ids)
     }
 
     fn absolute_local_reference(
@@ -4976,6 +5040,67 @@ else:
         assert_eq!(forced.referenced_by, vec!["kept"]);
         assert!(!fixture.paths.image_base(&first.metadata.id)?.exists());
         assert!(!fixture.paths.image_metadata(&first.metadata.id)?.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn image_reference_snapshot_metadata_pins_the_base_like_a_machine_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let source = fixture.write_source("pinned.qcow2", b"QFI\xFBPINNED")?;
+        let mut events = Vec::new();
+        let image = fixture
+            .store
+            .pull(&local_request(&source, &fixture.root), &mut events)?;
+
+        // The machine itself pins nothing: only its snapshot does.
+        let state = machine_state(
+            &fixture.paths,
+            "rolled",
+            StateImage {
+                r#ref: source.to_string_lossy().into_owned(),
+                id: None,
+                sha256: None,
+            },
+        )?;
+        let mut lock_events = Vec::new();
+        let _lock = create_machine(&fixture.paths, "rolled", &state, &mut lock_events)?;
+
+        let snapshots = fixture.paths.machine_snapshots_dir("rolled")?;
+        crate::snapshot::ensure_snapshot_directory(&snapshots)?;
+        for snapshot in ["snap-20260902-123456", ".partial-snap-20260902-125959"] {
+            let directory = snapshots.join(snapshot);
+            crate::snapshot::ensure_snapshot_directory(&directory)?;
+            crate::atomic::write_json_with_mode(
+                &Paths::snapshot_metadata(&directory),
+                &crate::snapshot::SnapshotMetadata {
+                    schema_version: crate::snapshot::SNAPSHOT_SCHEMA_VERSION,
+                    kind: crate::snapshot::SnapshotKind::Cold,
+                    created_at: "2026-09-02T12:34:56Z".to_owned(),
+                    image_id: Some(image.metadata.id.clone()),
+                    firestone_version: "0.1.4".to_owned(),
+                    disk_bytes: 4096,
+                    memory_bytes: None,
+                },
+                0o600,
+            )?;
+        }
+
+        assert_eq!(
+            fixture.store.referencing_machines(&image.metadata.id)?,
+            vec!["rolled".to_owned()]
+        );
+        let pruned = fixture.store.prune()?;
+        assert!(pruned.removed.is_empty(), "{pruned:?}");
+        assert!(fixture.paths.image_base(&image.metadata.id)?.exists());
+
+        let refusal = fixture
+            .store
+            .remove(&image.metadata.id, false)
+            .err()
+            .ok_or("expected a snapshot-referenced image refusal")?;
+        assert_eq!(refusal.kind(), ErrorKind::Conflict);
+        assert!(refusal.message().contains("rolled"), "{refusal}");
         Ok(())
     }
 

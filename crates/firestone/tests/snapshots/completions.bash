@@ -79,6 +79,9 @@ _firestone() {
             firestone,show)
                 cmd="firestone__subcmd__show"
                 ;;
+            firestone,snapshot)
+                cmd="firestone__subcmd__snapshot"
+                ;;
             firestone,ssh)
                 cmd="firestone__subcmd__shell"
                 ;;
@@ -157,6 +160,9 @@ _firestone() {
             firestone__subcmd__help,show)
                 cmd="firestone__subcmd__help__subcmd__show"
                 ;;
+            firestone__subcmd__help,snapshot)
+                cmd="firestone__subcmd__help__subcmd__snapshot"
+                ;;
             firestone__subcmd__help,ssh-config)
                 cmd="firestone__subcmd__help__subcmd__ssh__subcmd__config"
                 ;;
@@ -186,6 +192,18 @@ _firestone() {
                 ;;
             firestone__subcmd__help__subcmd__images,rm)
                 cmd="firestone__subcmd__help__subcmd__images__subcmd__rm"
+                ;;
+            firestone__subcmd__help__subcmd__snapshot,create)
+                cmd="firestone__subcmd__help__subcmd__snapshot__subcmd__create"
+                ;;
+            firestone__subcmd__help__subcmd__snapshot,list)
+                cmd="firestone__subcmd__help__subcmd__snapshot__subcmd__list"
+                ;;
+            firestone__subcmd__help__subcmd__snapshot,restore)
+                cmd="firestone__subcmd__help__subcmd__snapshot__subcmd__restore"
+                ;;
+            firestone__subcmd__help__subcmd__snapshot,rm)
+                cmd="firestone__subcmd__help__subcmd__snapshot__subcmd__rm"
                 ;;
             firestone__subcmd__images,help)
                 cmd="firestone__subcmd__images__subcmd__help"
@@ -223,6 +241,39 @@ _firestone() {
             firestone__subcmd__images__subcmd__help,rm)
                 cmd="firestone__subcmd__images__subcmd__help__subcmd__rm"
                 ;;
+            firestone__subcmd__snapshot,create)
+                cmd="firestone__subcmd__snapshot__subcmd__create"
+                ;;
+            firestone__subcmd__snapshot,help)
+                cmd="firestone__subcmd__snapshot__subcmd__help"
+                ;;
+            firestone__subcmd__snapshot,list)
+                cmd="firestone__subcmd__snapshot__subcmd__list"
+                ;;
+            firestone__subcmd__snapshot,ls)
+                cmd="firestone__subcmd__snapshot__subcmd__list"
+                ;;
+            firestone__subcmd__snapshot,restore)
+                cmd="firestone__subcmd__snapshot__subcmd__restore"
+                ;;
+            firestone__subcmd__snapshot,rm)
+                cmd="firestone__subcmd__snapshot__subcmd__rm"
+                ;;
+            firestone__subcmd__snapshot__subcmd__help,create)
+                cmd="firestone__subcmd__snapshot__subcmd__help__subcmd__create"
+                ;;
+            firestone__subcmd__snapshot__subcmd__help,help)
+                cmd="firestone__subcmd__snapshot__subcmd__help__subcmd__help"
+                ;;
+            firestone__subcmd__snapshot__subcmd__help,list)
+                cmd="firestone__subcmd__snapshot__subcmd__help__subcmd__list"
+                ;;
+            firestone__subcmd__snapshot__subcmd__help,restore)
+                cmd="firestone__subcmd__snapshot__subcmd__help__subcmd__restore"
+                ;;
+            firestone__subcmd__snapshot__subcmd__help,rm)
+                cmd="firestone__subcmd__snapshot__subcmd__help__subcmd__rm"
+                ;;
             *)
                 ;;
         esac
@@ -230,7 +281,7 @@ _firestone() {
 
     case "${cmd}" in
         firestone)
-            opts="-q -v -y -h -V --json --quiet --verbose --no-color --yes --home --help --version run create start stop restart resize rm ls list show edit shell ssh cp ssh-config console logs metrics catalog images doctor completions version serve ui clone help"
+            opts="-q -v -y -h -V --json --quiet --verbose --no-color --yes --home --help --version run create start stop restart resize rm ls list show edit shell ssh cp ssh-config console logs metrics catalog images doctor completions version serve ui clone snapshot help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -500,7 +551,7 @@ _firestone() {
             return 0
             ;;
         firestone__subcmd__help)
-            opts="run create start stop restart resize rm ls show edit shell cp ssh-config console logs metrics catalog images doctor completions version serve ui clone help"
+            opts="run create start stop restart resize rm ls show edit shell cp ssh-config console logs metrics catalog images doctor completions version serve ui clone snapshot help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -852,6 +903,76 @@ _firestone() {
         firestone__subcmd__help__subcmd__show)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        firestone__subcmd__help__subcmd__snapshot)
+            opts="create list restore rm"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        firestone__subcmd__help__subcmd__snapshot__subcmd__create)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        firestone__subcmd__help__subcmd__snapshot__subcmd__list)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        firestone__subcmd__help__subcmd__snapshot__subcmd__restore)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        firestone__subcmd__help__subcmd__snapshot__subcmd__rm)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -1436,6 +1557,180 @@ _firestone() {
         firestone__subcmd__show)
             opts="-q -v -y -h --vmconfig --json --quiet --verbose --no-color --yes --home --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        firestone__subcmd__snapshot)
+            opts="-q -v -y -h --json --quiet --verbose --no-color --yes --home --help create list ls restore rm help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        firestone__subcmd__snapshot__subcmd__create)
+            opts="-q -v -y -h --json --quiet --verbose --no-color --yes --home --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        firestone__subcmd__snapshot__subcmd__help)
+            opts="create list restore rm help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        firestone__subcmd__snapshot__subcmd__help__subcmd__create)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        firestone__subcmd__snapshot__subcmd__help__subcmd__help)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        firestone__subcmd__snapshot__subcmd__help__subcmd__list)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        firestone__subcmd__snapshot__subcmd__help__subcmd__restore)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        firestone__subcmd__snapshot__subcmd__help__subcmd__rm)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        firestone__subcmd__snapshot__subcmd__list)
+            opts="-q -v -y -h --json --quiet --verbose --no-color --yes --home --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        firestone__subcmd__snapshot__subcmd__restore)
+            opts="-q -v -y -h --force --start --json --quiet --verbose --no-color --yes --home --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        firestone__subcmd__snapshot__subcmd__rm)
+            opts="-q -v -y -h --json --quiet --verbose --no-color --yes --home --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi

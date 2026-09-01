@@ -57,6 +57,7 @@ set edit:completion:arg-completer[firestone] = {|@words|
             cand serve 'Run the stateless REST API over a private Unix socket or loopback port'
             cand ui 'Open the Firestone web interface on a loopback port'
             cand clone 'Copy a stopped machine''s spec and disk to a new machine'
+            cand snapshot 'Capture, list, restore, and remove machine snapshots'
             cand help 'Print this message or the help of the given subcommand(s)'
         }
         &'firestone;run'= {
@@ -571,6 +572,109 @@ set edit:completion:arg-completer[firestone] = {|@words|
             cand -h 'Print help'
             cand --help 'Print help'
         }
+        &'firestone;snapshot'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+            cand create 'Capture one immutable snapshot of a machine'
+            cand list 'List a machine''s snapshots'
+            cand ls 'List a machine''s snapshots'
+            cand restore 'Roll a machine back to one of its snapshots'
+            cand rm 'Remove one snapshot'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'firestone;snapshot;create'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;snapshot;list'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;snapshot;ls'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;snapshot;restore'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --force 'Stop the machine first instead of refusing a running machine'
+            cand --start 'Start the machine after restoring a cold snapshot'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;snapshot;rm'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;snapshot;help'= {
+            cand create 'Capture one immutable snapshot of a machine'
+            cand list 'List a machine''s snapshots'
+            cand restore 'Roll a machine back to one of its snapshots'
+            cand rm 'Remove one snapshot'
+            cand help 'Print this message or the help of the given subcommand(s)'
+        }
+        &'firestone;snapshot;help;create'= {
+        }
+        &'firestone;snapshot;help;list'= {
+        }
+        &'firestone;snapshot;help;restore'= {
+        }
+        &'firestone;snapshot;help;rm'= {
+        }
+        &'firestone;snapshot;help;help'= {
+        }
         &'firestone;help'= {
             cand run 'Create or reuse a machine, start it, and open an SSH shell'
             cand create 'Create a machine definition without booting it'
@@ -596,6 +700,7 @@ set edit:completion:arg-completer[firestone] = {|@words|
             cand serve 'Run the stateless REST API over a private Unix socket or loopback port'
             cand ui 'Open the Firestone web interface on a loopback port'
             cand clone 'Copy a stopped machine''s spec and disk to a new machine'
+            cand snapshot 'Capture, list, restore, and remove machine snapshots'
             cand help 'Print this message or the help of the given subcommand(s)'
         }
         &'firestone;help;run'= {
@@ -660,6 +765,20 @@ set edit:completion:arg-completer[firestone] = {|@words|
         &'firestone;help;ui'= {
         }
         &'firestone;help;clone'= {
+        }
+        &'firestone;help;snapshot'= {
+            cand create 'Capture one immutable snapshot of a machine'
+            cand list 'List a machine''s snapshots'
+            cand restore 'Roll a machine back to one of its snapshots'
+            cand rm 'Remove one snapshot'
+        }
+        &'firestone;help;snapshot;create'= {
+        }
+        &'firestone;help;snapshot;list'= {
+        }
+        &'firestone;help;snapshot;restore'= {
+        }
+        &'firestone;help;snapshot;rm'= {
         }
         &'firestone;help;help'= {
         }

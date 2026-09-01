@@ -220,6 +220,11 @@ struct LaunchPlan {
     control_io_timeout_ms: u64,
     launch_request_timeout_ms: u64,
     launch_overall_timeout_ms: u64,
+    /// Snapshot this launch restores instead of creating and booting a VM
+    /// (SPEC §23). Recorded in the plan so the launch and every later
+    /// recovery derive the same `FIRESTONE_LAUNCH_BINDING`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restore_snapshot: Option<String>,
 }
 
 impl LaunchPlan {
@@ -1094,6 +1099,7 @@ pub fn prepare_start(
             control_io_timeout_ms: duration_millis(timeouts.control_io, "control_io")?,
             launch_request_timeout_ms: duration_millis(timeouts.launch_request, "launch_request")?,
             launch_overall_timeout_ms: duration_millis(timeouts.launch_overall, "launch_overall")?,
+            restore_snapshot: read_launch_restore_snapshot(paths, name)?,
         };
         publish_launch_plan(paths, name, &plan)?;
         StateStore::new(paths.machine_state(name)?).write_from_locked_action(&state, lock)?;
@@ -2804,10 +2810,141 @@ pub fn stop_unsupervised(
 }
 
 fn vmm_launch_binding(plan: &LaunchPlan) -> String {
-    format!(
-        "{}:{}:{}",
-        plan.name, plan.vmm_binary_sha256, plan.vmconfig_sha256
-    )
+    match &plan.restore_snapshot {
+        Some(snapshot) => format!(
+            "{}:{}:{}:restore:{snapshot}",
+            plan.name, plan.vmm_binary_sha256, plan.vmconfig_sha256
+        ),
+        None => format!(
+            "{}:{}:{}",
+            plan.name, plan.vmm_binary_sha256, plan.vmconfig_sha256
+        ),
+    }
+}
+
+/// Reads the pending warm-restore marker of one machine, if it has one.
+///
+/// The marker is a machine-directory document written by `snapshot restore`
+/// (SPEC §23) and consumed by the next launch.
+fn read_launch_restore_snapshot(
+    paths: &Paths,
+    name: &str,
+) -> Result<Option<String>, FirestoneError> {
+    let path = paths.machine_restore_request(name)?;
+    match fs::symlink_metadata(&path) {
+        Ok(_) => Ok(Some(crate::snapshot::read_restore_request(&path)?.snapshot)),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(filesystem_error(
+            ErrorKind::Generic,
+            format!("cannot inspect restore marker {}", path.display()),
+            source,
+        )),
+    }
+}
+
+/// Consumes the restore marker after Cloud Hypervisor resumed the restored VM.
+fn remove_restore_marker(marker: &Path) -> Result<(), FirestoneError> {
+    match fs::remove_file(marker) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(filesystem_error(
+            ErrorKind::Generic,
+            format!("cannot clear restore marker {}", marker.display()),
+            source,
+        )),
+    }
+}
+
+/// One validated warm restore, ready to be handed to Cloud Hypervisor.
+struct RestoreLaunch {
+    snapshot: String,
+    source_url: String,
+    marker: PathBuf,
+}
+
+/// Validates a pending warm restore against the VmConfig this launch published.
+///
+/// The published VmConfig is derived from the restored `firestone.toml`, so it
+/// must be byte-identical to the `vmconfig.json` the snapshot captured: Cloud
+/// Hypervisor restores a VM whose devices, sockets and file paths were fixed
+/// when the snapshot was taken, and a different configuration would restore a
+/// machine that is not the one the memory image belongs to.
+fn prepare_restore_launch(
+    paths: &Paths,
+    name: &str,
+    snapshot: &str,
+    vmconfig: &[u8],
+) -> Result<RestoreLaunch, FirestoneError> {
+    let marker = paths.machine_restore_request(name)?;
+    let request = crate::snapshot::read_restore_request(&marker)?;
+    if request.snapshot != snapshot {
+        return Err(FirestoneError::new(
+            ErrorKind::Conflict,
+            format!(
+                "restore marker {} names snapshot `{}` but the launch plan restores `{snapshot}`",
+                marker.display(),
+                request.snapshot
+            ),
+        )
+        .with_hint(format!(
+            "run `firestone snapshot restore {name} {snapshot}` again"
+        )));
+    }
+    let snapshot_vmconfig = Paths::snapshot_vmconfig(&request.snapshot_dir);
+    let expected = read_regular_file(&snapshot_vmconfig, MAX_VMCONFIG_BYTES, "snapshot VmConfig")?;
+    if sha256_hex(&expected) != request.vmconfig_sha256 {
+        return Err(FirestoneError::new(
+            ErrorKind::Conflict,
+            format!(
+                "snapshot VmConfig {} changed after the restore was requested",
+                snapshot_vmconfig.display()
+            ),
+        )
+        .with_hint(format!(
+            "run `firestone snapshot restore {name} {snapshot}` again"
+        )));
+    }
+    if expected != vmconfig {
+        return Err(FirestoneError::new(
+            ErrorKind::Conflict,
+            format!(
+                "machine `{name}` no longer publishes the VmConfig snapshot `{snapshot}` was taken with"
+            ),
+        )
+        .with_hint(format!(
+            "restore snapshot {snapshot} again, or revert firestone.toml and the machine directory layout to the state the snapshot captured"
+        )));
+    }
+    let vmstate = request.vmstate_dir.clone();
+    let metadata = fs::symlink_metadata(&vmstate).map_err(|source| {
+        filesystem_error(
+            ErrorKind::NotFound,
+            format!("cannot inspect snapshot VM state {}", vmstate.display()),
+            source,
+        )
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(FirestoneError::new(
+            ErrorKind::Conflict,
+            format!("snapshot VM state {} is not a directory", vmstate.display()),
+        )
+        .with_hint("remove the damaged snapshot and take a new one"));
+    }
+    for required in ["config.json", "state.json"] {
+        let member = vmstate.join(required);
+        if !member.is_file() {
+            return Err(FirestoneError::new(
+                ErrorKind::Conflict,
+                format!("snapshot VM state {} has no {required}", vmstate.display()),
+            )
+            .with_hint("remove the damaged snapshot and take a new one"));
+        }
+    }
+    Ok(RestoreLaunch {
+        snapshot: snapshot.to_owned(),
+        source_url: crate::snapshot::snapshot_file_url(&vmstate)?,
+        marker,
+    })
 }
 
 fn vmm_argv(paths: &Paths, name: &str, plan: &LaunchPlan) -> Result<Vec<OsString>, FirestoneError> {
@@ -3832,6 +3969,16 @@ fn launch_vmm(
     ensure_launch_before_deadline(work_deadline, "validating VMM executable")?;
     validate_plan_executable(plan)?;
     let vmconfig = read_exact_vmconfig(paths, name, plan)?;
+    // A warm restore is an internal launch mode, not a control operation: the
+    // sidecars above already started on the same socket paths the snapshot
+    // baked in, and the marker is validated before cloud-hypervisor is spawned
+    // so a mismatch never leaves a half-restored VM behind (SPEC §23).
+    let restore = match plan.restore_snapshot.as_deref() {
+        Some(snapshot) => Some(prepare_restore_launch(paths, name, snapshot, &vmconfig)?),
+        None => None,
+    };
+    // Cloud Hypervisor v53 truncates the configured serial file when it
+    // restores, so console history is rotated here for both launch modes.
     rotate_console_log(paths, name)?;
     ensure_launch_before_deadline(work_deadline, "spawning cloud-hypervisor")?;
     let vmm_log = paths.machine_vmm_log(name)?;
@@ -3943,25 +4090,56 @@ fn launch_vmm(
         terminate_launch_vmm(&mut vmm, launch_deadline)?;
         return Err(error);
     }
-    let create_timeout = launch_phase_timeout(work_deadline, timeouts.api, "vm.create")?;
-    if let Err(error) = VmmApi::new(&api_socket, create_timeout).vm_create(&vmconfig) {
-        terminate_launch_vmm(&mut vmm, launch_deadline)?;
-        return Err(error);
-    }
-    secure_console_log(paths, name)?;
-    if let Err(error) = ensure_owned_sidecars_alive(&mut sidecars) {
-        terminate_launch_vmm(&mut vmm, launch_deadline)?;
-        return Err(error);
-    }
-    let boot_timeout = launch_phase_timeout(work_deadline, timeouts.api, "vm.boot")?;
-    if let Err(error) = VmmApi::new(&api_socket, boot_timeout).vm_boot() {
-        if let Ok(shutdown_timeout) =
-            launch_phase_timeout(work_deadline, timeouts.api, "failed vm.boot cleanup")
+    if let Some(restore) = &restore {
+        let restore_timeout = launch_phase_timeout(work_deadline, timeouts.api, "vm.restore")?;
+        if let Err(error) =
+            VmmApi::new(&api_socket, restore_timeout).vm_restore(&restore.source_url, false)
         {
-            let _ = VmmApi::new(&api_socket, shutdown_timeout).vmm_shutdown();
+            terminate_launch_vmm(&mut vmm, launch_deadline)?;
+            return Err(error);
         }
-        terminate_launch_vmm(&mut vmm, launch_deadline)?;
-        return Err(error);
+        secure_console_log(paths, name)?;
+        if let Err(error) = ensure_owned_sidecars_alive(&mut sidecars) {
+            terminate_launch_vmm(&mut vmm, launch_deadline)?;
+            return Err(error);
+        }
+        // A restored VM comes back paused; only vm.resume runs its vCPUs.
+        let resume_timeout = launch_phase_timeout(work_deadline, timeouts.api, "vm.resume")?;
+        if let Err(error) = VmmApi::new(&api_socket, resume_timeout).vm_resume() {
+            if let Ok(shutdown_timeout) =
+                launch_phase_timeout(work_deadline, timeouts.api, "failed vm.resume cleanup")
+            {
+                let _ = VmmApi::new(&api_socket, shutdown_timeout).vmm_shutdown();
+            }
+            terminate_launch_vmm(&mut vmm, launch_deadline)?;
+            return Err(error);
+        }
+        remove_restore_marker(&restore.marker)?;
+        write_shim_log(&format!(
+            "machine `{name}` restored snapshot `{}`",
+            restore.snapshot
+        ));
+    } else {
+        let create_timeout = launch_phase_timeout(work_deadline, timeouts.api, "vm.create")?;
+        if let Err(error) = VmmApi::new(&api_socket, create_timeout).vm_create(&vmconfig) {
+            terminate_launch_vmm(&mut vmm, launch_deadline)?;
+            return Err(error);
+        }
+        secure_console_log(paths, name)?;
+        if let Err(error) = ensure_owned_sidecars_alive(&mut sidecars) {
+            terminate_launch_vmm(&mut vmm, launch_deadline)?;
+            return Err(error);
+        }
+        let boot_timeout = launch_phase_timeout(work_deadline, timeouts.api, "vm.boot")?;
+        if let Err(error) = VmmApi::new(&api_socket, boot_timeout).vm_boot() {
+            if let Ok(shutdown_timeout) =
+                launch_phase_timeout(work_deadline, timeouts.api, "failed vm.boot cleanup")
+            {
+                let _ = VmmApi::new(&api_socket, shutdown_timeout).vmm_shutdown();
+            }
+            terminate_launch_vmm(&mut vmm, launch_deadline)?;
+            return Err(error);
+        }
     }
     let console_result = (|| {
         let info_timeout = launch_phase_timeout(work_deadline, timeouts.api, "vm.info console")?;

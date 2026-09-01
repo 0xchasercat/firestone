@@ -89,6 +89,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut sidecar_connections = Vec::new();
     let mut reported_vcpus: u64 = 0;
     let mut reported_ram: u64 = 1;
+    // Cloud Hypervisor v53 snapshot/restore state: a VM must be paused before
+    // vm.snapshot, and a restored VM comes back paused until vm.resume.
+    let mut paused = false;
+    let mut last_config: Vec<u8> = Vec::new();
     let listener = UnixListener::bind(&options.api_socket)?;
     for connection in listener.incoming() {
         let mut stream = connection?;
@@ -121,11 +125,100 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 reported_vcpus = json_u64(&request.body, "\"boot_vcpus\":").unwrap_or(0);
                 reported_ram = json_u64(&request.body, "\"size\":").unwrap_or(1);
                 fs::write(&options.body, &request.body)?;
+                last_config = request.body.clone();
                 sidecar_connections.extend(connect_sidecars(&request.body)?);
                 start_vsock(&request.body)?;
                 if let Some(console) = &options.console_log {
                     fs::write(console, b"current boot\n")?;
                 }
+                no_content(&mut stream)?;
+            }
+            "/api/v1/vm.pause" if options.behavior == "pause-fail" => {
+                response(
+                    &mut stream,
+                    "500 Internal Server Error",
+                    b"injected pause failure",
+                )?;
+            }
+            "/api/v1/vm.pause" => {
+                paused = true;
+                no_content(&mut stream)?;
+            }
+            "/api/v1/vm.resume" if options.behavior == "resume-fail" => {
+                response(
+                    &mut stream,
+                    "500 Internal Server Error",
+                    b"injected resume failure",
+                )?;
+            }
+            "/api/v1/vm.resume" => {
+                paused = false;
+                no_content(&mut stream)?;
+            }
+            "/api/v1/vm.snapshot" if options.behavior == "snapshot-fail" => {
+                response(
+                    &mut stream,
+                    "500 Internal Server Error",
+                    b"injected snapshot failure",
+                )?;
+            }
+            "/api/v1/vm.snapshot" => {
+                if !paused {
+                    response(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        b"VM is not paused",
+                    )?;
+                    continue;
+                }
+                let destination = file_url_path(&request.body, "\"destination_url\":\"")?;
+                if !destination.is_dir() {
+                    response(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        b"Destination is not a directory",
+                    )?;
+                    continue;
+                }
+                fs::write(destination.join("config.json"), &last_config)?;
+                fs::write(destination.join("state.json"), b"{\"fake\":\"state\"}")?;
+                // Apparent size is the guest RAM; the body is a hole, exactly
+                // like the pinned VMM writes an idle guest's memory ranges.
+                let ranges = fs::File::create(destination.join("memory-ranges"))?;
+                ranges.set_len(reported_ram)?;
+                ranges.sync_all()?;
+                no_content(&mut stream)?;
+            }
+            "/api/v1/vm.restore" if options.behavior == "restore-fail" => {
+                response(
+                    &mut stream,
+                    "500 Internal Server Error",
+                    b"injected restore failure",
+                )?;
+            }
+            "/api/v1/vm.restore" => {
+                let source = file_url_path(&request.body, "\"source_url\":\"")?;
+                if !source.join("state.json").is_file() {
+                    response(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        b"source is not a snapshot directory",
+                    )?;
+                    continue;
+                }
+                let config = fs::read(source.join("config.json"))?;
+                reported_vcpus = json_u64(&config, "\"boot_vcpus\":").unwrap_or(0);
+                reported_ram = json_u64(&config, "\"size\":").unwrap_or(1);
+                fs::write(&options.body, &config)?;
+                sidecar_connections.extend(connect_sidecars(&config)?);
+                start_vsock(&config)?;
+                // Cloud Hypervisor truncates the configured serial file when it
+                // restores a VM.
+                if let Some(console) = &options.console_log {
+                    fs::write(console, b"restored boot\n")?;
+                }
+                last_config = config;
+                paused = true;
                 no_content(&mut stream)?;
             }
             "/api/v1/vm.boot" if options.behavior == "boot-fail" => {
@@ -177,6 +270,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "/api/v1/vm.info" => {
                 let state = if options.behavior == "info-shutdown" {
                     "Shutdown"
+                } else if paused {
+                    "Paused"
                 } else {
                     "Running"
                 };
@@ -327,6 +422,16 @@ fn json_u64(body: &[u8], marker: &str) -> Option<u64> {
         .find(|character: char| !character.is_ascii_digit())
         .unwrap_or(rest.len());
     rest[..end].parse().ok()
+}
+
+fn file_url_path(body: &[u8], marker: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let text = std::str::from_utf8(body)?;
+    let start = text.find(marker).ok_or("request has no URL member")? + marker.len();
+    let tail = &text[start..];
+    let end = tail.find('"').ok_or("unterminated URL member")?;
+    let url = &tail[..end];
+    let path = url.strip_prefix("file://").ok_or("URL is not a file URL")?;
+    Ok(PathBuf::from(path))
 }
 
 fn json_string_values(text: &str, marker: &str) -> Vec<PathBuf> {
