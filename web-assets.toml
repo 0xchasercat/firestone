@@ -17,7 +17,8 @@
 #                        another Firestone asset rather than downloaded.
 #
 # The set of entries must equal the files present under crates/firestone/assets/ui/
-# minus the first-party sources Firestone authors itself: app.css, app.js, theme.js.
+# minus the first-party sources Firestone authors itself: app.css, app.js, theme.js,
+# term.js.
 # Vendoring a new third-party file without pinning it here fails the test suite,
 # and so does a pin whose file was deleted.
 #
@@ -105,3 +106,43 @@ path = "crates/firestone/assets/ui/logo.svg"
 sha256 = "a33d725f63af33e93af05c76f3477a1fec1edb717a91a0b84eb93899ca325379"
 license = "NOASSERTION"
 note = "Byte-identical to the source except the <metadata> C2PA manifest element and the now-unused xmlns:c2pa attribute are removed, dropping 36119 bytes to 8361. NOASSERTION because the repository ships no LICENSE file; the artwork is Firestone's own and carries no upstream terms."
+
+# The browser terminal (SPEC §16.5). ghostty-web is Ghostty's own VT parser
+# compiled to WebAssembly behind an xterm.js-shaped API, so the terminal page
+# renders escape sequences with the same emulator the native app uses instead
+# of a second hand-written parser.
+#
+# Three files rather than two. The published ESM bundle carries a base64 copy
+# of the wasm as a data: URL and falls back to fetching a path, so Firestone
+# pins the standalone `ghostty-vt.wasm` and hands its same-origin URL to
+# `Ghostty.load`: the served policy is `connect-src 'self'`, which a data:
+# fetch does not satisfy. The bundle's `loadFromPath` also dynamically imports
+# a Vite-generated Node shim on every load; that 41-byte stub is vendored so
+# the import resolves quietly rather than 404ing in the console. It is a
+# build-hash filename, so a version bump renames it and the pin moves with it.
+[asset.ghostty-web]
+origin = "fetched"
+version = "0.4.0"
+release_url = "https://github.com/coder/ghostty-web/releases/tag/v0.4.0"
+url = "https://cdn.jsdelivr.net/npm/ghostty-web@0.4.0/dist/ghostty-web.js"
+path = "crates/firestone/assets/ui/ghostty-web.js"
+sha256 = "078b3fe37e4ef469d3f3d7772ee263070f8613e5a6f5ff305c85778907f45e72"
+license = "MIT"
+
+[asset.ghostty-vt-wasm]
+origin = "fetched"
+version = "0.4.0"
+release_url = "https://github.com/coder/ghostty-web/releases/tag/v0.4.0"
+url = "https://cdn.jsdelivr.net/npm/ghostty-web@0.4.0/dist/ghostty-vt.wasm"
+path = "crates/firestone/assets/ui/ghostty-vt.wasm"
+sha256 = "d6f0326f1874ad2ce9f289e3a4a0c5f3507d4cb38d8747e4b287def470a0c60a"
+license = "MIT"
+
+[asset.ghostty-web-node-shim]
+origin = "fetched"
+version = "0.4.0"
+release_url = "https://github.com/coder/ghostty-web/releases/tag/v0.4.0"
+url = "https://cdn.jsdelivr.net/npm/ghostty-web@0.4.0/dist/__vite-browser-external-2447137e.js"
+path = "crates/firestone/assets/ui/__vite-browser-external-2447137e.js"
+sha256 = "f8c456031e5001c0cda4837cd9ee3a33d79beeba120ec633ec9d990632fb2aa6"
+license = "MIT"

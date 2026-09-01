@@ -103,6 +103,12 @@ const TEMPLATES: &[(&str, &str)] = &[
         "ui/error.html",
         include_str!("../../templates/ui/error.html"),
     ),
+    // Its own document rather than a body inside ui/shell.html: a terminal
+    // wants the whole window, not the sidebar chrome.
+    (
+        "ui/terminal.html",
+        include_str!("../../templates/ui/terminal.html"),
+    ),
 ];
 
 static ENVIRONMENT: OnceLock<Result<Environment<'static>, String>> = OnceLock::new();

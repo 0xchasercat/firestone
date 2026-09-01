@@ -44,6 +44,32 @@ const CONTENT_SECURITY_POLICY: &str = concat!(
     "base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 );
 
+/// The policy for the terminal page, and for nothing else (SPEC §16.5).
+///
+/// It differs from the policy above in exactly one token: `'wasm-unsafe-eval'`
+/// on `script-src`, which is what lets `WebAssembly.compile` run the vendored
+/// terminal emulator. It is not `'unsafe-eval'`: `eval` and `new Function`
+/// stay forbidden here too, and every script source is still `'self'`, so a
+/// page that carries this policy can only instantiate WebAssembly bytes it
+/// already fetched from this origin. Injecting a module therefore still means
+/// first writing a file into the executable's own asset table.
+const TERMINAL_CONTENT_SECURITY_POLICY: &str = concat!(
+    "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; ",
+    "img-src 'self' data:; font-src 'self'; connect-src 'self'; ",
+    "base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+);
+
+/// A handler's request for [`TERMINAL_CONTENT_SECURITY_POLICY`].
+///
+/// The relaxation is a property of one response, not of a route table or a
+/// path prefix, so it travels with the response the handler built: the
+/// terminal handler inserts this marker into its response extensions and
+/// [`security_headers`] reads it back. A route that never inserts it cannot
+/// acquire the weaker policy by being renamed, moved, or matched by a
+/// wildcard, and nothing outside this crate can construct one.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WasmPolicy;
+
 /// A 32-byte session secret for the loopback transport.
 ///
 /// The bytes are never printed by `Debug` and never compared with `==`.
@@ -283,11 +309,21 @@ pub fn secured(app: Router, gate: Option<LoopbackGate>) -> Router {
 
 async fn security_headers(request: Request<Body>, next: Next) -> Response {
     let mut response = next.run(request).await;
+    // One response in the whole application asks for the wasm-capable policy,
+    // and it asks by marking itself. Everything else — every screen, every
+    // fragment, every asset, and every rejection this gate itself produces —
+    // gets the strict policy, including a response that merely 404s a path
+    // that looks like the terminal's.
+    let policy = if response.extensions().get::<WasmPolicy>().is_some() {
+        TERMINAL_CONTENT_SECURITY_POLICY
+    } else {
+        CONTENT_SECURITY_POLICY
+    };
     let headers = response.headers_mut();
     for (name, value) in [
         (
             header::CONTENT_SECURITY_POLICY,
-            HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+            HeaderValue::from_static(policy),
         ),
         (
             header::REFERRER_POLICY,
@@ -1236,6 +1272,69 @@ mod tests {
         let error =
             load_or_create_token_file(&path, uid).expect_err("a short token file must be refused");
         assert_eq!(error.kind(), firestone_core::ErrorKind::Usage);
+        Ok(())
+    }
+    #[test]
+    fn the_two_policies_differ_by_exactly_the_wasm_token() {
+        // The terminal page needs WebAssembly.compile and nothing else. If a
+        // future edit widens the relaxed policy in any other direction, this
+        // is where it has to be justified.
+        assert_eq!(
+            super::TERMINAL_CONTENT_SECURITY_POLICY.replace(" 'wasm-unsafe-eval'", ""),
+            super::CONTENT_SECURITY_POLICY
+        );
+        assert!(super::TERMINAL_CONTENT_SECURITY_POLICY.contains("'wasm-unsafe-eval'"));
+        for policy in [
+            super::CONTENT_SECURITY_POLICY,
+            super::TERMINAL_CONTENT_SECURITY_POLICY,
+        ] {
+            assert!(!policy.contains("unsafe-inline"));
+            assert!(!policy.contains("'unsafe-eval'"));
+            assert!(policy.contains("default-src 'none'"));
+            assert!(policy.contains("connect-src 'self'"));
+            assert!(policy.contains("frame-ancestors 'none'"));
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_response_that_marks_itself_receives_the_wasm_policy() -> TestResult {
+        // The relaxation travels with one response, not with a path: two
+        // handlers on the same router, one marked and one not.
+        let app = secured(
+            Router::new()
+                .route("/plain", get(|| async { "plain" }))
+                .route(
+                    "/wasm",
+                    get(|| async {
+                        let mut response = axum::response::Response::new(Body::from("wasm"));
+                        response.extensions_mut().insert(super::WasmPolicy);
+                        response
+                    }),
+                ),
+            None,
+        );
+
+        for (uri, expected) in [
+            ("/plain", super::CONTENT_SECURITY_POLICY),
+            ("/wasm", super::TERMINAL_CONTENT_SECURITY_POLICY),
+        ] {
+            let response = send(
+                &app,
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())?,
+            )
+            .await?;
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_SECURITY_POLICY)
+                    .and_then(|value| value.to_str().ok()),
+                Some(expected),
+                "{uri}"
+            );
+        }
         Ok(())
     }
 }

@@ -1,0 +1,91 @@
+{#-
+  The browser terminal (SPEC §16.5).
+
+  Its own document rather than the sidebar shell: a terminal wants the whole
+  window, and the chrome here is one slim bar. Nothing on this page polls and
+  nothing here is an htmx swap — the only live thing is the WebSocket term.js
+  opens against the §16.3 transports.
+
+  This is also the one response that carries the relaxed policy
+  `script-src 'self' 'wasm-unsafe-eval'`, which the handler selects by marking
+  the response. Every script below is still a same-origin file: there is no
+  inline script and no inline style anywhere on this page.
+-#}
+{%- import "ui/_macros.html" as m -%}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>{{ terminal.name }} terminal · Firestone</title>
+<link rel="icon" href="/ui/static/logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/ui/static/app.css?v={{ build }}">
+{# Blocking, in head, before first paint: same reason as the shell layout. #}
+<script src="/ui/static/theme.js?v={{ build }}"></script>
+<script src="/ui/static/term.js?v={{ build }}" defer></script>
+</head>
+<body class="fs-termbody">
+<div class="fs-term"
+     id="fs-term"
+     data-fs-machine="{{ terminal.name }}"
+     data-fs-tab="{{ terminal.tab }}"
+     data-fs-console-url="/v1/machines/{{ terminal.slug }}/console/ws"
+     data-fs-shell-url="/v1/machines/{{ terminal.slug }}/shell/ws"
+     data-fs-state-url="/v1/machines/{{ terminal.slug }}"
+     data-fs-module-url="/ui/static/ghostty-web.js?v={{ build }}"
+     data-fs-wasm-url="/ui/static/ghostty-vt.wasm?v={{ build }}">
+
+  <header class="fs-term__bar">
+    <a class="fs-term__back" href="/machines/{{ terminal.slug }}">
+      <span class="fs-term__back-arrow" aria-hidden="true">←</span>
+      <span class="fs-term__back-name">{{ terminal.name }}</span>
+    </a>
+    {{ m.status(terminal.status, true) }}
+
+    <div class="fs-term__tabs" role="tablist" aria-label="Terminal transport">
+      <button type="button"
+              class="fs-term__tab{% if terminal.tab == 'console' %} is-active{% endif %}"
+              role="tab"
+              id="fs-term-tab-console"
+              data-fs-term-tab="console"
+              aria-selected="{{ 'true' if terminal.tab == 'console' else 'false' }}"
+              aria-controls="fs-term-screen">Console</button>
+      <button type="button"
+              class="fs-term__tab{% if terminal.tab == 'shell' %} is-active{% endif %}"
+              role="tab"
+              id="fs-term-tab-shell"
+              data-fs-term-tab="shell"
+              aria-selected="{{ 'true' if terminal.tab == 'shell' else 'false' }}"
+              aria-controls="fs-term-screen">Shell</button>
+    </div>
+
+    <span class="fs-term__pill"
+          id="fs-term-connection"
+          data-fs-connection="idle"
+          role="status"
+          aria-live="polite">idle</span>
+  </header>
+
+  <div class="fs-term__stage" id="fs-term-stage">
+    <div class="fs-term__screen" id="fs-term-screen" role="tabpanel"
+         aria-labelledby="fs-term-tab-{{ terminal.tab }}"></div>
+
+    {# Written by term.js only. Hidden with the `hidden` attribute rather than
+       a style, because the policy forbids an inline one. #}
+    <div class="fs-term__overlay" id="fs-term-overlay" role="alert" hidden>
+      <div class="fs-term__overlay-card">
+        <p class="fs-term__overlay-title" id="fs-term-overlay-title"></p>
+        <p class="fs-term__overlay-hint" id="fs-term-overlay-hint"></p>
+        <button type="button" class="fs-btn fs-btn--primary" id="fs-term-reconnect">Reconnect</button>
+      </div>
+    </div>
+  </div>
+
+  <footer class="fs-term__foot">
+    <span class="fs-term__note" id="fs-term-note">{{ terminal.note }}</span>
+    <span class="fs-term__geometry" id="fs-term-geometry"></span>
+  </footer>
+</div>
+</body>
+</html>
