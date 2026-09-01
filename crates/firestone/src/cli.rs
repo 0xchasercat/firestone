@@ -84,6 +84,9 @@ pub enum Command {
     #[command(visible_alias = "ssh")]
     Shell(ShellArgs),
 
+    /// Copy files between the host and a machine over the vsock transport.
+    Cp(CpArgs),
+
     /// Print an OpenSSH Host block for the machine.
     #[command(name = "ssh-config")]
     SshConfig(SshConfigArgs),
@@ -220,6 +223,22 @@ pub struct ShellArgs {
     /// Remote command. Values are passed to OpenSSH without retokenizing.
     #[arg(last = true, value_name = "CMD")]
     pub command: Vec<OsString>,
+}
+
+/// Arguments accepted by firestone cp.
+#[derive(Debug, Args)]
+pub struct CpArgs {
+    /// Copy directories recursively.
+    #[arg(short = 'r', long = "recursive")]
+    pub recursive: bool,
+
+    /// Source operand. Exactly one operand is remote, written `<machine>:<path>`.
+    #[arg(value_name = "SRC")]
+    pub source: String,
+
+    /// Destination operand. Exactly one operand is remote, written `<machine>:<path>`.
+    #[arg(value_name = "DST")]
+    pub target: String,
 }
 
 /// Arguments accepted by firestone ssh-config.
@@ -1264,6 +1283,43 @@ mod tests {
             missing_separator.kind(),
             ErrorKind::UnknownArgument | ErrorKind::TooManyValues
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn cp_grammar_accepts_recursive_and_two_positional_operands() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["firestone", "cp", "-r", "./notes", "dev:/srv/notes"])?;
+        match cli.command {
+            Command::Cp(arguments) => {
+                assert!(arguments.recursive);
+                assert_eq!(arguments.source, "./notes");
+                assert_eq!(arguments.target, "dev:/srv/notes");
+            }
+            _ => panic!("expected cp command"),
+        }
+
+        let long = Cli::try_parse_from(["firestone", "cp", "--recursive", "dev:/a", "./b"])?;
+        match long.command {
+            Command::Cp(arguments) => {
+                assert!(arguments.recursive);
+                assert_eq!(arguments.source, "dev:/a");
+                assert_eq!(arguments.target, "./b");
+            }
+            _ => panic!("expected cp command"),
+        }
+
+        let plain = Cli::try_parse_from(["firestone", "cp", "dev:/a", "./b"])?;
+        match plain.command {
+            Command::Cp(arguments) => assert!(!arguments.recursive),
+            _ => panic!("expected cp command"),
+        }
+
+        let missing = Cli::try_parse_from(["firestone", "cp", "dev:/a"])
+            .expect_err("cp requires two operands");
+        assert_eq!(missing.kind(), ErrorKind::MissingRequiredArgument);
+        let extra = Cli::try_parse_from(["firestone", "cp", "dev:/a", "./b", "./c"])
+            .expect_err("cp accepts exactly two operands");
+        assert_eq!(extra.kind(), ErrorKind::UnknownArgument);
         Ok(())
     }
 

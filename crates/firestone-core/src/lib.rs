@@ -68,10 +68,10 @@ pub use network::{
 pub use paths::{PathInputs, Paths};
 pub use readiness::{ReadinessOptions, wait_for_ssh_ready};
 pub use result::{
-    CatalogArchitectureSummary, CatalogEntrySummary, LogsResult, MachineRecord, MachineSummary,
-    MachineView, RemoveResult, RunResult, ShellResult, SpecResult, SpecWarningPayload,
-    SshConfigResult, StartResult, StopResult, VersionDependency, VersionIdentity, VersionPaths,
-    VersionResult,
+    CatalogArchitectureSummary, CatalogEntrySummary, CpResult, LogsResult, MachineRecord,
+    MachineSummary, MachineView, RemoveResult, RunResult, ShellResult, SpecResult,
+    SpecWarningPayload, SshConfigResult, StartResult, StopResult, VersionDependency,
+    VersionIdentity, VersionPaths, VersionResult,
 };
 pub use shim::{
     PreparedStart, ShimClient, ShimPids, ShimStatus, ShimTimeouts, cancel_prepared,
@@ -89,10 +89,10 @@ pub use spec::{
     validate_machine_spec,
 };
 pub use ssh::{
-    SshCommandPlan, SshConfigPlan, SshIdentity, VSOCK_HANDSHAKE_MAX_BYTES, VSOCK_HANDSHAKE_TIMEOUT,
-    VsockConnection, VsockPort, connect_vsock, ensure_ssh_identity,
-    invalidate_known_hosts_for_seed, machine_known_hosts_path, readiness_ssh_plan, run_vsock_proxy,
-    shell_ssh_plan, ssh_config_plan,
+    CpOperand, CpOperands, SshCommandPlan, SshConfigPlan, SshIdentity, VSOCK_HANDSHAKE_MAX_BYTES,
+    VSOCK_HANDSHAKE_TIMEOUT, VsockConnection, VsockPort, classify_cp_operand, classify_cp_operands,
+    connect_vsock, ensure_ssh_identity, invalidate_known_hosts_for_seed, machine_known_hosts_path,
+    readiness_ssh_plan, run_vsock_proxy, scp_command_plan, shell_ssh_plan, ssh_config_plan,
 };
 pub use state::{
     ExitReason, LastExit, LiveMachineState, LivenessObservation, MAX_MACHINE_STATE_BYTES,

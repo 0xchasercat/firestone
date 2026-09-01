@@ -15,7 +15,7 @@ use std::{
 };
 
 use firestone_core::{
-    Action, Arch, Catalog, CatalogArchitectureSummary, CatalogEntrySummary, Cmd,
+    Action, Arch, Catalog, CatalogArchitectureSummary, CatalogEntrySummary, Cmd, CpResult,
     DependencyManifest, DispatchFuture, Dispatcher, DoctorContext, DoctorOptions, ErrorKind, Event,
     EventSink, ExtractedPasstHelper, FirestoneError, GlobalConfig, ImagePullRequest, ImageStore,
     InternalHelper, Level, LiveMachineState, LogSource, LogsResult, MachineLock, MachineRecord,
@@ -23,9 +23,9 @@ use firestone_core::{
     ReadinessOptions, RealValidationHost, RemoveResult, ShimClient, ShimTimeouts, SpecResult,
     SpecWarningPayload, StartResult, StateImage, StateStore, StateVersion, StopResult, Supervision,
     ValidationContext, VersionDependency, VersionIdentity, VersionPaths, VersionResult, atomic,
-    cancel_prepared, launch_prepared_cancellable, prepare_start,
+    cancel_prepared, classify_cp_operands, launch_prepared_cancellable, prepare_start,
     read_reconciled_machine_state_live, read_reconciled_machine_state_live_locked, run_doctor,
-    stop_unsupervised, validate_machine_spec, wait_for_ssh_ready,
+    scp_command_plan, stop_unsupervised, validate_machine_spec, wait_for_ssh_ready,
 };
 
 const SPEC_TEMPLATE: &str = include_str!("../../../templates/firestone.toml");
@@ -1233,6 +1233,47 @@ impl LocalDispatcher {
         self.image_store()?.referencing_machines(id)
     }
 
+    /// Plans the exact scp invocation for one `firestone cp` operand pair (SPEC 11.8).
+    ///
+    /// The dispatcher owns operand classification, machine lookup, and the running check. Only the
+    /// CLI executes the returned argv.
+    pub fn cp_plan(
+        &self,
+        source: &str,
+        target: &str,
+        recursive: bool,
+    ) -> Result<CpResult, FirestoneError> {
+        let operands = classify_cp_operands(source, target)?;
+        let name = operands.machine();
+        let machine = self.terminal_machine(name)?;
+        if machine.state.status != MachineStatus::Running {
+            return Err(cp_not_running_error(name));
+        }
+        let user = machine.spec.user;
+        let plan = scp_command_plan(
+            &self.paths,
+            &self.shim_program()?,
+            name,
+            &user,
+            recursive,
+            operands.source(),
+            operands.target(),
+        )?;
+        let program = cp_argument(plan.program())?;
+        let args = plan
+            .args()
+            .iter()
+            .map(|argument| cp_argument(argument))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(CpResult {
+            name: name.to_owned(),
+            user,
+            recursive,
+            program,
+            args,
+        })
+    }
+
     fn catalog_list(&self, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
         let entries = self
             .catalog
@@ -1601,6 +1642,14 @@ impl Dispatcher for LocalDispatcher {
                     lines,
                     follow,
                 } => self.logs(&name, source, lines, follow, events),
+                Action::Cp {
+                    source,
+                    target,
+                    recursive,
+                } => {
+                    let result = self.cp_plan(&source, &target, recursive)?;
+                    emit_result(events, "cp", &result)
+                }
                 Action::CatalogList => self.catalog_list(events),
                 Action::ImageList => self.image_list(events),
                 Action::ImagePull { r#ref, sha256 } => self.image_pull(r#ref, sha256, events),
@@ -2227,6 +2276,24 @@ fn emit_spec_warnings(
         })?;
     }
     Ok(())
+}
+
+fn cp_argument(value: &OsStr) -> Result<String, FirestoneError> {
+    value.to_str().map(str::to_owned).ok_or_else(|| {
+        FirestoneError::new(
+            ErrorKind::Usage,
+            format!("cp argument {value:?} is not valid UTF-8"),
+        )
+        .with_hint("use UTF-8 cp operands and a UTF-8 Firestone home")
+    })
+}
+
+fn cp_not_running_error(name: &str) -> FirestoneError {
+    FirestoneError::new(
+        ErrorKind::NotRunning,
+        format!("machine {name} is not running"),
+    )
+    .with_hint(format!("start it with firestone start {name}"))
 }
 
 fn emit_result<T: serde::Serialize>(
@@ -3750,5 +3817,79 @@ esac
         assert_eq!(format_uptime_seconds(60), "1m");
         assert_eq!(format_uptime_seconds(3_600), "1h");
         assert_eq!(format_uptime_seconds(172_800), "2d");
+    }
+
+    #[tokio::test]
+    async fn cp_plan_stopped_machine_refuses_with_the_shell_not_running_family()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, _paths) = fixture()?;
+        create_machine(&dispatcher, "copy", MachineSpec::default()).await?;
+
+        let error = dispatcher
+            .cp_plan("./notes.txt", "copy:/tmp/notes.txt", false)
+            .err()
+            .ok_or("a created machine must refuse cp")?;
+
+        assert_eq!(error.kind(), ErrorKind::NotRunning);
+        assert_eq!(error.message(), "machine copy is not running");
+        assert_eq!(error.hint(), Some("start it with firestone start copy"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cp_plan_operand_pairs_without_one_machine_are_usage_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, _paths) = fixture()?;
+        create_machine(&dispatcher, "copy", MachineSpec::default()).await?;
+
+        let local = dispatcher
+            .cp_plan("./here", "./there", false)
+            .err()
+            .ok_or("two local operands must fail")?;
+        assert_eq!(local.kind(), ErrorKind::Usage);
+        assert_eq!(local.message(), "neither cp operand names a machine");
+
+        let remote = dispatcher
+            .cp_plan("copy:/a", "copy:/b", false)
+            .err()
+            .ok_or("two remote operands must fail")?;
+        assert_eq!(remote.kind(), ErrorKind::Usage);
+        assert_eq!(remote.message(), "both cp operands name a machine");
+
+        let missing = dispatcher
+            .cp_plan("./here", "absent:/there", false)
+            .err()
+            .ok_or("an unknown machine must fail")?;
+        assert_eq!(missing.kind(), ErrorKind::NotFound);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cp_action_dispatch_reports_the_same_refusal_as_the_plan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, _paths) = fixture()?;
+        create_machine(&dispatcher, "copy", MachineSpec::default()).await?;
+        let mut events = Vec::new();
+
+        let error = dispatcher
+            .run(
+                Action::Cp {
+                    source: "copy:/etc/hostname".to_owned(),
+                    target: "./hostname".to_owned(),
+                    recursive: false,
+                },
+                &mut events,
+            )
+            .await
+            .err()
+            .ok_or("a created machine must refuse the cp action")?;
+
+        assert_eq!(error.kind(), ErrorKind::NotRunning);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Result { .. }))
+        );
+        Ok(())
     }
 }

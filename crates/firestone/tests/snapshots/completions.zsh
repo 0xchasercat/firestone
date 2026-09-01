@@ -284,6 +284,25 @@ _arguments "${_arguments_options[@]}" : \
 '*::command -- Remote command. Values are passed to OpenSSH without retokenizing:_default' \
 && ret=0
 ;;
+(cp)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'-r[Copy directories recursively]' \
+'--recursive[Copy directories recursively]' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':source -- Source operand. Exactly one operand is remote, written `<machine>\:<path>`:_default' \
+':target -- Destination operand. Exactly one operand is remote, written `<machine>\:<path>`:_default' \
+&& ret=0
+;;
 (ssh-config)
 _arguments "${_arguments_options[@]}" : \
 '--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
@@ -632,6 +651,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(cp)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (ssh-config)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -732,6 +755,7 @@ _firestone_commands() {
 'edit:Edit and validate a machine'\''s firestone.toml' \
 'shell:Open SSH over the machine'\''s private vsock transport' \
 'ssh:Open SSH over the machine'\''s private vsock transport' \
+'cp:Copy files between the host and a machine over the vsock transport' \
 'ssh-config:Print an OpenSSH Host block for the machine' \
 'console:Attach to the machine'\''s hvc0 console' \
 'logs:Print a bounded machine log' \
@@ -761,6 +785,11 @@ _firestone__subcmd__console_commands() {
     local commands; commands=()
     _describe -t commands 'firestone console commands' commands "$@"
 }
+(( $+functions[_firestone__subcmd__cp_commands] )) ||
+_firestone__subcmd__cp_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone cp commands' commands "$@"
+}
 (( $+functions[_firestone__subcmd__create_commands] )) ||
 _firestone__subcmd__create_commands() {
     local commands; commands=()
@@ -789,6 +818,7 @@ _firestone__subcmd__help_commands() {
 'show:Show a machine'\''s specification and runtime state' \
 'edit:Edit and validate a machine'\''s firestone.toml' \
 'shell:Open SSH over the machine'\''s private vsock transport' \
+'cp:Copy files between the host and a machine over the vsock transport' \
 'ssh-config:Print an OpenSSH Host block for the machine' \
 'console:Attach to the machine'\''s hvc0 console' \
 'logs:Print a bounded machine log' \
@@ -817,6 +847,11 @@ _firestone__subcmd__help__subcmd__completions_commands() {
 _firestone__subcmd__help__subcmd__console_commands() {
     local commands; commands=()
     _describe -t commands 'firestone help console commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__cp_commands] )) ||
+_firestone__subcmd__help__subcmd__cp_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help cp commands' commands "$@"
 }
 (( $+functions[_firestone__subcmd__help__subcmd__create_commands] )) ||
 _firestone__subcmd__help__subcmd__create_commands() {

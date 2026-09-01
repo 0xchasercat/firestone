@@ -210,6 +210,143 @@ pub fn ssh_config_plan(
     Ok(SshConfigPlan { host, block })
 }
 
+/// One classified `firestone cp` operand (§11.8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CpOperand {
+    /// A host path. Rendered with the `./` escape when scp would read a colon as a host separator.
+    Local(String),
+    /// A `<machine>:<path>` operand naming a Firestone machine.
+    Remote { machine: String, path: String },
+}
+
+/// The one machine and the classified operand pair of a `firestone cp` invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CpOperands {
+    machine: String,
+    source: CpOperand,
+    target: CpOperand,
+}
+
+impl CpOperands {
+    #[must_use]
+    pub fn machine(&self) -> &str {
+        &self.machine
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> &CpOperand {
+        &self.source
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> &CpOperand {
+        &self.target
+    }
+}
+
+/// Classifies one `firestone cp` operand.
+///
+/// An operand is remote exactly when it contains a colon and everything before the first colon is a
+/// non-empty machine name: lowercase ASCII letters, digits, and dashes. Every other operand is
+/// local, including `./name:path`, `/absolute:path`, and a bare path without a colon.
+#[must_use]
+pub fn classify_cp_operand(value: &str) -> CpOperand {
+    match value.split_once(':') {
+        Some((machine, path)) if is_machine_operand(machine) => CpOperand::Remote {
+            machine: machine.to_owned(),
+            path: path.to_owned(),
+        },
+        _ => CpOperand::Local(value.to_owned()),
+    }
+}
+
+/// Classifies a `firestone cp` operand pair and requires exactly one remote operand.
+pub fn classify_cp_operands(source: &str, target: &str) -> Result<CpOperands, FirestoneError> {
+    let source = classify_cp_operand(source);
+    let target = classify_cp_operand(target);
+    let machine = match (&source, &target) {
+        (CpOperand::Remote { machine, .. }, CpOperand::Local(_))
+        | (CpOperand::Local(_), CpOperand::Remote { machine, .. }) => machine.clone(),
+        (CpOperand::Local(_), CpOperand::Local(_)) => {
+            return Err(FirestoneError::new(
+                ErrorKind::Usage,
+                "neither cp operand names a machine",
+            )
+            .with_hint(
+                "write exactly one operand as <machine>:<path>; prefix a local path with ./ to keep it local",
+            ));
+        }
+        (CpOperand::Remote { .. }, CpOperand::Remote { .. }) => {
+            return Err(FirestoneError::new(
+                ErrorKind::Usage,
+                "both cp operands name a machine",
+            )
+            .with_hint(
+                "copy between exactly one machine and the host; prefix a local path with ./ to keep it local",
+            ));
+        }
+    };
+    Ok(CpOperands {
+        machine,
+        source,
+        target,
+    })
+}
+
+fn is_machine_operand(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// Builds the exact system `scp` command used by firestone cp.
+///
+/// The remote operand renders as `<user>@firestone.<machine>:<path>` and reuses the same vsock
+/// `ProxyCommand` option block as `firestone shell`.
+pub fn scp_command_plan(
+    paths: &Paths,
+    current_executable: &Path,
+    name: &str,
+    user: &str,
+    recursive: bool,
+    source: &CpOperand,
+    target: &CpOperand,
+) -> Result<SshCommandPlan, FirestoneError> {
+    crate::spec::validate_guest_user(user)?;
+    let options = ssh_transport_options(paths, current_executable, name, false)?;
+    let mut args = Vec::with_capacity(usize::from(recursive) + options.len() + 2);
+    if recursive {
+        args.push(OsString::from("-r"));
+    }
+    args.extend(options);
+    args.push(render_cp_operand(source, name, user));
+    args.push(render_cp_operand(target, name, user));
+
+    Ok(SshCommandPlan {
+        program: OsString::from("scp"),
+        args,
+    })
+}
+
+fn render_cp_operand(operand: &CpOperand, name: &str, user: &str) -> OsString {
+    match operand {
+        CpOperand::Local(path) => OsString::from(escape_local_cp_operand(path)),
+        CpOperand::Remote { path, .. } => OsString::from(format!("{user}@firestone.{name}:{path}")),
+    }
+}
+
+/// Keeps a local operand local for scp, whose own rule is "remote when a colon precedes any slash".
+fn escape_local_cp_operand(path: &str) -> String {
+    let colon = path.find(':');
+    let slash = path.find('/');
+    match (colon, slash) {
+        (Some(colon), Some(slash)) if colon < slash => format!("./{path}"),
+        (Some(_), None) => format!("./{path}"),
+        _ => path.to_owned(),
+    }
+}
+
 fn ssh_command_plan(
     paths: &Paths,
     current_executable: &Path,
@@ -220,22 +357,10 @@ fn ssh_command_plan(
     remote_command: Vec<OsString>,
 ) -> Result<SshCommandPlan, FirestoneError> {
     crate::spec::validate_guest_user(user)?;
-    let identity = ensure_ssh_identity(paths)?;
-    let known_hosts = machine_known_hosts_path(paths, name)?;
-    let proxy = proxy_command(paths, current_executable, name)?;
-    let identity = ssh_config_word(identity.private_key(), "SSH identity")?;
-    let known_hosts = ssh_config_word(&known_hosts, "machine known_hosts")?;
+    let options = ssh_transport_options(paths, current_executable, name, batch_mode)?;
 
-    let mut args = Vec::with_capacity(13 + usize::from(batch_mode) * 2 + remote_command.len());
-    push_ssh_option(&mut args, format!("ProxyCommand={proxy}"));
-    push_ssh_option(&mut args, format!("IdentityFile={identity}"));
-    push_ssh_option(&mut args, "IdentitiesOnly=yes");
-    push_ssh_option(&mut args, format!("UserKnownHostsFile={known_hosts}"));
-    push_ssh_option(&mut args, "StrictHostKeyChecking=accept-new");
-    push_ssh_option(&mut args, "LogLevel=ERROR");
-    if batch_mode {
-        push_ssh_option(&mut args, "BatchMode=yes");
-    }
+    let mut args = Vec::with_capacity(options.len() + 1 + remote_command.len());
+    args.extend(options);
     if allocate_tty {
         args.push(OsString::from("-t"));
     }
@@ -246,6 +371,32 @@ fn ssh_command_plan(
         program: OsString::from("ssh"),
         args,
     })
+}
+
+/// The one OpenSSH option block shared by every Firestone vsock invocation.
+fn ssh_transport_options(
+    paths: &Paths,
+    current_executable: &Path,
+    name: &str,
+    batch_mode: bool,
+) -> Result<Vec<OsString>, FirestoneError> {
+    let identity = ensure_ssh_identity(paths)?;
+    let known_hosts = machine_known_hosts_path(paths, name)?;
+    let proxy = proxy_command(paths, current_executable, name)?;
+    let identity = ssh_config_word(identity.private_key(), "SSH identity")?;
+    let known_hosts = ssh_config_word(&known_hosts, "machine known_hosts")?;
+
+    let mut args = Vec::with_capacity(12 + usize::from(batch_mode) * 2);
+    push_ssh_option(&mut args, format!("ProxyCommand={proxy}"));
+    push_ssh_option(&mut args, format!("IdentityFile={identity}"));
+    push_ssh_option(&mut args, "IdentitiesOnly=yes");
+    push_ssh_option(&mut args, format!("UserKnownHostsFile={known_hosts}"));
+    push_ssh_option(&mut args, "StrictHostKeyChecking=accept-new");
+    push_ssh_option(&mut args, "LogLevel=ERROR");
+    if batch_mode {
+        push_ssh_option(&mut args, "BatchMode=yes");
+    }
+    Ok(args)
 }
 fn proxy_command(
     paths: &Paths,
@@ -1477,7 +1628,7 @@ mod tests {
     use crate::{ErrorKind, PathInputs, Paths};
 
     use super::{
-        VSOCK_HANDSHAKE_MAX_BYTES, VsockPort, ensure_ssh_identity_with,
+        CpOperand, VSOCK_HANDSHAKE_MAX_BYTES, VsockPort, ensure_ssh_identity_with,
         invalidate_known_hosts_for_seed, machine_known_hosts_path, parse_vsock_response,
     };
 
@@ -1981,6 +2132,177 @@ exit 23"#,
         assert_eq!(plan.block(), expected);
         assert!(!plan.block().contains("PRIVATE-TEST-BYTES"));
         assert!(!plan.block().contains("ssh-ed25519 AAAA"));
+        Ok(())
+    }
+
+    #[test]
+    fn cp_operand_classification_requires_a_machine_name_before_the_first_colon() {
+        let remote = |machine: &str, path: &str| CpOperand::Remote {
+            machine: machine.to_owned(),
+            path: path.to_owned(),
+        };
+        let local = |value: &str| CpOperand::Local(value.to_owned());
+        for (operand, expected) in [
+            ("demo:/etc/hostname", remote("demo", "/etc/hostname")),
+            ("web-01:notes.txt", remote("web-01", "notes.txt")),
+            ("demo:", remote("demo", "")),
+            ("dev:c:/win", remote("dev", "c:/win")),
+            ("./demo:/etc/hostname", local("./demo:/etc/hostname")),
+            ("/srv/demo:/etc", local("/srv/demo:/etc")),
+            ("notes.txt", local("notes.txt")),
+            ("Demo:/etc", local("Demo:/etc")),
+            ("demo_1:/etc", local("demo_1:/etc")),
+            (":/etc", local(":/etc")),
+            ("::1:/etc", local("::1:/etc")),
+            ("FE80::1:/etc", local("FE80::1:/etc")),
+            ("./fe80::1:/etc", local("./fe80::1:/etc")),
+            // The first label of an IPv6-shaped operand is a machine name, exactly as scp reads
+            // the same bytes as a host. A local path in this shape needs the ./ escape.
+            ("fe80::1:/etc", remote("fe80", ":1:/etc")),
+            ("2001:db8::1:/etc", remote("2001", "db8::1:/etc")),
+        ] {
+            assert_eq!(
+                super::classify_cp_operand(operand),
+                expected,
+                "misclassified {operand}"
+            );
+        }
+    }
+
+    #[test]
+    fn cp_operand_pair_requires_exactly_one_remote_side() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let operands = super::classify_cp_operands("./notes.txt", "demo:/tmp/notes.txt")?;
+        assert_eq!(operands.machine(), "demo");
+        assert_eq!(
+            operands.source(),
+            &CpOperand::Local("./notes.txt".to_owned())
+        );
+
+        let reversed = super::classify_cp_operands("demo:/tmp/notes.txt", "./notes.txt")?;
+        assert_eq!(reversed.machine(), "demo");
+
+        let neither = super::classify_cp_operands("./one", "./two")
+            .expect_err("two local operands must be rejected");
+        assert_eq!(neither.kind(), ErrorKind::Usage);
+        assert!(neither.hint().is_some_and(|hint| hint.contains("./")));
+
+        let both = super::classify_cp_operands("demo:/one", "other:/two")
+            .expect_err("two remote operands must be rejected");
+        assert_eq!(both.kind(), ErrorKind::Usage);
+        Ok(())
+    }
+
+    #[test]
+    fn scp_plan_reuses_the_shell_option_block_with_recursive_and_remote_rendering()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let keygen = fixture.keygen(&successful_keygen_body(&fixture, false)?)?;
+        let identity =
+            ensure_ssh_identity_with(&fixture.paths, keygen.as_os_str(), "fixture-host")?;
+        let executable = fixture.root.join("bin with space/firestone");
+        let known_hosts = machine_known_hosts_path(&fixture.paths, "demo")?;
+        let operands = super::classify_cp_operands("./local dir", "demo:/srv/data")?;
+
+        let plan = super::scp_command_plan(
+            &fixture.paths,
+            &executable,
+            operands.machine(),
+            "root",
+            true,
+            operands.source(),
+            operands.target(),
+        )?;
+
+        let proxy = format!(
+            "ProxyCommand={}",
+            super::proxy_command(&fixture.paths, &executable, "demo")?
+        );
+        assert!(proxy.contains("%%"), "fixture must exercise % quoting");
+        assert!(proxy.contains('\''), "fixture must exercise shell quoting");
+        let identity_option = format!(
+            "IdentityFile={}",
+            super::ssh_config_word(identity.private_key(), "SSH identity")?
+        );
+        let known_hosts_option = format!(
+            "UserKnownHostsFile={}",
+            super::ssh_config_word(&known_hosts, "machine known_hosts")?
+        );
+        let expected = vec![
+            OsString::from("-r"),
+            OsString::from("-o"),
+            OsString::from(proxy),
+            OsString::from("-o"),
+            OsString::from(identity_option),
+            OsString::from("-o"),
+            OsString::from("IdentitiesOnly=yes"),
+            OsString::from("-o"),
+            OsString::from(known_hosts_option),
+            OsString::from("-o"),
+            OsString::from("StrictHostKeyChecking=accept-new"),
+            OsString::from("-o"),
+            OsString::from("LogLevel=ERROR"),
+            OsString::from("./local dir"),
+            OsString::from("root@firestone.demo:/srv/data"),
+        ];
+        assert_eq!(plan.program(), std::ffi::OsStr::new("scp"));
+        assert_eq!(plan.args(), expected);
+        assert!(
+            !plan
+                .args()
+                .iter()
+                .any(|argument| argument == "BatchMode=yes")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scp_plan_download_omits_recursive_and_escapes_an_ambiguous_local_operand()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let keygen = fixture.keygen(&successful_keygen_body(&fixture, false)?)?;
+        ensure_ssh_identity_with(&fixture.paths, keygen.as_os_str(), "fixture-host")?;
+        let executable = fixture.root.join("bin with space/firestone");
+        let operands = super::classify_cp_operands("demo:/etc/hostname", "Host:name")?;
+
+        let plan = super::scp_command_plan(
+            &fixture.paths,
+            &executable,
+            operands.machine(),
+            "builder",
+            false,
+            operands.source(),
+            operands.target(),
+        )?;
+
+        assert!(!plan.args().iter().any(|argument| argument == "-r"));
+        assert_eq!(
+            &plan.args()[plan.args().len() - 2..],
+            [
+                OsString::from("builder@firestone.demo:/etc/hostname"),
+                OsString::from("./Host:name"),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scp_plan_rejects_an_invalid_guest_user() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let operands = super::classify_cp_operands("./notes", "demo:/notes")?;
+
+        let error = super::scp_command_plan(
+            &fixture.paths,
+            std::path::Path::new("/usr/bin/firestone"),
+            operands.machine(),
+            "Root User",
+            false,
+            operands.source(),
+            operands.target(),
+        )
+        .expect_err("an invalid guest user must be rejected");
+
+        assert_eq!(error.kind(), ErrorKind::InvalidSpec);
         Ok(())
     }
 }
