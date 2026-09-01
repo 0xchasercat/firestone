@@ -5844,10 +5844,10 @@ esac
         events: &[Event],
     ) -> Result<firestone_core::PruneResult, Box<dyn std::error::Error>> {
         for event in events {
-            if let Event::Result { action, payload } = event
-                && action == "system-prune"
-            {
-                return Ok(serde_json::from_value(payload.clone())?);
+            if let Event::Result { action, payload } = event {
+                if action == "system-prune" {
+                    return Ok(serde_json::from_value(payload.clone())?);
+                }
             }
         }
         Err("the prune action emitted no system-prune result".into())
