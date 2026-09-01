@@ -47,6 +47,7 @@ set edit:completion:arg-completer[firestone] = {|@words|
             cand ssh-config 'Print an OpenSSH Host block for the machine'
             cand console 'Attach to the machine''s hvc0 console'
             cand logs 'Print a bounded machine log'
+            cand metrics 'Print one cumulative resource sample for a running machine'
             cand catalog 'Print the merged built-in and user image catalog'
             cand images 'Manage the owned image store'
             cand doctor 'Check host requirements and optional safe repairs'
@@ -324,6 +325,19 @@ set edit:completion:arg-completer[firestone] = {|@words|
             cand -h 'Print help'
             cand --help 'Print help'
         }
+        &'firestone;metrics'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
         &'firestone;catalog'= {
             cand --home 'Override the Firestone home root (config, data, and runtime)'
             cand --json 'Print events as newline-delimited JSON and disable human output'
@@ -529,6 +543,7 @@ set edit:completion:arg-completer[firestone] = {|@words|
             cand ssh-config 'Print an OpenSSH Host block for the machine'
             cand console 'Attach to the machine''s hvc0 console'
             cand logs 'Print a bounded machine log'
+            cand metrics 'Print one cumulative resource sample for a running machine'
             cand catalog 'Print the merged built-in and user image catalog'
             cand images 'Manage the owned image store'
             cand doctor 'Check host requirements and optional safe repairs'
@@ -565,6 +580,8 @@ set edit:completion:arg-completer[firestone] = {|@words|
         &'firestone;help;console'= {
         }
         &'firestone;help;logs'= {
+        }
+        &'firestone;help;metrics'= {
         }
         &'firestone;help;catalog'= {
         }

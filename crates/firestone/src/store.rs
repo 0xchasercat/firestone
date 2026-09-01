@@ -19,13 +19,15 @@ use firestone_core::{
     DependencyManifest, DispatchFuture, Dispatcher, DoctorContext, DoctorOptions, ErrorKind, Event,
     EventSink, ExtractedPasstHelper, FirestoneError, GlobalConfig, ImagePullRequest, ImageStore,
     InternalHelper, Level, LiveMachineState, LogSource, LogsResult, MachineLock, MachineRecord,
-    MachineSpec, MachineSpecPatch, MachineState, MachineStatus, MachineSummary, MachineView, Paths,
-    ReadinessOptions, RealValidationHost, RemoveResult, ShimClient, ShimTimeouts, SpecResult,
-    SpecWarningPayload, StartResult, StateImage, StateStore, StateVersion, StopResult, Supervision,
-    ValidationContext, VersionDependency, VersionIdentity, VersionPaths, VersionResult, atomic,
+    MachineSpec, MachineSpecPatch, MachineState, MachineStatus, MachineSummary, MachineView,
+    MetricsCpu, MetricsMemory, MetricsResult, Paths, ReadinessOptions, RealValidationHost,
+    RemoveResult, ShimClient, ShimTimeouts, SpecResult, SpecWarningPayload, StartResult,
+    StateImage, StateStore, StateVersion, StopResult, Supervision, ValidationContext,
+    VersionDependency, VersionIdentity, VersionPaths, VersionResult, VmmApi, atomic,
     cancel_prepared, classify_cp_operands, forwards_differ, launch_prepared_cancellable,
-    prepare_start, read_reconciled_machine_state_live, read_reconciled_machine_state_live_locked,
-    run_doctor, scp_command_plan, stop_unsupervised, validate_machine_spec, wait_for_ssh_ready,
+    prepare_start, project_device_counters, read_reconciled_machine_state_live,
+    read_reconciled_machine_state_live_locked, run_doctor, sample_vmm_process, scp_command_plan,
+    stop_unsupervised, validate_machine_spec, wait_for_ssh_ready,
 };
 
 const SPEC_TEMPLATE: &str = include_str!("../../../templates/firestone.toml");
@@ -508,6 +510,43 @@ impl LocalDispatcher {
                 state: live.state,
                 supervision: live.supervision,
                 forwards_pending: pending,
+            },
+        )
+    }
+
+    fn metrics(&self, name: &str, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
+        let (spec, live) = self.load_machine(name)?;
+        if !live.state.status.is_active() {
+            return Err(machine_not_running(name));
+        }
+        let sampled_at = jiff::Timestamp::now().to_string();
+        let process = live
+            .state
+            .vmm_pid
+            .map(sample_vmm_process)
+            .unwrap_or_default();
+        let api_socket = self.paths.machine_api_socket(name)?;
+        let api = VmmApi::new(&api_socket, ShimTimeouts::default().api);
+        let counters = api.vm_counters()?;
+        let info = api.vm_info()?;
+        let (block, net) = project_device_counters(&counters);
+        emit_result(
+            events,
+            "metrics",
+            &MetricsResult {
+                sampled_at,
+                cpu: MetricsCpu {
+                    vcpus: spec.cpus,
+                    cpu_time_ns: process.cpu_time_ns,
+                },
+                memory: MetricsMemory {
+                    rss_bytes: process.rss_bytes,
+                    allocated_bytes: spec.memory.as_bytes(),
+                    guest_actual_bytes: (info.memory_actual_size != 0)
+                        .then_some(info.memory_actual_size),
+                },
+                block,
+                net,
             },
         )
     }
@@ -1656,6 +1695,7 @@ impl Dispatcher for LocalDispatcher {
                     let result = self.cp_plan(&source, &target, recursive)?;
                     emit_result(events, "cp", &result)
                 }
+                Action::Metrics { name } => self.metrics(&name, events),
                 Action::CatalogList => self.catalog_list(events),
                 Action::ImageList => self.image_list(events),
                 Action::ImagePull { r#ref, sha256 } => self.image_pull(r#ref, sha256, events),
@@ -2343,6 +2383,15 @@ fn emit_result<T: serde::Serialize>(
         action: action.to_owned(),
         payload,
     })
+}
+
+/// The shared machine-not-running failure for read-only runtime surfaces.
+fn machine_not_running(name: &str) -> FirestoneError {
+    FirestoneError::new(
+        ErrorKind::Conflict,
+        format!("machine `{name}` is not running"),
+    )
+    .with_hint(format!("run firestone start {name}"))
 }
 
 fn filesystem_error(
@@ -4004,6 +4053,47 @@ esac
                 .iter()
                 .any(|event| matches!(event, Event::Result { .. }))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metrics_created_machine_returns_conflict_without_touching_the_vmm_socket()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        create_machine(&dispatcher, "idle", MachineSpec::default()).await?;
+
+        let mut events = Vec::new();
+        let error = dispatcher
+            .run(
+                Action::Metrics {
+                    name: "idle".to_owned(),
+                },
+                &mut events,
+            )
+            .await
+            .err()
+            .ok_or("metrics on a stopped machine unexpectedly succeeded")?;
+        assert_eq!(error.kind(), ErrorKind::Conflict);
+        assert!(error.message().contains("machine `idle` is not running"));
+        assert!(events.is_empty());
+        assert!(!paths.machine_api_socket("idle")?.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metrics_missing_machine_returns_not_found() -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, _paths) = fixture()?;
+        let error = dispatcher
+            .run(
+                Action::Metrics {
+                    name: "absent".to_owned(),
+                },
+                &mut Vec::new(),
+            )
+            .await
+            .err()
+            .ok_or("metrics for a missing machine unexpectedly succeeded")?;
+        assert_eq!(error.kind(), ErrorKind::NotFound);
         Ok(())
     }
 }

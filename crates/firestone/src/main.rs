@@ -570,6 +570,18 @@ where
                 )
                 .await
         }
+        Command::Metrics(arguments) => {
+            let (global, catalog) = load_user_configuration(&paths)?;
+            LocalDispatcher::new(paths, global, catalog)
+                .with_source_base(source_base)
+                .run(
+                    Action::Metrics {
+                        name: arguments.name,
+                    },
+                    renderer,
+                )
+                .await
+        }
         Command::Catalog => {
             let (global, catalog) = load_user_configuration(&paths)?;
             LocalDispatcher::new(paths, global, catalog)

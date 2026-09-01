@@ -13,8 +13,8 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressState, P
 use firestone_core::{
     CatalogEntrySummary, CatalogFirmware, DoctorCheckId, DoctorReport, DoctorStatus, ErrorInfo,
     ErrorKind, Event, EventSink, FirestoneError, Level, LogsResult, MachineRecord, MachineStatus,
-    MachineSummary, MachineView, NetMode, RemoveResult, SshConfigResult, StartResult, StepId,
-    StopResult, Unit, VersionResult,
+    MachineSummary, MachineView, MetricsResult, NetMode, RemoveResult, SshConfigResult,
+    StartResult, StepId, StopResult, Unit, VersionResult,
 };
 use owo_colors::OwoColorize as _;
 use unicode_width::UnicodeWidthChar;
@@ -907,6 +907,11 @@ where
                     .map_err(|error| invalid_result_payload("doctor", error))?;
                 write_doctor_report(&mut self.stdout, &report).map_err(write_output_failure)
             }
+            "metrics" => {
+                let result: MetricsResult = serde_json::from_value(payload)
+                    .map_err(|error| invalid_result_payload("metrics", error))?;
+                write_metrics_report(&mut self.stdout, &result).map_err(write_output_failure)
+            }
             _ if payload.is_null() => Ok(()),
             _ => self.render_other_result(payload),
         }
@@ -1227,6 +1232,83 @@ const fn doctor_check_id_label(id: DoctorCheckId) -> &'static str {
         DoctorCheckId::DataSpace => "data_space",
         DoctorCheckId::StaleState => "stale_state",
     }
+}
+
+/// Renders one metrics sample as a deterministic human table.
+///
+/// Counters are cumulative, so the table states raw totals and never a rate.
+/// An absent figure prints `-` rather than a fabricated zero.
+fn write_metrics_report<W: Write>(writer: &mut W, result: &MetricsResult) -> io::Result<()> {
+    write!(writer, "sampled at ")?;
+    write_safe_text(writer, &result.sampled_at)?;
+    writer.write_all(b"\n")?;
+    writeln!(
+        writer,
+        "cpu       {} vcpus, {} ns cpu time",
+        result.cpu.vcpus,
+        optional_count(result.cpu.cpu_time_ns)
+    )?;
+    writeln!(
+        writer,
+        "memory    {} bytes rss, {} bytes allocated, {} bytes guest actual",
+        optional_count(result.memory.rss_bytes),
+        result.memory.allocated_bytes,
+        optional_count(result.memory.guest_actual_bytes)
+    )?;
+
+    if result.block.is_empty() {
+        writeln!(writer, "block     none")?;
+    } else {
+        let device_width = result
+            .block
+            .iter()
+            .map(|device| display_width(&device.device))
+            .chain(std::iter::once("DEVICE".len()))
+            .max()
+            .unwrap_or("DEVICE".len());
+        writeln!(
+            writer,
+            "{:<device_width$}  {:>14}  {:>14}  {:>10}  {:>10}",
+            "DEVICE",
+            "READ BYTES",
+            "WRITTEN BYTES",
+            "READ OPS",
+            "WRITE OPS",
+            device_width = device_width,
+        )?;
+        for device in &result.block {
+            write_safe_cell(writer, &device.device, device_width)?;
+            writeln!(
+                writer,
+                "  {:>14}  {:>14}  {:>10}  {:>10}",
+                optional_count(device.read_bytes),
+                optional_count(device.written_bytes),
+                optional_count(device.read_ops),
+                optional_count(device.write_ops),
+            )?;
+        }
+    }
+
+    match result.net.as_deref() {
+        None | Some([]) => writeln!(writer, "net       none reported"),
+        Some(devices) => {
+            for device in devices {
+                write!(writer, "net       ")?;
+                write_safe_text(writer, &device.device)?;
+                for (key, value) in &device.counters {
+                    writer.write_all(b" ")?;
+                    write_safe_text(writer, key)?;
+                    write!(writer, "={value}")?;
+                }
+                writer.write_all(b"\n")?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn optional_count(value: Option<u64>) -> String {
+    value.map_or_else(|| "-".to_owned(), |value| value.to_string())
 }
 
 fn write_catalog_table<W: Write>(
@@ -2434,5 +2516,51 @@ mod tests {
 
         let error = FirestoneError::new(ErrorKind::Timeout, "timed out");
         assert_eq!(error_exit_code(&error), 6);
+    }
+
+    #[test]
+    fn metrics_result_human_table_prints_totals_and_dashes_for_absent_figures() -> TestResult {
+        let result = firestone_core::MetricsResult {
+            sampled_at: "2026-09-02T12:00:00Z".to_owned(),
+            cpu: firestone_core::MetricsCpu {
+                vcpus: 2,
+                cpu_time_ns: Some(9_500_000_000),
+            },
+            memory: firestone_core::MetricsMemory {
+                rss_bytes: None,
+                allocated_bytes: 2_147_483_648,
+                guest_actual_bytes: Some(1_073_741_824),
+            },
+            block: vec![firestone_core::MetricsBlockDevice {
+                device: "_disk0".to_owned(),
+                read_bytes: Some(4096),
+                written_bytes: Some(8192),
+                read_ops: Some(2),
+                write_ops: None,
+            }],
+            net: None,
+        };
+        let mut renderer =
+            Renderer::new(Vec::new(), Vec::new(), RenderOptions::human(false, false));
+        renderer.emit(Event::Result {
+            action: "metrics".to_owned(),
+            payload: serde_json::to_value(&result)?,
+        })?;
+
+        let (stdout, stderr) = renderer.into_writers();
+        let text = String::from_utf8(stdout)?;
+        assert_eq!(
+            text,
+            concat!(
+                "sampled at 2026-09-02T12:00:00Z\n",
+                "cpu       2 vcpus, 9500000000 ns cpu time\n",
+                "memory    - bytes rss, 2147483648 bytes allocated, 1073741824 bytes guest actual\n",
+                "DEVICE      READ BYTES   WRITTEN BYTES    READ OPS   WRITE OPS\n",
+                "_disk0            4096            8192           2           -\n",
+                "net       none reported\n",
+            )
+        );
+        assert!(stderr.is_empty());
+        Ok(())
     }
 }

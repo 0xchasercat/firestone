@@ -136,6 +136,7 @@ define_rest_routes! {
     "/v1/machines/{name}/restart" => post(restart_machine);
     "/v1/machines/{name}/logs" => get(machine_logs);
     "/v1/machines/{name}/vmconfig" => get(machine_vmconfig);
+    "/v1/machines/{name}/metrics" => get(machine_metrics);
     "/v1/images" => get(images);
     "/v1/images/pull" => post(pull_image);
     "/v1/images/prune" => post(prune_images);
@@ -456,6 +457,10 @@ async fn machine_vmconfig(State(state): State<ApiState>, ApiPath(name): ApiPath)
         StatusCode::OK,
     )
     .await
+}
+
+async fn machine_metrics(State(state): State<ApiState>, ApiPath(name): ApiPath) -> Response {
+    payload_response(&state, Action::Metrics { name }, "metrics", StatusCode::OK).await
 }
 
 async fn catalog(State(state): State<ApiState>) -> Response {

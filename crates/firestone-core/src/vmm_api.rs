@@ -1,6 +1,7 @@
 //! Bounded Cloud Hypervisor v53 HTTP client over a Unix socket.
 
 use std::{
+    collections::BTreeMap,
     fmt::Write as _,
     io::{self, Read, Write},
     os::{
@@ -30,6 +31,7 @@ const MAX_CREATE_BODY_BYTES: usize = 51_200;
 const MAX_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
 const MAX_PING_BODY_BYTES: usize = 64 * 1024;
 const MAX_INFO_BODY_BYTES: usize = 1024 * 1024;
+const MAX_COUNTERS_BODY_BYTES: usize = 64 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const IO_CHUNK_BYTES: usize = 8 * 1024;
 
@@ -118,6 +120,21 @@ impl<'a> VmmApi<'a> {
             .request_inner(endpoint, None)
             .map_err(|failure| self.firestone_error(endpoint, failure))?;
         decode_json(response.body(), "vm.info JSON response")
+            .map_err(|failure| self.firestone_error(endpoint, failure))
+    }
+
+    /// Returns the VM's cumulative per-device counters.
+    ///
+    /// Cloud Hypervisor v53 keys the outer map by device id (`_disk0`) and the
+    /// inner map by counter name. Values are not interpreted here; callers
+    /// project them and drop the saturating sentinels v53 uses for counters a
+    /// device has never exercised.
+    pub fn vm_counters(&self) -> Result<BTreeMap<String, BTreeMap<String, u64>>, FirestoneError> {
+        let endpoint = Endpoint::VmCounters;
+        let response = self
+            .request_inner(endpoint, None)
+            .map_err(|failure| self.firestone_error(endpoint, failure))?;
+        decode_json(response.body(), "vm.counters JSON response")
             .map_err(|failure| self.firestone_error(endpoint, failure))
     }
 
@@ -294,6 +311,7 @@ enum Endpoint {
     VmCreate,
     VmBoot,
     VmInfo,
+    VmCounters,
     VmPowerButton,
     VmShutdown,
     VmmShutdown,
@@ -302,7 +320,7 @@ enum Endpoint {
 impl Endpoint {
     const fn method(self) -> &'static str {
         match self {
-            Self::VmmPing | Self::VmInfo => "GET",
+            Self::VmmPing | Self::VmInfo | Self::VmCounters => "GET",
             Self::VmCreate
             | Self::VmBoot
             | Self::VmPowerButton
@@ -317,6 +335,7 @@ impl Endpoint {
             Self::VmCreate => "/api/v1/vm.create",
             Self::VmBoot => "/api/v1/vm.boot",
             Self::VmInfo => "/api/v1/vm.info",
+            Self::VmCounters => "/api/v1/vm.counters",
             Self::VmPowerButton => "/api/v1/vm.power-button",
             Self::VmShutdown => "/api/v1/vm.shutdown",
             Self::VmmShutdown => "/api/v1/vmm.shutdown",
@@ -325,7 +344,7 @@ impl Endpoint {
 
     const fn expected_status(self) -> u16 {
         match self {
-            Self::VmmPing | Self::VmInfo | Self::VmmShutdown => 200,
+            Self::VmmPing | Self::VmInfo | Self::VmCounters | Self::VmmShutdown => 200,
             Self::VmCreate | Self::VmBoot | Self::VmPowerButton | Self::VmShutdown => 204,
         }
     }
@@ -334,6 +353,7 @@ impl Endpoint {
         match self {
             Self::VmmPing => MAX_PING_BODY_BYTES,
             Self::VmInfo => MAX_INFO_BODY_BYTES,
+            Self::VmCounters => MAX_COUNTERS_BODY_BYTES,
             Self::VmCreate
             | Self::VmBoot
             | Self::VmPowerButton
@@ -1475,6 +1495,59 @@ mod tests {
             error
                 .message()
                 .contains("cannot decode vmm.ping JSON response")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vm_counters_request_decodes_device_map_and_bounds_its_body()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let body = br#"{"_disk0":{"read_bytes":4096,"read_ops":2,"write_bytes":0,"write_latency_avg":9223372036854775815,"write_latency_max":18446744073709551615,"write_latency_min":18446744073709551615,"write_ops":0}}"#;
+        let server = FakeServer::spawn(vec![response("200 OK", body)], false)?;
+        let counters = VmmApi::new(server.path(), TEST_TIMEOUT).vm_counters()?;
+        assert_eq!(
+            server.finish()?,
+            b"GET /api/v1/vm.counters HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n\r\n"
+        );
+        let disk = counters
+            .get("_disk0")
+            .ok_or_else(|| io::Error::other("vm.counters lost its device entry"))?;
+        assert_eq!(disk.get("read_bytes"), Some(&4096));
+        assert_eq!(disk.get("write_latency_min"), Some(&u64::MAX));
+
+        let oversized = FakeServer::spawn(
+            vec![
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    super::MAX_COUNTERS_BODY_BYTES + 1
+                )
+                .into_bytes(),
+            ],
+            false,
+        )?;
+        let error = require_error(
+            VmmApi::new(oversized.path(), TEST_TIMEOUT).vm_counters(),
+            "oversized counters response must fail",
+        )?;
+        let _ = oversized.finish()?;
+        assert!(error.message().contains("GET /api/v1/vm.counters"));
+        assert!(error.message().contains("65536-byte limit"));
+        Ok(())
+    }
+
+    #[test]
+    fn vm_counters_non_object_response_is_protocol_drift() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let server = FakeServer::spawn(vec![response("200 OK", br#"{"_disk0":[1,2]}"#)], false)?;
+        let error = require_error(
+            VmmApi::new(server.path(), TEST_TIMEOUT).vm_counters(),
+            "non-object counters must fail",
+        )?;
+        let _ = server.finish()?;
+        assert!(
+            error
+                .message()
+                .contains("cannot decode vm.counters JSON response")
         );
         Ok(())
     }

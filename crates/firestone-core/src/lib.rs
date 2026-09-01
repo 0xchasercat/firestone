@@ -15,6 +15,7 @@ pub mod error;
 pub mod event;
 pub mod image;
 pub mod lock;
+pub mod metrics;
 pub mod network;
 pub mod paths;
 pub mod readiness;
@@ -62,6 +63,12 @@ pub use image::{
     PreparedMachineImage, PulledImage, ResolvedImageSource, StoredImage,
 };
 pub use lock::MachineLock;
+pub use metrics::{
+    COUNTER_SENTINEL_FLOOR, MetricsBlockDevice, MetricsCpu, MetricsMemory, MetricsNetDevice,
+    MetricsResult, VmmProcessSample, counter_is_sentinel, cpu_ticks_to_nanoseconds,
+    parse_proc_stat_cpu_ticks, parse_proc_status_rss_bytes, project_device_counters,
+    sample_vmm_process,
+};
 pub use network::{
     DEFAULT_NETWORK_READINESS_POLL_INTERVAL, DEFAULT_NETWORK_READINESS_TIMEOUT, NetworkPlan,
     NetworkPlanOptions, OwnedPathExpectation, PINNED_PASST_VERSION, PasstPlan,

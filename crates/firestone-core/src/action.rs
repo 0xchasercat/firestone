@@ -54,6 +54,9 @@ pub enum Action {
         target: String,
         recursive: bool,
     },
+    Metrics {
+        name: String,
+    },
     CatalogList,
     ImageList,
     ImagePull {
@@ -291,6 +294,17 @@ mod tests {
                 "recursive": true
             })
         );
+        assert_eq!(serde_json::from_value::<Action>(encoded)?, action);
+        Ok(())
+    }
+
+    #[test]
+    fn action_metrics_round_trips_with_its_stable_type_tag() -> Result<(), serde_json::Error> {
+        let action = Action::Metrics {
+            name: "ubuntu".to_owned(),
+        };
+        let encoded = serde_json::to_value(&action)?;
+        assert_eq!(encoded, json!({"type": "Metrics", "name": "ubuntu"}));
         assert_eq!(serde_json::from_value::<Action>(encoded)?, action);
         Ok(())
     }
