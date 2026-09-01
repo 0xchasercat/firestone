@@ -35,7 +35,7 @@ Build it twice into separate target directories and require the two outputs to b
 - `firestone-init` compiles for `x86_64-unknown-linux-musl` and for the host. Every Linux-only path is behind `cfg(target_os = "linux")`, so the workspace gate — `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` — passes on macOS with the pure modules fully covered, exactly as `shim.rs` does.
 - Unsafe is confined to `crates/firestone-init/src/ffi.rs`, which denies `unsafe_op_in_unsafe_fn` and documents every block. `firestone-initproto` forbids `unsafe` outright.
 - `crates/firestone-core/build.rs` already verifies and embeds a `firestone-init` asset when — and only when — `deps.toml` carries a `[dependency.firestone-init]` entry **and** `FIRESTONE_EMBEDDED_HELPERS_DIR` holds the named asset. Half a pin is a build failure; neither half is an ordinary development build.
-- Until then, `firestone_core::firestone_init_payload()` returns kind `dependency` with a hint naming the missing release, so the OCI pull pipeline cannot inject nothing by accident.
+- `firestone_core::firestone_init_payload()` prefers that embedded payload and, since the release below was pinned, falls back to downloading the pinned artifact. With neither available it returns kind `dependency` naming both ways out, so the OCI pull pipeline cannot inject nothing by accident.
 
 ## Release runbook (orchestrator)
 
