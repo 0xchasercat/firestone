@@ -1965,11 +1965,14 @@ impl LocalDispatcher {
             && owned_file_ready(&self.paths.machine_state(name)?)?)
     }
     fn image_store(&self) -> Result<ImageStore, FirestoneError> {
-        ImageStore::for_host(
+        Ok(ImageStore::for_host(
             self.paths.clone(),
             self.catalog.clone(),
             self.qemu_img_program()?,
-        )
+        )?
+        // SPEC §8.5: only a registry listed in the global configuration is
+        // ever contacted over plain HTTP.
+        .with_insecure_registries(self.global.images.insecure_registries.clone()))
     }
 
     /// Resolves the qemu-img this process runs, materializing the embedded

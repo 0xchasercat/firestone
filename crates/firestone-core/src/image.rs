@@ -26,12 +26,17 @@ use url::Url;
 
 use crate::{
     Arch, ByteSize, Catalog, CatalogChecksum, CatalogFirmware, ChecksumAlgorithm, Cmd,
-    DependencyArtifact, ErrorKind, Event, EventSink, FirestoneError, ImageFormat, ImageRef, Level,
-    MachineLock, MachineState, Paths, StateImage, StateStore, StepId, Unit, atomic,
+    DependencyArtifact, DependencyManifest, ErrorKind, Event, EventSink, FirestoneError,
+    ImageFormat, ImageRef, Level, MachineLock, MachineState, Paths, StateImage, StateStore, StepId,
+    Unit, atomic,
     bounded::{self, BoundedReadError},
     catalog::{SshdPath, parse_https_url},
     embedded_helpers::install_pinned_artifact_with,
-    oci::{OciClassification, OciReference, layers::OciImageConfig},
+    oci::{
+        OciClassification, OciReference,
+        layers::{FileLayer, LayerSource, MergeLimits, MergeRequest, OciImageConfig, merge_layers},
+        registry::{LayerDescriptor, RegistryClient, RegistryOptions},
+    },
 };
 const IMAGE_METADATA_VERSION: u32 = 1;
 /// The only `oci.boot` value SPEC §8.5 defines in v0.2.
@@ -50,6 +55,15 @@ const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const QEMU_INFO_TIMEOUT: Duration = Duration::from_secs(30);
 const QEMU_CREATE_TIMEOUT: Duration = Duration::from_secs(60);
 const QEMU_CONVERT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const MKFS_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Block size the pinned `mkfs.ext4` writes an OCI rootfs with (SPEC §8.5).
+const EXT4_BLOCK_BYTES: u64 = 4096;
+/// Fixed headroom added by the §8.5 sizing rule.
+const OCI_SIZE_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
+/// Alignment the §8.5 sizing rule rounds up to.
+const OCI_SIZE_ALIGNMENT_BYTES: u64 = 4 * 1024 * 1024;
+/// The §8.5 bound on the merged tree, measured uncompressed.
+const OCI_MAX_UNPACKED_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_HTTPS_REDIRECTS: usize = 5;
 const OWNED_DIRECTORY_MODE: u32 = 0o700;
 const LOCK_FILE_MODE: u32 = 0o600;
@@ -759,6 +773,24 @@ pub struct ImageStore {
     qemu_img: PathBuf,
     http: Arc<dyn HttpSource>,
     clock: Arc<dyn Clock>,
+    /// `images.insecure_registries` from the global configuration (§7.3).
+    insecure_registries: Vec<String>,
+    /// Already-installed `mkfs.ext4`, which the tests point at a fake helper.
+    /// Production leaves it `None` and installs the pinned artifact on demand.
+    mkfs_ext4: Option<PathBuf>,
+    /// Where the injected `firestone-init` payload comes from (§8.5, §10.5).
+    init_payload: InitPayloadSource,
+}
+
+/// Supplies the `firestone-init` bytes injected into a merged OCI rootfs.
+///
+/// Production reads the payload embedded in a standalone release; the tests
+/// install their own so both the success and the missing-payload paths are
+/// exercised on every build configuration.
+type InitPayloadSource = Arc<dyn Fn() -> Result<Vec<u8>, FirestoneError> + Send + Sync>;
+
+fn embedded_init_payload_source() -> InitPayloadSource {
+    Arc::new(|| crate::embedded_helpers::firestone_init_payload().map(<[u8]>::to_vec))
 }
 
 impl ImageStore {
@@ -776,7 +808,18 @@ impl ImageStore {
             qemu_img: qemu_img.into(),
             http: Arc::new(ReqwestHttpSource::new()?),
             clock: Arc::new(SystemClock),
+            insecure_registries: Vec::new(),
+            mkfs_ext4: None,
+            init_payload: embedded_init_payload_source(),
         })
+    }
+
+    /// Records the registries `images.insecure_registries` allows over plain
+    /// HTTP; every other registry is contacted over HTTPS (SPEC §8.5).
+    #[must_use]
+    pub fn with_insecure_registries(mut self, registries: Vec<String>) -> Self {
+        self.insecure_registries = registries;
+        self
     }
 
     /// Creates a store using the architecture of the current executable.
@@ -1484,13 +1527,268 @@ impl ImageStore {
         })
     }
 
+    /// Pulls one OCI image and publishes it as an owned qcow2 base (SPEC §8.5).
+    ///
+    /// The manifest digest is the cache key: a re-pull of an unchanged tag hits
+    /// the same stable id and skips, while a moved tag resolves to a different
+    /// manifest and publishes a new generation. Every intermediate artifact is
+    /// a tracked partial, so a failure at any step leaves the store untouched.
+    fn pull_oci_locked(
+        &self,
+        source: &ResolvedImageSource,
+        reference: &OciReference,
+        events: &mut dyn EventSink,
+    ) -> Result<PulledImage, FirestoneError> {
+        let started = Instant::now();
+        self.emit_image_start(&source.source_ref, events)?;
+
+        // The guest init is injected into the merged rootfs, so a build that
+        // carries no payload must fail before a single blob is downloaded.
+        let init_payload = self.firestone_init_bytes(reference)?;
+
+        let client = RegistryClient::with_http(
+            Arc::clone(&self.http),
+            &RegistryOptions::new(self.architecture)
+                .with_insecure_registries(self.insecure_registries.clone())
+                .with_docker_config(self.paths.docker_config_file()),
+        )?;
+        for warning in client.warnings() {
+            events.emit(Event::Log {
+                level: Level::Warn,
+                message: warning.clone(),
+            })?;
+        }
+        let resolved = client.resolve(reference)?;
+        let manifest_sha256 = manifest_identity_digest(reference, &resolved.manifest_digest)?;
+
+        // §8.5 identity: sidecar version, canonical reference, manifest digest,
+        // and host architecture. There is no source file and no source URL.
+        let id = stable_image_id(
+            &source.source_ref,
+            None,
+            self.architecture,
+            &manifest_sha256,
+        );
+        if let Some(cached) =
+            self.existing_identity(&id, source, &manifest_sha256, ImageFormat::Raw)?
+        {
+            events.emit(Event::StepSkip {
+                id: StepId::from("image"),
+                reason: "cached".to_owned(),
+            })?;
+            return Ok(PulledImage {
+                firmware: cached.metadata.firmware,
+                metadata: cached.metadata,
+                path: cached.path,
+                cached: true,
+            });
+        }
+
+        let operation = operation_key(source);
+        let source_partial = self.paths.image_source_partial(&operation)?;
+        let stored_partial = self.paths.image_stored_partial(&operation)?;
+        let tar_partial = self.paths.image_rootfs_tar_partial(&operation)?;
+        let layer_partials = (0..resolved.layers.len())
+            .map(|index| self.paths.image_layer_partial(&operation, index))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut cleanup = CleanupGuard::new();
+        for path in [&source_partial, &stored_partial, &tar_partial]
+            .into_iter()
+            .chain(layer_partials.iter())
+        {
+            remove_stale_partial(path)?;
+            cleanup.track(path.clone());
+        }
+
+        let total = total_layer_bytes(reference, &resolved.layers)?;
+        let mut done = 0_u64;
+        for (descriptor, path) in resolved.layers.iter().zip(&layer_partials) {
+            let mut file = create_partial_file(path)?;
+            let base = done;
+            client.fetch_layer(reference, descriptor, &mut file, &mut |layer_done, _| {
+                events.emit(Event::Progress {
+                    id: StepId::from("image"),
+                    done: base.saturating_add(layer_done),
+                    total: Some(total),
+                    unit: Unit::Bytes,
+                })
+            })?;
+            file.sync_all()
+                .map_err(|source| image_file_error("flush", path, source))?;
+            done = base.saturating_add(descriptor.size);
+        }
+        events.emit(Event::Progress {
+            id: StepId::from("image"),
+            done: total,
+            total: Some(total),
+            unit: Unit::Bytes,
+        })?;
+
+        let mkfs_ext4 = self.mkfs_ext4_program()?;
+
+        let layers = layer_partials
+            .iter()
+            .map(|path| FileLayer::new(path.clone()))
+            .collect::<Vec<_>>();
+        let sources = layers
+            .iter()
+            .map(|layer| layer as &dyn LayerSource)
+            .collect::<Vec<_>>();
+        let merge = MergeRequest::new(&sources, &resolved.config)
+            .with_limits(MergeLimits {
+                max_uncompressed_bytes: OCI_MAX_UNPACKED_BYTES,
+                ..MergeLimits::default()
+            })
+            .with_injected_init(&init_payload);
+        let summary = {
+            let mut tar = create_partial_file(&tar_partial)?;
+            let summary = merge_layers(&merge, &mut tar)?;
+            tar.sync_all()
+                .map_err(|source| image_file_error("flush", &tar_partial, source))?;
+            summary
+        };
+
+        let rootfs_bytes = oci_rootfs_bytes(reference, summary.unpacked_bytes)?;
+        create_partial_file(&source_partial)?
+            .set_len(rootfs_bytes)
+            .map_err(|source| image_file_error("size", &source_partial, source))?;
+        // Pinned e2fsprogs 1.47.3 tar-input argv. With `-b 4096` the trailing
+        // operand is a block count, and the §8.5 size is always a 4 MiB
+        // multiple, so the division is exact.
+        Cmd::new(mkfs_ext4.as_os_str())
+            .arg("-F")
+            .arg("-t")
+            .arg("ext4")
+            .arg("-d")
+            .arg(tar_partial.as_os_str())
+            .arg("-b")
+            .arg(EXT4_BLOCK_BYTES.to_string())
+            .arg(source_partial.as_os_str())
+            .arg((rootfs_bytes / EXT4_BLOCK_BYTES).to_string())
+            .timeout(MKFS_TIMEOUT)
+            .error_kind(ErrorKind::Dependency)
+            .run()?;
+        // The merged tar and the layer blobs are dead once the image is
+        // packed; releasing them keeps peak store usage down.
+        remove_stale_partial(&tar_partial)?;
+        for path in &layer_partials {
+            remove_stale_partial(path)?;
+        }
+        validate_created_regular_file(&source_partial, "staged OCI root filesystem")?;
+
+        self.convert_raw(&source_partial, &stored_partial)?;
+        validate_created_regular_file(&stored_partial, "staged qcow2 image")?;
+        let info = self.qemu_info(&stored_partial)?;
+        validate_base_info(&id, &info)?;
+        let (stored_sha256, stored_size) = hash_file_with_size(&stored_partial)?;
+        set_file_mode(&stored_partial, BASE_FILE_MODE, "staged qcow2 image")?;
+        sync_file(&stored_partial, "staged qcow2 image")?;
+
+        let base_path = self.paths.image_base(&id)?;
+        let sidecar_path = self.paths.image_metadata(&id)?;
+        let generation = self.next_generation(&source.source_ref, self.architecture)?;
+        let metadata = ImageMetadata {
+            version: ImageMetadataVersion,
+            id: id.clone(),
+            kind: ImageKind::Oci,
+            oci: Some(OciSidecar {
+                registry_ref: source.source_ref.clone(),
+                manifest_digest: resolved.manifest_digest.clone(),
+                config_digest: resolved.config_digest.clone(),
+                entrypoint: resolved.config.entrypoint.clone(),
+                cmd: resolved.config.cmd.clone(),
+                env: resolved.config.env.clone(),
+                workdir: resolved.config.working_dir.clone(),
+                user: resolved.config.user.clone(),
+                boot: FIRESTONE_INIT_BOOT.to_owned(),
+            }),
+            generation,
+            source_ref: source.source_ref.clone(),
+            source_url: None,
+            source_sha256: manifest_sha256.clone(),
+            stored_sha256,
+            architecture: self.architecture,
+            // §9.5: an OCI machine boots the pinned kernel directly, so the
+            // firmware field carries no selection.
+            firmware: None,
+            sshd_path: SshdPath::default(),
+            source_format: ImageFormat::Raw,
+            stored_format: ImageFormat::Qcow2,
+            verification_algorithm: Some(ChecksumAlgorithm::Sha256),
+            verification_digest: Some(manifest_sha256),
+            size: stored_size,
+            pulled_at: self.clock.now(),
+        };
+        metadata.validate()?;
+        let sidecar_bytes = serialize_image_metadata(&sidecar_path, &metadata)?;
+
+        ensure_pair_absent(&base_path, &sidecar_path, &id)?;
+        cleanup.track(base_path.clone());
+        cleanup.track(sidecar_path.clone());
+        publish_no_replace(&stored_partial, &base_path)?;
+        atomic::write_with_mode(&sidecar_path, &sidecar_bytes, SIDECAR_FILE_MODE)?;
+        self.paths.validate_owned_data_file(
+            &sidecar_path,
+            "image sidecar",
+            SIDECAR_FILE_MODE,
+            false,
+        )?;
+        remove_stale_partial(&source_partial)?;
+        sync_directory(&self.paths.images_dir(), "images directory")?;
+        cleanup.disarm();
+
+        events.emit(Event::StepDone {
+            id: StepId::from("image"),
+            detail: Some(format!(
+                "{} · {} · {stored_size} bytes",
+                source.source_ref, self.architecture
+            )),
+            elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        })?;
+        Ok(PulledImage {
+            firmware: metadata.firmware,
+            metadata,
+            path: base_path,
+            cached: false,
+        })
+    }
+
+    /// The `firestone-init` bytes injected at `/sbin/firestone-init` (§8.5).
+    fn firestone_init_bytes(&self, reference: &OciReference) -> Result<Vec<u8>, FirestoneError> {
+        match (self.init_payload)() {
+            Ok(bytes) => Ok(bytes),
+            Err(error) => Err(FirestoneError::new(
+                error.kind(),
+                format!(
+                    "cannot pull OCI image '{reference}': the firestone-init guest payload is unavailable"
+                ),
+            )
+            .with_hint(
+                "this build embeds no firestone-init: pull with an x86_64 standalone release that \
+                 embeds it, or publish the firestone-init release asset and pin it in deps.toml",
+            )
+            .with_source(error)),
+        }
+    }
+
+    /// Resolves the pinned `mkfs.ext4`, installing it on demand (§8.5, §17.2).
+    fn mkfs_ext4_program(&self) -> Result<PathBuf, FirestoneError> {
+        if let Some(path) = &self.mkfs_ext4 {
+            return Ok(path.clone());
+        }
+        let manifest = DependencyManifest::bundled()?;
+        let artifact = manifest.mkfs_ext4(self.architecture.as_str())?;
+        self.ensure_pinned_artifact(&artifact)
+    }
+
     fn pull_locked(
         &self,
         mut source: ResolvedImageSource,
         events: &mut dyn EventSink,
     ) -> Result<PulledImage, FirestoneError> {
         if let ImageSourceLocation::Oci(reference) = &source.location {
-            return Err(oci_pull_unsupported(reference));
+            let reference = reference.clone();
+            return self.pull_oci_locked(&source, &reference, events);
         }
         let started = Instant::now();
         self.emit_image_start(&source.source_ref, events)?;
@@ -3365,13 +3663,84 @@ fn classify_oci_reference(value: &str) -> Result<Option<OciReference>, Firestone
     }
 }
 
-/// The placeholder error returned until the OCI pull pipeline lands.
+/// The error returned when an OCI reference reaches a non-pull code path.
 fn oci_pull_unsupported(reference: &OciReference) -> FirestoneError {
     FirestoneError::new(
-        ErrorKind::Dependency,
-        format!("OCI image pulls land in a following change; cannot pull '{reference}' yet"),
+        ErrorKind::Generic,
+        format!("OCI reference '{reference}' cannot be staged as a file source"),
     )
-    .with_hint("use a catalog reference, an HTTPS URL, or a local qcow2/raw path for now")
+    .with_hint("report this as a firestone bug; an OCI pull has its own pipeline")
+}
+
+/// The 64-hex identity digest of a resolved manifest (SPEC §8.5).
+fn manifest_identity_digest(
+    reference: &OciReference,
+    digest: &str,
+) -> Result<String, FirestoneError> {
+    digest
+        .strip_prefix("sha256:")
+        .filter(|hex| is_lower_hex(hex, 64))
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            FirestoneError::new(
+                ErrorKind::Checksum,
+                format!("manifest digest '{digest}' for '{reference}' is not a sha256 digest"),
+            )
+            .with_hint("retry the pull; the registry returned an unusable manifest digest")
+        })
+}
+
+/// The declared byte total of every layer, used as the progress denominator.
+fn total_layer_bytes(
+    reference: &OciReference,
+    layers: &[LayerDescriptor],
+) -> Result<u64, FirestoneError> {
+    layers
+        .iter()
+        .try_fold(0_u64, |total, descriptor| {
+            total.checked_add(descriptor.size)
+        })
+        .ok_or_else(|| {
+            FirestoneError::new(
+                ErrorKind::Dependency,
+                format!("manifest for '{reference}' declares an impossible layer byte total"),
+            )
+            .with_hint("pull an image whose manifest declares plausible layer sizes")
+        })
+}
+
+/// The §8.5 ext4 sizing rule: `unpacked × 23 / 20 + 256 MiB`, rounded up to a
+/// 4 MiB multiple. Integer arithmetic only, so one manifest always yields the
+/// same size on every host.
+fn oci_rootfs_bytes(reference: &OciReference, unpacked_bytes: u64) -> Result<u64, FirestoneError> {
+    unpacked_bytes
+        .checked_mul(23)
+        .map(|scaled| scaled / 20)
+        .and_then(|scaled| scaled.checked_add(OCI_SIZE_HEADROOM_BYTES))
+        .and_then(|sized| sized.checked_next_multiple_of(OCI_SIZE_ALIGNMENT_BYTES))
+        .ok_or_else(|| {
+            FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "merged root filesystem for '{reference}' is too large to size ({unpacked_bytes} unpacked bytes)"
+                ),
+            )
+            .with_hint("pull a smaller image")
+        })
+}
+
+/// Creates one owner-only pull partial without following a symlink.
+fn create_partial_file(path: &Path) -> Result<File, FirestoneError> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(SIDECAR_FILE_MODE)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|source| image_file_error("create", path, source))?;
+    file.set_permissions(fs::Permissions::from_mode(SIDECAR_FILE_MODE))
+        .map_err(|source| image_file_error("set mode on", path, source))?;
+    Ok(file)
 }
 
 fn operation_key(source: &ResolvedImageSource) -> String {
@@ -3804,9 +4173,17 @@ fn is_known_partial_name(name: &str) -> bool {
     let Some(rest) = name.strip_prefix(".pull-") else {
         return false;
     };
+    // `.source`, `.stored` and `.tar` are fixed; an OCI pull adds one
+    // `.layer<N>` partial per manifest layer (SPEC §8.5).
     let digest = rest
         .strip_suffix(".source.partial")
-        .or_else(|| rest.strip_suffix(".stored.partial"));
+        .or_else(|| rest.strip_suffix(".stored.partial"))
+        .or_else(|| rest.strip_suffix(".tar.partial"))
+        .or_else(|| {
+            let body = rest.strip_suffix(".partial")?;
+            let (digest, index) = body.rsplit_once(".layer")?;
+            (!index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())).then_some(digest)
+        });
     digest.is_some_and(|value| is_lower_hex(value, 64))
 }
 
@@ -4308,6 +4685,20 @@ mod tests {
                 });
             Ok(())
         }
+
+        /// Removes the next queued reply for one URL, so a test can leave a
+        /// request unanswered or replace its body.
+        fn take(&self, url: &str) -> Result<(), Box<dyn std::error::Error>> {
+            let mut replies = self
+                .replies
+                .lock()
+                .map_err(|_| io::Error::other("scripted HTTP mutex poisoned"))?;
+            replies
+                .get_mut(url)
+                .and_then(VecDeque::pop_front)
+                .ok_or_else(|| io::Error::other(format!("no scripted reply queued for '{url}'")))?;
+            Ok(())
+        }
     }
 
     impl HttpSource for ScriptedHttp {
@@ -4338,6 +4729,7 @@ mod tests {
         root: PathBuf,
         paths: Paths,
         qemu_log: PathBuf,
+        mkfs_log: PathBuf,
         http: Arc<ScriptedHttp>,
         store: ImageStore,
     }
@@ -4354,6 +4746,9 @@ mod tests {
             let qemu_img = root.join("qemu-img");
             let qemu_log = root.join("qemu.log");
             write_fake_qemu(&qemu_img, &qemu_log, fail_convert)?;
+            let mkfs_ext4 = root.join("mkfs.ext4");
+            let mkfs_log = root.join("mkfs.log");
+            write_fake_mkfs(&mkfs_ext4, &mkfs_log, &root.join("mkfs-input.tar"))?;
             let http = Arc::new(ScriptedHttp::default());
             let store = ImageStore {
                 paths: paths.clone(),
@@ -4362,6 +4757,9 @@ mod tests {
                 qemu_img,
                 http: http.clone(),
                 clock: Arc::new(FixedClock),
+                insecure_registries: Vec::new(),
+                mkfs_ext4: Some(mkfs_ext4),
+                init_payload: test_init_payload_source(),
             };
             Ok(Self {
                 _test_lock: test_lock,
@@ -4369,9 +4767,24 @@ mod tests {
                 root,
                 paths,
                 qemu_log,
+                mkfs_log,
                 http,
                 store,
             })
+        }
+
+        /// Everything the fake `mkfs.ext4` was invoked with, one line per run.
+        fn mkfs_invocations(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+            match fs::read_to_string(&self.mkfs_log) {
+                Ok(text) => Ok(text.lines().map(ToOwned::to_owned).collect()),
+                Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+                Err(source) => Err(source.into()),
+            }
+        }
+
+        /// The canonical tar the last `mkfs.ext4` run consumed.
+        fn mkfs_input_tar(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+            Ok(fs::read(self.root.join("mkfs-input.tar"))?)
         }
 
         fn write_source(
@@ -4399,6 +4812,68 @@ mod tests {
             xdg_runtime_dir: None,
             uid: nix::unistd::getuid().as_raw(),
         })
+    }
+
+    /// Bytes the tests inject in place of the embedded `firestone-init`.
+    const TEST_INIT_PAYLOAD: &[u8] = b"\x7fELF-fake-firestone-init";
+    /// Creating this file next to the fake `mkfs.ext4` makes it exit non-zero.
+    const MKFS_FAILURE_MARKER: &str = "mkfs.fail";
+
+    fn test_init_payload_source() -> InitPayloadSource {
+        Arc::new(|| Ok(TEST_INIT_PAYLOAD.to_vec()))
+    }
+
+    /// A build that carries no `firestone-init`, which every plain `cargo
+    /// build` is until the standalone release embeds one.
+    fn missing_init_payload_source() -> InitPayloadSource {
+        Arc::new(|| {
+            Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                "this build carries no embedded firestone-init payload",
+            ))
+        })
+    }
+
+    /// Writes a recording stand-in for the pinned static `mkfs.ext4`.
+    ///
+    /// The real helper is Linux-only, so the unit path drives it through the
+    /// same `Cmd` seam: the fake logs its argv, copies the tar it was handed
+    /// aside for inspection, and writes a small deterministic image so the
+    /// fake `qemu-img convert` has bytes to read.
+    fn write_fake_mkfs(
+        path: &Path,
+        log: &Path,
+        tar_copy: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let log_literal = serde_json::to_string(&log.to_string_lossy())?;
+        let copy_literal = serde_json::to_string(&tar_copy.to_string_lossy())?;
+        let fail_literal = serde_json::to_string(
+            &path
+                .with_file_name(MKFS_FAILURE_MARKER)
+                .to_string_lossy()
+                .into_owned(),
+        )?;
+        let script = r#"#!/usr/bin/env python3
+import pathlib
+import shutil
+import sys
+
+args = sys.argv[1:]
+log = pathlib.Path(__LOG__)
+with log.open("a", encoding="utf-8") as output:
+    output.write(" ".join(args) + "\n")
+
+if pathlib.Path(__FAIL__).exists():
+    sys.exit(9)
+shutil.copyfile(args[4], __COPY__)
+pathlib.Path(args[7]).write_bytes(b"EXT4FAKE " + args[8].encode() + b"\n")
+"#
+        .replace("__LOG__", &log_literal)
+        .replace("__COPY__", &copy_literal)
+        .replace("__FAIL__", &fail_literal);
+        fs::write(path, script)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        Ok(())
     }
 
     fn write_fake_qemu(
@@ -4457,6 +4932,117 @@ else:
         digest_hex(Sha512::digest(bytes).as_slice())
     }
 
+    /// One gzip layer blob built from `(path, contents)` pairs.
+    ///
+    /// A `None` body writes a directory entry, so a fixture can describe a
+    /// small but realistic root filesystem.
+    fn gzip_layer(entries: &[(&str, Option<&str>)]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, contents) in entries {
+            let body = contents.unwrap_or_default().as_bytes();
+            let mut header = tar::Header::new_ustar();
+            header.set_path(path)?;
+            header.set_entry_type(if contents.is_some() {
+                tar::EntryType::Regular
+            } else {
+                tar::EntryType::Directory
+            });
+            header.set_mode(if contents.is_some() { 0o644 } else { 0o755 });
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_mtime(0);
+            header.set_size(body.len() as u64);
+            header.set_cksum();
+            builder.append(&header, body)?;
+        }
+        let uncompressed = builder.into_inner()?;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&uncompressed)?;
+        Ok(encoder.finish()?)
+    }
+
+    /// What one scripted registry image published, for later assertions.
+    struct FakeOciImage {
+        manifest_digest: String,
+        config_digest: String,
+        layer_digests: Vec<String>,
+    }
+
+    fn oci_config_json() -> String {
+        r#"{"architecture":"amd64","os":"linux","config":{"Env":["PATH=/usr/bin"],"Entrypoint":["/entry.sh"],"Cmd":["serve"],"WorkingDir":"/srv","User":"app"},"rootfs":{"type":"layers","diff_ids":[]}}"#
+            .to_owned()
+    }
+
+    /// Queues the manifest, config, and layer replies for one image pull.
+    ///
+    /// The reference is parsed and normalized exactly as the pull will, so the
+    /// scripted URLs are the ones the registry client asks for.
+    fn script_oci_image(
+        fixture: &Fixture,
+        reference: &str,
+        layers: &[Vec<u8>],
+        config: &str,
+    ) -> Result<FakeOciImage, Box<dyn std::error::Error>> {
+        let parsed = OciReference::parse(reference)?;
+        let host = crate::oci::registry::registry_endpoint_host(parsed.registry()).to_owned();
+        let repository = parsed.repository().to_owned();
+        let config_digest = format!("sha256:{}", sha256_bytes(config.as_bytes()));
+        let layer_digests = layers
+            .iter()
+            .map(|layer| format!("sha256:{}", sha256_bytes(layer)))
+            .collect::<Vec<_>>();
+        let descriptors = layers
+            .iter()
+            .zip(&layer_digests)
+            .map(|(layer, digest)| {
+                format!(
+                    r#"{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{digest}","size":{}}}"#,
+                    layer.len()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let manifest = format!(
+            r#"{{"schemaVersion":2,"mediaType":"{}","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest}","size":{}}},"layers":[{descriptors}]}}"#,
+            crate::oci::registry::MEDIA_TYPE_OCI_MANIFEST,
+            config.len()
+        );
+        let manifest_digest = format!("sha256:{}", sha256_bytes(manifest.as_bytes()));
+        let target = match parsed.reference() {
+            crate::oci::OciTagOrDigest::Tag(tag) => tag.clone(),
+            crate::oci::OciTagOrDigest::Digest(digest) => digest.clone(),
+        };
+        fixture.http.push(
+            &format!("https://{host}/v2/{repository}/manifests/{target}"),
+            manifest.clone().into_bytes(),
+            None,
+            Some(crate::oci::registry::MEDIA_TYPE_OCI_MANIFEST),
+        )?;
+        fixture.http.push(
+            &format!("https://{host}/v2/{repository}/blobs/{config_digest}"),
+            config.as_bytes().to_vec(),
+            None,
+            Some("application/vnd.oci.image.config.v1+json"),
+        )?;
+        for (layer, digest) in layers.iter().zip(&layer_digests) {
+            fixture.http.push(
+                &format!("https://{host}/v2/{repository}/blobs/{digest}"),
+                layer.clone(),
+                Some(layer.len() as u64),
+                None,
+            )?;
+        }
+        Ok(FakeOciImage {
+            manifest_digest,
+            config_digest,
+            layer_digests,
+        })
+    }
+
+    fn oci_request(reference: &str, source_base: &Path) -> ImagePullRequest {
+        ImagePullRequest::new(ImageRef::new(reference), source_base)
+    }
+
     fn url_request(url: &str, digest: Option<String>, source_base: &Path) -> ImagePullRequest {
         ImagePullRequest {
             image: ImageRef::new(url),
@@ -4493,6 +5079,9 @@ else:
             qemu_img: fixture.store.qemu_img.clone(),
             http: fixture.http.clone(),
             clock,
+            insecure_registries: Vec::new(),
+            mkfs_ext4: fixture.store.mkfs_ext4.clone(),
+            init_payload: Arc::clone(&fixture.store.init_payload),
         }
     }
 
@@ -5590,6 +6179,9 @@ else:
             qemu_img: fixture.store.qemu_img.clone(),
             http: fixture.http.clone(),
             clock: Arc::new(FixedClock),
+            insecure_registries: Vec::new(),
+            mkfs_ext4: None,
+            init_payload: test_init_payload_source(),
         };
         let name = "changed-override";
         let mut state = machine_state(
@@ -5705,6 +6297,9 @@ else:
             qemu_img: fixture.store.qemu_img.clone(),
             http: fixture.http.clone(),
             clock: Arc::new(FixedClock),
+            insecure_registries: Vec::new(),
+            mkfs_ext4: None,
+            init_payload: test_init_payload_source(),
         };
         let architecture_error = aarch_store
             .create_overlay(arch_name, &pinned, ByteSize::from_mib(1)?, &arch_lock)
@@ -6145,6 +6740,9 @@ else:
             qemu_img: PathBuf::from("/bin/false"),
             http: Arc::new(ScriptedHttp::default()),
             clock: Arc::new(FixedClock),
+            insecure_registries: Vec::new(),
+            mkfs_ext4: None,
+            init_payload: test_init_payload_source(),
         };
         let ancestry_error = store
             .list()
@@ -7657,26 +8255,608 @@ sshd_path = "{}"
         Ok(())
     }
 
+    /// A full scripted pull publishes a real qcow2 pair, a version-two sidecar
+    /// carrying the complete `oci` object, and the §8.5 packing argv.
     #[test]
-    fn pull_oci_reference_expected_dependency_error() -> Result<(), Box<dyn std::error::Error>> {
+    fn pull_oci_image_expected_published_base_and_oci_sidecar()
+    -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::new(false)?;
+        let layer = gzip_layer(&[
+            ("etc/", None),
+            ("etc/os-release", Some("NAME=fake\n")),
+            ("entry.sh", Some("#!/bin/sh\nexec true\n")),
+        ])?;
+        let scripted = script_oci_image(
+            &fixture,
+            "docker.io/library/alpine:3.20",
+            std::slice::from_ref(&layer),
+            &oci_config_json(),
+        )?;
+
+        let mut events = Vec::new();
+        let pulled = fixture.store.pull(
+            &oci_request("docker.io/library/alpine:3.20", &fixture.root),
+            &mut events,
+        )?;
+
+        assert!(!pulled.cached);
+        let metadata = &pulled.metadata;
+        assert_eq!(metadata.kind, ImageKind::Oci);
+        assert_eq!(metadata.source_ref, "docker.io/library/alpine:3.20");
+        assert_eq!(metadata.source_url, None);
+        assert_eq!(metadata.firmware, None);
+        assert_eq!(metadata.source_format, ImageFormat::Raw);
+        assert_eq!(metadata.stored_format, ImageFormat::Qcow2);
+        assert_eq!(metadata.generation, 1);
+        assert_eq!(
+            format!("sha256:{}", metadata.source_sha256),
+            scripted.manifest_digest
+        );
+        assert_eq!(
+            metadata.id,
+            stable_image_id(
+                "docker.io/library/alpine:3.20",
+                None,
+                Arch::X86_64,
+                &metadata.source_sha256,
+            )
+        );
+        let oci = metadata
+            .oci
+            .as_ref()
+            .ok_or("an oci image must publish an oci object")?;
+        assert_eq!(oci.registry_ref, "docker.io/library/alpine:3.20");
+        assert_eq!(oci.manifest_digest, scripted.manifest_digest);
+        assert_eq!(oci.config_digest, scripted.config_digest);
+        assert_eq!(oci.entrypoint, vec!["/entry.sh".to_owned()]);
+        assert_eq!(oci.cmd, vec!["serve".to_owned()]);
+        assert_eq!(oci.env, vec!["PATH=/usr/bin".to_owned()]);
+        assert_eq!(oci.workdir.as_deref(), Some("/srv"));
+        assert_eq!(oci.user.as_deref(), Some("app"));
+        assert_eq!(oci.boot, FIRESTONE_INIT_BOOT);
+
+        // The published pair round-trips through the strict sidecar reader.
+        let listed = fixture.store.list()?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].metadata, *metadata);
+        assert_eq!(
+            fs::symlink_metadata(&pulled.path)?.permissions().mode() & 0o7777,
+            BASE_FILE_MODE
+        );
+
+        // §8.5 packing: one `mkfs.ext4 -F -t ext4 -d <tar> -b 4096` run whose
+        // trailing operand is the sized block count.
+        let invocations = fixture.mkfs_invocations()?;
+        assert_eq!(invocations.len(), 1);
+        let argv = invocations[0].split(' ').collect::<Vec<_>>();
+        assert_eq!(argv[0..4], ["-F", "-t", "ext4", "-d"]);
+        assert_eq!(argv[5..7], ["-b", "4096"]);
+        assert!(argv[4].ends_with(".tar.partial"), "{}", invocations[0]);
+        assert!(argv[7].ends_with(".source.partial"), "{}", invocations[0]);
+        let blocks = argv[8].parse::<u64>()?;
+        assert_eq!(blocks * EXT4_BLOCK_BYTES % OCI_SIZE_ALIGNMENT_BYTES, 0);
+        assert!(blocks * EXT4_BLOCK_BYTES >= OCI_SIZE_HEADROOM_BYTES);
+
+        // The tar handed to mkfs carries the injected guest init.
+        let packed = fixture.mkfs_input_tar()?;
+        let mut archive = tar::Archive::new(packed.as_slice());
+        let mut injected = None;
+        let mut paths = Vec::new();
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            let path = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
+            if path == crate::oci::layers::FIRESTONE_INIT_PATH {
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes)?;
+                injected = Some(bytes);
+            }
+            paths.push(path);
+        }
+        assert_eq!(injected.as_deref(), Some(TEST_INIT_PAYLOAD));
+        assert!(paths.iter().any(|path| path == "etc/os-release"));
+        assert!(
+            paths
+                .iter()
+                .any(|path| path == crate::oci::layers::FIRESTONE_OCI_MARKER_PATH)
+        );
+
+        // §8.3 events: one start, byte progress against the layer total, one
+        // done. No partial survives.
+        let total = layer.len() as u64;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Progress { done, total: Some(declared), unit: Unit::Bytes, .. }
+                if *done == total && *declared == total
+        )));
+        assert!(events.iter().any(
+            |event| matches!(event, Event::StepDone { detail: Some(detail), .. }
+                    if detail.contains("docker.io/library/alpine:3.20"))
+        ));
+        let remaining = fs::read_dir(fixture.paths.images_dir())?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".partial"))
+            .count();
+        assert_eq!(remaining, 0);
+        Ok(())
+    }
+
+    /// Re-pulling an unchanged tag resolves the same manifest digest and hits
+    /// the exact cache, exactly as an unchanged HTTPS source does.
+    #[test]
+    fn pull_oci_image_unchanged_tag_expected_cached_skip() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let fixture = Fixture::new(false)?;
+        let layer = gzip_layer(&[("etc/", None), ("etc/hostname", Some("fake\n"))])?;
+        let config = oci_config_json();
+        let reference = "docker.io/library/alpine:3.20";
+        script_oci_image(&fixture, reference, std::slice::from_ref(&layer), &config)?;
+        let first = fixture
+            .store
+            .pull(&oci_request(reference, &fixture.root), &mut Vec::new())?;
+
+        // The second pull re-reads the manifest and stops there.
+        script_oci_image(&fixture, reference, std::slice::from_ref(&layer), &config)?;
+        let mut events = Vec::new();
+        let second = fixture
+            .store
+            .pull(&oci_request(reference, &fixture.root), &mut events)?;
+
+        assert!(second.cached);
+        assert_eq!(second.metadata.id, first.metadata.id);
+        assert_eq!(second.metadata.generation, 1);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::StepSkip { reason, .. } if reason == "cached"
+        )));
+        assert_eq!(fixture.mkfs_invocations()?.len(), 1);
+        assert_eq!(fixture.store.list()?.len(), 1);
+        Ok(())
+    }
+
+    /// A moved tag resolves to another manifest digest, so it publishes a new
+    /// id and generation and leaves the earlier base in place.
+    #[test]
+    fn pull_oci_image_moved_tag_expected_second_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let reference = "ghcr.io/owner/app:edge";
+        let first_layer = gzip_layer(&[("etc/", None), ("etc/build", Some("one\n"))])?;
+        let first_scripted = script_oci_image(
+            &fixture,
+            reference,
+            std::slice::from_ref(&first_layer),
+            &oci_config_json(),
+        )?;
+        let first = fixture
+            .store
+            .pull(&oci_request(reference, &fixture.root), &mut Vec::new())?;
+
+        let second_layer = gzip_layer(&[("etc/", None), ("etc/build", Some("two\n"))])?;
+        let second_scripted = script_oci_image(
+            &fixture,
+            reference,
+            std::slice::from_ref(&second_layer),
+            &oci_config_json(),
+        )?;
+        let second = fixture
+            .store
+            .pull(&oci_request(reference, &fixture.root), &mut Vec::new())?;
+
+        assert_ne!(
+            first_scripted.manifest_digest,
+            second_scripted.manifest_digest
+        );
+        assert!(!second.cached);
+        assert_ne!(second.metadata.id, first.metadata.id);
+        assert_eq!(second.metadata.generation, 2);
+        assert_eq!(fixture.store.list()?.len(), 2);
+        assert!(fs::symlink_metadata(&first.path).is_ok());
+        Ok(())
+    }
+
+    /// A digest reference selects that exact manifest and is persisted, and
+    /// the layer digests it names are the ones fetched.
+    #[test]
+    fn pull_oci_digest_reference_expected_exact_manifest_selection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let layer = gzip_layer(&[("etc/", None), ("etc/pinned", Some("yes\n"))])?;
+        let config = oci_config_json();
+        let tagged = script_oci_image(
+            &fixture,
+            "ghcr.io/owner/app:edge",
+            std::slice::from_ref(&layer),
+            &config,
+        )?;
+        let pinned = format!("ghcr.io/owner/app@{}", tagged.manifest_digest);
+        let scripted = script_oci_image(&fixture, &pinned, std::slice::from_ref(&layer), &config)?;
+        assert_eq!(scripted.manifest_digest, tagged.manifest_digest);
+
+        let pulled = fixture
+            .store
+            .pull(&oci_request(&pinned, &fixture.root), &mut Vec::new())?;
+
+        assert_eq!(pulled.metadata.source_ref, pinned);
+        let oci = pulled
+            .metadata
+            .oci
+            .as_ref()
+            .ok_or("an oci image must publish an oci object")?;
+        assert_eq!(oci.registry_ref, pinned);
+        assert_eq!(oci.manifest_digest, tagged.manifest_digest);
+        assert_eq!(scripted.layer_digests.len(), 1);
+        Ok(())
+    }
+
+    /// The `firestone-init` payload is checked before a byte is downloaded: a
+    /// build without one fails with the scripted blobs still untouched.
+    #[test]
+    fn pull_oci_image_without_init_payload_expected_dependency_before_download()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut fixture = Fixture::new(false)?;
+        let layer = gzip_layer(&[("etc/", None), ("etc/hostname", Some("fake\n"))])?;
+        let reference = "docker.io/library/alpine:3.20";
+        script_oci_image(
+            &fixture,
+            reference,
+            std::slice::from_ref(&layer),
+            &oci_config_json(),
+        )?;
+        fixture.store.init_payload = missing_init_payload_source();
+
+        let error = fixture
+            .store
+            .pull(&oci_request(reference, &fixture.root), &mut Vec::new())
+            .err()
+            .ok_or("expected a missing firestone-init payload to fail the pull")?;
+
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert!(error.message().contains("firestone-init"));
+        assert!(error.message().contains(reference));
+        assert!(
+            error
+                .hint()
+                .is_some_and(|hint| hint.contains("standalone") && hint.contains("deps.toml")),
+            "the hint must name the release limitation: {:?}",
+            error.hint()
+        );
+        assert!(fixture.mkfs_invocations()?.is_empty());
+        assert_no_image_artifacts(&fixture.paths)?;
+
+        // Nothing was requested: the queued replies still serve a full pull.
+        fixture.store.init_payload = test_init_payload_source();
+        let pulled = fixture
+            .store
+            .pull(&oci_request(reference, &fixture.root), &mut Vec::new())?;
+        assert!(!pulled.cached);
+        Ok(())
+    }
+
+    /// A zstd layer is refused with the media type named, before any blob is
+    /// downloaded, because §8.5 decompresses gzip only in v0.2.
+    #[test]
+    fn pull_oci_zstd_layer_expected_dependency_naming_the_media_type()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let config = oci_config_json();
+        let config_digest = format!("sha256:{}", sha256_bytes(config.as_bytes()));
+        let manifest = format!(
+            r#"{{"schemaVersion":2,"mediaType":"{}","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest}","size":{}}},"layers":[{{"mediaType":"{}","digest":"sha256:{}","size":10}}]}}"#,
+            crate::oci::registry::MEDIA_TYPE_OCI_MANIFEST,
+            config.len(),
+            crate::oci::layers::MEDIA_TYPE_OCI_LAYER_ZSTD,
+            "b".repeat(64),
+        );
+        fixture.http.push(
+            "https://registry-1.docker.io/v2/library/alpine/manifests/3.20",
+            manifest.into_bytes(),
+            None,
+            Some(crate::oci::registry::MEDIA_TYPE_OCI_MANIFEST),
+        )?;
+
         let error = fixture
             .store
             .pull(
-                &ImagePullRequest::new(ImageRef::new("docker://nginx"), &fixture.root),
+                &oci_request("docker.io/library/alpine:3.20", &fixture.root),
                 &mut Vec::new(),
             )
             .err()
-            .ok_or("expected the OCI pull placeholder to fail")?;
+            .ok_or("expected a zstd layer to be refused")?;
 
         assert_eq!(error.kind(), ErrorKind::Dependency);
         assert!(
             error
                 .message()
-                .contains("OCI image pulls land in a following change")
+                .contains(crate::oci::layers::MEDIA_TYPE_OCI_LAYER_ZSTD)
         );
-        assert!(error.message().contains("docker.io/library/nginx:latest"));
-        assert!(error.hint().is_some());
+        assert!(error.hint().is_some_and(|hint| hint.contains("gzip")));
+        assert_no_image_artifacts(&fixture.paths)?;
+        Ok(())
+    }
+
+    /// Every failure injection point leaves the store exactly as it was: no
+    /// partial, no half-published pair.
+    #[test]
+    fn pull_oci_image_failure_at_each_step_expected_clean_store()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let layer = gzip_layer(&[("etc/", None), ("etc/hostname", Some("fake\n"))])?;
+        let reference = "docker.io/library/alpine:3.20";
+
+        // 1. The layer blob is unavailable.
+        {
+            let fixture = Fixture::new(false)?;
+            let config = oci_config_json();
+            let scripted =
+                script_oci_image(&fixture, reference, std::slice::from_ref(&layer), &config)?;
+            let host = "registry-1.docker.io";
+            let blob = format!(
+                "https://{host}/v2/library/alpine/blobs/{}",
+                scripted.layer_digests[0]
+            );
+            fixture.http.take(&blob)?;
+            let error = fixture
+                .store
+                .pull(&oci_request(reference, &fixture.root), &mut Vec::new())
+                .err()
+                .ok_or("expected an unavailable layer blob to fail the pull")?;
+            assert!(error.message().contains("no scripted HTTP response"));
+            assert_no_image_artifacts(&fixture.paths)?;
+        }
+
+        // 2. A truncated layer blob fails digest verification.
+        {
+            let fixture = Fixture::new(false)?;
+            let config = oci_config_json();
+            let scripted =
+                script_oci_image(&fixture, reference, std::slice::from_ref(&layer), &config)?;
+            let blob = format!(
+                "https://registry-1.docker.io/v2/library/alpine/blobs/{}",
+                scripted.layer_digests[0]
+            );
+            fixture.http.take(&blob)?;
+            fixture
+                .http
+                .push(&blob, layer[..layer.len() - 1].to_vec(), None, None)?;
+            let error = fixture
+                .store
+                .pull(&oci_request(reference, &fixture.root), &mut Vec::new())
+                .err()
+                .ok_or("expected a truncated layer blob to fail the pull")?;
+            assert_eq!(error.kind(), ErrorKind::Checksum);
+            assert_no_image_artifacts(&fixture.paths)?;
+        }
+
+        // 3. `mkfs.ext4` exits non-zero.
+        {
+            let fixture = Fixture::new(false)?;
+            script_oci_image(
+                &fixture,
+                reference,
+                std::slice::from_ref(&layer),
+                &oci_config_json(),
+            )?;
+            fs::write(fixture.root.join(MKFS_FAILURE_MARKER), b"")?;
+            let error = fixture
+                .store
+                .pull(&oci_request(reference, &fixture.root), &mut Vec::new())
+                .err()
+                .ok_or("expected a failing mkfs.ext4 to fail the pull")?;
+            assert_eq!(error.kind(), ErrorKind::Dependency);
+            assert_eq!(fixture.mkfs_invocations()?.len(), 1);
+            assert_no_image_artifacts(&fixture.paths)?;
+        }
+
+        // 4. `qemu-img convert` exits non-zero.
+        {
+            let fixture = Fixture::new(true)?;
+            script_oci_image(
+                &fixture,
+                reference,
+                std::slice::from_ref(&layer),
+                &oci_config_json(),
+            )?;
+            let error = fixture
+                .store
+                .pull(&oci_request(reference, &fixture.root), &mut Vec::new())
+                .err()
+                .ok_or("expected a failing qemu-img convert to fail the pull")?;
+            assert_eq!(error.kind(), ErrorKind::Dependency);
+            assert_no_image_artifacts(&fixture.paths)?;
+        }
+        Ok(())
+    }
+
+    /// `create NAME <oci ref>` then `start NAME`: an unpinned OCI reference
+    /// pulls through the registry, pins immutable identity in `state.json`, and
+    /// reaches the §9.5 direct-kernel payload with no firmware in sight.
+    #[test]
+    fn prepare_start_unpinned_oci_reference_expected_pull_then_direct_kernel_boot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let kernel = b"pinned-direct-boot-kernel";
+        let kernel_url = "https://kernel.example.invalid/bzImage-x86_64";
+        let manifest = direct_boot_kernel_manifest(kernel_url, kernel, None)?;
+        fixture.http.push(
+            kernel_url,
+            kernel.to_vec(),
+            Some(kernel.len() as u64),
+            Some("application/octet-stream"),
+        )?;
+        let reference = "docker.io/library/alpine:3.20";
+        let layer = gzip_layer(&[("etc/", None), ("etc/hostname", Some("packed\n"))])?;
+        let scripted = script_oci_image(
+            &fixture,
+            reference,
+            std::slice::from_ref(&layer),
+            &oci_config_json(),
+        )?;
+        let name = "oci-created";
+        let state = machine_state(
+            &fixture.paths,
+            name,
+            StateImage {
+                r#ref: reference.to_owned(),
+                id: None,
+                sha256: None,
+            },
+        )?;
+        let spec = MachineSpec {
+            image: ImageRef::new(reference),
+            arch: Some(Arch::X86_64),
+            network: NetworkSpec {
+                mode: NetMode::None,
+                ..NetworkSpec::default()
+            },
+            vmm: VmmSpec {
+                binary: Some(fixture.store.qemu_img.clone()),
+                ..VmmSpec::default()
+            },
+            ..MachineSpec::default()
+        };
+        let mut events = Vec::new();
+        let lock = create_machine(&fixture.paths, name, &state, &mut events)?;
+
+        let prepared = prepare_start(
+            &fixture.paths,
+            &fixture.store,
+            &manifest,
+            name,
+            &spec,
+            state,
+            &fixture.root,
+            &lock,
+            &mut events,
+            ShimTimeouts::default(),
+        )?;
+
+        // The pull pinned the manifest digest as the machine's image identity.
+        let pinned = &prepared.state().image;
+        assert_eq!(pinned.r#ref, reference);
+        assert_eq!(
+            pinned
+                .sha256
+                .as_deref()
+                .map(|digest| format!("sha256:{digest}")),
+            Some(scripted.manifest_digest.clone())
+        );
+        let id = pinned
+            .id
+            .clone()
+            .ok_or("a started machine pins an image id")?;
+        assert_eq!(fixture.mkfs_invocations()?.len(), 1);
+
+        // §9.5: the payload is the pinned kernel plus the fixed command line.
+        let vmconfig: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.paths.machine_vmconfig(name)?)?)?;
+        assert_eq!(
+            vmconfig["payload"]["cmdline"],
+            "console=hvc0 console=ttyS0 root=/dev/vda rw init=/sbin/firestone-init"
+        );
+        assert!(vmconfig["payload"]["firmware"].is_null());
+        assert!(
+            vmconfig["payload"]["kernel"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("bzImage-ch-test"))
+        );
+        // §10.5: an OCI machine boots the config disk, never a cloud-init seed,
+        // and its entrypoint comes from the sidecar the pull just wrote.
+        assert!(!fixture.paths.machine_seed_image(name)?.exists());
+        let document = fixture.paths.machine_config_file(name, "config.json")?;
+        let inspected: serde_json::Value = serde_json::from_slice(&fs::read(&document)?)?;
+        assert_eq!(inspected["entrypoint"][0], "/entry.sh");
+        assert_eq!(inspected["cmd"][0], "serve");
+
+        let stored = fixture.store.inspect(&id)?;
+        assert_eq!(stored.image.metadata.kind, ImageKind::Oci);
+        Ok(())
+    }
+
+    /// The pinned static `mkfs.ext4` accepts the exact §8.5 argv and tar input.
+    ///
+    /// The helper is a Linux x86_64 binary, so this runs only there and only
+    /// when `FIRESTONE_TEST_MKFS_EXT4` names an installed copy; every other
+    /// host proves the same pipeline through the recording fake above.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mkfs_ext4_real_helper_packs_the_merged_tar_expected_ext4_superblock()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Some(helper) = env::var_os("FIRESTONE_TEST_MKFS_EXT4").map(PathBuf::from) else {
+            return Ok(());
+        };
+        if !helper.is_file() {
+            return Ok(());
+        }
+        let fixture = Fixture::new(false)?;
+        let reference = OciReference::parse("docker://alpine")?;
+        let layer = gzip_layer(&[
+            ("etc/", None),
+            ("etc/os-release", Some("NAME=fake\n")),
+            ("bin/", None),
+        ])?;
+        let blob = fixture.root.join("layer.tar.gz");
+        fs::write(&blob, &layer)?;
+        let source = FileLayer::new(blob);
+        let sources: [&dyn LayerSource; 1] = [&source];
+        let config = OciImageConfig::default();
+        let request = MergeRequest::new(&sources, &config).with_injected_init(TEST_INIT_PAYLOAD);
+        let tar = fixture.root.join("rootfs.tar");
+        let summary = merge_layers(&request, &mut File::create(&tar)?)?;
+
+        let raw = fixture.root.join("rootfs.raw");
+        let bytes = oci_rootfs_bytes(&reference, summary.unpacked_bytes)?;
+        File::create(&raw)?.set_len(bytes)?;
+        Cmd::new(helper.as_os_str())
+            .arg("-F")
+            .arg("-t")
+            .arg("ext4")
+            .arg("-d")
+            .arg(tar.as_os_str())
+            .arg("-b")
+            .arg(EXT4_BLOCK_BYTES.to_string())
+            .arg(raw.as_os_str())
+            .arg((bytes / EXT4_BLOCK_BYTES).to_string())
+            .timeout(MKFS_TIMEOUT)
+            .error_kind(ErrorKind::Dependency)
+            .run()?;
+
+        assert_eq!(fs::symlink_metadata(&raw)?.len(), bytes);
+        // The ext2/3/4 superblock magic lives at byte 1080 of the image.
+        let mut head = [0_u8; 1082];
+        File::open(&raw)?.read_exact(&mut head)?;
+        assert_eq!(&head[1080..], &[0x53, 0xef], "ext4 superblock magic");
+        Ok(())
+    }
+
+    /// The §8.5 sizing rule is pure integer arithmetic, so one manifest yields
+    /// the same ext4 size on every host.
+    #[test]
+    fn oci_rootfs_bytes_documented_table_expected_exact_sizes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let reference = OciReference::parse("docker://alpine")?;
+        let mib = 1024 * 1024;
+        // (unpacked bytes, expected ext4 bytes)
+        let cases: &[(u64, u64)] = &[
+            // An empty tree is exactly the headroom, which is already aligned.
+            (0, 256 * mib),
+            // One byte past it rounds up a whole 4 MiB step.
+            (1, 260 * mib),
+            (4096, 260 * mib),
+            (100 * mib, 372 * mib),
+            (1024 * mib, 1436 * mib),
+            (3 * 1024 * mib + 12345, 3792 * mib),
+        ];
+        for (unpacked, expected) in cases {
+            let sized = oci_rootfs_bytes(&reference, *unpacked)?;
+            assert_eq!(sized, *expected, "sizing {unpacked} unpacked bytes");
+            assert_eq!(sized % OCI_SIZE_ALIGNMENT_BYTES, 0);
+            assert!(sized >= unpacked.saturating_add(OCI_SIZE_HEADROOM_BYTES));
+        }
+
+        let overflow = oci_rootfs_bytes(&reference, u64::MAX)
+            .err()
+            .ok_or("expected an impossible tree size to be refused")?;
+        assert_eq!(overflow.kind(), ErrorKind::Dependency);
+        assert!(overflow.hint().is_some());
         Ok(())
     }
 

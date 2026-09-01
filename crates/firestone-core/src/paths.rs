@@ -380,6 +380,20 @@ impl Paths {
         self.image_file(&format!(".pull-{operation}.stored.partial"))
     }
 
+    /// One downloaded OCI layer blob of an in-flight pull (SPEC §8.5).
+    pub fn image_layer_partial(
+        &self,
+        operation: &str,
+        index: usize,
+    ) -> Result<PathBuf, FirestoneError> {
+        self.image_file(&format!(".pull-{operation}.layer{index}.partial"))
+    }
+
+    /// The canonical merged tar `mkfs.ext4 -d` consumes (SPEC §8.5).
+    pub fn image_rootfs_tar_partial(&self, operation: &str) -> Result<PathBuf, FirestoneError> {
+        self.image_file(&format!(".pull-{operation}.tar.partial"))
+    }
+
     pub fn machine_dir(&self, name: &str) -> Result<PathBuf, FirestoneError> {
         checked_join(&self.machines_dir(), "machine name", name)
     }
