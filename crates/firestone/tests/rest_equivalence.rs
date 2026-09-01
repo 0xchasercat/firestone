@@ -1165,6 +1165,140 @@ fn real_unix_rest_streams_aggregates_disconnects_and_survives_restart() -> TestR
     Ok(())
 }
 
+/// Replaces one JSON scalar with a marker so volatile sample fields can be
+/// byte-compared across two independent samples.
+fn redact_scalar(payload: &[u8], field: &str) -> TestResult<Vec<u8>> {
+    let marker = format!("\"{field}\":").into_bytes();
+    let start = payload
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .map(|index| index + marker.len())
+        .ok_or_else(|| format!("metrics payload has no {field}"))?;
+    let end = start
+        + payload[start..]
+            .iter()
+            .position(|byte| *byte == b',' || *byte == b'}')
+            .ok_or_else(|| format!("metrics payload {field} is unterminated"))?;
+    let mut redacted = payload[..start].to_vec();
+    redacted.extend_from_slice(format!("<{field}>").as_bytes());
+    redacted.extend_from_slice(&payload[end..]);
+    Ok(redacted)
+}
+
+fn redact_metrics_sample(payload: &[u8]) -> TestResult<Vec<u8>> {
+    let mut redacted = payload.to_vec();
+    for field in ["sampled_at", "cpu_time_ns", "rss_bytes"] {
+        redacted = redact_scalar(&redacted, field)?;
+    }
+    Ok(redacted)
+}
+
+#[test]
+fn real_cli_and_unix_rest_project_one_metrics_sample_and_conflict() -> TestResult {
+    let fixture = Fixture::new()?;
+    let server = Server::spawn(&fixture)?;
+    require_success(
+        &fixture.create_fake_machine("sampled", "normal", Some(2))?,
+        "metrics machine create",
+    )?;
+
+    let stopped_cli = fixture.json_command(&["metrics", "sampled"])?;
+    assert_eq!(stopped_cli.status.code(), Some(4));
+    let stopped_rest = http_request(
+        &server.socket,
+        "GET",
+        "/v1/machines/sampled/metrics",
+        b"",
+        None,
+    )?;
+    assert_eq!(stopped_rest.status, 409);
+    assert_eq!(stopped_rest.body, error_bytes(&stopped_cli.stdout)?);
+
+    require_success(
+        &fixture.json_command(&["start", "sampled", "--no-wait", "--timeout", "20s"])?,
+        "metrics machine start",
+    )?;
+
+    let metrics_cli = fixture.json_command(&["metrics", "sampled"])?;
+    require_success(&metrics_cli, "CLI metrics")?;
+    let metrics_cli = terminal_result(&metrics_cli.stdout, "metrics")?;
+    let metrics_rest = http_request(
+        &server.socket,
+        "GET",
+        "/v1/machines/sampled/metrics",
+        b"",
+        None,
+    )?;
+    assert_eq!(metrics_rest.status, 200);
+    assert_eq!(
+        metrics_rest.headers.get("content-type").map(String::as_str),
+        Some("application/json")
+    );
+    assert_eq!(
+        redact_metrics_sample(&metrics_rest.body)?,
+        redact_metrics_sample(&metrics_cli.payload_bytes)?,
+        "metrics stable payload bytes or field order changed"
+    );
+
+    let payload = &metrics_cli.payload;
+    assert_eq!(payload["cpu"]["vcpus"], 2);
+    assert_eq!(payload["memory"]["allocated_bytes"], 2_147_483_648_u64);
+    assert_eq!(payload["memory"]["guest_actual_bytes"], 1);
+    assert_eq!(payload["net"], Value::Null);
+    assert_eq!(
+        payload["block"],
+        json!([
+            {
+                "device": "_disk0",
+                "read_bytes": 4096,
+                "written_bytes": 8192,
+                "read_ops": 2,
+                "write_ops": 3
+            },
+            {
+                "device": "_disk1",
+                "read_bytes": 0,
+                "written_bytes": 0,
+                "read_ops": 0,
+                "write_ops": 0
+            }
+        ])
+    );
+    assert!(
+        payload["sampled_at"]
+            .as_str()
+            .is_some_and(|value| value.ends_with('Z')),
+        "sampled_at must be an RFC 3339 instant: {payload}"
+    );
+
+    let rest_text = String::from_utf8(metrics_rest.body.clone())?;
+    assert!(
+        !rest_text.contains("18446744073709551615"),
+        "a u64::MAX sentinel reached the metrics payload: {rest_text}"
+    );
+    assert!(
+        !rest_text.contains("latency"),
+        "an unprojected latency counter reached the metrics payload: {rest_text}"
+    );
+
+    let mut human = fixture.command();
+    human.args(["metrics", "sampled"]);
+    let human = run_bounded(human, COMMAND_TIMEOUT)?;
+    require_success(&human, "human metrics")?;
+    let human_text = String::from_utf8(human.stdout)?;
+    assert!(human_text.starts_with("sampled at "), "{human_text}");
+    assert!(human_text.contains("cpu       2 vcpus"), "{human_text}");
+    assert!(
+        human_text.contains("net       none reported"),
+        "{human_text}"
+    );
+
+    fixture.remove_machine("sampled");
+    let output = server.signal(Signal::SIGTERM)?;
+    assert!(output.status.success());
+    Ok(())
+}
+
 #[test]
 fn real_cli_lock_blocks_rest_patch_until_editor_releases() -> TestResult {
     let fixture = Fixture::new()?;

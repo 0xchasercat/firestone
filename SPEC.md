@@ -983,6 +983,7 @@ Global flags on every command: `--json` (NDJSON events on stdout, human output o
 | `ssh-config NAME` | print an OpenSSH Host block |
 | `console NAME` | attach to hvc0 |
 | `logs NAME [-f] [--source S] [-n N]` | view logs |
+| `metrics NAME` | one cumulative resource sample for a running machine (§25) |
 | `catalog` | deterministic table of the merged built-in and user catalog, including aliases, effective firmware, and available architectures |
 | `images ls` / `images pull REF [--sha256 HEX]` / `images inspect ID` / `images rm ID [--force]` / `images prune` | image management; `--sha256` is valid only for an HTTPS URL |
 | `doctor [--fix]` | diagnose host; `--fix` downloads vendorable binaries and prints the rest |
@@ -1098,7 +1099,7 @@ The server holds no state and takes the same machine locks as the CLI. `curl --u
 
 The server holds no state and takes the same machine locks as the CLI. `curl --unix-socket … http://firestone/v1/machines` is the smoke test.
 
-[`docs/openapi.json`](docs/openapi.json) is the dependency-free OpenAPI 3.1 contract for the existing routes. It records exact request and response schemas, Unix-socket transport, aggregation and stream framing, limits, statuses, nullability, and examples. It is a static artifact, not a runtime endpoint. A behavior-level test parses it and compares its 18 explicitly authored operations with the configured axum router; axum's synthesized `HEAD` handling for `GET` remains framework behavior rather than a separately authored Firestone operation.
+[`docs/openapi.json`](docs/openapi.json) is the dependency-free OpenAPI 3.1 contract for the existing routes. It records exact request and response schemas, Unix-socket transport, aggregation and stream framing, limits, statuses, nullability, and examples. It is a static artifact, not a runtime endpoint. A behavior-level test parses it and compares its 19 explicitly authored operations with the configured axum router; axum's synthesized `HEAD` handling for `GET` remains framework behavior rather than a separately authored Firestone operation.
 
 ### 16.2 Routes
 
@@ -1117,6 +1118,7 @@ The server holds no state and takes the same machine locks as the CLI. `curl --u
 | POST | `/v1/machines/{name}/restart` | | event stream → `Result` |
 | GET | `/v1/machines/{name}/logs?source=&follow=&lines=` | | `text/plain`, chunked |
 | GET | `/v1/machines/{name}/vmconfig` | | generated VmConfig JSON |
+| GET | `/v1/machines/{name}/metrics` | | `MetricsResult` (§25); 409 when the machine is not running |
 | GET | `/v1/catalog` | | `[{reference, aliases, architectures: [{architecture, firmware}]}]` |
 | GET | `/v1/images` | | `[StoredImage]` |
 | POST | `/v1/images/pull` | `{ref, sha256?}` | event stream → `Result` |
@@ -1334,6 +1336,7 @@ Do these in the first milestone, against the pinned versions, and record results
 
 | Decision | Chosen | Alternatives considered | Why |
 |---|---|---|---|
+| Machine metrics sampling (M6-01) | One on-demand `Action::Metrics` sample per call: reconciled state and spec, `/proc/<vmm_pid>/stat` fields 14+15 and `VmRSS` (Linux only, `null` elsewhere), plus v53 `vm.counters` and `vm.info`; counters stay cumulative, `u64::MAX`-family sentinels are projected as absent, block counters are typed while network counters pass through under `net: null` when the VMM reports none | run a sampling daemon or ring buffer; compute rates on the host; surface raw v53 counter maps verbatim; type network counters from their presumed names; report `0` for an unavailable figure | A daily-driver metric needs no background process: both sources are already open for a running machine, and two client samples give a rate without Firestone owning a time series. Publishing `u64::MAX` latency sentinels or a fabricated `0` would poison every derived rate, and the verified v53 fact that vhost-user `passt` emits no network entries means typed network fields would be unverified invention. |
 | M6 interface contracts frozen up front | Snapshot, clone, resize, metrics, prune, and terminal WS routes plus spec additions are fixed before implementation (route shapes recorded in the M6 milestone's feature sections as they land); UI work proceeds against the contracts in parallel | design each surface inside its implementation PR; a single serialized workstream | Parallel agents need a stable seam; freezing the action names, REST paths and payload shapes first lets core and UI land independently while the drift gate keeps `docs/openapi.json` honest. |
 | First-start pinned firmware | Before `vmconfig.json` publication, install only the effective built-in `auto`/`rhf`/`edk2` artifact through the shared locked, no-follow, exact hash/mode, fsynced, no-replace publisher; reverify it for VmConfig; never install or modify a custom firmware path | require a broad `doctor --fix` preflight; download every vendored artifact; trust an existing regular file; rewrite custom firmware | A direct first start from an empty home gets the one firmware it needs without unrelated host repair. The manifest identity and secure publisher keep VMM input inside Firestone's owned dependency boundary, while the custom path remains authoritative. |
 | Passt runtime isolation diagnosis | Probe the exact foreground, one-off vhost-user mode with repair disabled; classify both `Couldn't create user namespace` and `Failed to detach isolating namespaces` as fatal; offer the existing AppArmor repair when host facts support it; runtime selects only the verified literal root-owned pinned copy after repair | treat later detach failure as available because the first userns succeeded; use generic `unshare`; disable AppArmor or a sysctl; accept a user-writable profiled path | Passt cannot serve Cloud Hypervisor after either fatal exit. Matching runtime argv closes the false-ok gap, and verified literal-path selection proves the repair authorizes only the pinned binary. |
@@ -1484,7 +1487,7 @@ Do these in the first milestone, against the pinned versions, and record results
 | M5-13 release version has one source of truth | Treat `[workspace.package] version` in `Cargo.toml` as the only declaration of the release version. Derive every consequence — `identity.release`, the `--version` line, the published artifact name — rather than restating it, and check the files the release workflow rewrites (`versions.env`'s `FIRESTONE_VERSION` and `CARGO_LOCK_SHA256`) for agreement with `Cargo.toml` and `Cargo.lock` instead of pinning their bytes. Enforce that agreement in `cargo test`. | a literal version in a test, a harness, a doc, or a comment; a `EXPECTED_FILE_HASHES` entry for a file the release workflow rewrites; discovering the drift in a release build | The workflow bumps `Cargo.toml`, `Cargo.lock` and `versions.env` together on a tagged run, so anything that restates the version is wrong the moment a release is cut and anything that pins those bytes is stale. That is not hypothetical: after `release: v0.1.3`, `store.rs` still asserted `v0.1.0`, the M5-04 harness still pinned the pre-bump `Cargo.lock`, and its `FIRESTONE_VERSION` pin still read `0.1.0` — a red `cargo test` and a red doctor-matrix CI job. Checking `versions.env` against the real `Cargo.lock` is also strictly stronger than a literal hash, because it catches a lock edited without updating its pin, which is what a `deps.toml` or dependency change does. |
 | M5-12 vendored web assets | Pin every third-party web asset by SHA-256 in `web-assets.toml`, not `deps.toml`, and enforce it with a Rust test that recomputes each hash and compares the pinned set against the files actually present. | append to `deps.toml`; trust a vendored file because it is committed; hash only at vendoring time | `scripts/pin-deps.sh` regenerates `deps.toml` byte-for-byte from a heredoc and verifies with `cmp`, so an appended table breaks `verify` and is deleted by the next `refresh`. A separate manifest keeps that generator canonical, and moving the check into `cargo test` makes it part of the required gate instead of an optional script. |
 
-| Static Firestone REST contract | Keep `docs/openapi.json` as OpenAPI 3.1 JSON for the 18 explicitly authored §16.2 operations. Build production routing from one private `REST_ROUTES` factory table, parse the static document with existing `serde_json`, and probe each configured axum `MethodRouter` through `Allow`; remove only axum's synthesized `HEAD` when its `GET` is present. | generate or serve OpenAPI at runtime; add schema/router dependencies or annotations; scrape Rust source text; advertise incidental `HEAD` operations as first-class Firestone routes | The checked-in artifact remains usable without Firestone or a parser dependency and adds no endpoint or behavior. One executable route source plus behavior-level method probing makes additions, removals, and method changes fail the contract test in both directions while preserving §16.2 as the authored public surface. |
+| Static Firestone REST contract | Keep `docs/openapi.json` as OpenAPI 3.1 JSON for the 19 explicitly authored §16.2 operations. Build production routing from one private `REST_ROUTES` factory table, parse the static document with existing `serde_json`, and probe each configured axum `MethodRouter` through `Allow`; remove only axum's synthesized `HEAD` when its `GET` is present. | generate or serve OpenAPI at runtime; add schema/router dependencies or annotations; scrape Rust source text; advertise incidental `HEAD` operations as first-class Firestone routes | The checked-in artifact remains usable without Firestone or a parser dependency and adds no endpoint or behavior. One executable route source plus behavior-level method probing makes additions, removals, and method changes fail the contract test in both directions while preserving §16.2 as the authored public surface. |
 
 ---
 
@@ -1512,6 +1515,84 @@ Progress bars, timing details, hints on every error kind, `completions`, `versio
 
 **M6 — daily driver (v0.2.0)**
 Snapshots (cold guaranteed; warm gated on verified vhost-user restore), `clone`, disk grow and live cpu/memory resize with opt-in headroom, per-machine metrics sampling, `cp`, system prune, pending-forward surfacing, cloud-init password/inline-key/inline-user-data authoring, OCI image boot (registry pull, ext4 rootfs packing, pinned direct-boot kernel, embedded `firestone-init` PID 1), and the web UI grown to parity: ANSI-color logs, WebSocket console and SSH shell terminal, machine editing, create-form image picker and structured inputs, metrics sparklines, snapshot/clone/prune surfaces. Each feature lands with its own normative sections and decision-log entries. Acceptance: required local gate plus `scripts/m6-kvm-e2e.py` and `scripts/m6-oci-kvm-e2e.py` green on a real x86_64 KVM host, existing e2e regression green, docs validated, release `v0.2.0` published.
+
+## 25. Metrics (normative)
+
+### 25.1 Design
+
+Firestone runs no metrics daemon, stores no time series, and keeps no ring buffer on the host. `Action::Metrics { name }` reads one sample on demand from sources that already exist — the machine's Cloud Hypervisor API socket and the host `/proc` entries for its VMM process — and returns it as a single JSON object. Every device figure is cumulative since the VMM process started, so a client that wants a rate takes two samples and divides by the elapsed wall clock between their `sampled_at` values.
+
+The sample is read-only. It never writes state, never restarts a sidecar, and never mutates the spec. It takes the machine lock only for the ordinary reconciled state read; it holds no lock while talking to the VMM.
+
+A machine that is not active fails with the shared machine-not-running error: kind `conflict`, message ``machine `NAME` is not running``, hint `run firestone start NAME`. The REST adapter maps `conflict` to 409 and the CLI exits 4 (§15.5).
+
+### 25.2 Payload (normative)
+
+`MetricsResult` is emitted as one `Event::Result` with action `metrics` and rendered as a plain JSON object by `GET /v1/machines/{name}/metrics` — not as an NDJSON stream.
+
+```json
+{
+  "sampled_at": "2026-09-02T12:00:00Z",
+  "cpu": { "vcpus": 2, "cpu_time_ns": 9500000000 },
+  "memory": {
+    "rss_bytes": 67108864,
+    "allocated_bytes": 2147483648,
+    "guest_actual_bytes": 2147483648
+  },
+  "block": [
+    {
+      "device": "_disk0",
+      "read_bytes": 4096,
+      "written_bytes": 8192,
+      "read_ops": 2,
+      "write_ops": 3
+    }
+  ],
+  "net": null
+}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `sampled_at` | RFC 3339 instant | when the host and VMM sources were read |
+| `cpu.vcpus` | integer | guest vCPU count from the effective spec |
+| `cpu.cpu_time_ns` | integer or null | cumulative VMM user + system time in nanoseconds |
+| `memory.rss_bytes` | integer or null | VMM resident set size in bytes |
+| `memory.allocated_bytes` | integer | guest memory requested by the spec, in bytes |
+| `memory.guest_actual_bytes` | integer or null | Cloud Hypervisor `memory_actual_size` |
+| `block[]` | array | one entry per block device the VMM reports, in device-id order |
+| `block[].device` | string | the VMM's device id, such as `_disk0` |
+| `block[].read_bytes`, `written_bytes`, `read_ops`, `write_ops` | integer or null | cumulative virtio-block counters |
+| `net` | array or null | network devices, or null when the VMM reports none |
+| `net[].device` | string | the VMM's device id, such as `_net0` |
+| `net[].counters` | object | counter name to cumulative value, exactly as the VMM names them |
+
+Every field is always present; an unavailable figure is `null` and is never replaced by a zero, a guess, or a saturating number. Field order is fixed and identical across the CLI `--json` `Result` payload and the REST body (§16.2 equivalence).
+
+Network counter key names are passed through rather than typed, because Firestone has not verified them on a real device: the default vhost-user `passt` path reports no network entries at all, so `net` is `null` for a default machine. Typed network fields are a later amendment, gated on a bare-metal `tap`-mode probe.
+
+### 25.3 Sampling sources (normative)
+
+One sample reads, in order:
+
+1. the reconciled machine state and effective spec, for `status`, `vmm_pid`, `cpus`, and `memory`;
+2. `/proc/<vmm_pid>/stat` fields 14 and 15 (`utime` + `stime`), converted to nanoseconds with `sysconf(_SC_CLK_TCK)`, and `/proc/<vmm_pid>/status` `VmRSS`, converted from kibibytes to bytes;
+3. `GET /api/v1/vm.counters` on the machine's `api.sock`, for the per-device counter map;
+4. `GET /api/v1/vm.info` on the same socket, for `memory_actual_size`.
+
+Field 14 and 15 are located relative to the closing parenthesis of `/proc/<pid>/stat` field 2, because a process name may itself contain spaces and parentheses. `/proc` sampling is best effort and Linux-only: a host without `/proc`, or a VMM that exited between the state read and the sample, yields `null` for `cpu_time_ns` and `rss_bytes` rather than failing the action. A failing `vm.counters` or `vm.info` call fails the action with the VMM API client's error.
+
+`vm.counters` is added to the bounded v53 client as a `GET` with expected status 200, no request body, and a 64 KiB response limit.
+
+**Counter projection.** A device whose counter map carries both `read_bytes` and `write_bytes` is a block device; every other device is a network device. `write_bytes` is published as `written_bytes`. Cloud Hypervisor v53 reports a counter a device has never exercised as a `u64::MAX`-family sentinel — `write_latency_min` and `write_latency_max` are `u64::MAX` on a disk with no writes, and the matching average is derived from those saturating values. Any counter at or above 2^63 is therefore treated as absent: block counters become `null` and network counters are dropped from the map. A sentinel is never surfaced, and no counter Firestone does not publish, such as latency, appears in the payload.
+
+`memory_actual_size` of 0 means the VMM has no actual-size figure and is projected as `null`.
+
+### 25.4 Surfaces
+
+- CLI: `firestone metrics NAME` prints a one-shot human table — sample instant, CPU line, memory line, a block-device table, and one network line — with `-` for every absent figure and no derived rate. `--json` emits the `Result` event unchanged.
+- REST: `GET /v1/machines/{name}/metrics` returns the payload as `application/json` with status 200.
+- Both project the same `Action::Metrics` through the shared dispatcher; neither adds a field the other lacks.
 
 ---
 

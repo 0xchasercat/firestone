@@ -914,6 +914,59 @@
         ]
       }
     },
+    "/v1/machines/{name}/metrics": {
+      "get": {
+        "tags": [
+          "Machines"
+        ],
+        "operationId": "getMachineMetrics",
+        "summary": "Sample machine metrics once",
+        "description": "Returns one cumulative resource sample for a running machine, read from the VMM vm.counters and vm.info endpoints and the host /proc entries for the VMM process. Counters are cumulative since VMM start; clients derive rates from two samples. A machine that is not running returns 409. Request bodies and undocumented query fields are ignored.",
+        "responses": {
+          "200": {
+            "description": "One metrics sample.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MetricsResult"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/Metrics"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Error504"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineName"
+          }
+        ]
+      }
+    },
     "/v1/catalog": {
       "get": {
         "tags": [
@@ -4336,6 +4389,185 @@
           }
         ],
         "description": "Machine image reference containing at least one non-whitespace character."
+      },
+      "MetricsCpu": {
+        "type": "object",
+        "properties": {
+          "vcpus": {
+            "type": "integer",
+            "description": "Guest vCPU count from the machine spec.",
+            "minimum": 1,
+            "maximum": 255
+          },
+          "cpu_time_ns": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Cumulative VMM user plus system time in nanoseconds, or null when the host exposes no /proc sample.",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "vcpus",
+          "cpu_time_ns"
+        ]
+      },
+      "MetricsMemory": {
+        "type": "object",
+        "properties": {
+          "rss_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "VMM resident set size in bytes, or null when the host exposes no /proc sample.",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "allocated_bytes": {
+            "type": "integer",
+            "description": "Guest memory requested by the machine spec, in bytes.",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          },
+          "guest_actual_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Cloud Hypervisor memory_actual_size in bytes, or null when the VMM reports none.",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "rss_bytes",
+          "allocated_bytes",
+          "guest_actual_bytes"
+        ]
+      },
+      "MetricsBlockDevice": {
+        "type": "object",
+        "description": "Cumulative virtio-block counters for one guest disk. A counter the VMM omits, or reports as a saturating sentinel, is null.",
+        "properties": {
+          "device": {
+            "type": "string",
+            "description": "Cloud Hypervisor device id, such as _disk0."
+          },
+          "read_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Bytes read from the device since VMM start.",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "written_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Bytes written to the device since VMM start.",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "read_ops": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Completed reads since VMM start.",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "write_ops": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Completed writes since VMM start.",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "device",
+          "read_bytes",
+          "written_bytes",
+          "read_ops",
+          "write_ops"
+        ]
+      },
+      "MetricsNetDevice": {
+        "type": "object",
+        "description": "Cumulative counters for one guest network device, keyed as the VMM names them because Firestone has not verified v53 network counter names.",
+        "properties": {
+          "device": {
+            "type": "string",
+            "description": "Cloud Hypervisor device id, such as _net0."
+          },
+          "counters": {
+            "type": "object",
+            "description": "Counter name to cumulative value, with saturating sentinels removed.",
+            "additionalProperties": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9223372036854775807
+            }
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "device",
+          "counters"
+        ]
+      },
+      "MetricsResult": {
+        "type": "object",
+        "description": "One cumulative resource sample for a running machine. Firestone runs no metrics daemon and stores no history, so clients derive rates from two samples.",
+        "properties": {
+          "sampled_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "RFC 3339 instant at which the host and VMM sources were read."
+          },
+          "cpu": {
+            "$ref": "#/components/schemas/MetricsCpu"
+          },
+          "memory": {
+            "$ref": "#/components/schemas/MetricsMemory"
+          },
+          "block": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MetricsBlockDevice"
+            }
+          },
+          "net": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "description": "Network devices, or null when the VMM reports none. Cloud Hypervisor v53 reports no network counters under the default vhost-user passt path.",
+            "items": {
+              "$ref": "#/components/schemas/MetricsNetDevice"
+            }
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "sampled_at",
+          "cpu",
+          "memory",
+          "block",
+          "net"
+        ]
       }
     },
     "parameters": {
@@ -5357,6 +5589,30 @@
       },
       "NdjsonError504": {
         "value": "{\"error\":{\"kind\":\"timeout\",\"message\":\"the action timed out\",\"hint\":\"retry with a larger bounded timeout\"}}\n"
+      },
+      "Metrics": {
+        "value": {
+          "sampled_at": "2026-09-02T12:00:00Z",
+          "cpu": {
+            "vcpus": 2,
+            "cpu_time_ns": 9500000000
+          },
+          "memory": {
+            "rss_bytes": 67108864,
+            "allocated_bytes": 2147483648,
+            "guest_actual_bytes": 2147483648
+          },
+          "block": [
+            {
+              "device": "_disk0",
+              "read_bytes": 4096,
+              "written_bytes": 8192,
+              "read_ops": 2,
+              "write_ops": 3
+            }
+          ],
+          "net": null
+        }
       }
     }
   },

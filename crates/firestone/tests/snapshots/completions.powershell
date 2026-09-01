@@ -49,6 +49,7 @@ Register-ArgumentCompleter -Native -CommandName 'firestone' -ScriptBlock {
             [CompletionResult]::new('ssh-config', 'ssh-config', [CompletionResultType]::ParameterValue, 'Print an OpenSSH Host block for the machine')
             [CompletionResult]::new('console', 'console', [CompletionResultType]::ParameterValue, 'Attach to the machine''s hvc0 console')
             [CompletionResult]::new('logs', 'logs', [CompletionResultType]::ParameterValue, 'Print a bounded machine log')
+            [CompletionResult]::new('metrics', 'metrics', [CompletionResultType]::ParameterValue, 'Print one cumulative resource sample for a running machine')
             [CompletionResult]::new('catalog', 'catalog', [CompletionResultType]::ParameterValue, 'Print the merged built-in and user image catalog')
             [CompletionResult]::new('images', 'images', [CompletionResultType]::ParameterValue, 'Manage the owned image store')
             [CompletionResult]::new('doctor', 'doctor', [CompletionResultType]::ParameterValue, 'Check host requirements and optional safe repairs')
@@ -327,6 +328,20 @@ Register-ArgumentCompleter -Native -CommandName 'firestone' -ScriptBlock {
             [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
             break
         }
+        'firestone;metrics' {
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
         'firestone;catalog' {
             [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
             [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
@@ -550,6 +565,7 @@ Register-ArgumentCompleter -Native -CommandName 'firestone' -ScriptBlock {
             [CompletionResult]::new('ssh-config', 'ssh-config', [CompletionResultType]::ParameterValue, 'Print an OpenSSH Host block for the machine')
             [CompletionResult]::new('console', 'console', [CompletionResultType]::ParameterValue, 'Attach to the machine''s hvc0 console')
             [CompletionResult]::new('logs', 'logs', [CompletionResultType]::ParameterValue, 'Print a bounded machine log')
+            [CompletionResult]::new('metrics', 'metrics', [CompletionResultType]::ParameterValue, 'Print one cumulative resource sample for a running machine')
             [CompletionResult]::new('catalog', 'catalog', [CompletionResultType]::ParameterValue, 'Print the merged built-in and user image catalog')
             [CompletionResult]::new('images', 'images', [CompletionResultType]::ParameterValue, 'Manage the owned image store')
             [CompletionResult]::new('doctor', 'doctor', [CompletionResultType]::ParameterValue, 'Check host requirements and optional safe repairs')
@@ -597,6 +613,9 @@ Register-ArgumentCompleter -Native -CommandName 'firestone' -ScriptBlock {
             break
         }
         'firestone;help;logs' {
+            break
+        }
+        'firestone;help;metrics' {
             break
         }
         'firestone;help;catalog' {

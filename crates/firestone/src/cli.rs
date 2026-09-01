@@ -94,6 +94,9 @@ pub enum Command {
     /// Print a bounded machine log.
     Logs(LogsArgs),
 
+    /// Print one cumulative resource sample for a running machine.
+    Metrics(MetricsArgs),
+
     /// Print the merged built-in and user image catalog.
     Catalog,
 
@@ -332,6 +335,12 @@ pub struct LogsArgs {
         value_name = "LINES"
     )]
     pub lines: u32,
+}
+
+/// Arguments accepted by firestone metrics.
+#[derive(Debug, Args)]
+pub struct MetricsArgs {
+    pub name: String,
 }
 
 /// Arguments accepted by firestone images.

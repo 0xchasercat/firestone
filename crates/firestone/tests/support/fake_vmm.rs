@@ -162,6 +162,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 response(&mut stream, "200 OK", body.as_bytes())?;
             }
+            "/api/v1/vm.counters" => {
+                // Mirrors verified Cloud Hypervisor v53 shapes: block devices keyed
+                // by id, latency counters saturated to u64::MAX-family sentinels when
+                // a device has never been written, and no net entries under passt
+                // vhost-user networking.
+                let body = concat!(
+                    "{\"_disk0\":{\"read_bytes\":4096,\"read_latency_avg\":37,",
+                    "\"read_latency_max\":81,\"read_latency_min\":11,\"read_ops\":2,",
+                    "\"write_bytes\":8192,\"write_latency_avg\":9223372036854775815,",
+                    "\"write_latency_max\":18446744073709551615,",
+                    "\"write_latency_min\":18446744073709551615,\"write_ops\":3},",
+                    "\"_disk1\":{\"read_bytes\":0,\"read_latency_avg\":9223372036854775815,",
+                    "\"read_latency_max\":18446744073709551615,",
+                    "\"read_latency_min\":18446744073709551615,\"read_ops\":0,",
+                    "\"write_bytes\":0,\"write_latency_avg\":9223372036854775815,",
+                    "\"write_latency_max\":18446744073709551615,",
+                    "\"write_latency_min\":18446744073709551615,\"write_ops\":0}}"
+                );
+                response(&mut stream, "200 OK", body.as_bytes())?;
+            }
             "/api/v1/vmm.shutdown" => {
                 stream.write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
