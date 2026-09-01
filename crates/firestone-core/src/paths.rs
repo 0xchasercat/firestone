@@ -263,6 +263,17 @@ impl Paths {
         self.config_dir.join("catalog.toml")
     }
 
+    /// The Docker CLI configuration file read for registry credentials (§8.5).
+    ///
+    /// Returns `None` when no home directory is available, which the registry
+    /// client treats exactly like a missing file: anonymous access.
+    #[must_use]
+    pub fn docker_config_file(&self) -> Option<PathBuf> {
+        self.home_dir
+            .as_ref()
+            .map(|home| home.join(".docker").join("config.json"))
+    }
+
     #[must_use]
     pub fn machines_dir(&self) -> PathBuf {
         self.data_dir.join("machines")
@@ -2584,5 +2595,31 @@ mod tests {
         let mut bytes = path.as_os_str().as_bytes().to_vec();
         bytes.extend(std::iter::repeat_n(b'/', count));
         PathBuf::from(OsString::from_vec(bytes))
+    }
+
+    #[test]
+    fn paths_docker_config_file_follows_home_directory() -> Result<(), crate::FirestoneError> {
+        let mut with_home = inputs();
+        with_home.firestone_home = Some(PathBuf::from("/firestone"));
+
+        let paths = Paths::from_inputs(&with_home)?;
+
+        assert_eq!(
+            paths.docker_config_file(),
+            Some(PathBuf::from("/home/alice/.docker/config.json"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn paths_docker_config_file_without_home_is_none() -> Result<(), crate::FirestoneError> {
+        let mut without_home = inputs();
+        without_home.home_dir = None;
+        without_home.firestone_home = Some(PathBuf::from("/firestone"));
+
+        let paths = Paths::from_inputs(&without_home)?;
+
+        assert_eq!(paths.docker_config_file(), None);
+        Ok(())
     }
 }

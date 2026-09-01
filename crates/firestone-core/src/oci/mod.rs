@@ -11,6 +11,7 @@ use std::fmt;
 use crate::error::{ErrorKind, FirestoneError};
 
 pub mod layers;
+pub mod registry;
 
 /// Explicit scheme prefix that always selects the OCI branch.
 pub const OCI_SCHEME_PREFIX: &str = "oci://";

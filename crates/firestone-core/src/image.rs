@@ -512,14 +512,66 @@ impl Clock for SystemClock {
     }
 }
 
-struct HttpResponse {
-    body: Box<dyn Read>,
-    content_length: Option<u64>,
-    content_type: Option<String>,
+pub(crate) struct HttpResponse {
+    pub(crate) body: Box<dyn Read>,
+    pub(crate) content_length: Option<u64>,
+    pub(crate) content_type: Option<String>,
 }
 
-trait HttpSource: Send + Sync {
+/// One request issued through the shared HTTP seam with explicit headers.
+///
+/// The image pull path only ever needs [`HttpSource::get`]; the OCI registry
+/// client (§8.5) additionally needs request headers and an unmapped status
+/// code, so both travel through this same transport rather than a second
+/// client stack.
+pub(crate) struct HttpRequest<'a> {
+    pub(crate) url: &'a Url,
+    pub(crate) headers: &'a [(&'static str, String)],
+}
+
+/// A response whose status line and headers survive the transport.
+pub(crate) struct HttpStatusResponse {
+    pub(crate) status: u16,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: Box<dyn Read>,
+    pub(crate) content_length: Option<u64>,
+}
+
+impl HttpStatusResponse {
+    /// Returns the first value of one header, matched case-insensitively.
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+pub(crate) trait HttpSource: Send + Sync {
     fn get(&self, url: &Url) -> Result<HttpResponse, FirestoneError>;
+
+    /// Issues one request with explicit headers, preserving the status code.
+    ///
+    /// The default implementation delegates to [`HttpSource::get`], which maps
+    /// every non-success status to an error, and therefore reports `200`.
+    fn send(&self, request: &HttpRequest<'_>) -> Result<HttpStatusResponse, FirestoneError> {
+        let response = self.get(request.url)?;
+        let headers = response
+            .content_type
+            .map(|value| vec![("content-type".to_owned(), value)])
+            .unwrap_or_default();
+        Ok(HttpStatusResponse {
+            status: 200,
+            headers,
+            body: response.body,
+            content_length: response.content_length,
+        })
+    }
+}
+
+/// Builds the shared strict-transport HTTP client used by every image source.
+pub(crate) fn shared_http_source() -> Result<Arc<dyn HttpSource>, FirestoneError> {
+    Ok(Arc::new(ReqwestHttpSource::new()?))
 }
 
 struct ReqwestHttpSource {
@@ -575,6 +627,34 @@ impl HttpSource for ReqwestHttpSource {
             body: Box::new(response),
             content_length,
             content_type,
+        })
+    }
+
+    fn send(&self, request: &HttpRequest<'_>) -> Result<HttpStatusResponse, FirestoneError> {
+        let mut builder = self.client.get(request.url.clone());
+        for (name, value) in request.headers {
+            builder = builder.header(*name, value.as_str());
+        }
+        let response = builder
+            .send()
+            .map_err(|source| download_error(request.url, source))?;
+        let status = response.status().as_u16();
+        let content_length = response.content_length();
+        let headers = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_owned(), value.to_owned()))
+            })
+            .collect();
+        Ok(HttpStatusResponse {
+            status,
+            headers,
+            body: Box::new(response),
+            content_length,
         })
     }
 }
