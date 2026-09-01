@@ -2734,6 +2734,7 @@ mod tests {
             },
             supervision: None,
             forwards_pending: false,
+            image_pending: false,
         };
         let mut expected = serde_json::to_vec_pretty(&view)?;
         expected.push(b'\n');
@@ -2784,6 +2785,7 @@ mod tests {
             },
             supervision: None,
             forwards_pending: true,
+            image_pending: false,
         };
         let mut renderer =
             Renderer::new(Vec::new(), Vec::new(), RenderOptions::human(false, false));

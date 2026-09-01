@@ -95,6 +95,7 @@ const TEMPLATES: &[(&str, &str)] = &[
         "ui/_image_picker.html",
         include_str!("../../templates/ui/_image_picker.html"),
     ),
+    ("ui/edit.html", include_str!("../../templates/ui/edit.html")),
     (
         "ui/palette.html",
         include_str!("../../templates/ui/palette.html"),

@@ -1038,9 +1038,14 @@ async fn the_ui_never_offers_a_second_mutation_surface() -> TestResult {
 
     // The create dialog and its picker fragment are held to the same rule. The
     // dialog's own POST /ui/machines is the one documented exception; the
-    // picker is a read and must declare no write at all, and the in-dialog
-    // pull goes to /v1/images/pull through app.js like every other pull.
-    for uri in ["/ui/machines/new", "/ui/machines/new/images"] {
+    // picker is a read and must declare no write at all, the edit dialog writes
+    // through PATCH /v1 and POST /v1/…/resize from app.js, and the in-dialog
+    // pull goes to /v1/images/pull like every other pull.
+    for uri in [
+        "/ui/machines/new",
+        "/ui/machines/new/images",
+        "/ui/machines/web/edit",
+    ] {
         let (_, _, body) = get_fragment(&router, uri).await?;
         for forbidden in [
             "hx-post=\"/ui/machines/",
@@ -1259,6 +1264,157 @@ async fn the_metrics_strip_renders_only_for_a_running_machine() -> TestResult {
     Ok(())
 }
 
+/// The embedded runtime has to at least be parseable.
+///
+/// A merge once spliced a new section into the middle of `applySgr`, leaving
+/// three braces unclosed. `app.js` stopped parsing, every line of UI
+/// JavaScript stopped running, and nothing in the suite noticed — the Rust
+/// side only ever asserted that the bytes were served. This is not a
+/// JavaScript parser: it skips comments and string literals and counts braces,
+/// which is exactly the damage a bad merge does.
+///
+/// One caveat, deliberately loud rather than silent: a regular-expression
+/// literal containing a brace or a quote would trip this. Write such a pattern
+/// with a character class, or build it with `new RegExp`.
+#[test]
+fn the_embedded_runtime_script_closes_every_block() {
+    const APP_JS: &str = include_str!("../../assets/ui/app.js");
+
+    let mut depth: i32 = 0;
+    let mut quote: Option<char> = None;
+    let mut in_block_comment = false;
+    let bytes: Vec<char> = APP_JS.chars().collect();
+    let mut index = 0;
+    while index < bytes.len() {
+        let current = bytes[index];
+        let next = bytes.get(index + 1).copied();
+        if in_block_comment {
+            if current == '*' && next == Some('/') {
+                in_block_comment = false;
+                index += 2;
+                continue;
+            }
+            index += 1;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if current == '\\' {
+                index += 2;
+                continue;
+            }
+            if current == delimiter {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        match (current, next) {
+            ('/', Some('*')) => {
+                in_block_comment = true;
+                index += 2;
+                continue;
+            }
+            ('/', Some('/')) => {
+                while index < bytes.len() && bytes[index] != '\n' {
+                    index += 1;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        match current {
+            '"' | '\'' | '`' => quote = Some(current),
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            _ => {}
+        }
+        assert!(depth >= 0, "app.js closes a block it never opened");
+        index += 1;
+    }
+
+    assert_eq!(depth, 0, "app.js does not close every block it opens");
+}
+
+/// The same view with observable drift: the dispatcher, which owns the catalog,
+/// reports both the image reference and the forwards as pending. Both flags are
+/// server-computed and false for a machine that is not running, so the fixture
+/// mirrors that rather than inventing a state the dispatcher cannot produce.
+fn machine_view_with_drift(name: &str, status: &str) -> Value {
+    let mut view = machine_view(name, status);
+    view["spec"]["image"] = json!("ubuntu:24.10");
+    view["forwards_pending"] = json!(status == "running");
+    view["image_pending"] = json!(status == "running");
+    view
+}
+
+/// A running machine created from a catalog alias or default: the spec keeps
+/// what was typed, the state keeps the canonical reference the pull resolved,
+/// and the dispatcher therefore reports no image drift at all.
+fn machine_view_with_catalog_alias(name: &str) -> Value {
+    let mut view = machine_view(name, "running");
+    view["spec"]["image"] = json!("ubuntu");
+    view["state"]["image"]["ref"] = json!("ubuntu:24.04");
+    view
+}
+
+/// Reads one attribute value out of rendered HTML and undoes the escaping
+/// minijinja applied, so a JSON payload carried in an attribute can be parsed.
+fn attribute(body: &str, name: &str) -> String {
+    let needle = format!("{name}=\"");
+    let Some(start) = body.find(&needle).map(|at| at + needle.len()) else {
+        return String::new();
+    };
+    let end = body[start..].find('"').map_or(body.len(), |at| start + at);
+    body[start..end]
+        .replace("&quot;", "\"")
+        .replace("&#34;", "\"")
+        .replace("&#x22;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&#x2f;", "/")
+        .replace("&#x2F;", "/")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+#[tokio::test]
+async fn the_edit_dialog_prefills_every_field_group_from_the_machine_spec() -> TestResult {
+    let router = app(FakeDispatcher {
+        machine: machine_view_with_mounts("web", "running"),
+        ..FakeDispatcher::default()
+    })?;
+    let (status, _, body) = get_fragment(&router, "/ui/machines/web/edit").await?;
+    assert_eq!(status, StatusCode::OK);
+
+    // Scalars come back as the exact strings the CLI and REST accept.
+    assert!(body.contains(r#"name="cpus""#) && body.contains(r#"value="4""#));
+    assert!(body.contains(r#"name="memory" value="8G""#));
+    assert!(body.contains(r#"name="disk" value="40G""#));
+    assert!(body.contains(r#"name="user""#) && body.contains(r#"value="ubuntu""#));
+    assert!(body.contains(r#"name="image""#) && body.contains(r#"value="ubuntu:24.04""#));
+
+    // Network, forwards and mounts render the same macros the create dialog
+    // uses, against the same names.
+    assert!(body.contains(r#"<option value="passt" selected>"#));
+    assert!(body.contains(r#"name="tap""#) && body.contains(r#"name="mac""#));
+    assert!(body.contains(r#"name="forward""#));
+    assert!(
+        body.contains("127.0.0.1:8080:80"),
+        "forwards were not prefilled"
+    );
+    assert!(body.contains("data-fs-forward-template"));
+    assert!(body.contains("data-fs-mount-template"));
+    assert!(body.contains("work:ro"), "the mount row was not prefilled");
+
+    // The dialog opens itself and identifies the machine it edits.
+    assert!(body.contains("data-fs-autoopen"));
+    assert!(body.contains(r#"data-fs-machine="web""#));
+    // The CSP forbids inline styles, here as everywhere else.
+    assert!(!body.contains(" style=\""), "the dialog emitted a style");
+    Ok(())
+}
+
 #[tokio::test]
 async fn the_metrics_strip_ships_an_empty_state_and_no_fabricated_numbers() -> TestResult {
     // Counters are cumulative, so a rate needs two samples. Until the client
@@ -1292,6 +1448,37 @@ async fn the_metrics_strip_ships_an_empty_state_and_no_fabricated_numbers() -> T
 }
 
 #[tokio::test]
+async fn the_edit_dialog_original_matches_every_rendered_control() -> TestResult {
+    // patchFromForm sends only what changed, by comparing each control against
+    // this projection. If the two ever disagree the dialog would report every
+    // field as edited, so the equality is asserted here rather than in a
+    // browser.
+    let router = app(FakeDispatcher {
+        machine: machine_view_with_mounts("web", "stopped"),
+        ..FakeDispatcher::default()
+    })?;
+    let (_, _, body) = get_fragment(&router, "/ui/machines/web/edit").await?;
+    let original: Value = serde_json::from_str(&attribute(&body, "data-fs-original"))?;
+
+    assert_eq!(original["image"], json!("ubuntu:24.04"));
+    assert_eq!(original["cpus"], json!("4"));
+    assert_eq!(original["memory"], json!("8G"));
+    assert_eq!(original["disk"], json!("40G"));
+    assert_eq!(original["user"], json!("ubuntu"));
+    assert_eq!(original["net_mode"], json!("passt"));
+    assert_eq!(original["forward"], json!("127.0.0.1:8080:80"));
+    assert_eq!(original["tap"], json!(""));
+    assert_eq!(original["mac"], json!(""));
+    assert_eq!(original["mounts"], json!("/srv/project:/work:ro"));
+
+    // Every one of those is also what the control itself carries.
+    for value in ["8G", "40G", "ubuntu", "127.0.0.1:8080:80"] {
+        assert!(body.contains(value), "{value} is not in the rendered form");
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn the_metrics_strip_sits_outside_the_polled_detail_region() -> TestResult {
     // `#fs-detail-live` is swapped every five seconds. The strip must not be
     // inside it, or each poll would throw away the client's ring buffer.
@@ -1315,6 +1502,22 @@ async fn the_metrics_strip_sits_outside_the_polled_detail_region() -> TestResult
         !head.contains("data-fs-metrics="),
         "the polled head fragment must not carry the strip"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_running_edit_dialog_separates_live_fields_from_restart_fields() -> TestResult {
+    let router = app(FakeDispatcher::default())?;
+    let (_, _, body) = get_fragment(&router, "/ui/machines/web/edit").await?;
+
+    assert!(body.contains(r#"data-fs-running="true""#));
+    // vCPUs and memory are the only two that change a live VM (§9.5).
+    assert!(body.contains(r#"data-fs-applies="live""#));
+    assert!(body.contains("/v1/machines/web/resize"));
+    // The disk grows at the next start; everything else waits for a restart.
+    assert!(body.contains(r#"data-fs-applies="next-start""#));
+    assert!(body.contains(r#"data-fs-applies="restart""#));
+    assert!(body.contains("applies after restart"));
     Ok(())
 }
 
@@ -1471,6 +1674,41 @@ async fn the_terminal_page_opens_the_tab_the_url_asks_for() -> TestResult {
 }
 
 #[tokio::test]
+async fn a_stopped_edit_dialog_promises_nothing_live() -> TestResult {
+    let router = app(FakeDispatcher {
+        machine: machine_view("web", "stopped"),
+        ..FakeDispatcher::default()
+    })?;
+    let (_, _, body) = get_fragment(&router, "/ui/machines/web/edit").await?;
+
+    assert!(body.contains(r#"data-fs-running="false""#));
+    assert!(
+        !body.contains("data-fs-applies"),
+        "a stopped machine must not badge a field as live or deferred"
+    );
+    assert!(body.contains("data-fs-edit-note"));
+    assert!(body.contains("the next time it starts"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_detail_head_offers_the_edit_dialog_for_every_machine() -> TestResult {
+    for status in ["running", "stopped", "starting"] {
+        let router = app(FakeDispatcher {
+            machine: machine_view("web", status),
+            ..FakeDispatcher::default()
+        })?;
+        let (_, _, head) = get_fragment(&router, "/ui/machines/web/head").await?;
+        assert!(
+            head.contains(r#"hx-get="/ui/machines/web/edit""#),
+            "a {status} machine is not offered an edit dialog"
+        );
+        assert!(head.contains(r##"hx-target="#fs-dialog-slot""##));
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_stopped_machine_still_renders_a_terminal_page_that_can_explain_itself() -> TestResult {
     let router = app(FakeDispatcher {
         machine: machine_view("staging-db", "stopped"),
@@ -1548,6 +1786,35 @@ async fn only_the_terminal_page_relaxes_the_content_security_policy() -> TestRes
 }
 
 #[tokio::test]
+async fn the_detail_head_reports_observable_drift_only_while_running() -> TestResult {
+    let router = app(FakeDispatcher {
+        machine: machine_view_with_drift("web", "running"),
+        ..FakeDispatcher::default()
+    })?;
+    let (_, _, head) = get_fragment(&router, "/ui/machines/web/head").await?;
+    assert!(head.contains(r#"data-fs-drift="server""#), "no drift pill");
+    assert!(head.contains("spec drift · image"));
+    assert!(head.contains("port forwards"));
+
+    // A machine that is not running has nothing applied to disagree with.
+    let stopped = app(FakeDispatcher {
+        machine: machine_view_with_drift("web", "stopped"),
+        ..FakeDispatcher::default()
+    })?;
+    let (_, _, quiet) = get_fragment(&stopped, "/ui/machines/web/head").await?;
+    assert!(
+        !quiet.contains("data-fs-drift"),
+        "a stopped machine cannot have drifted from a running instance"
+    );
+
+    // And a running machine whose spec matches what it booted says nothing.
+    let matched = app(FakeDispatcher::default())?;
+    let (_, _, silent) = get_fragment(&matched, "/ui/machines/web/head").await?;
+    assert!(!silent.contains("data-fs-drift"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_failed_terminal_page_falls_back_to_the_strict_policy() -> TestResult {
     // The marker is attached to the rendered page, never to the error path,
     // so a machine that cannot be read cannot hand out the weaker policy.
@@ -1585,6 +1852,29 @@ async fn the_terminal_link_is_offered_only_while_a_machine_is_running() -> TestR
         !body.contains("/terminal\""),
         "a stopped machine offers a terminal that cannot connect"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_edit_dialog_warns_when_a_shared_folder_sets_a_tag() -> TestResult {
+    // HOST:GUEST[:ro] cannot carry a MountSpec tag, so a list rebuild would
+    // drop one from rows nobody touched. Untagged mounts say nothing.
+    let quiet = app(FakeDispatcher {
+        machine: machine_view_with_mounts("web", "running"),
+        ..FakeDispatcher::default()
+    })?;
+    let (_, _, body) = get_fragment(&quiet, "/ui/machines/web/edit").await?;
+    assert!(!body.contains("data-fs-mount-tags"));
+
+    let mut tagged = machine_view_with_mounts("web", "running");
+    tagged["spec"]["mount"][0]["tag"] = json!("project");
+    let router = app(FakeDispatcher {
+        machine: tagged,
+        ..FakeDispatcher::default()
+    })?;
+    let (_, _, warned) = get_fragment(&router, "/ui/machines/web/edit").await?;
+    assert!(warned.contains("data-fs-mount-tags"), "no tag warning");
+    assert!(warned.contains("firestone.toml"));
     Ok(())
 }
 
@@ -1659,6 +1949,24 @@ async fn the_terminal_page_offers_no_mutation_surface_of_its_own() -> TestResult
         source.matches("fetch(").count(),
         1,
         "term.js makes a request beyond the one machine read"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_detail_head_reports_no_image_drift_for_a_catalog_alias() -> TestResult {
+    // `firestone run ubuntu` stores `ubuntu` in the spec and the resolved
+    // `ubuntu:24.04` in the state. The two strings differ and the machine has
+    // not drifted, so the head must stay silent: this pill once accused every
+    // default-reference machine of a drift no restart could clear.
+    let router = app(FakeDispatcher {
+        machine: machine_view_with_catalog_alias("web"),
+        ..FakeDispatcher::default()
+    })?;
+    let (_, _, head) = get_fragment(&router, "/ui/machines/web/head").await?;
+    assert!(
+        !head.contains("data-fs-drift"),
+        "a catalog alias or default reference is not image drift"
     );
     Ok(())
 }

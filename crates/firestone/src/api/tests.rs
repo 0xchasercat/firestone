@@ -456,6 +456,7 @@ async fn machine_routes_project_forwards_pending_and_the_document_advertises_it(
         },
         supervision: None,
         forwards_pending: true,
+        image_pending: false,
     };
 
     let cases = [

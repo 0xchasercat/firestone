@@ -1,0 +1,149 @@
+{#
+  Rendered into #fs-dialog-slot and opened by app.js, exactly like the create
+  dialog — and, unlike it, this form posts nothing to `/ui`.
+
+  Every write goes from the browser straight to the documented REST routes:
+  `PATCH /v1/machines/{name}` for the spec, and `POST /v1/machines/{name}/resize`
+  for a live vCPU or memory change on a running machine. The `/ui` side stays a
+  read, so there is still exactly one mutation surface (SPEC §16.5).
+
+  The controls are the same `_spec_fields.html` macros the create dialog uses,
+  against the same field names, so a value edited here is the same string the
+  CLI and REST already accept. The form also carries `data-fs-create-form`,
+  because that attribute is what the shared spec-field machinery in app.js keys
+  on: it marks "a form built from these macros", not "the create dialog".
+#}
+{% import "ui/_spec_fields.html" as f %}
+<dialog class="fs-dialog fs-dialog--wide" id="fs-edit" data-fs-autoopen
+        aria-labelledby="fs-edit-title">
+  <form data-fs-create-form data-fs-edit-form
+        data-fs-machine="{{ machine.name }}"
+        data-fs-running="{{ 'true' if machine.is_running else 'false' }}"
+        data-fs-original="{{ original }}">
+    <div class="fs-dialog__head">
+      <div class="fs-dialog__title" id="fs-edit-title">Edit {{ machine.name }}</div>
+      <span class="fs-panel__note">PATCH /v1/machines/{{ machine.name }}</span>
+    </div>
+
+    <div class="fs-dialog__body">
+      <div class="fs-form">
+        {% if machine.is_running %}
+        <div class="fs-inline-notice" role="status">
+          <span>{{ machine.name }} is running. vCPUs and memory change live; every other
+                field is written to the spec and takes effect on the next start.</span>
+        </div>
+        {% else %}
+        <div class="fs-field__hint" data-fs-edit-note>
+          {{ machine.name }} is {{ machine.status }} · every field applies the next time it starts
+        </div>
+        {% endif %}
+
+        <div class="fs-editgroup">
+          <div class="fs-editgroup__head">
+            <span class="fs-editgroup__title">Sizing</span>
+            {% if machine.is_running %}
+            <span class="fs-applies fs-applies--live" data-fs-applies="live">live</span>
+            {% endif %}
+          </div>
+          <div class="fs-form__grid">
+            <div class="fs-field">
+              <label class="fs-field__label" for="fs-edit-cpus">vCPUs</label>
+              <input class="fs-input fs-input--mono" id="fs-edit-cpus" name="cpus"
+                     type="number" min="1" max="255" value="{{ form.cpus }}">
+              <div class="fs-field__hint">
+                {% if machine.is_running %}POST /v1/machines/{{ machine.name }}/resize{% else %}1 through 255{% endif %}
+              </div>
+            </div>
+            {{ f.size_field(
+                "fs-edit-memory", "memory", "Memory", memory, "", "G is GiB · 1024 MiB"
+            ) }}
+          </div>
+        </div>
+
+        <div class="fs-editgroup">
+          <div class="fs-editgroup__head">
+            <span class="fs-editgroup__title">Disk</span>
+            {% if machine.is_running %}
+            <span class="fs-applies" data-fs-applies="next-start">applies at next start</span>
+            {% endif %}
+          </div>
+          {{ f.size_field(
+              "fs-edit-disk", "disk", "Disk", disk, "",
+              "grows on the next start · a shrink is refused"
+          ) }}
+        </div>
+
+        <div class="fs-editgroup">
+          <div class="fs-editgroup__head">
+            <span class="fs-editgroup__title">Image and guest user</span>
+            {% if machine.is_running %}
+            <span class="fs-applies" data-fs-applies="restart">applies after restart</span>
+            {% endif %}
+          </div>
+          {{ f.text_field(
+              "fs-edit-image", "image", "Image", form.image, "",
+              "a catalog reference, an https:// URL, or a local path", "", true, false
+          ) }}
+          {{ f.text_field(
+              "fs-edit-user", "user", "Guest user", form.user, "", "", "", true, false
+          ) }}
+        </div>
+
+        <div class="fs-editgroup">
+          <div class="fs-editgroup__head">
+            <span class="fs-editgroup__title">Network</span>
+            {% if machine.is_running %}
+            <span class="fs-applies" data-fs-applies="restart">applies after restart</span>
+            {% endif %}
+          </div>
+          {{ f.network_fields(form, errors, net_modes) }}
+        </div>
+
+        <div class="fs-editgroup">
+          <div class="fs-editgroup__head">
+            <span class="fs-editgroup__title">Port forwards</span>
+            {% if machine.is_running %}
+            <span class="fs-applies" data-fs-applies="restart">applies after restart</span>
+            {% endif %}
+          </div>
+          {{ f.forward_rows(form, errors) }}
+        </div>
+
+        <div class="fs-editgroup">
+          <div class="fs-editgroup__head">
+            <span class="fs-editgroup__title">Shared folders</span>
+            {% if machine.is_running %}
+            <span class="fs-applies" data-fs-applies="restart">applies after restart</span>
+            {% endif %}
+          </div>
+          {# The row grammar is HOST:GUEST[:ro] and has no place for a
+             MountSpec tag. Deleting or reordering rows resends the whole list
+             built from that grammar, which would drop a configured tag from
+             every row — including rows nobody touched. Say so rather than
+             lose it quietly (SPEC §16.5). #}
+          {% if mount_tags %}
+          <div class="fs-inline-notice fs-inline-notice--fail" role="status"
+               data-fs-mount-tags>
+            <span>a shared folder here sets a virtiofs tag, which these rows cannot
+                  express.</span>
+            <span class="fs-inline-notice__hint">adding a row is safe; deleting or
+                  reordering rows would drop every tag, so change those in
+                  firestone.toml</span>
+          </div>
+          {% endif %}
+          {{ f.mount_rows(form, errors) }}
+        </div>
+
+        {# Errors the ErrorEnvelope could not attach to one control land here.
+           A `usage` rejection from the PATCH route is one of them: the body is
+           parsed as a single document, so it names no field. #}
+        <div data-fs-edit-banner></div>
+      </div>
+    </div>
+
+    <div class="fs-dialog__foot">
+      <button type="button" class="fs-btn" data-fs-dialog-close>Cancel</button>
+      <button type="submit" class="fs-btn fs-btn--primary" data-fs-edit-submit>Save changes</button>
+    </div>
+  </form>
+</dialog>

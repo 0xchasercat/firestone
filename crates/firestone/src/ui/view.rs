@@ -393,6 +393,16 @@ pub struct MachineDetail {
     pub is_running: bool,
     pub meta: Vec<Pair>,
     pub spec_groups: Vec<SpecGroup>,
+    /// Spec forwards this running machine has not applied yet (§12.4).
+    pub forwards_pending: bool,
+    /// Editable spec fields that observably differ from what the running
+    /// instance is using, named as an operator would name them.
+    ///
+    /// Only fields `state.json` actually records can be compared, so this is
+    /// deliberately narrow and never a claim that the rest agrees: see
+    /// [`observable_drift`].
+    pub drift: Vec<&'static str>,
+    pub drift_summary: String,
 }
 
 impl MachineDetail {
@@ -405,6 +415,7 @@ impl MachineDetail {
             _ => (Some("start"), "Start"),
         };
 
+        let drift = observable_drift(view);
         Self {
             name: name.to_owned(),
             status: status.to_owned(),
@@ -419,8 +430,47 @@ impl MachineDetail {
             is_running: view.state.status == MachineStatus::Running,
             meta: meta_rows(&view.state, view.supervision.is_some()),
             spec_groups: spec_groups(&view.spec),
+            forwards_pending: view.forwards_pending,
+            drift_summary: drift.join(", "),
+            drift,
         }
     }
+}
+
+/// Spec fields that provably disagree with the machine that is running.
+///
+/// `state.json` records the image reference, the MAC and the forwards the
+/// running instance actually applied, and nothing else about the spec. So this
+/// reports exactly those three and stays silent about the rest rather than
+/// guessing: an empty list means "nothing observable has drifted", never
+/// "the running machine matches the spec". Changes to fields the state does not
+/// record — cpus, memory, disk, user, mounts, network mode — are announced by
+/// the edit dialog itself when it saves them against a running machine, and
+/// that client-side marker is cleared the next time the machine starts.
+///
+/// Image and forward drift are decided by the dispatcher rather than here: both
+/// need a canonical comparison this projection cannot make. `state.image.ref`
+/// holds the catalog's canonical `distro:version`, so `ubuntu` in the spec is
+/// the same image as `ubuntu:24.04` in the state, and only the side holding the
+/// catalog can say so (§8.2).
+fn observable_drift(view: &MachineView) -> Vec<&'static str> {
+    if view.state.status != MachineStatus::Running {
+        return Vec::new();
+    }
+    let mut drift = Vec::new();
+    if view.image_pending {
+        drift.push("image");
+    }
+    if view.forwards_pending {
+        drift.push("port forwards");
+    }
+    if let (Some(spec_mac), Some(state_mac)) =
+        (view.spec.network.mac.as_ref(), view.state.mac.as_deref())
+        && !spec_mac.to_string().eq_ignore_ascii_case(state_mac)
+    {
+        drift.push("mac");
+    }
+    drift
 }
 
 fn status_token(status: MachineStatus) -> &'static str {

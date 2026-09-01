@@ -1911,8 +1911,7 @@
     }
   });
 
-  /* ==========================================================================
-   * SECTION: live utilization                                        (M6-25)
+  /* ===================================================================   * SECTION: live utilization                                        (M6-25)
    * ==========================================================================
    *
    * `GET /v1/machines/{name}/metrics` is one sample of cumulative counters.
@@ -2609,4 +2608,590 @@
       }
     }
   });
+=======
+  /* ========================================================= machine edit ==
+   *
+   * The edit dialog is the create dialog's fields pointed at a machine that
+   * already exists, and it writes the way every other mutation in this UI
+   * writes: straight to `/v1`. Two routes, chosen by what actually changed.
+   *
+   *   - PATCH /v1/machines/{name} takes a *sparse* MachineSpecPatch. Only the
+   *     fields the operator touched are sent, and an optional field they
+   *     emptied is sent as a `clear` entry rather than as an empty string,
+   *     because that is what the patch grammar means by "remove this" (§7).
+   *   - POST /v1/machines/{name}/resize takes cpus and memory on a running
+   *     machine: those two are the only fields that change a live VM rather
+   *     than the file it will boot from next time (§9.5).
+   *
+   * Repeatable lists are the one place the patch grammar and a form disagree.
+   * An action patch *appends* to `network.forward` and `mount`, and a layer may
+   * not clear and set the same leaf, so a row the operator deleted cannot be
+   * expressed in a single request. Deleting or reordering rows therefore sends
+   * two patches with the clear first: if the second is rejected the list is
+   * empty, which is always a valid spec, and the dialog says exactly that and
+   * keeps the rows for a retry. Appending rows, and emptying a list, each still
+   * take one request.
+   *
+   * Nothing here parses a Firestone grammar. A value the server cannot accept
+   * comes back as an ErrorEnvelope and is rendered against `error.field` when
+   * it names one; the only client-side refusals are the two the browser needs
+   * to build the request body at all: a field that must not be empty, and a
+   * mount row that cannot be turned into a MountSpec object.
+   * ==================================================================== */
+
+  var EDIT_FORM = "[data-fs-edit-form]";
+
+  /* Machines whose spec was saved while they were running, in a way the server
+   * cannot observe (ui/view.rs `observable_drift` explains which fields those
+   * are). Held for this page session only, and dropped as soon as the machine
+   * is seen in any state but running. */
+  var editedWhileRunning = Object.create(null);
+
+  /* ErrorInfo.field speaks dotted spec paths; the form speaks the field names
+   * the CLI and REST already accept. This is the whole translation. */
+  var EDIT_FIELD_CONTROLS = {
+    image: "image",
+    cpus: "cpus",
+    memory: "memory",
+    disk: "disk",
+    user: "user",
+    "network.mode": "net_mode",
+    "network.tap": "tap",
+    "network.mac": "mac",
+    "network.forward": "forward",
+    mount: "mounts"
+  };
+
+  /* Fields with no meaningful empty value: emptying one is a mistake, not a
+   * request to clear it, and the patch grammar has no clear path for any of
+   * them. */
+  var EDIT_REQUIRED = {
+    image: "an image reference is required",
+    cpus: "cpus must be 1 through 255",
+    memory: "a memory size is required",
+    disk: "a disk size is required",
+    user: "a guest user is required"
+  };
+
+  function editFormOf(node) {
+    return node && node.closest ? node.closest(EDIT_FORM) : null;
+  }
+
+  function trimmedText(value) {
+    return value === undefined || value === null ? "" : String(value).trim();
+  }
+
+  function editControl(form, path) {
+    var name =
+      EDIT_FIELD_CONTROLS[path] ||
+      EDIT_FIELD_CONTROLS[String(path).split("[")[0]];
+    return name ? qs('[name="' + name + '"]', form) : null;
+  }
+
+  /* ------------------------------------------------------- field errors -- */
+
+  function clearEditErrors(form) {
+    fieldsOf(form, "[data-fs-edit-error]").forEach(function (node) {
+      node.remove();
+    });
+    fieldsOf(form, '[aria-invalid="true"]').forEach(function (node) {
+      node.removeAttribute("aria-invalid");
+    });
+    var banner = qs("[data-fs-edit-banner]", form);
+    if (banner) {
+      banner.textContent = "";
+    }
+  }
+
+  function showEditFieldError(form, path, message, hint) {
+    var control = editControl(form, path);
+    if (!control) {
+      return false;
+    }
+    var field = control.closest(".fs-field") || control.parentNode;
+    control.setAttribute("aria-invalid", "true");
+    var error = el("div", "fs-field__error", message);
+    error.setAttribute("data-fs-edit-error", "");
+    field.appendChild(error);
+    if (hint) {
+      var note = el("div", "fs-field__hint", hint);
+      note.setAttribute("data-fs-edit-error", "");
+      field.appendChild(note);
+    }
+    return true;
+  }
+
+  function showEditBanner(form, message, hint, severe) {
+    var banner = qs("[data-fs-edit-banner]", form);
+    if (!banner) {
+      return;
+    }
+    var notice = el(
+      "div",
+      "fs-inline-notice" + (severe ? " fs-inline-notice--fail" : "")
+    );
+    notice.setAttribute("role", severe ? "alert" : "status");
+    notice.appendChild(el("span", null, message));
+    if (hint) {
+      notice.appendChild(el("span", "fs-inline-notice__hint", hint));
+    }
+    banner.textContent = "";
+    banner.appendChild(notice);
+  }
+
+  /* A rejection is answered beside the field it names. An error that names no
+   * field — a `usage` rejection of the whole body, a conflict about the machine
+   * rather than about one value — has nowhere better to go than the dialog. */
+  function reportEditError(form, envelope) {
+    var info = (envelope && envelope.error) || {};
+    var message = info.message || "the edit was rejected";
+    if (info.field && showEditFieldError(form, info.field, message, info.hint)) {
+      return;
+    }
+    showEditBanner(form, message, info.hint, true);
+  }
+
+  /* --------------------------------------------------------- the patch --- */
+
+  function readSpecForm(form) {
+    return {
+      image: valueOf(form, '[name="image"]'),
+      cpus: valueOf(form, '[name="cpus"]'),
+      memory: valueOf(form, '[name="memory"]'),
+      disk: valueOf(form, '[name="disk"]'),
+      user: valueOf(form, '[name="user"]'),
+      net_mode: valueOf(form, '[name="net_mode"]'),
+      forward: valueOf(form, '[name="forward"]'),
+      tap: valueOf(form, '[name="tap"]'),
+      mac: valueOf(form, '[name="mac"]'),
+      mounts: valueOf(form, '[name="mounts"]')
+    };
+  }
+
+  function splitList(raw, separator) {
+    return trimmedText(raw)
+      .split(separator)
+      .map(function (item) {
+        return item.trim();
+      })
+      .filter(function (item) {
+        return item.length > 0;
+      });
+  }
+
+  function sameList(before, after) {
+    if (before.length !== after.length) {
+      return false;
+    }
+    for (var index = 0; index < before.length; index += 1) {
+      if (before[index] !== after[index]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /* What one repeatable list needs, given the patch grammar's append merge:
+   * nothing, a clear, an append of the new tail, or a clear followed by the
+   * whole list in a second patch. */
+  function listChange(before, after) {
+    if (sameList(before, after)) {
+      return { mode: "same", values: [] };
+    }
+    if (!after.length) {
+      return { mode: "clear", values: [] };
+    }
+    if (
+      before.length < after.length &&
+      sameList(before, after.slice(0, before.length))
+    ) {
+      return { mode: "append", values: after.slice(before.length) };
+    }
+    return { mode: "replace", values: after };
+  }
+
+  /* cpus is the one numeric leaf in the patch. A value that is not a whole
+   * number is passed through unchanged rather than coerced: the route rejects
+   * it, which is the same answer the CLI would give. */
+  function numericLeaf(text) {
+    return /^[0-9]+$/.test(text) ? Number(text) : text;
+  }
+
+  /* The ByteSize grammar, exactly: a bare integer is MiB, a `M`/`m` suffix is
+   * MiB, a `G`/`g` suffix is GiB. Anything else is not a size and is left to
+   * the server to reject. Sizes are compared as byte counts rather than as the
+   * strings the unit select composed, so re-entering 4096M as 4G is correctly
+   * seen as no change and sends no patch. */
+  function sizeBytes(text) {
+    var match = /^([0-9]+)([MmGg]?)$/.exec(trimmedText(text));
+    if (!match) {
+      return null;
+    }
+    var unit = match[2].toLowerCase() === "g" ? 1024 * 1024 * 1024 : 1024 * 1024;
+    return Number(match[1]) * unit;
+  }
+
+  /* True when two size fields mean different amounts. Unparsable text falls
+   * back to a text comparison so a typo still reaches the server. */
+  function sizeChanged(before, after) {
+    var left = sizeBytes(before);
+    var right = sizeBytes(after);
+    if (left === null || right === null) {
+      return trimmedText(before) !== trimmedText(after);
+    }
+    return left !== right;
+  }
+
+  /* Builds the request plan for one edit. Pure: it reads the form it is given
+   * and the original projection it is given, and touches nothing else. */
+  function patchFromForm(form, original) {
+    var before = original || {};
+    var after = readSpecForm(form);
+    var running = form.getAttribute("data-fs-running") === "true";
+
+    var plan = { patches: [], resize: null, replaced: [], errors: {} };
+    var patch = {};
+    var network = {};
+    var clear = [];
+    var second = null;
+
+    var SIZE_KEYS = { memory: true, disk: true };
+
+    function changed(key) {
+      if (SIZE_KEYS[key]) {
+        return sizeChanged(before[key], after[key]);
+      }
+      return after[key] !== trimmedText(before[key]);
+    }
+
+    Object.keys(EDIT_REQUIRED).forEach(function (key) {
+      if (changed(key) && !after[key]) {
+        plan.errors[key] = EDIT_REQUIRED[key];
+      }
+    });
+
+    if (changed("image")) {
+      patch.image = after.image;
+    }
+    if (changed("user")) {
+      patch.user = after.user;
+    }
+    if (changed("disk")) {
+      patch.disk = after.disk;
+    }
+
+    /* A running machine resizes; a stopped one is only ever a spec change. */
+    if (running) {
+      if (changed("cpus") || changed("memory")) {
+        plan.resize = {};
+        if (changed("cpus")) {
+          plan.resize.cpus = numericLeaf(after.cpus);
+        }
+        if (changed("memory")) {
+          plan.resize.memory = after.memory;
+        }
+      }
+    } else {
+      if (changed("cpus")) {
+        patch.cpus = numericLeaf(after.cpus);
+      }
+      if (changed("memory")) {
+        patch.memory = after.memory;
+      }
+    }
+
+    if (changed("net_mode")) {
+      network.mode = after.net_mode;
+    }
+    if (changed("tap")) {
+      if (after.tap) {
+        network.tap = after.tap;
+      } else {
+        clear.push("network.tap");
+      }
+    }
+    if (changed("mac")) {
+      if (after.mac) {
+        network.mac = after.mac;
+      } else {
+        clear.push("network.mac");
+      }
+    }
+
+    var forwards = listChange(
+      splitList(before.forward, ","),
+      splitList(after.forward, ",")
+    );
+    if (forwards.mode === "clear") {
+      clear.push("network.forward");
+    } else if (forwards.mode === "append") {
+      network.forward = forwards.values;
+    } else if (forwards.mode === "replace") {
+      clear.push("network.forward");
+      second = second || {};
+      second.network = { forward: forwards.values };
+      plan.replaced.push("port forwards");
+    }
+
+    var mounts = listChange(
+      splitList(before.mounts, "\n"),
+      splitList(after.mounts, "\n")
+    );
+    var mountValues = [];
+    for (var index = 0; index < mounts.values.length; index += 1) {
+      var parsed = splitMount(mounts.values[index]);
+      if (!parsed) {
+        plan.errors.mount =
+          mounts.values[index] + " is not HOST:GUEST[:ro]";
+        mountValues = null;
+        break;
+      }
+      mountValues.push({
+        host: parsed.host,
+        guest: parsed.guest,
+        readonly: parsed.readonly
+      });
+    }
+    if (mounts.mode === "clear") {
+      clear.push("mount");
+    } else if (mountValues && mounts.mode === "append") {
+      patch.mount = mountValues;
+    } else if (mountValues && mounts.mode === "replace") {
+      clear.push("mount");
+      second = second || {};
+      second.mount = mountValues;
+      plan.replaced.push("shared folders");
+    }
+
+    if (Object.keys(network).length) {
+      patch.network = network;
+    }
+    if (clear.length) {
+      patch.clear = clear;
+    }
+    if (Object.keys(patch).length) {
+      plan.patches.push(patch);
+    }
+    if (second) {
+      plan.patches.push(second);
+    }
+    return plan;
+  }
+
+  /* ------------------------------------------------------------ writing -- */
+
+  async function sendSpecPatch(name, patch) {
+    var response = await fetch("/v1/machines/" + encodeURIComponent(name), {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(patch)
+    });
+    if (response.ok) {
+      return null;
+    }
+    var envelope;
+    try {
+      envelope = await response.json();
+    } catch (error) {
+      envelope = null;
+    }
+    return isErrorEnvelope(envelope)
+      ? envelope
+      : {
+          error: {
+            kind: "generic",
+            message: "the server returned " + response.status,
+            hint: "check that firestone serve is still running"
+          }
+        };
+  }
+
+  /* The live half. resize streams NDJSON like every other action, so it uses
+   * the same drawer the lifecycle buttons use. */
+  async function runResize(name, body) {
+    var terminal = await streamAction(
+      "/v1/machines/" + encodeURIComponent(name) + "/resize",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/x-ndjson"
+        },
+        body: JSON.stringify(body)
+      },
+      function (record) {
+        pushStreamLine(name, record);
+      }
+    );
+    return isErrorEnvelope(terminal) ? terminal : null;
+  }
+
+  async function submitEdit(form) {
+    var submit = qs("[data-fs-edit-submit]", form);
+    if (submit && submit.disabled) {
+      return;
+    }
+    var name = form.getAttribute("data-fs-machine");
+    var running = form.getAttribute("data-fs-running") === "true";
+    clearEditErrors(form);
+
+    var original;
+    try {
+      original = JSON.parse(form.getAttribute("data-fs-original") || "{}");
+    } catch (error) {
+      original = {};
+    }
+
+    var plan = patchFromForm(form, original);
+    var problems = Object.keys(plan.errors);
+    if (problems.length) {
+      problems.forEach(function (path) {
+        if (!showEditFieldError(form, path, plan.errors[path])) {
+          showEditBanner(form, plan.errors[path], null, true);
+        }
+      });
+      return;
+    }
+    if (!plan.patches.length && !plan.resize) {
+      showEditBanner(
+        form,
+        "nothing changed",
+        "edit a field, or close the dialog",
+        false
+      );
+      return;
+    }
+
+    if (submit) {
+      submit.disabled = true;
+      submit.setAttribute("aria-busy", "true");
+    }
+    markStreaming("edit:" + name, true);
+
+    var applied = [];
+    var failed = null;
+    var afterClear = false;
+    try {
+      for (var index = 0; index < plan.patches.length; index += 1) {
+        failed = await sendSpecPatch(name, plan.patches[index]);
+        if (failed) {
+          afterClear = index > 0 && plan.replaced.length > 0;
+          break;
+        }
+        applied.push("PATCH /v1/machines/" + name);
+      }
+      if (!failed && plan.resize) {
+        failed = await runResize(name, plan.resize);
+        if (!failed) {
+          applied.push("POST /v1/machines/" + name + "/resize");
+        }
+      }
+    } catch (error) {
+      failed = { error: { kind: "generic", message: String(error) } };
+    } finally {
+      markStreaming("edit:" + name, false);
+      closeDrawer(name);
+      if (submit) {
+        submit.disabled = false;
+        submit.removeAttribute("aria-busy");
+      }
+    }
+
+    if (failed) {
+      reportEditError(form, failed);
+      if (afterClear) {
+        showEditBanner(
+          form,
+          "the " +
+            plan.replaced.join(" and ") +
+            " list was emptied before this was rejected, so it is now empty",
+          "fix the rows above and save again",
+          true
+        );
+      }
+      /* Something may still have been written before the rejection, so the
+       * page is re-read either way rather than left showing stale values. */
+      refreshFromServer();
+      return;
+    }
+
+    var dialog = form.closest("dialog");
+    if (dialog) {
+      dialog.close();
+    }
+    var slot = qs("#fs-dialog-slot");
+    if (slot) {
+      slot.innerHTML = "";
+    }
+    /* A resize-only edit applies live *and* persists the spec, so nothing is
+     * left pending and the pill would be a lie. Only a spec patch — the fields
+     * the running VM cannot take now — raises it. */
+    if (running && plan.patches.length) {
+      editedWhileRunning[name] = true;
+    }
+    toast("saved " + name, applied.join(" · "), "ok");
+    refreshFromServer();
+    applyClientDrift();
+  }
+
+  /* ---------------------------------------------------------- drift pill -- */
+
+  /* The server proves drift for the three fields state.json records. For every
+   * other editable field there is nothing to compare against, so the pill is
+   * driven by the one thing the browser does know: this session saved a spec
+   * change while the machine was running. It is dropped the moment the machine
+   * is seen in any other state, and a page reload drops it too — it is a
+   * reminder, never a record. */
+  function applyClientDrift() {
+    Object.keys(editedWhileRunning).forEach(function (name) {
+      var head = qs('[data-fs-row="' + CSS.escape(name) + '"]');
+      if (!head) {
+        return;
+      }
+      var status = qs("[data-status]", head);
+      if (status && status.getAttribute("data-status") !== "running") {
+        delete editedWhileRunning[name];
+        return;
+      }
+      var ident = qs(".fs-detail-head__ident", head);
+      if (!ident || qs("[data-fs-drift]", ident)) {
+        return;
+      }
+      var pill = el("span", "fs-drift", "spec drift · edited while running");
+      pill.setAttribute("data-fs-drift", "client");
+      pill.title =
+        "the spec was saved while " +
+        name +
+        " was running; restart it to apply the change";
+      ident.appendChild(pill);
+    });
+  }
+
+  /* --------------------------------------------------------- listeners -- */
+
+  /* Capture, and registered after the composition listener above, so the raw
+   * forward and mount fields are already canonical by the time the patch is
+   * built from them. */
+  document.addEventListener(
+    "submit",
+    function (event) {
+      var form = editFormOf(event.target);
+      if (!form) {
+        return;
+      }
+      event.preventDefault();
+      submitEdit(form);
+    },
+    true
+  );
+
+  document.body.addEventListener("htmx:afterSwap", applyClientDrift);
+  document.addEventListener("DOMContentLoaded", applyClientDrift);
+
+  /* Exposed for isolated testing, like the ANSI helpers above; nothing else
+   * reads them. */
+  window.firestoneEdit = {
+    patchFromForm: patchFromForm,
+    listChange: listChange
+  };
 })();

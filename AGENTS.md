@@ -22,6 +22,7 @@ Read `docs/PROJECT_STATUS.md` before starting work. Update the row for your task
 - Never log cloud-init contents.
 - Add unit or integration coverage for every behavior changed.
 - Test names use `subject_condition_expected`.
+- In `crates/firestone/assets/ui/app.js`, keep braces and quotes out of regular-expression literals: use a character class (`[{]`) or `new RegExp("…")`. The `the_embedded_runtime_script_closes_every_block` guard counts braces outside comments and strings, and a literal brace or quote inside a pattern makes it fail on correct code.
 
 Before committing, run:
 

@@ -1033,6 +1033,43 @@ where
     }
 }
 
+// ------------------------------------------------------------------- edit --
+
+/// The machine edit dialog, prefilled from the machine's own spec.
+///
+/// A read, like every other `/ui` fragment. The dialog itself writes through
+/// `PATCH /v1/machines/{name}` and `POST /v1/machines/{name}/resize` from the
+/// browser, so the UI still offers exactly one mutation surface (§16.5).
+///
+/// The prefill is deliberately the same [`CreateForm`] projection the create
+/// dialog renders: identical field names, identical grammars, one place where
+/// a `MachineSpec` becomes editable text. `original` carries that same
+/// projection as JSON so the browser can send a *sparse* patch — only what the
+/// operator actually changed — rather than a full spec rewrite.
+pub async fn edit_form(State(state): State<UiState>, Path(name): Path<String>) -> Response {
+    let result = async {
+        let view = show_machine(&state, &name).await?;
+        let machine = MachineDetail::new(&name, &view);
+        let form = CreateForm::from_defaults(&view.spec);
+        let original = serde_json::to_string(&form).unwrap_or_else(|_| "{}".to_owned());
+        render(
+            "ui/edit.html",
+            context! {
+                machine => machine,
+                form => form,
+                original => original,
+                errors => BTreeMap::<String, String>::new(),
+                memory => SizeField::split(&form.memory),
+                disk => SizeField::split(&form.disk),
+                net_modes => ["passt", "tap", "none"],
+                mount_tags => view.spec.mounts.iter().any(|mount| mount.tag.is_some()),
+            },
+        )
+    }
+    .await;
+    fragment(result)
+}
+
 // ------------------------------------------------------------------- tabs --
 
 fn tab_template(tab: &str) -> &'static str {
