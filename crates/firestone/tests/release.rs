@@ -56,14 +56,19 @@ fn dependency_pins() -> Vec<(&'static str, &'static str, &'static str)> {
                 "58088758f601a04ef85b09cf23db5530d51edc039ed47afbf2264c5b762cb568",
             ),
             (
+                "mkfs-ext4",
+                "1.47.3",
+                "f1ed0b2b8b14a29e4edccf2bb44e2fb81e63a9bf74286746057915655795b987",
+            ),
+            (
                 "passt",
                 "2025_02_17.a1e48a0",
-                "40e59201765c60a0a5bbd0f2caae1aae3fd8f9a9a0628a835159fb2f17ff7025",
+                "a60b0b5e54e6f48caa5984b0a6b21938a9e57ba2222cddb9c0ca021f10e9b10e",
             ),
             (
                 "qemu-img",
                 "8.2.2",
-                "30bff329fe1001635cafcfebddc68a1c824d25110c66f968b428c4cf4785d75d",
+                "7d7f32b1f6861140a95c4daa31c013a888dcc02c04551136f05e7da519d7e0ed",
             ),
             (
                 "rust-hypervisor-firmware",

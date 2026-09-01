@@ -69,7 +69,7 @@ FINAL_SIGNAL_MASK: set[signal.Signals] | None = None
 # literal cannot catch a lock edited without updating its pin.
 EXPECTED_FILE_HASHES = {
     "catalog/images.toml": "23affd021f17f46f52ce909ec6c9e1b524cee46d54e8cd71f3db32fd7f5cb028",
-    "deps.toml": "20e8023d5c8d829ecdf688019ada96a12df74e5eb0f2d8b24a7a8f83eb55e202",
+    "deps.toml": "b9ebfe1c9ce3f6e9fb1ad678f7902cf0844b6cb0829204b5ec7f8d5eba339a95",
     "docs/verification/doctor-matrix.md": "c3254636863e741ae237f61b86b1fca0bbc8d097f1f40f799d090325e4eeb844",
     "scripts/m1-kvm-e2e.py": "719660526334393f2cb5df6b0b7d2eaf5a106f6e41674fdf3feb9476da11d124",
     "scripts/m2-kvm-e2e.py": "152a8f0ae19a0f46b2415186f545e4109c1d4ca47dbd57e335e0757e72f6d66f",
@@ -90,11 +90,11 @@ EXPECTED_RELEASE_DEPENDENCIES = {
     },
     "passt": {
         "version": "2025_02_17.a1e48a0",
-        "sha256": "40e59201765c60a0a5bbd0f2caae1aae3fd8f9a9a0628a835159fb2f17ff7025",
+        "sha256": "a60b0b5e54e6f48caa5984b0a6b21938a9e57ba2222cddb9c0ca021f10e9b10e",
     },
     "qemu-img": {
         "version": "8.2.2",
-        "sha256": "30bff329fe1001635cafcfebddc68a1c824d25110c66f968b428c4cf4785d75d",
+        "sha256": "7d7f32b1f6861140a95c4daa31c013a888dcc02c04551136f05e7da519d7e0ed",
     },
     "rust-hypervisor-firmware": {
         "version": "0.5.0",
@@ -112,6 +112,10 @@ EXPECTED_LAZY_DEPENDENCIES = {
     "cloud-hypervisor-kernel": {
         "version": "ch-release-v6.16.9-20260508",
         "sha256": "58088758f601a04ef85b09cf23db5530d51edc039ed47afbf2264c5b762cb568",
+    },
+    "mkfs-ext4": {
+        "version": "1.47.3",
+        "sha256": "f1ed0b2b8b14a29e4edccf2bb44e2fb81e63a9bf74286746057915655795b987",
     },
 }
 
