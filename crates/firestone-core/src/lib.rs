@@ -16,6 +16,7 @@ pub mod event;
 pub mod image;
 pub mod lock;
 pub mod network;
+pub mod oci;
 pub mod paths;
 pub mod readiness;
 pub mod result;
