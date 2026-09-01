@@ -572,6 +572,28 @@ async fn streaming_routes_project_exact_actions_and_ndjson() -> TestResult {
                 ),
             },
         },
+        Case {
+            uri: "/v1/system/prune",
+            body: None,
+            result_action: "system-prune",
+            expected_action: Action::SystemPrune {
+                machines: false,
+                images: false,
+                force: false,
+                dry_run: false,
+            },
+        },
+        Case {
+            uri: "/v1/system/prune",
+            body: Some(json!({"machines":true,"images":true,"force":true,"dry_run":true})),
+            result_action: "system-prune",
+            expected_action: Action::SystemPrune {
+                machines: true,
+                images: true,
+                force: true,
+                dry_run: true,
+            },
+        },
     ];
 
     for case in cases {

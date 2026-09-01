@@ -251,6 +251,65 @@ pub struct SnapshotRemoveResult {
     pub snapshot: String,
 }
 
+/// Which class of artifact one prune entry belongs to (SPEC §26).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PruneKind {
+    /// A stale per-machine runtime directory.
+    Runtime,
+    /// A rotated `console.log.previous`.
+    Log,
+    /// An unfinished `.partial` or `.removing-` artifact.
+    Partial,
+    /// An unfinished snapshot directory under `snapshots/`.
+    SnapshotPartial,
+    /// A stored base image no machine and no snapshot references.
+    Image,
+    /// A whole machine removed by the destructive `machines` tier.
+    Machine,
+}
+
+impl PruneKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Runtime => "runtime",
+            Self::Log => "log",
+            Self::Partial => "partial",
+            Self::SnapshotPartial => "snapshot-partial",
+            Self::Image => "image",
+            Self::Machine => "machine",
+        }
+    }
+}
+
+impl std::fmt::Display for PruneKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `pad` rather than `write_str`: the CLI prints the kind in a fixed
+        // column, and `write_str` would silently ignore the width.
+        formatter.pad(self.as_str())
+    }
+}
+
+/// One artifact system prune removed, or would remove under `--dry-run`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruneItem {
+    pub kind: PruneKind,
+    /// Stable identifier: a machine name, an image id, or a data-directory
+    /// relative path, depending on `kind` (SPEC §26).
+    pub id: String,
+    /// Bytes the artifact occupied on disk, measured before deletion.
+    pub bytes: u64,
+}
+
+/// Everything one system prune reclaimed, or would reclaim (SPEC §26).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruneResult {
+    pub dry_run: bool,
+    pub reclaimed_bytes: u64,
+    pub removed: Vec<PruneItem>,
+}
+
 /// Resolved process-wide roots exposed by the version action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionPaths {
@@ -262,10 +321,89 @@ pub struct VersionPaths {
 #[cfg(test)]
 mod tests {
     use super::{
-        RunResult, ShellResult, SnapshotListResult, SnapshotResult, SnapshotSummary,
-        SshConfigResult,
+        PruneItem, PruneKind, PruneResult, RunResult, ShellResult, SnapshotListResult,
+        SnapshotResult, SnapshotSummary, SshConfigResult,
     };
     use crate::snapshot::SnapshotKind;
+
+    #[test]
+    fn prune_result_serializes_every_kind_as_its_stable_lowercase_word()
+    -> Result<(), serde_json::Error> {
+        let result = PruneResult {
+            dry_run: true,
+            reclaimed_bytes: 6,
+            removed: vec![
+                PruneItem {
+                    kind: PruneKind::Runtime,
+                    id: "dev".to_owned(),
+                    bytes: 1,
+                },
+                PruneItem {
+                    kind: PruneKind::Log,
+                    id: "dev/console.log.previous".to_owned(),
+                    bytes: 1,
+                },
+                PruneItem {
+                    kind: PruneKind::Partial,
+                    id: "machines/dev/disk.qcow2.partial".to_owned(),
+                    bytes: 1,
+                },
+                PruneItem {
+                    kind: PruneKind::SnapshotPartial,
+                    id: "dev/snapshots/.partial-snap".to_owned(),
+                    bytes: 1,
+                },
+                PruneItem {
+                    kind: PruneKind::Image,
+                    id: "image-0123".to_owned(),
+                    bytes: 1,
+                },
+                PruneItem {
+                    kind: PruneKind::Machine,
+                    id: "old".to_owned(),
+                    bytes: 1,
+                },
+            ],
+        };
+        let encoded = serde_json::to_value(&result)?;
+        assert_eq!(encoded["dry_run"], true);
+        assert_eq!(encoded["reclaimed_bytes"], 6);
+        let kinds = encoded["removed"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| item["kind"].clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            kinds,
+            vec![
+                serde_json::json!("runtime"),
+                serde_json::json!("log"),
+                serde_json::json!("partial"),
+                serde_json::json!("snapshot-partial"),
+                serde_json::json!("image"),
+                serde_json::json!("machine"),
+            ]
+        );
+        assert_eq!(serde_json::from_value::<PruneResult>(encoded)?, result);
+        for kind in [
+            PruneKind::Runtime,
+            PruneKind::Log,
+            PruneKind::Partial,
+            PruneKind::SnapshotPartial,
+            PruneKind::Image,
+            PruneKind::Machine,
+        ] {
+            assert_eq!(
+                serde_json::to_value(kind)?,
+                serde_json::json!(kind.to_string())
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn snapshot_results_serialize_kind_as_a_stable_lowercase_word() -> Result<(), serde_json::Error>

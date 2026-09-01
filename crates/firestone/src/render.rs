@@ -11,6 +11,7 @@ use console::measure_text_width;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
 
 use firestone_core::CloneResult;
+use firestone_core::PruneResult;
 use firestone_core::{
     CatalogEntrySummary, CatalogFirmware, DoctorCheckId, DoctorReport, DoctorStatus, ErrorInfo,
     ErrorKind, Event, EventSink, FirestoneError, Level, LogsResult, MachineRecord, MachineStatus,
@@ -965,6 +966,11 @@ where
             "images-pull" => self.render_image_pull_result(&payload),
             "images-rm" => self.render_image_remove_result(&payload),
             "images-prune" => self.render_image_prune_result(&payload),
+            "system-prune" => {
+                let result: PruneResult = serde_json::from_value(payload)
+                    .map_err(|error| invalid_result_payload("system-prune", error))?;
+                self.render_system_prune_result(&result)
+            }
             "version" => {
                 let result: VersionResult = serde_json::from_value(payload)
                     .map_err(|error| invalid_result_payload("version", error))?;
@@ -1198,6 +1204,29 @@ where
             ),
         )
     }
+    /// Prints one prune row per artifact, then the reclaimed total (SPEC §26).
+    fn render_system_prune_result(&mut self, result: &PruneResult) -> Result<(), FirestoneError> {
+        for item in &result.removed {
+            write_line(
+                &mut self.stdout,
+                format_args!("{:<16} {} · {}", item.kind, item.id, HumanBytes(item.bytes)),
+            )?;
+        }
+        let verb = if result.dry_run {
+            "would reclaim"
+        } else {
+            "reclaimed"
+        };
+        write_line(
+            &mut self.stdout,
+            format_args!(
+                "{verb} {} from {} artifact(s)",
+                HumanBytes(result.reclaimed_bytes),
+                result.removed.len()
+            ),
+        )
+    }
+
     fn render_other_result(&mut self, payload: serde_json::Value) -> Result<(), FirestoneError> {
         if let serde_json::Value::String(message) = payload {
             return write_line(&mut self.stdout, format_args!("{message}"));
@@ -2209,6 +2238,38 @@ mod tests {
         assert_eq!(
             String::from_utf8(stdout)?,
             "ubuntu:24.04 · x86_64 · 1 kB · cached\nremoved image-id · 10 B freed\npruned 2 image(s) · 2 kB freed\n"
+        );
+        assert!(stderr.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn system_prune_result_lists_each_artifact_and_names_the_mode() -> TestResult {
+        let mut renderer =
+            Renderer::new(Vec::new(), Vec::new(), RenderOptions::human(false, false));
+        renderer.emit(Event::Result {
+            action: "system-prune".to_owned(),
+            payload: json!({
+                "dry_run": false,
+                "reclaimed_bytes": 12288,
+                "removed": [
+                    {"kind": "runtime", "id": "ghost", "bytes": 4096},
+                    {"kind": "snapshot-partial", "id": "dev/snapshots/.partial-x", "bytes": 8192}
+                ]
+            }),
+        })?;
+        renderer.emit(Event::Result {
+            action: "system-prune".to_owned(),
+            payload: json!({"dry_run": true, "reclaimed_bytes": 0, "removed": []}),
+        })?;
+
+        let (stdout, stderr) = renderer.into_writers();
+        assert_eq!(
+            String::from_utf8(stdout)?,
+            "runtime          ghost · 4.1 kB\n\
+             snapshot-partial dev/snapshots/.partial-x · 8.2 kB\n\
+             reclaimed 12 kB from 2 artifact(s)\n\
+             would reclaim 0 B from 0 artifact(s)\n"
         );
         assert!(stderr.is_empty());
         Ok(())

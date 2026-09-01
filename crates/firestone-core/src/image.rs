@@ -482,6 +482,16 @@ pub struct ImagePruneResult {
     pub bytes_freed: u64,
 }
 
+/// One image-store artifact system prune reported, with its measured size.
+///
+/// `id` is a stored image id for an unreferenced base pair and the partial
+/// file's own name for an interrupted download (SPEC §26).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PrunedImageArtifact {
+    pub id: String,
+    pub bytes: u64,
+}
+
 /// A validated machine overlay and its exact backing file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OverlayInfo {
@@ -1109,6 +1119,92 @@ impl ImageStore {
             removed,
             bytes_freed,
         })
+    }
+
+    /// Reports, and unless `dry_run` removes, interrupted download artifacts.
+    ///
+    /// These are the `.pull-<digest>.{source,stored}.partial` files any locked
+    /// image-store operation already discards; system prune measures them
+    /// first so the reclaimed bytes can be reported (SPEC §26). Nothing else in
+    /// the store is touched, so this is safe in the default prune scope.
+    pub fn prune_partials(
+        &self,
+        dry_run: bool,
+    ) -> Result<Vec<PrunedImageArtifact>, FirestoneError> {
+        if !self.store_exists_for_read()? {
+            return Ok(Vec::new());
+        }
+        let _lock = self.acquire_lock()?;
+        let mut names = Vec::new();
+        for entry in fs::read_dir(self.paths.images_dir())
+            .map_err(|source| image_file_error("read", &self.paths.images_dir(), source))?
+        {
+            let entry =
+                entry.map_err(|source| directory_entry_error(&self.paths.images_dir(), source))?;
+            let name = entry.file_name().into_string().map_err(|_| {
+                FirestoneError::new(
+                    ErrorKind::Dependency,
+                    "images directory contains a non-UTF-8 file name",
+                )
+                .with_hint("move the unknown file out of the images directory")
+            })?;
+            if is_known_partial_name(&name) {
+                names.push(name);
+            }
+        }
+        names.sort();
+
+        let mut pruned = Vec::with_capacity(names.len());
+        let mut removed_any = false;
+        for name in names {
+            let path = self.paths.image_file(&name)?;
+            validate_regular_nofollow(&path, "image partial")?;
+            let bytes = crate::snapshot::allocated_bytes(&path)?;
+            if !dry_run {
+                fs::remove_file(&path)
+                    .map_err(|source| image_file_error("remove stale", &path, source))?;
+                removed_any = true;
+            }
+            pruned.push(PrunedImageArtifact { id: name, bytes });
+        }
+        if removed_any {
+            sync_directory(&self.paths.images_dir(), "images directory")?;
+        }
+        Ok(pruned)
+    }
+
+    /// Reports, and unless `dry_run` removes, every unreferenced stored image.
+    ///
+    /// References are the same extended set `images rm` and `images prune`
+    /// refuse to break: a machine's pinned `state.json` image and every
+    /// published snapshot's `metadata.json` image (SPEC §23, §26). Sizes are
+    /// the bytes the base and its sidecar occupy on disk, measured before the
+    /// pair is unpublished, so a dry run and a real run report the same
+    /// numbers for the same starting state.
+    pub fn prune_unreferenced(
+        &self,
+        dry_run: bool,
+    ) -> Result<Vec<PrunedImageArtifact>, FirestoneError> {
+        if !self.store_exists_for_read()? {
+            return Ok(Vec::new());
+        }
+        let _lock = self.acquire_lock()?;
+        let references = self.image_references()?;
+        let mut pruned = Vec::new();
+        for image in self.list_locked()? {
+            let id = image.metadata.id;
+            if references.contains_key(&id) {
+                continue;
+            }
+            let bytes = crate::snapshot::allocated_bytes(&image.path)?.saturating_add(
+                crate::snapshot::allocated_bytes(&self.paths.image_metadata(&id)?)?,
+            );
+            if !dry_run {
+                self.remove_pair(&id)?;
+            }
+            pruned.push(PrunedImageArtifact { id, bytes });
+        }
+        Ok(pruned)
     }
 
     /// Pins immutable identity in state before lazily creating the machine overlay.
@@ -2098,6 +2194,13 @@ impl ImageStore {
                 )
                 .with_hint("move the invalid machine directory aside")
             })?;
+            // A leading dot is reserved for Firestone's own working entries
+            // (`.removing-<name>`, `.creating`). A removal tombstone is doomed
+            // debris, not a machine, so the base it still names is not a
+            // reference (SPEC §26).
+            if name.starts_with('.') {
+                continue;
+            }
             let machine_dir = self.paths.machine_dir(&name)?;
             self.paths
                 .validate_owned_data_directory(&machine_dir, "machine directory", false)?;
@@ -5486,6 +5589,116 @@ else:
             .ok_or("expected a snapshot-referenced image refusal")?;
         assert_eq!(refusal.kind(), ErrorKind::Conflict);
         assert!(refusal.message().contains("rolled"), "{refusal}");
+        Ok(())
+    }
+
+    #[test]
+    fn prune_unreferenced_keeps_machine_and_snapshot_pinned_images_in_both_modes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let mut events = Vec::new();
+        let pinned_source = fixture.write_source("pinned.qcow2", b"QFI\xFBSTATE-PINNED")?;
+        let snapshotted_source =
+            fixture.write_source("snapshotted.qcow2", b"QFI\xFBSNAP-PINNED")?;
+        let loose_source = fixture.write_source("loose.qcow2", b"QFI\xFBLOOSE")?;
+        let pinned = fixture
+            .store
+            .pull(&local_request(&pinned_source, &fixture.root), &mut events)?;
+        let snapshotted = fixture.store.pull(
+            &local_request(&snapshotted_source, &fixture.root),
+            &mut events,
+        )?;
+        let loose = fixture
+            .store
+            .pull(&local_request(&loose_source, &fixture.root), &mut events)?;
+
+        let pinned_state = machine_state(
+            &fixture.paths,
+            "pinned",
+            StateImage {
+                r#ref: pinned_source.to_string_lossy().into_owned(),
+                id: Some(pinned.metadata.id.clone()),
+                sha256: Some(pinned.metadata.source_sha256.clone()),
+            },
+        )?;
+        let mut lock_events = Vec::new();
+        let _pinned_lock =
+            create_machine(&fixture.paths, "pinned", &pinned_state, &mut lock_events)?;
+        let rolled_state = machine_state(
+            &fixture.paths,
+            "rolled",
+            StateImage {
+                r#ref: snapshotted_source.to_string_lossy().into_owned(),
+                id: None,
+                sha256: None,
+            },
+        )?;
+        let _rolled_lock =
+            create_machine(&fixture.paths, "rolled", &rolled_state, &mut lock_events)?;
+        let snapshots = fixture.paths.machine_snapshots_dir("rolled")?;
+        crate::snapshot::ensure_snapshot_directory(&snapshots)?;
+        let snapshot_dir = snapshots.join("snap-20260902-123456");
+        crate::snapshot::ensure_snapshot_directory(&snapshot_dir)?;
+        crate::atomic::write_json_with_mode(
+            &Paths::snapshot_metadata(&snapshot_dir),
+            &crate::snapshot::SnapshotMetadata {
+                schema_version: crate::snapshot::SNAPSHOT_SCHEMA_VERSION,
+                kind: crate::snapshot::SnapshotKind::Cold,
+                created_at: "2026-09-02T12:34:56Z".to_owned(),
+                image_id: Some(snapshotted.metadata.id.clone()),
+                firestone_version: "0.1.4".to_owned(),
+                disk_bytes: 4096,
+                memory_bytes: None,
+            },
+            0o600,
+        )?;
+
+        let planned = fixture.store.prune_unreferenced(true)?;
+        assert_eq!(
+            planned
+                .iter()
+                .map(|artifact| artifact.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![loose.metadata.id.as_str()]
+        );
+        assert!(planned.iter().all(|artifact| artifact.bytes > 0));
+        assert!(fixture.paths.image_base(&loose.metadata.id)?.exists());
+
+        let acted = fixture.store.prune_unreferenced(false)?;
+        assert_eq!(acted, planned);
+        assert!(!fixture.paths.image_base(&loose.metadata.id)?.exists());
+        assert!(fixture.paths.image_base(&pinned.metadata.id)?.exists());
+        assert!(fixture.paths.image_base(&snapshotted.metadata.id)?.exists());
+        assert!(fixture.store.prune_unreferenced(false)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn prune_partials_measures_interrupted_downloads_before_removing_them()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        fixture.store.ensure_store()?;
+        let digest = "a".repeat(64);
+        let partial = fixture
+            .paths
+            .image_file(&format!(".pull-{digest}.stored.partial"))?;
+        fs::write(&partial, vec![7_u8; 8192])?;
+        fs::set_permissions(&partial, fs::Permissions::from_mode(0o600))?;
+        let kept = fixture.paths.image_file("keep-me.txt")?;
+        fs::write(&kept, b"not a partial")?;
+        fs::set_permissions(&kept, fs::Permissions::from_mode(0o600))?;
+
+        let planned = fixture.store.prune_partials(true)?;
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].id, format!(".pull-{digest}.stored.partial"));
+        assert!(planned[0].bytes >= 8192, "{planned:?}");
+        assert!(partial.exists());
+
+        let acted = fixture.store.prune_partials(false)?;
+        assert_eq!(acted, planned);
+        assert!(!partial.exists());
+        assert!(kept.exists());
+        assert!(fixture.store.prune_partials(false)?.is_empty());
         Ok(())
     }
 

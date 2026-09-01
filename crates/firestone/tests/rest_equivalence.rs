@@ -1366,3 +1366,105 @@ fn real_cli_lock_blocks_rest_patch_until_editor_releases() -> TestResult {
     assert!(output.status.success());
     Ok(())
 }
+
+#[test]
+fn real_cli_and_unix_rest_project_the_same_system_prune_payload() -> TestResult {
+    let fixture = Fixture::new()?;
+    let server = Server::spawn(&fixture)?;
+    require_success(
+        &fixture.create_fake_machine("pruned", "normal", None)?,
+        "prune machine create",
+    )?;
+    let previous = fixture
+        .home
+        .join("data/machines/pruned/console.log.previous");
+    fs::write(&previous, vec![b'p'; 8192])?;
+    fs::set_permissions(&previous, fs::Permissions::from_mode(0o600))?;
+
+    // The destructive tier is refused before anything is inspected, and the
+    // refusal names the member the caller left out (SPEC section 26).
+    let refusal = http_request(
+        &server.socket,
+        "POST",
+        "/v1/system/prune",
+        br#"{"machines":true}"#,
+        Some("application/json"),
+    )?;
+    assert_eq!(refusal.status, 400);
+    let refusal_body: Value = serde_json::from_slice(&refusal.body)?;
+    assert_eq!(refusal_body["error"]["kind"], "usage");
+    assert!(
+        refusal_body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("force")),
+        "{refusal_body}"
+    );
+    assert!(previous.exists(), "a refused prune removed an artifact");
+
+    // A non-interactive CLI run is refused the same way, with exit code 2.
+    let cli_refusal = fixture.json_command(&["system", "prune", "--machines"])?;
+    assert_eq!(cli_refusal.status.code(), Some(2));
+    assert_eq!(error_bytes(&cli_refusal.stdout)?, refusal.body);
+    assert!(previous.exists(), "a refused CLI prune removed an artifact");
+
+    let cli = fixture.json_command(&["system", "prune", "--dry-run"])?;
+    require_success(&cli, "CLI system prune dry run")?;
+    let cli = terminal_result(&cli.stdout, "system-prune")?;
+    assert_eq!(cli.payload["dry_run"], true);
+    assert!(
+        cli.payload["removed"]
+            .as_array()
+            .is_some_and(|removed| removed
+                .iter()
+                .any(|item| item["kind"] == "log" && item["id"] == "pruned/console.log.previous")),
+        "{}",
+        cli.payload
+    );
+    assert!(previous.exists(), "a dry run removed an artifact");
+
+    let rest = http_request(
+        &server.socket,
+        "POST",
+        "/v1/system/prune",
+        br#"{"dry_run":true}"#,
+        None,
+    )?;
+    assert_eq!(rest.status, 200);
+    assert_eq!(
+        rest.headers.get("content-type").map(String::as_str),
+        Some("application/x-ndjson")
+    );
+    let rest = terminal_result(&rest.body, "system-prune")?;
+    assert_eq!(
+        rest.payload_bytes, cli.payload_bytes,
+        "system prune stable payload bytes or field order changed"
+    );
+
+    // The real run removes exactly what both previews listed.
+    let acted = http_request(&server.socket, "POST", "/v1/system/prune", b"", None)?;
+    assert_eq!(acted.status, 200);
+    let acted = terminal_result(&acted.body, "system-prune")?;
+    assert_eq!(acted.payload["dry_run"], false);
+    assert_eq!(acted.payload["removed"], cli.payload["removed"]);
+    assert_eq!(
+        acted.payload["reclaimed_bytes"],
+        cli.payload["reclaimed_bytes"]
+    );
+    assert!(!previous.exists(), "the acted prune kept the rotated log");
+    assert!(
+        fixture.home.join("data/machines/pruned").exists(),
+        "the default scope removed a machine"
+    );
+
+    let mut human = fixture.command();
+    human.args(["system", "prune"]);
+    let human = run_bounded(human, COMMAND_TIMEOUT)?;
+    require_success(&human, "human system prune")?;
+    let human_text = String::from_utf8(human.stdout)?;
+    assert!(human_text.contains("reclaimed"), "{human_text}");
+
+    fixture.remove_machine("pruned");
+    let output = server.signal(Signal::SIGTERM)?;
+    assert!(output.status.success());
+    Ok(())
+}

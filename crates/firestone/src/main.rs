@@ -35,7 +35,8 @@ use firestone_core::{
 use crate::{
     cli::{
         Cli, Command, CpArgs, CreateDraft, CreateRequest, ImageCommand, ListenAddress, RunArgs,
-        ShellArgs, SnapshotCommand, UiArgs, derive_machine_name, parse_hidden_vsock_proxy,
+        ShellArgs, SnapshotCommand, SystemCommand, UiArgs, derive_machine_name,
+        parse_hidden_vsock_proxy,
     },
     render::{RenderOptions, Renderer, error_exit_code},
     serve::{BoundListener, ServeListener},
@@ -530,6 +531,41 @@ where
                 },
             };
             dispatcher.run(action, renderer).await
+        }
+        Command::System(arguments) => {
+            let (global, catalog) = load_user_configuration(&paths)?;
+            let dispatcher =
+                LocalDispatcher::new(paths, global, catalog).with_source_base(source_base);
+            let SystemCommand::Prune(arguments) = arguments.command;
+            let machines = arguments.machines || arguments.all;
+            let images = arguments.images || arguments.all;
+            let mut force = arguments.force || yes;
+            if machines && !force && !arguments.dry_run && terminal.interactive() {
+                let candidates = dispatcher.prune_confirmation_names()?;
+                let prompt = if candidates.is_empty() {
+                    "remove no machines (none are stopped, created, or failed)? [y/N] ".to_owned()
+                } else {
+                    format!("remove machine(s) {}? [y/N] ", candidates.join(", "))
+                };
+                force = confirm(renderer, &prompt)?;
+                if !force {
+                    return Err(FirestoneError::new(
+                        ErrorKind::Generic,
+                        "system prune cancelled",
+                    ));
+                }
+            }
+            dispatcher
+                .run(
+                    Action::SystemPrune {
+                        machines,
+                        images,
+                        force,
+                        dry_run: arguments.dry_run,
+                    },
+                    renderer,
+                )
+                .await
         }
         Command::Resize(arguments) => {
             let (global, catalog) = load_user_configuration(&paths)?;

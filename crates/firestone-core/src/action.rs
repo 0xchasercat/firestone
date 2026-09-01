@@ -116,6 +116,20 @@ pub enum Action {
         name: String,
         snapshot: String,
     },
+    /// Reclaims disk space held by Firestone's own artifacts (SPEC §26).
+    ///
+    /// The default scope removes only inert debris. `machines` is the one
+    /// destructive tier and is refused unless `force` is also true.
+    SystemPrune {
+        #[serde(default)]
+        machines: bool,
+        #[serde(default)]
+        images: bool,
+        #[serde(default)]
+        force: bool,
+        #[serde(default)]
+        dry_run: bool,
+    },
 }
 
 /// One bounded, Firestone-owned machine log selected by the CLI or API.
@@ -456,6 +470,41 @@ mod tests {
             serde_json::from_value::<Action>(serde_json::to_value(&remove)?)?,
             remove
         );
+        Ok(())
+    }
+
+    #[test]
+    fn action_system_prune_defaults_every_tier_to_false_and_round_trips()
+    -> Result<(), serde_json::Error> {
+        let defaulted = serde_json::from_value::<Action>(json!({"type": "SystemPrune"}))?;
+        assert_eq!(
+            defaulted,
+            Action::SystemPrune {
+                machines: false,
+                images: false,
+                force: false,
+                dry_run: false,
+            }
+        );
+
+        let full = Action::SystemPrune {
+            machines: true,
+            images: true,
+            force: true,
+            dry_run: true,
+        };
+        let encoded = serde_json::to_value(&full)?;
+        assert_eq!(
+            encoded,
+            json!({
+                "type": "SystemPrune",
+                "machines": true,
+                "images": true,
+                "force": true,
+                "dry_run": true
+            })
+        );
+        assert_eq!(serde_json::from_value::<Action>(encoded)?, full);
         Ok(())
     }
 
