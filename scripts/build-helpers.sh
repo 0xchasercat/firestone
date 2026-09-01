@@ -6,9 +6,9 @@ usage() {
     cat <<'EOF'
 Usage: scripts/build-helpers.sh --input-dir DIR --output-dir DIR
 
-Builds passt and qemu-img twice in network-disabled containers, requires every
-output byte to match, then copies the first build into the empty output dir.
-Run scripts/fetch-helper-inputs.sh first.
+Builds passt, qemu-img and mkfs.ext4 twice in network-disabled containers,
+requires every output byte to match, then copies the first build into the empty
+output dir. Run scripts/fetch-helper-inputs.sh first.
 EOF
 }
 
