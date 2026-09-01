@@ -78,6 +78,12 @@ pub enum Action {
         elevation_confirmed: bool,
     },
     Version,
+    Clone {
+        source: String,
+        dest: String,
+        #[serde(default)]
+        fresh_disk: bool,
+    },
 }
 
 /// One bounded, Firestone-owned machine log selected by the CLI or API.
@@ -306,6 +312,41 @@ mod tests {
         let encoded = serde_json::to_value(&action)?;
         assert_eq!(encoded, json!({"type": "Metrics", "name": "ubuntu"}));
         assert_eq!(serde_json::from_value::<Action>(encoded)?, action);
+        Ok(())
+    }
+
+    #[test]
+    fn action_clone_defaults_fresh_disk_and_round_trips() -> Result<(), serde_json::Error> {
+        let defaulted = serde_json::from_value::<Action>(json!({
+            "type": "Clone",
+            "source": "dev",
+            "dest": "dev-copy"
+        }))?;
+        assert_eq!(
+            defaulted,
+            Action::Clone {
+                source: "dev".to_owned(),
+                dest: "dev-copy".to_owned(),
+                fresh_disk: false,
+            }
+        );
+
+        let fresh = Action::Clone {
+            source: "dev".to_owned(),
+            dest: "dev-copy".to_owned(),
+            fresh_disk: true,
+        };
+        let encoded = serde_json::to_value(&fresh)?;
+        assert_eq!(
+            encoded,
+            json!({
+                "type": "Clone",
+                "source": "dev",
+                "dest": "dev-copy",
+                "fresh_disk": true
+            })
+        );
+        assert_eq!(serde_json::from_value::<Action>(encoded)?, fresh);
         Ok(())
     }
 

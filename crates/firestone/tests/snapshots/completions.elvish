@@ -55,6 +55,7 @@ set edit:completion:arg-completer[firestone] = {|@words|
             cand version 'Print Firestone, pinned dependency, and resolved path versions'
             cand serve 'Run the stateless REST API over a private Unix socket or loopback port'
             cand ui 'Open the Firestone web interface on a loopback port'
+            cand clone 'Copy a stopped machine''s spec and disk to a new machine'
             cand help 'Print this message or the help of the given subcommand(s)'
         }
         &'firestone;run'= {
@@ -528,6 +529,20 @@ set edit:completion:arg-completer[firestone] = {|@words|
             cand -h 'Print help'
             cand --help 'Print help'
         }
+        &'firestone;clone'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --fresh-disk 'Give the clone an empty overlay on the same base image'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
         &'firestone;help'= {
             cand run 'Create or reuse a machine, start it, and open an SSH shell'
             cand create 'Create a machine definition without booting it'
@@ -551,6 +566,7 @@ set edit:completion:arg-completer[firestone] = {|@words|
             cand version 'Print Firestone, pinned dependency, and resolved path versions'
             cand serve 'Run the stateless REST API over a private Unix socket or loopback port'
             cand ui 'Open the Firestone web interface on a loopback port'
+            cand clone 'Copy a stopped machine''s spec and disk to a new machine'
             cand help 'Print this message or the help of the given subcommand(s)'
         }
         &'firestone;help;run'= {
@@ -611,6 +627,8 @@ set edit:completion:arg-completer[firestone] = {|@words|
         &'firestone;help;serve'= {
         }
         &'firestone;help;ui'= {
+        }
+        &'firestone;help;clone'= {
         }
         &'firestone;help;help'= {
         }

@@ -77,6 +77,7 @@ pub use network::{
 };
 pub use paths::{PathInputs, Paths};
 pub use readiness::{ReadinessOptions, wait_for_ssh_ready};
+pub use result::CloneResult;
 pub use result::{
     CatalogArchitectureSummary, CatalogEntrySummary, CpResult, LogsResult, MachineRecord,
     MachineSummary, MachineView, RemoveResult, RunResult, ShellResult, SpecResult,

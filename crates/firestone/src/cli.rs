@@ -120,6 +120,25 @@ pub enum Command {
 
     /// Open the Firestone web interface on a loopback port.
     Ui(UiArgs),
+
+    /// Copy a stopped machine's spec and disk to a new machine.
+    Clone(CloneArgs),
+}
+
+/// Arguments accepted by firestone clone.
+#[derive(Debug, Args)]
+pub struct CloneArgs {
+    /// Existing stopped or created machine to copy.
+    #[arg(value_name = "SRC")]
+    pub source: String,
+
+    /// New machine name.
+    #[arg(value_name = "DEST")]
+    pub dest: String,
+
+    /// Give the clone an empty overlay on the same base image.
+    #[arg(long)]
+    pub fresh_disk: bool,
 }
 /// Arguments accepted by firestone completions.
 #[derive(Debug, Args)]

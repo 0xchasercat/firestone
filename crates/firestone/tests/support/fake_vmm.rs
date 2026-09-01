@@ -423,6 +423,24 @@ fn run_qemu(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     append(&log, format!("{}\n", arguments[1..].join(" ")).as_bytes())?;
     match arguments.get(1).map(String::as_str) {
         Some("convert") => {
+            if let Some(index) = arguments.iter().position(|argument| argument == "-B") {
+                // Overlay copy: qemu-img convert -f qcow2 -O qcow2 -o backing_fmt=qcow2
+                //               -B <backing> <src> <dest>
+                let backing = arguments.get(index + 1).ok_or("missing convert backing")?;
+                let source = Path::new(arguments.get(index + 2).ok_or("missing convert source")?);
+                let target = Path::new(arguments.get(index + 3).ok_or("missing convert target")?);
+                let data = fs::read(source)?;
+                let suffix = data.get(4..).unwrap_or_default();
+                let text = std::str::from_utf8(suffix)?;
+                let size = text
+                    .lines()
+                    .nth(2)
+                    .ok_or("overlay source has no recorded size")?;
+                let mut output = vec![b'Q', b'F', b'I', 0xfb];
+                output.extend_from_slice(format!("OVERLAY\n{backing}\n{size}\n").as_bytes());
+                fs::write(target, output)?;
+                return Ok(());
+            }
             let source = Path::new(arguments.get(6).ok_or("missing convert source")?);
             let target = Path::new(arguments.get(7).ok_or("missing convert target")?);
             let mut output = vec![b'Q', b'F', b'I', 0xfb];

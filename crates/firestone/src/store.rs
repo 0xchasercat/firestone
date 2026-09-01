@@ -29,6 +29,7 @@ use firestone_core::{
     read_reconciled_machine_state_live_locked, run_doctor, sample_vmm_process, scp_command_plan,
     stop_unsupervised, validate_machine_spec, wait_for_ssh_ready,
 };
+use firestone_core::{CloneResult, StepId};
 
 const SPEC_TEMPLATE: &str = include_str!("../../../templates/firestone.toml");
 const MAX_VMCONFIG_BYTES: u64 = 51_200;
@@ -472,6 +473,176 @@ impl LocalDispatcher {
             degraded: Vec::new(),
             last_exit: None,
         })
+    }
+
+    /// Copies a stopped or created machine's spec and overlay to a new machine (SPEC section 24).
+    fn clone_machine(
+        &self,
+        source: &str,
+        dest: &str,
+        fresh_disk: bool,
+        events: &mut dyn EventSink,
+    ) -> Result<(), FirestoneError> {
+        self.validate_machine_storage()?;
+        let source_dir = self.paths.machine_dir(source)?;
+        let dest_dir = self.paths.machine_dir(dest)?;
+        if source == dest {
+            return Err(FirestoneError::new(
+                ErrorKind::Usage,
+                format!("cannot clone machine `{source}` onto itself"),
+            )
+            .with_hint("choose a destination name that differs from the source"));
+        }
+        ensure_machine_exists(&self.paths, source, &source_dir)?;
+        // A live machine holds its own machine lock, so refuse before waiting on it.
+        ensure_clonable(source, self.read_live_state(source)?.state.status)?;
+
+        // Stable lock order: the source machine first, then the destination
+        // under the same creation path `create` uses.
+        let source_lock = MachineLock::acquire(source, &self.paths.machine_lock(source)?, events)?;
+        ensure_machine_exists(&self.paths, source, &source_dir)?;
+        let live = self.read_live_state_locked(source, &source_lock)?;
+        ensure_clonable(source, live.state.status)?;
+
+        let spec_document = read_file(
+            &self.paths.machine_spec(source)?,
+            "machine spec",
+            ErrorKind::NotFound,
+        )?;
+        let text = std::str::from_utf8(&spec_document).map_err(|source_error| {
+            FirestoneError::new(
+                ErrorKind::InvalidSpec,
+                format!("machine spec for `{source}` is not UTF-8"),
+            )
+            .with_hint("save firestone.toml as UTF-8 TOML")
+            .with_source(source_error)
+        })?;
+        // The copied document becomes the destination spec verbatim, so it must
+        // already resolve against the destination machine directory.
+        let loaded = self.load_spec_text_with_pinned(
+            text,
+            &dest_dir,
+            &dest_dir,
+            pinned_image_reference(&live.state),
+        )?;
+        if loaded.spec.network.mac.is_some() {
+            events.emit(Event::Log {
+                level: Level::Warn,
+                message: format!(
+                    "machine `{source}` pins network.mac; `{dest}` inherits the same address"
+                ),
+            })?;
+        }
+
+        self.paths
+            .ensure_owned_data_directory(self.paths.data_dir(), "data directory", true)?;
+        self.paths.ensure_owned_data_directory(
+            &self.paths.machines_dir(),
+            "machines directory",
+            false,
+        )?;
+        let (dest_lock, creating_marker) =
+            self.prepare_machine_creation(dest, &dest_dir, events)?;
+
+        let spec_started = Instant::now();
+        events.emit(Event::StepStart {
+            id: StepId::from("spec"),
+            label: format!("copying spec to {dest}"),
+        })?;
+        atomic::write(&self.paths.machine_spec(dest)?, &spec_document)?;
+        let mut state = self.created_state(dest, &loaded.spec)?;
+        state.image = live.state.image.clone();
+        StateStore::new(self.paths.machine_state(dest)?)
+            .write_from_locked_action(&state, &dest_lock)?;
+        events.emit(Event::StepDone {
+            id: StepId::from("spec"),
+            detail: None,
+            elapsed_ms: elapsed_millis(spec_started.elapsed()),
+        })?;
+
+        let disk_bytes = self.clone_disk(
+            source,
+            dest,
+            fresh_disk,
+            &state,
+            &loaded.spec,
+            &dest_lock,
+            events,
+        )?;
+
+        fs::remove_file(&creating_marker).map_err(|source_error| {
+            filesystem_error(
+                ErrorKind::Generic,
+                format!("cannot publish machine `{dest}`"),
+                "check the machine directory permissions",
+                source_error,
+            )
+        })?;
+        emit_result(
+            events,
+            "clone",
+            &CloneResult {
+                source: source.to_owned(),
+                dest: dest.to_owned(),
+                disk_bytes,
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn clone_disk(
+        &self,
+        source: &str,
+        dest: &str,
+        fresh_disk: bool,
+        state: &MachineState,
+        spec: &MachineSpec,
+        dest_lock: &MachineLock,
+        events: &mut dyn EventSink,
+    ) -> Result<u64, FirestoneError> {
+        let started = Instant::now();
+        events.emit(Event::StepStart {
+            id: StepId::from("disk"),
+            label: format!("preparing {dest} disk"),
+        })?;
+        let source_disk = self.paths.machine_disk(source)?;
+        let source_disk_ready = owned_file_ready(&source_disk)?;
+        let (Some(id), Some(_)) = (&state.image.id, &state.image.sha256) else {
+            if source_disk_ready {
+                return Err(FirestoneError::new(
+                    ErrorKind::Conflict,
+                    format!("machine `{source}` has a disk but no pinned image identity"),
+                )
+                .with_hint("repair state.json so image id and sha256 are both present"));
+            }
+            events.emit(Event::StepSkip {
+                id: StepId::from("disk"),
+                reason: "no disk yet".to_owned(),
+            })?;
+            return Ok(0);
+        };
+        let store = self.image_store()?;
+        if fresh_disk || !source_disk_ready {
+            let overlay = store.create_overlay(dest, &state.image, spec.disk, dest_lock)?;
+            events.emit(Event::StepDone {
+                id: StepId::from("disk"),
+                detail: Some("fresh overlay".to_owned()),
+                elapsed_ms: elapsed_millis(started.elapsed()),
+            })?;
+            return Ok(overlay.virtual_size);
+        }
+
+        let overlay = store.copy_overlay(
+            &source_disk,
+            &self.paths.machine_disk_partial(dest)?,
+            &self.paths.image_base(id)?,
+        )?;
+        events.emit(Event::StepDone {
+            id: StepId::from("disk"),
+            detail: Some("copied overlay".to_owned()),
+            elapsed_ms: elapsed_millis(started.elapsed()),
+        })?;
+        Ok(overlay.virtual_size)
     }
 
     fn list(&self, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
@@ -1707,6 +1878,11 @@ impl Dispatcher for LocalDispatcher {
                     elevation_confirmed,
                 } => self.doctor(fix, elevation_confirmed, events),
                 Action::Version => self.version(events),
+                Action::Clone {
+                    source,
+                    dest,
+                    fresh_disk,
+                } => self.clone_machine(&source, &dest, fresh_disk, events),
             }
         })
     }
@@ -1760,6 +1936,35 @@ fn ensure_startable(name: &str, state: &MachineState) -> Result<(), FirestoneErr
                 "use firestone stop {name} before starting it again"
             )))
         }
+    }
+}
+
+/// Only a machine that owns no running processes can be copied consistently.
+fn ensure_clonable(name: &str, status: MachineStatus) -> Result<(), FirestoneError> {
+    if matches!(status, MachineStatus::Created | MachineStatus::Stopped) {
+        return Ok(());
+    }
+    Err(FirestoneError::new(
+        ErrorKind::Conflict,
+        format!(
+            "machine `{name}` is {} and cannot be cloned",
+            machine_status_word(status)
+        ),
+    )
+    .with_hint(format!(
+        "run `firestone stop {name}` and clone the stopped machine"
+    )))
+}
+
+/// Stable lowercase status word used in clone refusal messages.
+const fn machine_status_word(status: MachineStatus) -> &'static str {
+    match status {
+        MachineStatus::Created => "created",
+        MachineStatus::Starting => "starting",
+        MachineStatus::Running => "running",
+        MachineStatus::Stopping => "stopping",
+        MachineStatus::Stopped => "stopped",
+        MachineStatus::Failed => "failed",
     }
 }
 

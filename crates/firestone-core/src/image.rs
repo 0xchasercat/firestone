@@ -1052,6 +1052,81 @@ impl ImageStore {
         self.create_overlay_locked(name, image, disk_size, machine_lock, None)
     }
 
+    /// Copies one owned qcow2 overlay onto a new overlay that shares its qcow2 base.
+    ///
+    /// `dest_partial` must end in `.partial`; the copy is published, without
+    /// replacing anything, at the same path with that suffix removed. The
+    /// source overlay's backing chain must already resolve to exactly
+    /// `backing`, and the published copy is validated the same way a freshly
+    /// created overlay is (SPEC section 24).
+    pub fn copy_overlay(
+        &self,
+        source: &Path,
+        dest_partial: &Path,
+        backing: &Path,
+    ) -> Result<OverlayInfo, FirestoneError> {
+        let published = published_overlay_path(dest_partial)?;
+        let destination_dir = published.parent().ok_or_else(|| {
+            FirestoneError::new(
+                ErrorKind::Generic,
+                format!(
+                    "overlay copy '{}' has no parent directory",
+                    published.display()
+                ),
+            )
+        })?;
+        self.paths
+            .validate_owned_data_directory(destination_dir, "machine directory", false)?;
+        self.paths
+            .validate_owned_data_file(source, "machine overlay", OVERLAY_FILE_MODE, false)?;
+        let _lock = self.acquire_lock()?;
+        self.paths
+            .validate_owned_data_file(backing, "image base", BASE_FILE_MODE, false)?;
+        let base_info = self.qemu_info(backing)?;
+        validate_qcow2_structure(&format!("image base '{}'", backing.display()), &base_info)?;
+        let source_info = self.qemu_info(source)?;
+        validate_overlay_info(source, backing, source_info.virtual_size, &source_info)?;
+        let virtual_size = source_info.virtual_size;
+
+        remove_stale_partial(dest_partial)?;
+        let mut cleanup = CleanupGuard::new();
+        cleanup.track(dest_partial.to_path_buf());
+
+        // Pinned qemu-img 8.2.2 overlay-copy argv. `-B` keeps the shared base
+        // out of the copy and `-o backing_fmt=qcow2` records the backing format
+        // explicitly, exactly as `create -F qcow2` does for a fresh overlay.
+        Cmd::new(self.qemu_img.as_os_str())
+            .arg("convert")
+            .arg("-f")
+            .arg("qcow2")
+            .arg("-O")
+            .arg("qcow2")
+            .arg("-o")
+            .arg("backing_fmt=qcow2")
+            .arg("-B")
+            .arg(backing.as_os_str())
+            .arg(source.as_os_str())
+            .arg(dest_partial.as_os_str())
+            .timeout(QEMU_CONVERT_TIMEOUT)
+            .error_kind(ErrorKind::Dependency)
+            .run()?;
+        validate_created_regular_file(dest_partial, "machine overlay partial")?;
+        set_file_mode(dest_partial, OVERLAY_FILE_MODE, "machine overlay partial")?;
+        sync_file(dest_partial, "machine overlay partial")?;
+        let info = self.qemu_info(dest_partial)?;
+        validate_overlay_info(dest_partial, backing, virtual_size, &info)?;
+        cleanup.track(published.clone());
+        publish_no_replace(dest_partial, &published)?;
+        sync_directory(destination_dir, "machine directory")?;
+        cleanup.disarm();
+        Ok(OverlayInfo {
+            path: published,
+            backing_path: backing.to_path_buf(),
+            virtual_size: info.virtual_size,
+            cached: false,
+        })
+    }
+
     fn pull_locked(
         &self,
         mut source: ResolvedImageSource,
@@ -3488,6 +3563,25 @@ fn validate_base_info(id: &str, info: &QemuInfo) -> Result<(), FirestoneError> {
     Ok(())
 }
 
+fn published_overlay_path(dest_partial: &Path) -> Result<PathBuf, FirestoneError> {
+    let published = dest_partial
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".partial"))
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            FirestoneError::new(
+                ErrorKind::Generic,
+                format!(
+                    "overlay staging path '{}' does not end in '.partial'",
+                    dest_partial.display()
+                ),
+            )
+            .with_hint("stage an overlay copy at '<name>.partial' beside its published path")
+        })?;
+    Ok(dest_partial.with_file_name(published))
+}
+
 fn validate_overlay_info(
     overlay: &Path,
     base: &Path,
@@ -5011,6 +5105,27 @@ else:
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn published_overlay_path_requires_a_partial_suffix() -> Result<(), FirestoneError> {
+        assert_eq!(
+            super::published_overlay_path(Path::new("/data/machines/dev/disk.qcow2.partial"))?,
+            PathBuf::from("/data/machines/dev/disk.qcow2")
+        );
+        assert_eq!(
+            super::published_overlay_path(Path::new(
+                "/data/machines/dev/snapshots/a.qcow2.partial"
+            ))?,
+            PathBuf::from("/data/machines/dev/snapshots/a.qcow2")
+        );
+        for rejected in ["/data/machines/dev/disk.qcow2", "/data/dev/.partial", "/"] {
+            assert!(
+                super::published_overlay_path(Path::new(rejected)).is_err(),
+                "accepted {rejected}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

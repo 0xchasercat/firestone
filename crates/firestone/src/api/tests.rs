@@ -1163,3 +1163,83 @@ async fn duplicate_or_missing_result_becomes_one_terminal_shared_error() -> Test
 fn documented_defaults_remain_stable() {
     assert_eq!(DEFAULT_LOG_LINES, 200);
 }
+
+#[tokio::test]
+async fn clone_route_projects_source_dest_and_default_fresh_disk() -> TestResult {
+    let payload = json!({"source":"dev","dest":"dev-copy","disk_bytes":21_474_836_480_u64});
+    for (body, expected_fresh_disk) in [
+        (json!({"name":"dev-copy"}), false),
+        (json!({"name":"dev-copy","fresh_disk":false}), false),
+        (json!({"name":"dev-copy","fresh_disk":true}), true),
+    ] {
+        let dispatcher = Arc::new(RecordingDispatcher::success(
+            "clone",
+            payload.clone(),
+            vec![step_event("spec")],
+        ));
+        let response = send(
+            &app(Arc::clone(&dispatcher)),
+            json_request(Method::POST, "/v1/machines/dev/clone", &body)?,
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(content_type(&response), Some(NDJSON_CONTENT_TYPE));
+        assert_eq!(
+            dispatcher.actions()?,
+            vec![Action::Clone {
+                source: "dev".to_owned(),
+                dest: "dev-copy".to_owned(),
+                fresh_disk: expected_fresh_disk,
+            }]
+        );
+        assert_eq!(
+            response_bytes(response).await?,
+            expected_ndjson(&[
+                step_event("spec"),
+                Event::Result {
+                    action: "clone".to_owned(),
+                    payload: payload.clone(),
+                },
+            ])?
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn clone_route_aggregates_json_and_rejects_malformed_bodies() -> TestResult {
+    let payload = json!({"source":"dev","dest":"dev-copy","disk_bytes":0});
+    let dispatcher = Arc::new(RecordingDispatcher::success(
+        "clone",
+        payload.clone(),
+        Vec::new(),
+    ));
+    let aggregate_request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/machines/dev/clone")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json")
+        .body(Body::from(serde_json::to_vec(&json!({"name":"dev-copy"}))?))?;
+    let response = send(&app(Arc::clone(&dispatcher)), aggregate_request).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated = serde_json::from_slice::<Value>(&response_bytes(response).await?)?;
+    assert_eq!(aggregated["events"], json!([]));
+    assert_eq!(aggregated["result"]["action"], "clone");
+    assert_eq!(aggregated["result"]["payload"], payload);
+
+    for body in [json!({}), json!({"name":"dev-copy","extra":1}), json!([])] {
+        let rejected = Arc::new(RecordingDispatcher::success(
+            "clone",
+            payload.clone(),
+            Vec::new(),
+        ));
+        let response = send(
+            &app(Arc::clone(&rejected)),
+            json_request(Method::POST, "/v1/machines/dev/clone", &body)?,
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        assert!(rejected.actions()?.is_empty(), "{body}");
+    }
+    Ok(())
+}
