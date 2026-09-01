@@ -116,6 +116,21 @@
             <span class="fs-applies" data-fs-applies="restart">applies after restart</span>
             {% endif %}
           </div>
+          {# The row grammar is HOST:GUEST[:ro] and has no place for a
+             MountSpec tag. Deleting or reordering rows resends the whole list
+             built from that grammar, which would drop a configured tag from
+             every row — including rows nobody touched. Say so rather than
+             lose it quietly (SPEC §16.5). #}
+          {% if mount_tags %}
+          <div class="fs-inline-notice fs-inline-notice--fail" role="status"
+               data-fs-mount-tags>
+            <span>a shared folder here sets a virtiofs tag, which these rows cannot
+                  express.</span>
+            <span class="fs-inline-notice__hint">adding a row is safe; deleting or
+                  reordering rows would drop every tag, so change those in
+                  firestone.toml</span>
+          </div>
+          {% endif %}
           {{ f.mount_rows(form, errors) }}
         </div>
 

@@ -415,12 +415,18 @@ impl MachineDetail {
 /// record — cpus, memory, disk, user, mounts, network mode — are announced by
 /// the edit dialog itself when it saves them against a running machine, and
 /// that client-side marker is cleared the next time the machine starts.
+///
+/// Image and forward drift are decided by the dispatcher rather than here: both
+/// need a canonical comparison this projection cannot make. `state.image.ref`
+/// holds the catalog's canonical `distro:version`, so `ubuntu` in the spec is
+/// the same image as `ubuntu:24.04` in the state, and only the side holding the
+/// catalog can say so (§8.2).
 fn observable_drift(view: &MachineView) -> Vec<&'static str> {
     if view.state.status != MachineStatus::Running {
         return Vec::new();
     }
     let mut drift = Vec::new();
-    if view.spec.image.as_str() != view.state.image.r#ref {
+    if view.image_pending {
         drift.push("image");
     }
     if view.forwards_pending {

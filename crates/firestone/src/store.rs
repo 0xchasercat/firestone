@@ -15,8 +15,8 @@ use std::{
 };
 
 use firestone_core::{
-    Action, Arch, ByteSize, Catalog, CatalogArchitectureSummary, CatalogEntrySummary, Cmd,
-    CpResult, DependencyManifest, DispatchFuture, Dispatcher, DoctorContext, DoctorOptions,
+    Action, Arch, ByteSize, Catalog, CatalogArchitectureSummary, CatalogEntry, CatalogEntrySummary,
+    Cmd, CpResult, DependencyManifest, DispatchFuture, Dispatcher, DoctorContext, DoctorOptions,
     ErrorKind, Event, EventSink, ExtractedPasstHelper, FirestoneError, GlobalConfig,
     ImagePullRequest, ImageStore, InternalHelper, Level, LiveMachineState, LogSource, LogsResult,
     MachineLock, MachineRecord, MachineSpec, MachineSpecPatch, MachineState, MachineStatus,
@@ -681,6 +681,7 @@ impl LocalDispatcher {
     fn show(&self, name: &str, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
         let (spec, live) = self.load_machine(name)?;
         let pending = forwards_pending(&spec, &live.state);
+        let image = image_pending(&self.catalog, &spec, &live.state);
         emit_result(
             events,
             "show",
@@ -689,6 +690,7 @@ impl LocalDispatcher {
                 state: live.state,
                 supervision: live.supervision,
                 forwards_pending: pending,
+                image_pending: image,
             },
         )
     }
@@ -2723,6 +2725,32 @@ fn forwards_pending(spec: &MachineSpec, state: &MachineState) -> bool {
         && forwards_differ(&spec.network.forward, &state.forwards)
 }
 
+/// The spec now names an image other than the one a running machine booted
+/// (§8.2).
+///
+/// `state.image.ref` is the *canonical* reference: `created_state` writes the
+/// catalog's `distro:version` for a catalog machine, and the pull rewrites it
+/// again from the resolved entry. The spec keeps whatever the operator typed,
+/// so a machine created as `ubuntu` or `ubuntu:noble` runs `ubuntu:24.04` and
+/// has not drifted at all. Comparing the two strings directly would therefore
+/// accuse the flagship `firestone run ubuntu` of permanent image drift, and no
+/// restart would ever clear it, so the spec reference is resolved through the
+/// same catalog first. Only catalog references need it: a local path, an HTTPS
+/// URL and an OCI reference are already canonical in the spec and compare
+/// verbatim. A machine that is not running has booted nothing to disagree with.
+fn image_pending(catalog: &Catalog, spec: &MachineSpec, state: &MachineState) -> bool {
+    state.status == MachineStatus::Running
+        && canonical_image_reference(catalog, spec.image.as_str()) != state.image.r#ref
+}
+
+/// The catalog's canonical `distro:version` for a reference it knows, and the
+/// reference unchanged for one it does not.
+fn canonical_image_reference(catalog: &Catalog, reference: &str) -> String {
+    catalog
+        .entry(reference)
+        .map_or_else(|| reference.to_owned(), CatalogEntry::canonical_reference)
+}
+
 fn emit_forward_restart_warning(
     spec: &MachineSpec,
     state: &MachineState,
@@ -2989,7 +3017,7 @@ mod tests {
 
     use super::{
         LocalDispatcher, MAX_LOG_TAIL_BYTES, display_forward, display_status,
-        emit_forward_restart_warning, format_uptime_seconds, forwards_pending,
+        emit_forward_restart_warning, format_uptime_seconds, forwards_pending, image_pending,
         parse_editor_command, published_vmconfig_capacity,
     };
     struct WaitingSink(mpsc::Sender<()>);
@@ -4733,6 +4761,51 @@ esac
         // The same difference on a stopped machine is not pending.
         state.status = MachineStatus::Stopped;
         assert!(!forwards_pending(&spec, &state));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn image_pending_resolves_catalog_aliases_before_reporting_drift()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        let catalog = Catalog::built_in()?;
+        let mut spec = MachineSpec {
+            image: ImageRef::new("ubuntu:24.04"),
+            ..MachineSpec::default()
+        };
+        create_machine(&dispatcher, "aliased", spec.clone()).await?;
+
+        let store = StateStore::new(paths.machine_state("aliased")?);
+        let mut state = store.read()?;
+        assert_eq!(state.image.r#ref, "ubuntu:24.04");
+        state.status = MachineStatus::Running;
+
+        // The default reference and the alias both resolve to what was booted.
+        spec.image = ImageRef::new("ubuntu");
+        assert!(!image_pending(&catalog, &spec, &state));
+        spec.image = ImageRef::new("ubuntu:noble");
+        assert!(!image_pending(&catalog, &spec, &state));
+        spec.image = ImageRef::new("ubuntu:24.04");
+        assert!(!image_pending(&catalog, &spec, &state));
+
+        // A different catalog entry, by canonical reference or by alias, is
+        // real drift.
+        spec.image = ImageRef::new("debian:12");
+        assert!(image_pending(&catalog, &spec, &state));
+        spec.image = ImageRef::new("ubuntu:jammy");
+        assert!(image_pending(&catalog, &spec, &state));
+
+        // A reference the catalog does not own is already canonical in the
+        // spec and compares verbatim.
+        spec.image = ImageRef::new("docker://nginx:latest");
+        assert!(image_pending(&catalog, &spec, &state));
+        state.image.r#ref = "docker://nginx:latest".to_owned();
+        assert!(!image_pending(&catalog, &spec, &state));
+
+        // Nothing is pending against a machine that booted nothing.
+        state.status = MachineStatus::Stopped;
+        spec.image = ImageRef::new("debian:12");
+        assert!(!image_pending(&catalog, &spec, &state));
         Ok(())
     }
 

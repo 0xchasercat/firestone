@@ -819,6 +819,7 @@ pub async fn edit_form(State(state): State<UiState>, Path(name): Path<String>) -
                 memory => SizeField::split(&form.memory),
                 disk => SizeField::split(&form.disk),
                 net_modes => ["passt", "tap", "none"],
+                mount_tags => view.spec.mounts.iter().any(|mount| mount.tag.is_some()),
             },
         )
     }

@@ -3374,6 +3374,10 @@
           "forwards_pending": {
             "type": "boolean",
             "description": "Spec forwards differ from the forwards this running machine applied at spawn. Always false unless the machine is running; passt applies the new set on the next start."
+          },
+          "image_pending": {
+            "type": "boolean",
+            "description": "The spec's image reference, resolved through the catalog by the §8.2 rules, names an image other than the one this running machine booted. Catalog aliases and default references resolve first, so a machine created as 'ubuntu' and running 'ubuntu:24.04' is not pending. Always false unless the machine is running."
           }
         },
         "additionalProperties": false,
@@ -3381,7 +3385,8 @@
           "spec",
           "state",
           "supervision",
-          "forwards_pending"
+          "forwards_pending",
+          "image_pending"
         ]
       },
       "MachineRecord": {
@@ -5962,7 +5967,8 @@
             "last_exit": null
           },
           "supervision": null,
-          "forwards_pending": false
+          "forwards_pending": false,
+          "image_pending": false
         }
       },
       "MachineSpecInput": {

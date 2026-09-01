@@ -1138,12 +1138,25 @@ fn the_embedded_runtime_script_closes_every_block() {
     assert_eq!(depth, 0, "app.js does not close every block it opens");
 }
 
-/// The same view with observable drift: the spec names an image the running
-/// instance is not using, and the dispatcher reports pending forwards.
+/// The same view with observable drift: the dispatcher, which owns the catalog,
+/// reports both the image reference and the forwards as pending. Both flags are
+/// server-computed and false for a machine that is not running, so the fixture
+/// mirrors that rather than inventing a state the dispatcher cannot produce.
 fn machine_view_with_drift(name: &str, status: &str) -> Value {
     let mut view = machine_view(name, status);
     view["spec"]["image"] = json!("ubuntu:24.10");
-    view["forwards_pending"] = json!(true);
+    view["forwards_pending"] = json!(status == "running");
+    view["image_pending"] = json!(status == "running");
+    view
+}
+
+/// A running machine created from a catalog alias or default: the spec keeps
+/// what was typed, the state keeps the canonical reference the pull resolved,
+/// and the dispatcher therefore reports no image drift at all.
+fn machine_view_with_catalog_alias(name: &str) -> Value {
+    let mut view = machine_view(name, "running");
+    view["spec"]["image"] = json!("ubuntu");
+    view["state"]["image"]["ref"] = json!("ubuntu:24.04");
     view
 }
 
@@ -1313,5 +1326,46 @@ async fn the_detail_head_reports_observable_drift_only_while_running() -> TestRe
     let matched = app(FakeDispatcher::default())?;
     let (_, _, silent) = get_fragment(&matched, "/ui/machines/web/head").await?;
     assert!(!silent.contains("data-fs-drift"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_edit_dialog_warns_when_a_shared_folder_sets_a_tag() -> TestResult {
+    // HOST:GUEST[:ro] cannot carry a MountSpec tag, so a list rebuild would
+    // drop one from rows nobody touched. Untagged mounts say nothing.
+    let quiet = app(FakeDispatcher {
+        machine: machine_view_with_mounts("web", "running"),
+        ..FakeDispatcher::default()
+    })?;
+    let (_, _, body) = get_fragment(&quiet, "/ui/machines/web/edit").await?;
+    assert!(!body.contains("data-fs-mount-tags"));
+
+    let mut tagged = machine_view_with_mounts("web", "running");
+    tagged["spec"]["mount"][0]["tag"] = json!("project");
+    let router = app(FakeDispatcher {
+        machine: tagged,
+        ..FakeDispatcher::default()
+    })?;
+    let (_, _, warned) = get_fragment(&router, "/ui/machines/web/edit").await?;
+    assert!(warned.contains("data-fs-mount-tags"), "no tag warning");
+    assert!(warned.contains("firestone.toml"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_detail_head_reports_no_image_drift_for_a_catalog_alias() -> TestResult {
+    // `firestone run ubuntu` stores `ubuntu` in the spec and the resolved
+    // `ubuntu:24.04` in the state. The two strings differ and the machine has
+    // not drifted, so the head must stay silent: this pill once accused every
+    // default-reference machine of a drift no restart could clear.
+    let router = app(FakeDispatcher {
+        machine: machine_view_with_catalog_alias("web"),
+        ..FakeDispatcher::default()
+    })?;
+    let (_, _, head) = get_fragment(&router, "/ui/machines/web/head").await?;
+    assert!(
+        !head.contains("data-fs-drift"),
+        "a catalog alias or default reference is not image drift"
+    );
     Ok(())
 }

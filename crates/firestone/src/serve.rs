@@ -1720,6 +1720,7 @@ mod tests {
         let view = MachineView {
             spec,
             forwards_pending: false,
+            image_pending: false,
             state: MachineState {
                 version: StateVersion,
                 status,

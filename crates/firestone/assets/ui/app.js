@@ -2119,6 +2119,31 @@
     return /^[0-9]+$/.test(text) ? Number(text) : text;
   }
 
+  /* The ByteSize grammar, exactly: a bare integer is MiB, a `M`/`m` suffix is
+   * MiB, a `G`/`g` suffix is GiB. Anything else is not a size and is left to
+   * the server to reject. Sizes are compared as byte counts rather than as the
+   * strings the unit select composed, so re-entering 4096M as 4G is correctly
+   * seen as no change and sends no patch. */
+  function sizeBytes(text) {
+    var match = /^([0-9]+)([MmGg]?)$/.exec(trimmedText(text));
+    if (!match) {
+      return null;
+    }
+    var unit = match[2].toLowerCase() === "g" ? 1024 * 1024 * 1024 : 1024 * 1024;
+    return Number(match[1]) * unit;
+  }
+
+  /* True when two size fields mean different amounts. Unparsable text falls
+   * back to a text comparison so a typo still reaches the server. */
+  function sizeChanged(before, after) {
+    var left = sizeBytes(before);
+    var right = sizeBytes(after);
+    if (left === null || right === null) {
+      return trimmedText(before) !== trimmedText(after);
+    }
+    return left !== right;
+  }
+
   /* Builds the request plan for one edit. Pure: it reads the form it is given
    * and the original projection it is given, and touches nothing else. */
   function patchFromForm(form, original) {
@@ -2132,7 +2157,12 @@
     var clear = [];
     var second = null;
 
+    var SIZE_KEYS = { memory: true, disk: true };
+
     function changed(key) {
+      if (SIZE_KEYS[key]) {
+        return sizeChanged(before[key], after[key]);
+      }
       return after[key] !== trimmedText(before[key]);
     }
 
@@ -2395,7 +2425,10 @@
     if (slot) {
       slot.innerHTML = "";
     }
-    if (running) {
+    /* A resize-only edit applies live *and* persists the spec, so nothing is
+     * left pending and the pill would be a lie. Only a spec patch — the fields
+     * the running VM cannot take now — raises it. */
+    if (running && plan.patches.length) {
       editedWhileRunning[name] = true;
     }
     toast("saved " + name, applied.join(" · "), "ok");

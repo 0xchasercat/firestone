@@ -48,6 +48,11 @@ pub struct MachineView {
     /// spawn; always false when the machine is not running (§12.4).
     #[serde(default)]
     pub forwards_pending: bool,
+    /// The spec's image reference, resolved through the catalog, names an image
+    /// other than the one this running machine booted; always false when the
+    /// machine is not running (§8.2).
+    #[serde(default)]
+    pub image_pending: bool,
 }
 
 /// Newly-created machine returned by every action surface.
