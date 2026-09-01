@@ -47,8 +47,8 @@ pub use console::{
     console_plan, relay_console,
 };
 pub use deps::{
-    DIRECT_BOOT_KERNEL_DEPENDENCY, DependencyArtifact, DependencyManifest,
-    PINNED_DIRECT_BOOT_KERNEL_VERSION,
+    DIRECT_BOOT_KERNEL_DEPENDENCY, DependencyArtifact, DependencyManifest, MKFS_EXT4_DEPENDENCY,
+    PINNED_DIRECT_BOOT_KERNEL_VERSION, PINNED_MKFS_EXT4_VERSION,
 };
 pub use dispatcher::{DispatchFuture, Dispatcher, EventSink, block_on};
 pub use doctor::{
