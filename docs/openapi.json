@@ -930,7 +930,17 @@
             "$ref": "#/components/responses/Error400"
           },
           "403": {
-            "description": "The loopback session gate refused the upgrade. A protocol upgrade must additionally prove same-origin: `Sec-Fetch-Site: same-origin` or `none`, or an `Origin` in the bound loopback allowlist. A Unix listener has no gate."
+            "description": "The loopback session gate refused the upgrade. A protocol upgrade must additionally prove same-origin: `Sec-Fetch-Site: same-origin` or `none`, or an `Origin` in the bound loopback allowlist. A Unix listener has no gate.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-firestone-error-kinds": [
+              "usage"
+            ]
           },
           "404": {
             "$ref": "#/components/responses/Error404"
@@ -962,7 +972,7 @@
         ],
         "operationId": "openMachineShellWebSocket",
         "summary": "Open an SSH shell over a WebSocket",
-        "description": "Upgrades to a WebSocket carrying one interactive shell. The machine must be `running` before the upgrade. After the upgrade the server allocates a host pseudo-terminal and runs the same OpenSSH argv `firestone shell` execs, with the pseudo-terminal slave as the child's stdin, stdout and stderr; the master is relayed to the WebSocket. One session per connection: closing the WebSocket kills the child's process group and reaps it.\n\nFraming: binary frames are raw terminal bytes in both directions; text frames are JSON control messages. `{\"resize\":{\"rows\":R,\"cols\":C}}` applies `TIOCSWINSZ` to the pseudo-terminal master. Any other text frame is ignored. The server closes with a descriptive close frame: code 1000 and reason `machine stopped` when the shell ends, or code 1011 and the failure detail when the session could not be established.\n\nThis is a WebSocket handshake, not a JSON route: a successful request answers `101 Switching Protocols` with `Upgrade: websocket`. The handshake headers (`Connection`, `Upgrade`, `Sec-WebSocket-Key`, `Sec-WebSocket-Version`) are the standard RFC 6455 ones and are not repeated here. Firestone negotiates no subprotocol and no extension.",
+        "description": "Upgrades to a WebSocket carrying one interactive shell. The machine must be `running` before the upgrade. After the upgrade the server allocates a host pseudo-terminal and runs the same OpenSSH argv `firestone shell` execs, with the pseudo-terminal slave as the child's stdin, stdout and stderr; the master is relayed to the WebSocket. One session per connection: closing the WebSocket kills the child's process group and reaps it.\n\nFraming: binary frames are raw terminal bytes in both directions; text frames are JSON control messages. `{\"resize\":{\"rows\":R,\"cols\":C}}` applies `TIOCSWINSZ` to the pseudo-terminal master. Any other text frame is ignored. The server closes with a descriptive close frame: code 1000 and reason `session ended` when the shell ends, or code 1011 and the failure detail when the session could not be established.\n\nThis is a WebSocket handshake, not a JSON route: a successful request answers `101 Switching Protocols` with `Upgrade: websocket`. The handshake headers (`Connection`, `Upgrade`, `Sec-WebSocket-Key`, `Sec-WebSocket-Version`) are the standard RFC 6455 ones and are not repeated here. Firestone negotiates no subprotocol and no extension.",
         "responses": {
           "101": {
             "description": "Upgraded. The connection now carries WebSocket frames."
@@ -971,7 +981,17 @@
             "$ref": "#/components/responses/Error400"
           },
           "403": {
-            "description": "The loopback session gate refused the upgrade. A protocol upgrade must additionally prove same-origin: `Sec-Fetch-Site: same-origin` or `none`, or an `Origin` in the bound loopback allowlist. A Unix listener has no gate."
+            "description": "The loopback session gate refused the upgrade. A protocol upgrade must additionally prove same-origin: `Sec-Fetch-Site: same-origin` or `none`, or an `Origin` in the bound loopback allowlist. A Unix listener has no gate.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-firestone-error-kinds": [
+              "usage"
+            ]
           },
           "404": {
             "$ref": "#/components/responses/Error404"

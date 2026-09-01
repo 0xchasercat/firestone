@@ -54,6 +54,14 @@ const RELAY_BUFFER_BYTES: usize = 16 * 1024;
 /// How long the console broker has to acknowledge before the request fails.
 const CONSOLE_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The close reason a console relay ends with: the broker only stops when the
+/// machine does.
+const CONSOLE_EOF_REASON: &str = "machine stopped";
+
+/// The close reason a shell relay ends with: the usual end of a shell session
+/// is the person typing `exit`, not the machine going away.
+const SHELL_EOF_REASON: &str = "session ended";
+
 /// The terminal type advertised to the guest shell.
 ///
 /// The browser terminal renders 256-colour SGR, and OpenSSH forwards `TERM`
@@ -125,7 +133,7 @@ pub(super) async fn console(
     }
 
     upgrade.on_upgrade(move |socket| async move {
-        bridge(socket, stream, None).await;
+        bridge(socket, stream, None, CONSOLE_EOF_REASON).await;
     })
 }
 
@@ -263,7 +271,7 @@ async fn run_shell_session(socket: WebSocket, plan: SshCommandPlan) {
         }
     };
 
-    bridge(socket, stream, Some(resizer)).await;
+    bridge(socket, stream, Some(resizer), SHELL_EOF_REASON).await;
 
     // One session per connection: when the WebSocket goes, so does OpenSSH
     // and everything it started.
@@ -277,7 +285,10 @@ async fn run_shell_session(socket: WebSocket, plan: SshCommandPlan) {
 /// Why a relay stopped, which becomes the close frame the client sees.
 enum Ending {
     /// The byte stream ended: the machine stopped, or the shell exited.
-    Eof,
+    ///
+    /// The reason names whichever of the two this route can mean, so a client
+    /// is not told a running machine stopped because someone typed `exit`.
+    Eof(&'static str),
     /// The byte stream failed.
     Failed(String),
     /// The client went away first; nothing is left to tell it.
@@ -289,7 +300,7 @@ enum Ending {
 /// Backpressure is the await itself: the outbound task cannot read the next
 /// chunk until the WebSocket has accepted the previous one, so a slow browser
 /// slows the reader rather than growing an unbounded queue.
-async fn bridge<S>(socket: WebSocket, stream: S, resize: Option<Resizer>)
+async fn bridge<S>(socket: WebSocket, stream: S, resize: Option<Resizer>, eof_reason: &'static str)
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
@@ -299,7 +310,7 @@ where
     let mut outbound = tokio::spawn(async move {
         let mut reader = reader;
         let mut sink = sink;
-        let ending = pump_out(&mut reader, &mut sink).await;
+        let ending = pump_out(&mut reader, &mut sink, eof_reason).await;
         close_sink(&mut sink, &ending).await;
     });
     let mut inbound = tokio::spawn(async move {
@@ -329,14 +340,18 @@ where
     }
 }
 
-async fn pump_out<R>(reader: &mut R, sink: &mut SplitSink<WebSocket, Message>) -> Ending
+async fn pump_out<R>(
+    reader: &mut R,
+    sink: &mut SplitSink<WebSocket, Message>,
+    eof_reason: &'static str,
+) -> Ending
 where
     R: AsyncRead + Unpin,
 {
     let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
     loop {
         match reader.read(&mut buffer).await {
-            Ok(0) => return Ending::Eof,
+            Ok(0) => return Ending::Eof(eof_reason),
             Ok(read) => {
                 if sink
                     .send(Message::Binary(Bytes::copy_from_slice(&buffer[..read])))
@@ -351,19 +366,23 @@ where
     }
 }
 
-async fn close_sink(sink: &mut SplitSink<WebSocket, Message>, ending: &Ending) {
-    let frame = match ending {
+/// The close frame an ending earns, or `None` when nobody is left to read it.
+fn close_frame_for(ending: &Ending) -> Option<CloseFrame> {
+    match ending {
         Ending::ClientGone => None,
-        Ending::Eof => Some(CloseFrame {
+        Ending::Eof(reason) => Some(CloseFrame {
             code: close_code::NORMAL,
-            reason: Utf8Bytes::from_static("machine stopped"),
+            reason: Utf8Bytes::from(truncated_reason(reason)),
         }),
         Ending::Failed(detail) => Some(CloseFrame {
             code: close_code::ERROR,
             reason: Utf8Bytes::from(truncated_reason(detail)),
         }),
-    };
-    if let Some(frame) = frame {
+    }
+}
+
+async fn close_sink(sink: &mut SplitSink<WebSocket, Message>, ending: &Ending) {
+    if let Some(frame) = close_frame_for(ending) {
         let _ = sink.send(Message::Close(Some(frame))).await;
     }
     let _ = sink.close().await;
@@ -528,7 +547,10 @@ mod tests {
 
     use firestone_core::PtyPair;
 
-    use super::{Control, Resize, Resizer, apply_control, truncated_reason};
+    use super::{
+        CONSOLE_EOF_REASON, Control, Ending, Resize, Resizer, SHELL_EOF_REASON, apply_control,
+        close_code, close_frame_for, truncated_reason,
+    };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -608,5 +630,27 @@ mod tests {
         let multibyte = truncated_reason(&"é".repeat(400));
         assert!(multibyte.len() <= 120);
         assert_eq!(multibyte.chars().count(), 60);
+    }
+
+    #[test]
+    fn end_of_stream_names_the_ending_the_route_can_mean() -> TestResult {
+        let console = close_frame_for(&Ending::Eof(CONSOLE_EOF_REASON))
+            .ok_or("an end of stream must close the socket")?;
+        assert_eq!(console.code, close_code::NORMAL);
+        assert_eq!(console.reason.as_str(), "machine stopped");
+
+        let shell = close_frame_for(&Ending::Eof(SHELL_EOF_REASON))
+            .ok_or("an end of stream must close the socket")?;
+        assert_eq!(shell.code, close_code::NORMAL);
+        assert_eq!(shell.reason.as_str(), "session ended");
+
+        let failed = close_frame_for(&Ending::Failed("broken pipe".to_owned()))
+            .ok_or("a failure must close the socket")?;
+        assert_eq!(failed.code, close_code::ERROR);
+        assert_eq!(failed.reason.as_str(), "broken pipe");
+
+        // Nothing is left to tell: no frame is sent to a client that left.
+        assert!(close_frame_for(&Ending::ClientGone).is_none());
+        Ok(())
     }
 }
