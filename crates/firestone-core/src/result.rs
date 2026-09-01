@@ -155,6 +155,15 @@ pub struct VersionDependency {
     pub sha256: String,
 }
 
+/// One machine copied from a stopped or created source by the clone action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloneResult {
+    pub source: String,
+    pub dest: String,
+    /// Virtual size of the destination overlay, or zero when none was materialized.
+    pub disk_bytes: u64,
+}
+
 /// Resolved process-wide roots exposed by the version action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionPaths {

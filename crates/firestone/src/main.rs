@@ -490,6 +490,20 @@ where
                 )
                 .await
         }
+        Command::Clone(arguments) => {
+            let (global, catalog) = load_user_configuration(&paths)?;
+            LocalDispatcher::new(paths, global, catalog)
+                .with_source_base(source_base)
+                .run(
+                    Action::Clone {
+                        source: arguments.source,
+                        dest: arguments.dest,
+                        fresh_disk: arguments.fresh_disk,
+                    },
+                    renderer,
+                )
+                .await
+        }
         Command::Remove(arguments) => {
             let (global, catalog) = load_user_configuration(&paths)?;
             let dispatcher =

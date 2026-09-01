@@ -56,6 +56,7 @@ Register-ArgumentCompleter -Native -CommandName 'firestone' -ScriptBlock {
             [CompletionResult]::new('version', 'version', [CompletionResultType]::ParameterValue, 'Print Firestone, pinned dependency, and resolved path versions')
             [CompletionResult]::new('serve', 'serve', [CompletionResultType]::ParameterValue, 'Run the stateless REST API over a private Unix socket or loopback port')
             [CompletionResult]::new('ui', 'ui', [CompletionResultType]::ParameterValue, 'Open the Firestone web interface on a loopback port')
+            [CompletionResult]::new('clone', 'clone', [CompletionResultType]::ParameterValue, 'Copy a stopped machine''s spec and disk to a new machine')
             [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
             break
         }
@@ -536,6 +537,21 @@ Register-ArgumentCompleter -Native -CommandName 'firestone' -ScriptBlock {
             [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
             break
         }
+        'firestone;clone' {
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--fresh-disk', '--fresh-disk', [CompletionResultType]::ParameterName, 'Give the clone an empty overlay on the same base image')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
         'firestone;help' {
             [CompletionResult]::new('run', 'run', [CompletionResultType]::ParameterValue, 'Create or reuse a machine, start it, and open an SSH shell')
             [CompletionResult]::new('create', 'create', [CompletionResultType]::ParameterValue, 'Create a machine definition without booting it')
@@ -557,6 +573,7 @@ Register-ArgumentCompleter -Native -CommandName 'firestone' -ScriptBlock {
             [CompletionResult]::new('version', 'version', [CompletionResultType]::ParameterValue, 'Print Firestone, pinned dependency, and resolved path versions')
             [CompletionResult]::new('serve', 'serve', [CompletionResultType]::ParameterValue, 'Run the stateless REST API over a private Unix socket or loopback port')
             [CompletionResult]::new('ui', 'ui', [CompletionResultType]::ParameterValue, 'Open the Firestone web interface on a loopback port')
+            [CompletionResult]::new('clone', 'clone', [CompletionResultType]::ParameterValue, 'Copy a stopped machine''s spec and disk to a new machine')
             [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
             break
         }
@@ -638,6 +655,9 @@ Register-ArgumentCompleter -Native -CommandName 'firestone' -ScriptBlock {
             break
         }
         'firestone;help;ui' {
+            break
+        }
+        'firestone;help;clone' {
             break
         }
         'firestone;help;help' {

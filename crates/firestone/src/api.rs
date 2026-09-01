@@ -140,6 +140,7 @@ define_rest_routes! {
     "/v1/images/pull" => post(pull_image);
     "/v1/images/prune" => post(prune_images);
     "/v1/images/{id}" => delete(remove_image);
+    "/v1/machines/{name}/clone" => post(clone_machine);
 }
 
 /// Builds the complete v1 REST router over the shared action dispatcher.
@@ -201,6 +202,14 @@ struct StartBody {
 struct StopBody {
     timeout_s: Option<u64>,
     force: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CloneMachineBody {
+    name: String,
+    #[serde(default)]
+    fresh_disk: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -413,6 +422,29 @@ async fn restart_machine(
         &state,
         Action::Restart { name, timeout },
         "restart",
+        aggregate,
+    )
+    .await
+}
+
+async fn clone_machine(
+    State(state): State<ApiState>,
+    ApiPath(name): ApiPath,
+    request: Request<Body>,
+) -> Response {
+    let aggregate = accepts_json(request.headers());
+    let body = match parse_required_json::<CloneMachineBody>(request, "clone machine").await {
+        Ok(body) => body,
+        Err(error) => return error_response(error),
+    };
+    action_response(
+        &state,
+        Action::Clone {
+            source: name,
+            dest: body.name,
+            fresh_disk: body.fresh_disk.unwrap_or(false),
+        },
+        "clone",
         aggregate,
     )
     .await

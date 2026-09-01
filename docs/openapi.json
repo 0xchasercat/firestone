@@ -1195,6 +1195,103 @@
           }
         ]
       }
+    },
+    "/v1/machines/{name}/clone": {
+      "post": {
+        "tags": [
+          "Machines"
+        ],
+        "operationId": "cloneMachine",
+        "summary": "Clone a machine",
+        "description": "Copies the source machine's firestone.toml verbatim and, by default, its qcow2 overlay onto a new machine in created state. The source must be stopped or created. State, host keys, seed artifacts and snapshots are never copied; the clone derives a fresh MAC and cloud-init instance id from its own name.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloneMachineRequest"
+              },
+              "examples": {
+                "default": {
+                  "$ref": "#/components/examples/CloneMachineRequest"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Clone progress and the terminal clone result.",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string",
+                  "description": "LF-delimited compact JSON records. Progress records arrive as produced. Success ends with exactly one typed Result record; a dispatcher failure after progress ends with one ErrorEnvelope record under HTTP 200.",
+                  "x-ndjson-item-schema": {
+                    "oneOf": [
+                      {
+                        "$ref": "#/components/schemas/NonTerminalEvent"
+                      },
+                      {
+                        "$ref": "#/components/schemas/CloneResultEvent"
+                      },
+                      {
+                        "$ref": "#/components/schemas/ErrorEnvelope"
+                      }
+                    ]
+                  },
+                  "x-firestone-terminal-records": [
+                    "CloneResultEvent",
+                    "ErrorEnvelope"
+                  ]
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/CloneNdjson"
+                  }
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CloneDispatchOutput"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/CloneAggregate"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ActionError400"
+          },
+          "404": {
+            "$ref": "#/components/responses/ActionError404"
+          },
+          "409": {
+            "$ref": "#/components/responses/ActionError409"
+          },
+          "500": {
+            "$ref": "#/components/responses/ActionError500"
+          },
+          "502": {
+            "$ref": "#/components/responses/ActionError502"
+          },
+          "503": {
+            "$ref": "#/components/responses/ActionError503"
+          },
+          "504": {
+            "$ref": "#/components/responses/ActionError504"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineName"
+          }
+        ],
+        "x-firestone-aggregation-accept": "application/json"
+      }
     }
   },
   "components": {
@@ -4336,6 +4433,92 @@
           }
         ],
         "description": "Machine image reference containing at least one non-whitespace character."
+      },
+      "CloneMachineRequest": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Destination machine name. One non-empty path component with no separators or control characters."
+          },
+          "fresh_disk": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "default": false,
+            "description": "Give the clone an empty overlay on the same base image instead of copying the source overlay."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name"
+        ],
+        "description": "Required JSON body. The source machine is the path name."
+      },
+      "CloneResult": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": "string"
+          },
+          "dest": {
+            "type": "string"
+          },
+          "disk_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "Virtual size of the destination overlay, or zero when the source had no overlay to copy and none was created."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "source",
+          "dest",
+          "disk_bytes"
+        ]
+      },
+      "CloneResultEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "Result"
+          },
+          "action": {
+            "type": "string",
+            "const": "clone"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/CloneResult"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "action",
+          "payload"
+        ]
+      },
+      "CloneDispatchOutput": {
+        "type": "object",
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NonTerminalEvent"
+            }
+          },
+          "result": {
+            "$ref": "#/components/schemas/CloneResultEvent"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "events",
+          "result"
+        ]
       }
     },
     "parameters": {
@@ -5357,6 +5540,52 @@
       },
       "NdjsonError504": {
         "value": "{\"error\":{\"kind\":\"timeout\",\"message\":\"the action timed out\",\"hint\":\"retry with a larger bounded timeout\"}}\n"
+      },
+      "CloneMachineRequest": {
+        "value": {
+          "name": "dev-copy",
+          "fresh_disk": false
+        }
+      },
+      "CloneNdjson": {
+        "value": "{\"type\":\"StepStart\",\"id\":\"spec\",\"label\":\"copying spec to dev-copy\"}\n{\"type\":\"StepDone\",\"id\":\"spec\",\"detail\":null,\"elapsed_ms\":2}\n{\"type\":\"StepStart\",\"id\":\"disk\",\"label\":\"preparing dev-copy disk\"}\n{\"type\":\"StepDone\",\"id\":\"disk\",\"detail\":\"copied overlay\",\"elapsed_ms\":812}\n{\"type\":\"Result\",\"action\":\"clone\",\"payload\":{\"source\":\"dev\",\"dest\":\"dev-copy\",\"disk_bytes\":21474836480}}\n"
+      },
+      "CloneAggregate": {
+        "value": {
+          "events": [
+            {
+              "type": "StepStart",
+              "id": "spec",
+              "label": "copying spec to dev-copy"
+            },
+            {
+              "type": "StepDone",
+              "id": "spec",
+              "detail": null,
+              "elapsed_ms": 2
+            },
+            {
+              "type": "StepStart",
+              "id": "disk",
+              "label": "preparing dev-copy disk"
+            },
+            {
+              "type": "StepDone",
+              "id": "disk",
+              "detail": "copied overlay",
+              "elapsed_ms": 812
+            }
+          ],
+          "result": {
+            "type": "Result",
+            "action": "clone",
+            "payload": {
+              "source": "dev",
+              "dest": "dev-copy",
+              "disk_bytes": 21474836480
+            }
+          }
+        }
       }
     }
   },

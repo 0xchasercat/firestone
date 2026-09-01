@@ -10,6 +10,7 @@ use std::{
 use console::measure_text_width;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
 
+use firestone_core::CloneResult;
 use firestone_core::{
     CatalogEntrySummary, CatalogFirmware, DoctorCheckId, DoctorReport, DoctorStatus, ErrorInfo,
     ErrorKind, Event, EventSink, FirestoneError, Level, LogsResult, MachineRecord, MachineStatus,
@@ -857,6 +858,14 @@ where
                     write_line(&mut self.stdout, format_args!("removed {name}"))?;
                 }
                 Ok(())
+            }
+            "clone" => {
+                let result: CloneResult = serde_json::from_value(payload)
+                    .map_err(|error| invalid_result_payload("clone", error))?;
+                write_line(
+                    &mut self.stdout,
+                    format_args!("cloned {} to {}", result.source, result.dest),
+                )
             }
             "ssh-config" => {
                 let result: SshConfigResult = serde_json::from_value(payload)

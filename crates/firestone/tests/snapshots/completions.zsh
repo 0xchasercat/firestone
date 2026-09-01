@@ -580,6 +580,24 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(clone)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--fresh-disk[Give the clone an empty overlay on the same base image]' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':source -- Existing stopped or created machine to copy:_default' \
+':dest -- New machine name:_default' \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_firestone__subcmd__help_commands" \
@@ -704,6 +722,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(clone)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -742,6 +764,7 @@ _firestone_commands() {
 'version:Print Firestone, pinned dependency, and resolved path versions' \
 'serve:Run the stateless REST API over a private Unix socket or loopback port' \
 'ui:Open the Firestone web interface on a loopback port' \
+'clone:Copy a stopped machine'\''s spec and disk to a new machine' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'firestone commands' commands "$@"
@@ -750,6 +773,11 @@ _firestone_commands() {
 _firestone__subcmd__catalog_commands() {
     local commands; commands=()
     _describe -t commands 'firestone catalog commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__clone_commands] )) ||
+_firestone__subcmd__clone_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone clone commands' commands "$@"
 }
 (( $+functions[_firestone__subcmd__completions_commands] )) ||
 _firestone__subcmd__completions_commands() {
@@ -799,6 +827,7 @@ _firestone__subcmd__help_commands() {
 'version:Print Firestone, pinned dependency, and resolved path versions' \
 'serve:Run the stateless REST API over a private Unix socket or loopback port' \
 'ui:Open the Firestone web interface on a loopback port' \
+'clone:Copy a stopped machine'\''s spec and disk to a new machine' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'firestone help commands' commands "$@"
@@ -807,6 +836,11 @@ _firestone__subcmd__help_commands() {
 _firestone__subcmd__help__subcmd__catalog_commands() {
     local commands; commands=()
     _describe -t commands 'firestone help catalog commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__clone_commands] )) ||
+_firestone__subcmd__help__subcmd__clone_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help clone commands' commands "$@"
 }
 (( $+functions[_firestone__subcmd__help__subcmd__completions_commands] )) ||
 _firestone__subcmd__help__subcmd__completions_commands() {

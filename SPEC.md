@@ -28,6 +28,7 @@ Anything not in it is out of scope until it is added to the decision log (§21).
 20. Assumptions to verify before relying on them
 21. Decision log
 22. Milestones
+24. Clone
 Appendix A. Example session
 Appendix B. Suggested `CLAUDE.md`
 
@@ -976,6 +977,7 @@ Global flags on every command: `--json` (NDJSON events on stdout, human output o
 | `stop NAME [--timeout D] [--force]` | graceful ACPI stop, escalate on timeout |
 | `restart NAME` | stop + start |
 | `rm NAME… [--force]` | stop if needed, delete everything |
+| `clone SRC DEST [--fresh-disk]` | copy a stopped or created machine's spec and disk to a new machine (§24) |
 | `ls` (alias `list`) | table of machines (§15.3) |
 | `show NAME [--vmconfig]` | spec + state (+ generated VmConfig) |
 | `edit NAME` | open `firestone.toml` in the selected editor; validate on save, re-open on error |
@@ -1115,6 +1117,7 @@ The server holds no state and takes the same machine locks as the CLI. `curl --u
 | POST | `/v1/machines/{name}/start` | `{wait?, timeout_s?}` | event stream → `Result` |
 | POST | `/v1/machines/{name}/stop` | `{timeout_s?, force?}` | event stream → `Result` |
 | POST | `/v1/machines/{name}/restart` | | event stream → `Result` |
+| POST | `/v1/machines/{name}/clone` | `{name, fresh_disk?}` | event stream → `Result` (§24) |
 | GET | `/v1/machines/{name}/logs?source=&follow=&lines=` | | `text/plain`, chunked |
 | GET | `/v1/machines/{name}/vmconfig` | | generated VmConfig JSON |
 | GET | `/v1/catalog` | | `[{reference, aliases, architectures: [{architecture, firmware}]}]` |
@@ -1334,6 +1337,7 @@ Do these in the first milestone, against the pinned versions, and record results
 
 | Decision | Chosen | Alternatives considered | Why |
 |---|---|---|---|
+| `clone` disk semantics | Copy the source's qcow2 overlay with `qemu-img convert -B <base>` by default so installed guest state carries over while the immutable base stays shared; require the source to be `created` or `stopped`; offer `--fresh-disk` for an empty overlay on the same base; copy `firestone.toml` byte for byte and never copy `state.json`, `known_hosts`, seed artifacts, logs or snapshots | reference the source overlay as a new backing file; copy the whole machine directory; snapshot-and-restore into the destination; allow cloning a running machine | A copied overlay is a real independent disk: removing the source cannot corrupt the clone, which a backing-file chain would allow. Refusing a running source is the only way to get a crash-consistent copy without a VMM-level quiesce, and the M6-04 snapshot work reuses the same `copy_overlay` primitive. Excluding runtime files keeps MAC and cloud-init instance id derived from the destination name, so the clone is a new machine by construction; the duplicated guest `/etc/machine-id` is documented in §24.4 rather than papered over by rewriting guest filesystems. |
 | M6 interface contracts frozen up front | Snapshot, clone, resize, metrics, prune, and terminal WS routes plus spec additions are fixed before implementation (route shapes recorded in the M6 milestone's feature sections as they land); UI work proceeds against the contracts in parallel | design each surface inside its implementation PR; a single serialized workstream | Parallel agents need a stable seam; freezing the action names, REST paths and payload shapes first lets core and UI land independently while the drift gate keeps `docs/openapi.json` honest. |
 | First-start pinned firmware | Before `vmconfig.json` publication, install only the effective built-in `auto`/`rhf`/`edk2` artifact through the shared locked, no-follow, exact hash/mode, fsynced, no-replace publisher; reverify it for VmConfig; never install or modify a custom firmware path | require a broad `doctor --fix` preflight; download every vendored artifact; trust an existing regular file; rewrite custom firmware | A direct first start from an empty home gets the one firmware it needs without unrelated host repair. The manifest identity and secure publisher keep VMM input inside Firestone's owned dependency boundary, while the custom path remains authoritative. |
 | Passt runtime isolation diagnosis | Probe the exact foreground, one-off vhost-user mode with repair disabled; classify both `Couldn't create user namespace` and `Failed to detach isolating namespaces` as fatal; offer the existing AppArmor repair when host facts support it; runtime selects only the verified literal root-owned pinned copy after repair | treat later detach failure as available because the first userns succeeded; use generic `unshare`; disable AppArmor or a sysctl; accept a user-writable profiled path | Passt cannot serve Cloud Hypervisor after either fatal exit. Matching runtime argv closes the false-ok gap, and verified literal-path selection proves the repair authorizes only the pinned binary. |
@@ -1512,6 +1516,68 @@ Progress bars, timing details, hints on every error kind, `completions`, `versio
 
 **M6 — daily driver (v0.2.0)**
 Snapshots (cold guaranteed; warm gated on verified vhost-user restore), `clone`, disk grow and live cpu/memory resize with opt-in headroom, per-machine metrics sampling, `cp`, system prune, pending-forward surfacing, cloud-init password/inline-key/inline-user-data authoring, OCI image boot (registry pull, ext4 rootfs packing, pinned direct-boot kernel, embedded `firestone-init` PID 1), and the web UI grown to parity: ANSI-color logs, WebSocket console and SSH shell terminal, machine editing, create-form image picker and structured inputs, metrics sparklines, snapshot/clone/prune surfaces. Each feature lands with its own normative sections and decision-log entries. Acceptance: required local gate plus `scripts/m6-kvm-e2e.py` and `scripts/m6-oci-kvm-e2e.py` green on a real x86_64 KVM host, existing e2e regression green, docs validated, release `v0.2.0` published.
+
+---
+
+## 24. Clone (normative)
+
+`clone` copies an existing machine definition, and by default its writable disk, into a new machine that has never run.
+
+### 24.1 Surfaces
+
+| Surface | Form |
+|---|---|
+| CLI | `firestone clone SRC DEST [--fresh-disk]` |
+| REST | `POST /v1/machines/{name}/clone` with body `{"name": "<dest>", "fresh_disk": false}`, streaming NDJSON events (§16.3) |
+| Action | `Action::Clone { source, dest, fresh_disk }` |
+| Result | `CloneResult { source, dest, disk_bytes }` under result action `clone` |
+
+`fresh_disk` is optional in the REST body and defaults to `false`. `disk_bytes` is the virtual size of the destination overlay in bytes, or `0` when the source had no overlay and none was created. Both surfaces construct the same action and therefore produce byte-identical `Result` payloads.
+
+### 24.2 Requirements
+
+- `DEST` must be a valid machine name (one non-empty path component, §6.1) and must not already name a machine; a taken name fails with `already_exists`.
+- `DEST` must differ from `SRC`; cloning a machine onto itself is a `usage` error.
+- The source must be `created` or `stopped`. Any other status fails with `conflict`, message `machine '<src>' is <status> and cannot be cloned`, and hint `run 'firestone stop <src>' and clone the stopped machine`. This is checked before the source machine lock is taken, so a running machine reports the refusal instead of waiting on its shim's lock.
+- Locks are taken in one stable order: the source machine lock first, then the destination through the same creation path `create` uses (`.creating` marker, destination machine lock, publication). A failed clone leaves no published destination.
+- The destination's `firestone.toml` is the source document **byte for byte**. It must resolve against the destination machine directory; a spec whose relative `cloud_init.user_data`, `cloud_init.network_config`, or `mount.host` path only exists beside the source is rejected before anything is written.
+- The destination `state.json` is written fresh in `created` status with the source's pinned `image` identity (`ref`, `id`, `sha256`) so the clone reuses the exact verified base, and with `mac`, `instance_id`, `shim_pid`, `vmm_pid`, `sidecar_pids`, `started_at`, `degraded` and `last_exit` empty.
+- Events: `StepStart`/`StepDone` for `spec`, then for `disk`. The `disk` step reports `copied overlay` or `fresh overlay`, or is a `StepSkip` with reason `no disk yet` when the source has never started and therefore owns no overlay.
+
+### 24.3 What is and is not copied
+
+| Artifact | Default clone | `--fresh-disk` |
+|---|---|---|
+| `firestone.toml` | copied verbatim | copied verbatim |
+| `disk.qcow2` | copied with `qemu-img convert`, keeping the shared base | new empty overlay on the same base |
+| pinned image identity in `state.json` | copied | copied |
+| `state.json` runtime fields | never copied | never copied |
+| `known_hosts` | never copied | never copied |
+| `seed.img`, `seed/`, `vmconfig.json` | never copied | never copied |
+| `console.log` and other logs | never copied | never copied |
+| snapshots | never copied | never copied |
+| base image in the image store | shared, never duplicated | shared, never duplicated |
+
+The default copy is a full qcow2 overlay copy, so packages installed in the source guest are present in the clone; only the immutable base stays shared. The copy runs through `Cmd` with the pinned qemu-img 8.2.2 argv
+
+```
+qemu-img convert -f qcow2 -O qcow2 -o backing_fmt=qcow2 -B <absolute base path> <source overlay> <dest partial>
+```
+
+with the 30-minute conversion timeout, under the image-store lock, followed by the same discipline `create` uses for a fresh overlay (§8.4): mode `0600`, `fsync`, `qemu-img info` validation of the copy's backing chain and virtual size, publication with no replace, and a directory `fsync`. The source overlay's backing chain is validated to be exactly the pinned base before the copy starts, so a clone can never silently re-point at a different image.
+
+### 24.4 Identity
+
+| Identity | Derivation | Clone result |
+|---|---|---|
+| MAC address | `sha256("firestone-machine-mac-v1\0" ‖ data dir ‖ "\0" ‖ machine name)` at first start, unless `network.mac` is set in the spec | fresh by construction |
+| cloud-init instance id | `iid-<machine name>-<12 hex of the rendered seed digest>` at first start | fresh by construction |
+| vsock CID | fixed 3, per-machine socket namespace | unchanged |
+| guest `/etc/machine-id` | written inside the guest filesystem | **duplicated** (known limitation) |
+
+Because the MAC and the instance id are derived from the machine name and are only materialized at start, the clone allocates its own on its first boot; nothing is carried over in `state.json`. A source spec that pins `network.mac` explicitly is the one exception: the clone inherits that address verbatim with the rest of the document, and Firestone emits a warning naming both machines. Change `network.mac` in the clone before running both machines on the same L2 segment.
+
+Known limitation: a copied overlay carries the guest's `/etc/machine-id`, `/etc/hostname` contents written by the source's first boot, and any other in-guest state. Two clones of the same source therefore present the same `/etc/machine-id` to DHCP servers and to systemd-journal upload. Firestone does not rewrite guest filesystems; run `systemd-firstboot --setup-machine-id` (or delete `/etc/machine-id` and reboot) inside the clone when a unique guest identity matters. `--fresh-disk` avoids the issue entirely by re-provisioning from the base image.
 
 ---
 
