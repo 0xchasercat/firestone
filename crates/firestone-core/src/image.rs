@@ -6677,6 +6677,66 @@ else:
     }
 
     #[test]
+    fn partial_name_classification_oci_pull_artifacts_expected_recognized() {
+        let digest = "b".repeat(64);
+        for name in [
+            format!(".pull-{digest}.source.partial"),
+            format!(".pull-{digest}.stored.partial"),
+            format!(".pull-{digest}.tar.partial"),
+            format!(".pull-{digest}.layer0.partial"),
+            format!(".pull-{digest}.layer12.partial"),
+        ] {
+            assert!(is_known_partial_name(&name), "{name}");
+        }
+        for name in [
+            // A layer index is required and must be decimal.
+            format!(".pull-{digest}.layer.partial"),
+            format!(".pull-{digest}.layerx.partial"),
+            // Every partial still has to name a 64-hex operation key.
+            ".pull-short.tar.partial".to_owned(),
+            ".pull-short.layer0.partial".to_owned(),
+            // Neither an unknown suffix nor an unrelated file is a partial.
+            format!(".pull-{digest}.rootfs.partial"),
+            format!("{digest}.tar.partial"),
+            "keep-me.txt".to_owned(),
+        ] {
+            assert!(!is_known_partial_name(&name), "{name}");
+        }
+    }
+
+    #[test]
+    fn prune_partials_interrupted_oci_pull_expected_layer_and_tar_removed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        fixture.store.ensure_store()?;
+        let digest = "c".repeat(64);
+        let tar = fixture.paths.image_rootfs_tar_partial(&digest)?;
+        let layer = fixture.paths.image_layer_partial(&digest, 3)?;
+        for path in [&tar, &layer] {
+            fs::write(path, vec![9_u8; 4096])?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
+
+        let planned = fixture.store.prune_partials(true)?;
+        let ids = planned
+            .iter()
+            .map(|artifact| artifact.id.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            ids,
+            BTreeSet::from([
+                format!(".pull-{digest}.layer3.partial"),
+                format!(".pull-{digest}.tar.partial"),
+            ])
+        );
+        assert!(tar.exists() && layer.exists());
+
+        assert_eq!(fixture.store.prune_partials(false)?, planned);
+        assert!(!tar.exists() && !layer.exists());
+        Ok(())
+    }
+
+    #[test]
     fn image_store_lock_contention_returns_busy() -> Result<(), Box<dyn std::error::Error>> {
         if env::var_os(LOCK_HELPER_ENV).is_some() {
             return Ok(());
