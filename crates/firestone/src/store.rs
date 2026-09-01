@@ -4155,7 +4155,7 @@ esac
         );
         assert_eq!(result.architecture, architecture.as_str());
         let expected_dependencies = match architecture {
-            Arch::X86_64 => 7,
+            Arch::X86_64 => 8,
             Arch::Aarch64 => 5,
         };
         assert_eq!(result.dependencies.len(), expected_dependencies);
