@@ -273,8 +273,10 @@ impl Catalog {
         } else {
             format!("unknown image '{reference}'; closest catalog images: {closest}")
         };
-        FirestoneError::new(ErrorKind::NotFound, message)
-            .with_hint("run `firestone images ls` to list catalog images")
+        FirestoneError::new(ErrorKind::NotFound, message).with_hint(
+            "run `firestone catalog` to list catalog images, or pull a container image \
+                 by writing `docker://nginx`",
+        )
     }
 
     fn closest_names(&self, reference: &str, limit: usize) -> Vec<String> {

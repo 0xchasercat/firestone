@@ -16,6 +16,7 @@ pub mod event;
 pub mod image;
 pub mod lock;
 pub mod network;
+pub mod oci;
 pub mod paths;
 pub mod readiness;
 pub mod result;
@@ -65,6 +66,7 @@ pub use network::{
     ReadinessCancellation, SocketReadiness, SocketReadinessPlan, TapHost, TapOwnership, TapPlan,
     passt_forward_argument, prepare_network, validate_tap,
 };
+pub use oci::{OciClassification, OciReference, OciTagOrDigest};
 pub use paths::{PathInputs, Paths};
 pub use readiness::{ReadinessOptions, wait_for_ssh_ready};
 pub use result::{

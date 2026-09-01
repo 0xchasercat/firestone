@@ -31,6 +31,7 @@ use crate::{
     bounded::{self, BoundedReadError},
     catalog::{SshdPath, parse_https_url},
     embedded_helpers::install_pinned_artifact_with,
+    oci::{OciClassification, OciReference},
 };
 const IMAGE_METADATA_VERSION: u32 = 1;
 const IMAGE_ID_PREFIX: &str = "image-";
@@ -316,6 +317,7 @@ pub struct ImageVerification {
 pub enum ImageSourceLocation {
     Https(String),
     Local(PathBuf),
+    Oci(OciReference),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -687,6 +689,19 @@ impl ImageStore {
             });
         }
 
+        if let Some(reference) = classify_oci_reference(value)? {
+            if supplied_sha256.is_some() {
+                return Err(FirestoneError::new(
+                    ErrorKind::Usage,
+                    format!("--sha256 is not accepted for OCI image reference '{reference}'"),
+                )
+                .with_hint(
+                    "pin an OCI image with a repo@sha256:… digest reference instead of --sha256",
+                ));
+            }
+            return Ok(self.oci_source(reference));
+        }
+
         if supplied_sha256.is_some() {
             return Err(FirestoneError::new(
                 ErrorKind::Usage,
@@ -751,6 +766,22 @@ impl ImageStore {
         }
     }
 
+    /// Builds the resolved source for an already-parsed OCI reference.
+    fn oci_source(&self, reference: OciReference) -> ResolvedImageSource {
+        ResolvedImageSource {
+            source_ref: reference.to_string(),
+            source_url: None,
+            architecture: self.architecture,
+            source_format: None,
+            firmware: None,
+            sshd_path: SshdPath::default(),
+            verification: None,
+            location: ImageSourceLocation::Oci(reference),
+            checksum: ExpectedChecksum::None,
+            local_source: None,
+        }
+    }
+
     fn resolve_persisted(&self, reference: &str) -> Result<ResolvedImageSource, FirestoneError> {
         if let Some(url) = parse_https_url(reference) {
             let source_url = url.to_string();
@@ -787,6 +818,9 @@ impl ImageStore {
                 checksum: ExpectedChecksum::None,
                 local_source: Some(opened),
             });
+        }
+        if let Some(oci) = classify_oci_reference(reference)? {
+            return Ok(self.oci_source(oci));
         }
         let resolved = self
             .catalog
@@ -1057,6 +1091,9 @@ impl ImageStore {
         mut source: ResolvedImageSource,
         events: &mut dyn EventSink,
     ) -> Result<PulledImage, FirestoneError> {
+        if let ImageSourceLocation::Oci(reference) = &source.location {
+            return Err(oci_pull_unsupported(reference));
+        }
         let started = Instant::now();
         self.emit_image_start(&source.source_ref, events)?;
         self.resolve_expected_checksum(&mut source)?;
@@ -1269,6 +1306,7 @@ impl ImageStore {
                     events,
                 )
             }
+            ImageSourceLocation::Oci(reference) => Err(oci_pull_unsupported(reference)),
         }
     }
 
@@ -2837,6 +2875,33 @@ fn stable_image_id(
         "{IMAGE_ID_PREFIX}{}",
         digest_hex(hasher.finalize().as_slice())
     )
+}
+
+/// Applies the §8.5 OCI classifier to one reference.
+///
+/// Returns `Ok(Some(reference))` when the value is an OCI reference that parses,
+/// `Ok(None)` when the value is not OCI at all or when only the registry-host
+/// heuristic matched and the value did not parse (so path and catalog
+/// resolution keep their existing behavior), and `Err` when an explicit
+/// `oci://` or `docker://` reference is malformed.
+fn classify_oci_reference(value: &str) -> Result<Option<OciReference>, FirestoneError> {
+    let Some(classification) = crate::oci::classify(value) else {
+        return Ok(None);
+    };
+    match OciReference::parse(value) {
+        Ok(reference) => Ok(Some(reference)),
+        Err(error) if classification == OciClassification::Scheme => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
+/// The placeholder error returned until the OCI pull pipeline lands.
+fn oci_pull_unsupported(reference: &OciReference) -> FirestoneError {
+    FirestoneError::new(
+        ErrorKind::Dependency,
+        format!("OCI image pulls land in a following change; cannot pull '{reference}' yet"),
+    )
+    .with_hint("use a catalog reference, an HTTPS URL, or a local qcow2/raw path for now")
 }
 
 fn operation_key(source: &ResolvedImageSource) -> String {
@@ -6232,6 +6297,191 @@ sshd_path = "{}"
             assert!(!name.ends_with(".partial"), "stale partial: {name}");
         }
         assert_eq!(over_store.list()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_oci_reference_expected_normalized_oci_location()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let cases: &[(&str, &str)] = &[
+            ("docker://nginx", "docker.io/library/nginx:latest"),
+            ("oci://nginx:1.27", "docker.io/library/nginx:1.27"),
+            ("ghcr.io/owner/app:v1", "ghcr.io/owner/app:v1"),
+            ("localhost:5000/app", "localhost:5000/app:latest"),
+        ];
+
+        for (input, canonical) in cases {
+            let resolved = fixture
+                .store
+                .resolve(&ImageRef::new(*input), None, &fixture.root)?;
+            assert_eq!(resolved.source_ref, *canonical, "resolving {input}");
+            assert_eq!(resolved.source_url, None);
+            assert_eq!(resolved.firmware, None);
+            assert_eq!(resolved.verification, None);
+            let ImageSourceLocation::Oci(reference) = &resolved.location else {
+                return Err(format!("{input} did not resolve to an OCI location").into());
+            };
+            assert_eq!(reference.to_string(), *canonical);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_non_oci_references_expected_unchanged_after_the_oci_branch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let local = fixture.write_source("local.qcow2", b"QFI\xFBLOCAL")?;
+
+        let catalog = fixture
+            .store
+            .resolve(&ImageRef::new("ubuntu:24.04"), None, &fixture.root)?;
+        assert_eq!(catalog.source_ref, "ubuntu:24.04");
+        assert!(matches!(catalog.location, ImageSourceLocation::Https(_)));
+
+        let url = "https://example.invalid/base.qcow2";
+        let direct = fixture
+            .store
+            .resolve(&ImageRef::new(url), None, &fixture.root)?;
+        assert_eq!(direct.location, ImageSourceLocation::Https(url.to_owned()));
+
+        let relative =
+            fixture
+                .store
+                .resolve(&ImageRef::new("./local.qcow2"), None, &fixture.root)?;
+        assert_eq!(relative.location, ImageSourceLocation::Local(local.clone()));
+
+        let absolute = fixture.store.resolve(
+            &ImageRef::new(local.to_string_lossy().as_ref()),
+            None,
+            &fixture.root,
+        )?;
+        assert_eq!(absolute.location, ImageSourceLocation::Local(local));
+
+        let missing = fixture
+            .store
+            .resolve(&ImageRef::new("./missing.qcow2"), None, &fixture.root)
+            .err()
+            .ok_or("expected a missing relative path to fail")?;
+        assert_eq!(missing.kind(), ErrorKind::NotFound);
+        assert!(missing.message().contains("local image path"));
+
+        let bare = fixture
+            .store
+            .resolve(&ImageRef::new("nginx"), None, &fixture.root)
+            .err()
+            .ok_or("expected a bare name to stay a catalog error")?;
+        assert_eq!(bare.kind(), ErrorKind::NotFound);
+        assert!(bare.message().contains("unknown image 'nginx'"));
+        assert!(
+            bare.hint()
+                .is_some_and(|hint| hint.contains("docker://nginx")),
+            "bare-name hint should name docker://nginx"
+        );
+
+        let namespaced = fixture
+            .store
+            .resolve(&ImageRef::new("owner/app"), None, &fixture.root)
+            .err()
+            .ok_or("expected a registry-less namespaced name to stay a path error")?;
+        assert_eq!(namespaced.kind(), ErrorKind::NotFound);
+        assert!(namespaced.message().contains("local image path"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_oci_reference_with_supplied_sha256_expected_usage_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let error = fixture
+            .store
+            .resolve(
+                &ImageRef::new("docker://nginx"),
+                Some(&"a".repeat(64)),
+                &fixture.root,
+            )
+            .err()
+            .ok_or("expected --sha256 to be rejected for an OCI reference")?;
+
+        assert_eq!(error.kind(), ErrorKind::Usage);
+        assert!(error.message().contains("docker.io/library/nginx:latest"));
+        assert!(
+            error
+                .hint()
+                .is_some_and(|hint| hint.contains("repo@sha256:")),
+            "hint should point at digest references"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_malformed_oci_scheme_reference_expected_invalid_spec()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let error = fixture
+            .store
+            .resolve(&ImageRef::new("docker://NGINX"), None, &fixture.root)
+            .err()
+            .ok_or("expected an explicit malformed OCI reference to fail")?;
+
+        assert_eq!(error.kind(), ErrorKind::InvalidSpec);
+        assert!(error.message().contains("invalid OCI image reference"));
+        Ok(())
+    }
+
+    #[test]
+    fn pull_oci_reference_expected_dependency_error() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let error = fixture
+            .store
+            .pull(
+                &ImagePullRequest::new(ImageRef::new("docker://nginx"), &fixture.root),
+                &mut Vec::new(),
+            )
+            .err()
+            .ok_or("expected the OCI pull placeholder to fail")?;
+
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert!(
+            error
+                .message()
+                .contains("OCI image pulls land in a following change")
+        );
+        assert!(error.message().contains("docker.io/library/nginx:latest"));
+        assert!(error.hint().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_persisted_references_expected_oci_only_for_classified_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let local = fixture.write_source("persisted.qcow2", b"QFI\xFBPERSIST")?;
+
+        let oci = fixture
+            .store
+            .resolve_persisted("docker.io/library/nginx:latest")?;
+        assert_eq!(oci.source_ref, "docker.io/library/nginx:latest");
+        assert!(matches!(oci.location, ImageSourceLocation::Oci(_)));
+
+        let catalog = fixture.store.resolve_persisted("ubuntu:24.04")?;
+        assert!(matches!(catalog.location, ImageSourceLocation::Https(_)));
+
+        let url = "https://example.invalid/persisted.qcow2";
+        let direct = fixture.store.resolve_persisted(url)?;
+        assert_eq!(direct.location, ImageSourceLocation::Https(url.to_owned()));
+
+        let absolute = fixture
+            .store
+            .resolve_persisted(local.to_string_lossy().as_ref())?;
+        assert_eq!(absolute.location, ImageSourceLocation::Local(local));
+
+        let relative = fixture
+            .store
+            .resolve_persisted("./persisted.qcow2")
+            .err()
+            .ok_or("persisted resolution must not probe relative paths")?;
+        assert_eq!(relative.kind(), ErrorKind::NotFound);
         Ok(())
     }
 }

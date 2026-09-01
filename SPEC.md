@@ -477,6 +477,7 @@ color = "auto"          # "auto" | "always" | "never"   (NO_COLOR env also respe
 
 [images]
 catalog = []            # extra catalog files, merged over the built-in one
+insecure_registries = []  # OCI registries reachable over plain HTTP: "host" or "host:port"
 ```
 
 ### 7.4 CLI flag ↔ field mapping
@@ -552,9 +553,10 @@ Initial catalog: `ubuntu` (24.04 default, 22.04), `debian` (12 default, 13), `fe
 
 1. Absolute or relative path that exists → local file (raw or qcow2; detected by header).
 2. `https://…` → download to the images dir keyed by URL sha; no checksum unless `--sha256` given (warn once).
-3. `distro:version` or `distro:alias` → catalog entry.
-4. `distro` → the catalog entry marked `default` for that distro.
-5. Otherwise error `unknown image` listing the closest catalog names.
+3. An OCI reference per §8.5 → container registry.
+4. `distro:version` or `distro:alias` → catalog entry.
+5. `distro` → the catalog entry marked `default` for that distro.
+6. Otherwise error `unknown image` listing the closest catalog names.
 
 The host architecture selects the `[image.arch.<arch>]` table; a missing table is an error naming the architectures that exist. An optional architecture-level `firmware` overrides the entry default for that source only. Catalog distro, version, and alias components must start with ASCII alphanumeric and then contain only ASCII alphanumeric, `.`, `_`, `+`, or `-`; path separators, URL syntax, traversal components, colons, and controls are rejected while loading the catalog.
 
@@ -580,6 +582,27 @@ User-entered image arguments retain path-first resolution. Persisted machine ref
   The partial is inspected with `qemu-img info --output=json -f qcow2 PATH`. Immutable bases must be clean and non-corrupt. Writable overlays may report `dirty-flag: true` after a crash so qcow2/Cloud Hypervisor can recover them, but corrupt overlays, any external data file, malformed dependency-shaped fields, and unexpected backing metadata are rejected. An overlay must report both `backing-filename` and `full-backing-filename` as the exact owned base string, `backing-filename-format: qcow2`, and the requested virtual size before atomic publication or cached reuse as `<machine>/disk.qcow2`. `qemu-img info`, overlay creation, and raw conversion run through `Cmd` with respective 30 s, 60 s, and 30 min timeouts while the relevant locks remain held.
 - Cloud Hypervisor v53 accepted the exact qcow2 overlay with `backing_files: true` and booted the converted Ubuntu 24.04 x86_64 source through edk2 to a serial login prompt. The M1-06 guest fio run records overlay and raw auxiliary-disk measurements in §21. This specification defines no performance threshold, so none is inferred. The aarch64 result remains open outside the M1 gate.
 - Base images are mode 0400 and never attached read-write. `images rm` refuses (without `--force`) while any complete `state.json` references the full id; `images prune` removes only valid unreferenced pairs and reports stored bytes freed.
+
+### 8.5 OCI image references (normative)
+
+Firestone accepts container images alongside catalog references, HTTPS URLs, and local files. This section defines only reference syntax and where the OCI branch sits in resolution; the registry client, layer merge, and pull pipeline are specified separately.
+
+**Classification.** A reference is an OCI reference exactly when it starts with `oci://` or `docker://` (the prefix is stripped before parsing), or when it contains `/` and its first `/`-separated component contains `.` or `:` or equals `localhost`. Nothing else is an OCI reference: `ubuntu:24.04`, `nginx`, `owner/app`, `./disk.qcow2`, `~/disk.qcow2`, and absolute paths are not.
+
+**Resolution order.** The OCI branch sits between the HTTPS-URL check and the catalog lookup, so local-file probing still runs first for user-entered arguments (§8.2) and a strict HTTPS URL is still a direct download. When only the registry-host heuristic classified a reference and it does not parse, resolution falls through to the existing path and catalog behavior unchanged; an explicit `oci://`/`docker://` reference that does not parse is an `invalid_spec` error, because no other interpretation exists. A bare name such as `nginx` therefore remains an `unknown image` catalog error, whose hint names `docker://nginx`.
+
+**Normalization.** A parsed reference is `registry/repository:tag` or `registry/repository@sha256:<64 lowercase hex>`, and its rendering re-parses to itself.
+
+- The registry is `host` or `host:port`, lowercased. A reference with no registry component uses `docker.io`, and `index.docker.io` normalizes to `docker.io`.
+- A `docker.io` repository with a single component is prefixed with `library/`, so `docker://nginx` is `docker.io/library/nginx:latest`.
+- A reference with neither tag nor digest uses the tag `latest`. A digest reference carries no tag.
+- Repository components are lowercase `[a-z0-9]` runs separated by `.`, `_`, `__`, or one or more `-`, and start and end with a letter or digit. Tags are at most 128 characters, start with a letter, digit, or `_`, and otherwise contain letters, digits, `.`, `_`, and `-`. Only `sha256` digests are accepted.
+
+**Persisted references.** Validation rewrites an accepted OCI reference in the machine spec to its normalized form, exactly as it rewrites an existing local path to its canonical absolute path. Persisted resolution classifies an OCI reference after the strict HTTPS URL and the absolute canonical path and before the catalog, so a relative filesystem name still cannot shadow it.
+
+**`--sha256`.** The flag stays HTTPS-only. Supplying it with an OCI reference is a `usage` error whose hint points at `repo@sha256:…` digest references.
+
+**Configuration.** `[images].insecure_registries` in `~/.config/firestone/config.toml` lists registries reachable over plain HTTP as bare `host` or `host:port` entries. An entry carrying a scheme, a path, credentials, an empty host, or a non-numeric or out-of-range port is an `invalid_spec` error naming `images.insecure_registries`.
 
 ---
 
@@ -1334,6 +1357,7 @@ Do these in the first milestone, against the pinned versions, and record results
 
 | Decision | Chosen | Alternatives considered | Why |
 |---|---|---|---|
+| OCI reference classification and docker.io normalization | A reference is OCI exactly when it carries an `oci://`/`docker://` prefix or contains `/` with a first component holding `.` or `:` or equal to `localhost`; parsed references normalize to `registry/repository:tag` or `repository@sha256:…` with `docker.io`, the `library/` namespace, and the `latest` tag filled in; the branch sits between the HTTPS check and the catalog, and a heuristic-only reference that fails to parse falls through unchanged | require an explicit scheme for every container image; ask the registry whether a name exists; treat any `a/b` name as OCI; hard-fail every classified reference that does not parse | The heuristic is the one users already know from Docker and Podman, so `ghcr.io/owner/app` works without ceremony while `ubuntu:24.04`, `nginx`, and `owner/app` keep their current meaning. Normalizing at parse time gives the registry client, the cache key, and `state.image.ref` one canonical spelling. Falling through on a heuristic-only parse failure is what keeps `./file.qcow2` and other dotted relative paths reporting the same missing-path error they reported before. |
 | M6 interface contracts frozen up front | Snapshot, clone, resize, metrics, prune, and terminal WS routes plus spec additions are fixed before implementation (route shapes recorded in the M6 milestone's feature sections as they land); UI work proceeds against the contracts in parallel | design each surface inside its implementation PR; a single serialized workstream | Parallel agents need a stable seam; freezing the action names, REST paths and payload shapes first lets core and UI land independently while the drift gate keeps `docs/openapi.json` honest. |
 | First-start pinned firmware | Before `vmconfig.json` publication, install only the effective built-in `auto`/`rhf`/`edk2` artifact through the shared locked, no-follow, exact hash/mode, fsynced, no-replace publisher; reverify it for VmConfig; never install or modify a custom firmware path | require a broad `doctor --fix` preflight; download every vendored artifact; trust an existing regular file; rewrite custom firmware | A direct first start from an empty home gets the one firmware it needs without unrelated host repair. The manifest identity and secure publisher keep VMM input inside Firestone's owned dependency boundary, while the custom path remains authoritative. |
 | Passt runtime isolation diagnosis | Probe the exact foreground, one-off vhost-user mode with repair disabled; classify both `Couldn't create user namespace` and `Failed to detach isolating namespaces` as fatal; offer the existing AppArmor repair when host facts support it; runtime selects only the verified literal root-owned pinned copy after repair | treat later detach failure as available because the first userns succeeded; use generic `unshare`; disable AppArmor or a sysctl; accept a user-writable profiled path | Passt cannot serve Cloud Hypervisor after either fatal exit. Matching runtime argv closes the false-ok gap, and verified literal-path selection proves the repair authorizes only the pinned binary. |

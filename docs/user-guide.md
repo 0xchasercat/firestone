@@ -465,7 +465,7 @@ Start with `firestone doctor`, then use the narrowest relevant log.
 | Vendored dependency or Firestone SSH key missing | Run `firestone doctor --fix` as the Firestone user. |
 | Unsafe config, data, runtime, lock, log, or socket path | Move the unexpected node aside and let Firestone recreate its own path. Do not chmod or follow an unknown-owner or symlinked node just to silence the check. |
 | Less than 5 GB free | Free space in the data filesystem or move the data directory with `FIRESTONE_DATA_DIR`. |
-| `unknown image` | Use a reference from the catalog table, a strict HTTPS URL, or an existing local path. Compile-only aarch64 source metadata does not enable runtime support; doctor rejects an aarch64 host in this MVP. |
+| `unknown image` | Use a reference from the catalog table, a strict HTTPS URL, an existing local path, or an OCI reference such as `docker://nginx` or `ghcr.io/owner/app:v1`. A bare `nginx` is a catalog name, not a container image. Compile-only aarch64 source metadata does not enable runtime support; doctor rejects an aarch64 host in this MVP. |
 | Checksum mismatch | Do not bypass it. Retry from a trusted network and compare the vendor metadata. A direct URL needs `--sha256`. |
 | Disk is smaller than the base image | Recreate the machine with a larger `--disk` before an overlay exists. |
 | Name already in use | Reuse the existing machine or pass a different `--name` when running an image. |

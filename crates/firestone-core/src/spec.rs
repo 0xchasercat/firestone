@@ -715,7 +715,9 @@ pub struct GlobalConfig {
 impl GlobalConfig {
     pub fn from_toml(input: &str) -> Result<Self, FirestoneError> {
         validate_known_keys(input, TomlSchema::Global, "config.toml")?;
-        deserialize_global_toml(input, "config.toml")
+        let config = deserialize_global_toml(input, "config.toml")?;
+        config.images.validate()?;
+        Ok(config)
     }
 
     /// Serializes global configuration without losing nested overlay nulls.
@@ -785,6 +787,29 @@ pub enum ColorMode {
 #[serde(default, deny_unknown_fields)]
 pub struct ImagesConfig {
     pub catalog: Vec<PathBuf>,
+    /// Registries reachable over plain HTTP, as `host` or `host:port` entries.
+    pub insecure_registries: Vec<String>,
+}
+
+impl ImagesConfig {
+    /// Rejects `insecure_registries` entries that carry a scheme or a path.
+    pub fn validate(&self) -> Result<(), FirestoneError> {
+        for entry in &self.insecure_registries {
+            crate::oci::validate_registry_host(entry).map_err(|error| {
+                FirestoneError::new(
+                    ErrorKind::InvalidSpec,
+                    format!("images.insecure_registries: {}", error.message()),
+                )
+                .with_hint(
+                    error
+                        .hint()
+                        .unwrap_or("write a bare 'host' or 'host:port' entry")
+                        .to_owned(),
+                )
+            })?;
+        }
+        Ok(())
+    }
 }
 
 /// How one patch leaf combines with an earlier configuration layer.
@@ -1132,7 +1157,7 @@ impl TableSchema {
             Self::Start => &["timeout_first_boot", "timeout"],
             Self::Stop => &["timeout"],
             Self::Ui => &["color"],
-            Self::Images => &["catalog"],
+            Self::Images => &["catalog", "insecure_registries"],
         }
     }
 
@@ -2054,6 +2079,60 @@ config_overlay = "[]"
             },
             key == "mount",
         )
+    }
+
+    #[test]
+    fn global_config_insecure_registries_valid_entries_expected_accepted() {
+        let config = GlobalConfig::from_toml(
+            "[images]\ninsecure_registries = [\"localhost:5000\", \"registry.internal\"]\n",
+        )
+        .expect("valid insecure registries");
+
+        assert_eq!(
+            config.images.insecure_registries,
+            vec!["localhost:5000".to_owned(), "registry.internal".to_owned()]
+        );
+        let round_trip =
+            GlobalConfig::from_toml(&config.to_toml().expect("serialize")).expect("reparse");
+        assert_eq!(round_trip, config);
+    }
+
+    #[test]
+    fn global_config_insecure_registries_scheme_or_path_expected_invalid_spec() {
+        for entry in [
+            "https://registry.example.com",
+            "registry.example.com/v2",
+            "registry.example.com:port",
+            "",
+        ] {
+            let toml = format!(
+                "[images]\ninsecure_registries = [{}]\n",
+                serde_json::to_string(entry).expect("encode entry")
+            );
+            let error = GlobalConfig::from_toml(&toml)
+                .expect_err(&format!("expected {entry:?} to be rejected"));
+            assert_eq!(error.kind(), ErrorKind::InvalidSpec);
+            assert!(
+                error.message().contains("images.insecure_registries"),
+                "message for {entry:?}: {}",
+                error.message()
+            );
+            assert!(error.hint().is_some(), "hint for {entry:?}");
+        }
+    }
+
+    #[test]
+    fn global_config_unknown_images_key_expected_suggestion() {
+        let error = GlobalConfig::from_toml("[images]\ninsecure_registry = []\n")
+            .expect_err("unknown images key");
+
+        assert_eq!(error.kind(), ErrorKind::InvalidSpec);
+        assert!(error.message().contains("images.insecure_registry"));
+        assert!(
+            error
+                .hint()
+                .is_some_and(|hint| hint.contains("images.insecure_registries"))
+        );
     }
 
     fn array_leaf_paths(value: &Value) -> BTreeSet<String> {
