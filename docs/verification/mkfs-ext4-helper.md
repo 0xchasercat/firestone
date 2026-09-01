@@ -58,3 +58,17 @@ Nothing below can be done from this pull request: every step needs bytes that on
 8. Update the `mkfs.ext4` row in SPEC section 17.2 to name the published release, add the resulting hashes to this document, and move the M6-11 row in `docs/PROJECT_STATUS.md` to `complete`.
 
 `deps.toml` is deliberately untouched by the recipe pull request so that it does not collide with the M6-10 regeneration of the same file.
+
+## Published release (orchestrator record)
+
+`helpers-v0.2.0-firestone.1` was published from workflow run `33557495344` (twice-built, byte-identical) and independently reproduced byte-for-byte on the bare-metal x86_64 host `w` with the same locked inputs before upload:
+
+| Asset | SHA-256 |
+|---|---|
+| `mkfs.ext4-1.47.3-x86_64-unknown-linux-musl` | `f1ed0b2b8b14a29e4edccf2bb44e2fb81e63a9bf74286746057915655795b987` |
+| `passt-2025_02_17.a1e48a0-x86_64-unknown-linux-musl` | `a60b0b5e54e6f48caa5984b0a6b21938a9e57ba2222cddb9c0ca021f10e9b10e` |
+| `qemu-img-8.2.2-x86_64-unknown-linux-musl` | `7d7f32b1f6861140a95c4daa31c013a888dcc02c04551136f05e7da519d7e0ed` |
+| `firestone-static-helpers-v0.2.0-corresponding-source.tar` | `7f13fd891d15d8a4f6a7780be64927a05f18b1b9ace1ab2495f983cef442ae28` |
+| `firestone-static-helpers-v0.2.0-build-info.txt` | `addcdf903e19f785ca038887cfdbe46f7240c3507d2be506b622efe4b8a427af` |
+
+`passt` and `qemu-img` changed bytes relative to `helpers-v0.1.0-firestone.1` because the shared locked package closure grew for this recipe; both were re-pinned in the same `deps.toml` regeneration, as anticipated by step 5 above. The v0.1.0 input mirrors were re-uploaded byte-for-byte, and aports packaging snapshots for the newly linked static libraries remain the recorded follow-up.

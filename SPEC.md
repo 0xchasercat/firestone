@@ -1584,7 +1584,7 @@ The mechanism is a response marker, not a path prefix: the terminal handler atta
 | `passt` | networking | Firestone static helper release from pinned commit `a1e48a02ff3550eb7875a7df6726086e9b3a1213` | x86_64 musl payload embedded in Firestone, checksum-verified and materialized on first use; no host package |
 | `qemu-img` | overlays, raw→qcow2 | Firestone static helper release from signed QEMU 8.2.2 source | x86_64 musl payload embedded in Firestone, checksum-verified and materialized on first use; no host package |
 | `bzImage-x86_64` / `Image-arm64` | direct-boot kernel for OCI machines (§9.5) | cloud-hypervisor/linux release `ch-release-v6.16.9-20260508` | vendored, pinned; downloaded and published mode 0644 on the first OCI start, never embedded |
-| `mkfs.ext4` | packs the merged OCI rootfs (§8.5) | Firestone static helper release built from e2fsprogs 1.47.3 | vendored, pinned; downloaded and published on the first OCI pull, never embedded |
+| `mkfs.ext4` | packs the merged OCI rootfs (§8.5) | Firestone static helper release `helpers-v0.2.0-firestone.1` built from e2fsprogs 1.47.3 with direct libarchive 3.8.3 | vendored, pinned; downloaded and published on the first OCI pull, never embedded |
 | `firestone-init` | guest PID 1 for OCI machines (§10.5) | built from this repository | static musl payload embedded in Firestone, checksum-verified and injected into the packed rootfs at `/sbin/firestone-init` |
 | `ssh`, `ssh-keygen` | shell | distro package (`openssh-client`) | system |
 
