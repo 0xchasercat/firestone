@@ -17,6 +17,7 @@ pub mod image;
 pub mod lock;
 pub mod network;
 pub mod paths;
+pub mod pty;
 pub mod readiness;
 pub mod result;
 pub mod shim;
@@ -36,9 +37,10 @@ pub use cloudinit::{
     RenderedCloudInit, SEED_IMAGE_SIZE, publish_seed, publish_seed_with_sshd_path,
     render_cloud_init, render_cloud_init_with_guest_ssh,
 };
-pub use cmd::{Cmd, CmdOutput, ManagedProcess, ProcessSignal};
+pub use cmd::{Cmd, CmdOutput, ManagedProcess, ProcessSignal, signal_process_group};
 pub use console::{
-    ConsoleBroker, ConsolePlan, ConsoleResult, RawTerminal, console_plan, relay_console,
+    CONSOLE_ACK_MAX_BYTES, ConsoleAck, ConsoleBroker, ConsolePlan, ConsoleResult, RawTerminal,
+    console_plan, relay_console,
 };
 pub use deps::{DependencyArtifact, DependencyManifest};
 pub use dispatcher::{DispatchFuture, Dispatcher, EventSink, block_on};
@@ -66,6 +68,7 @@ pub use network::{
     passt_forward_argument, prepare_network, validate_tap,
 };
 pub use paths::{PathInputs, Paths};
+pub use pty::{PtyPair, set_window_size};
 pub use readiness::{ReadinessOptions, wait_for_ssh_ready};
 pub use result::{
     CatalogArchitectureSummary, CatalogEntrySummary, LogsResult, MachineRecord, MachineSummary,

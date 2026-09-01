@@ -36,6 +36,40 @@ const CONSOLE_REPLY_MAX_BYTES: usize = 32;
 const CONSOLE_OK: &[u8] = b"OK\n";
 const CONSOLE_BUSY: &[u8] = b"BUSY\n";
 
+/// The largest acknowledgement line the broker may send before it is refused.
+///
+/// The broker answers one short line and then switches to raw terminal bytes,
+/// so a transport that reads more than this is not talking to a Firestone
+/// console broker.
+pub const CONSOLE_ACK_MAX_BYTES: usize = CONSOLE_REPLY_MAX_BYTES;
+
+/// The broker's acknowledgement line, classified for any transport.
+///
+/// The blocking CLI path and the WebSocket transport read the line with
+/// different I/O, but they must agree on what it means. This is that one
+/// agreement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleAck {
+    /// `OK`: this client owns the console and raw bytes follow.
+    Ready,
+    /// `BUSY`: another client already holds the single-client broker.
+    Busy,
+    /// Anything else, including a truncated or absent line.
+    Invalid,
+}
+
+impl ConsoleAck {
+    /// Classifies one acknowledgement line exactly as the broker writes it.
+    #[must_use]
+    pub fn classify(reply: &[u8]) -> Self {
+        match reply {
+            CONSOLE_OK => Self::Ready,
+            CONSOLE_BUSY => Self::Busy,
+            _ => Self::Invalid,
+        }
+    }
+}
+
 /// Paths needed to attach to one running machine console.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsolePlan {
@@ -52,6 +86,22 @@ impl ConsolePlan {
     #[must_use]
     pub fn socket(&self) -> &Path {
         &self.socket
+    }
+
+    /// The error a transport reports when the broker socket cannot be reached.
+    ///
+    /// The WebSocket transport connects asynchronously rather than through
+    /// [`Self::connect`], so it needs the same `not_running` error without the
+    /// blocking handshake.
+    #[must_use]
+    pub fn unavailable_error(&self, source: io::Error) -> FirestoneError {
+        console_not_running(&self.name, &self.socket, source)
+    }
+
+    /// The error a transport reports for an unrecognized acknowledgement.
+    #[must_use]
+    pub fn invalid_ack_error(&self) -> FirestoneError {
+        console_invalid_ack(&self.name)
     }
 
     /// Connects and completes the private broker acknowledgement.
@@ -78,14 +128,7 @@ impl ConsolePlan {
                 .with_hint("detach the other console with Ctrl-] and retry"));
             }
             _ => {
-                return Err(FirestoneError::new(
-                    ErrorKind::Conflict,
-                    format!(
-                        "machine `{}` console broker returned an invalid acknowledgement",
-                        self.name
-                    ),
-                )
-                .with_hint("restart the machine to replace the stale console broker"));
+                return Err(console_invalid_ack(&self.name));
             }
         }
         stream.set_read_timeout(None).map_err(|source| {
@@ -706,6 +749,14 @@ fn console_not_running(name: &str, path: &Path, source: io::Error) -> FirestoneE
         "start the machine with `firestone start {name}` and retry"
     ))
     .with_source(source)
+}
+
+fn console_invalid_ack(name: &str) -> FirestoneError {
+    FirestoneError::new(
+        ErrorKind::Conflict,
+        format!("machine `{name}` console broker returned an invalid acknowledgement"),
+    )
+    .with_hint("restart the machine to replace the stale console broker")
 }
 
 fn console_io_error(name: &str, phase: &str, source: io::Error) -> FirestoneError {

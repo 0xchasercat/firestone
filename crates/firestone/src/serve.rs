@@ -184,7 +184,7 @@ pub fn run(
     };
     let app = auth::secured(
         merged_router(
-            api::router(Arc::clone(&tracked), config),
+            api::router(Arc::clone(&tracked), config, paths),
             crate::ui::router(tracked, config, paths),
         ),
         gate,
@@ -495,7 +495,12 @@ async fn serve_connection(stream: Connection, app: Router, mut shutdown: watch::
     });
     let io = TokioIo::new(stream);
     let builder = http1::Builder::new();
-    let connection = builder.serve_connection(io, service);
+    // `with_upgrades` is what lets a handler answer 101 and take the socket:
+    // it is required by the WebSocket console and shell transports. The
+    // returned `UpgradeableConnection` keeps `graceful_shutdown`, so the
+    // shutdown select below is unchanged. An attached terminal has no idle
+    // point, so it holds its connection until the drain timeout aborts it.
+    let connection = builder.serve_connection(io, service).with_upgrades();
     tokio::pin!(connection);
 
     if *shutdown.borrow() {
@@ -1077,7 +1082,11 @@ mod tests {
             let directory = tempfile::tempdir()?;
             let socket = directory.path().join("serve.sock");
             let listener = UnixListener::bind(&socket)?;
-            let app = api::router(dispatcher, &GlobalConfig::default());
+            let paths = firestone_core::Paths::from_inputs(&firestone_core::PathInputs {
+                firestone_home: Some(directory.path().to_path_buf()),
+                ..firestone_core::PathInputs::capture()?
+            })?;
+            let app = api::router(dispatcher, &GlobalConfig::default(), &paths);
             let (shutdown, receiver) = oneshot::channel();
             let task = tokio::spawn(serve_until_shutdown(
                 listener,
@@ -1258,8 +1267,13 @@ mod tests {
         use tower::ServiceExt as _;
 
         let dispatcher: Arc<dyn Dispatcher> = Arc::new(QuietDispatcher);
+        let directory = tempfile::tempdir()?;
+        let paths = firestone_core::Paths::from_inputs(&firestone_core::PathInputs {
+            firestone_home: Some(directory.path().to_path_buf()),
+            ..firestone_core::PathInputs::capture()?
+        })?;
         let app = merged_router(
-            api::router(dispatcher, &GlobalConfig::default()),
+            api::router(dispatcher, &GlobalConfig::default(), &paths),
             stub_ui_router(),
         );
         let request = axum::http::Request::builder()
@@ -1564,6 +1578,365 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(body(&live)?)?,
             json!({"alive":true})
         );
+        server.stop().await
+    }
+
+    // --- WebSocket console and shell transports (SPEC 16.3) -----------------
+
+    /// A loopback server whose connections accept protocol upgrades.
+    ///
+    /// This is the real `serve_until_shutdown` path, so it proves
+    /// `serve_connection`'s `with_upgrades()` is what lets a handler answer
+    /// `101` and keep the socket.
+    struct UpgradeServer {
+        directory: tempfile::TempDir,
+        paths: firestone_core::Paths,
+        address: std::net::SocketAddr,
+        shutdown: Option<oneshot::Sender<()>>,
+        task: JoinHandle<Result<(), FirestoneError>>,
+    }
+
+    impl UpgradeServer {
+        async fn start(dispatcher: Arc<dyn Dispatcher>) -> TestResult<Self> {
+            let directory = tempfile::tempdir()?;
+            // The runtime-directory guard refuses a symlinked ancestor, and
+            // macOS puts every temporary directory under a symlinked `/var`.
+            let home = directory.path().canonicalize()?;
+            let paths = firestone_core::Paths::from_inputs(&firestone_core::PathInputs {
+                firestone_home: Some(home),
+                ..firestone_core::PathInputs::capture()?
+            })?;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let app = crate::api::router(dispatcher, &GlobalConfig::default(), &paths);
+            let (shutdown, receiver) = oneshot::channel();
+            let task = tokio::spawn(serve_until_shutdown(
+                listener,
+                app,
+                async move {
+                    receiver.await.map_err(|_| {
+                        FirestoneError::new(
+                            firestone_core::ErrorKind::Generic,
+                            "test shutdown sender disappeared",
+                        )
+                    })?;
+                    Ok(())
+                },
+                Duration::from_millis(200),
+            ));
+            Ok(Self {
+                directory,
+                paths,
+                address,
+                shutdown: Some(shutdown),
+                task,
+            })
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("ws://{}{path}", self.address)
+        }
+
+        async fn connect(
+            &self,
+            path: &str,
+        ) -> Result<
+            tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+            tokio_tungstenite::tungstenite::Error,
+        > {
+            use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+            let request = self.url(path).into_client_request()?;
+            let stream = tokio::net::TcpStream::connect(self.address)
+                .await
+                .map_err(tokio_tungstenite::tungstenite::Error::Io)?;
+            let (socket, _) = tokio_tungstenite::client_async(request, stream).await?;
+            Ok(socket)
+        }
+
+        async fn stop(mut self) -> TestResult {
+            if let Some(shutdown) = self.shutdown.take() {
+                shutdown.send(()).map_err(|_| "serve task stopped early")?;
+            }
+            self.task.await.map_err(|_| "serve task panicked")??;
+            drop(self.directory);
+            Ok(())
+        }
+    }
+
+    /// Serves one console-broker acknowledgement, then echoes what it reads.
+    ///
+    /// This is the exact wire the real single-client broker speaks: a short
+    /// `OK`/`BUSY` line followed by raw terminal bytes.
+    fn spawn_fake_broker(
+        paths: &firestone_core::Paths,
+        name: &str,
+        acknowledgement: &'static [u8],
+        banner: &'static [u8],
+        echo: bool,
+    ) -> TestResult<JoinHandle<()>> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        paths.ensure_machine_runtime_dir(name)?;
+        let socket = paths.machine_console_socket(name)?;
+        let listener = UnixListener::bind(&socket)?;
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+        Ok(tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            if stream.write_all(acknowledgement).await.is_err() {
+                return;
+            }
+            if !banner.is_empty() && stream.write_all(banner).await.is_err() {
+                return;
+            }
+            if !echo {
+                return;
+            }
+            let mut buffer = [0_u8; 1024];
+            while let Ok(read) = stream.read(&mut buffer).await {
+                if read == 0 || stream.write_all(&buffer[..read]).await.is_err() {
+                    return;
+                }
+            }
+        }))
+    }
+
+    /// The exact `show` payload the shared action emits, for one status.
+    fn show_payload(status: firestone_core::MachineStatus) -> TestResult<serde_json::Value> {
+        use firestone_core::{
+            MachineSpec, MachineSpecPatch, MachineState, MachineView, StateImage, StateVersion,
+        };
+
+        let config = GlobalConfig::default();
+        let spec = MachineSpec::from_layers(
+            &config.defaults,
+            &MachineSpecPatch::default(),
+            &MachineSpecPatch::default(),
+        )?;
+        let view = MachineView {
+            spec,
+            state: MachineState {
+                version: StateVersion,
+                status,
+                image: StateImage {
+                    r#ref: "ubuntu-24.04".to_owned(),
+                    id: None,
+                    sha256: None,
+                },
+                mac: None,
+                cid: 3,
+                instance_id: None,
+                shim_pid: None,
+                vmm_pid: None,
+                sidecar_pids: std::collections::BTreeMap::new(),
+                runtime_dir: PathBuf::from("/nonexistent"),
+                started_at: None,
+                forwards: Vec::new(),
+                degraded: Vec::new(),
+                last_exit: None,
+            },
+            supervision: None,
+        };
+        Ok(serde_json::to_value(view)?)
+    }
+
+    struct ShowDispatcher {
+        payload: serde_json::Value,
+    }
+
+    impl ShowDispatcher {
+        fn arc(status: firestone_core::MachineStatus) -> TestResult<Arc<dyn Dispatcher>> {
+            Ok(Arc::new(Self {
+                payload: show_payload(status)?,
+            }))
+        }
+    }
+
+    impl Dispatcher for ShowDispatcher {
+        fn run<'a>(&'a self, _action: Action, events: &'a mut dyn EventSink) -> DispatchFuture<'a> {
+            Box::pin(async move {
+                events.emit(Event::Result {
+                    action: "show".to_owned(),
+                    payload: self.payload.clone(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn console_websocket_upgrades_and_relays_binary_frames_both_ways() -> TestResult {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let dispatcher = ShowDispatcher::arc(firestone_core::MachineStatus::Running)?;
+        let server = UpgradeServer::start(dispatcher).await?;
+        let broker = spawn_fake_broker(&server.paths, "dev", b"OK\n", b"login: ", true)?;
+
+        let mut socket = server.connect("/v1/machines/dev/console/ws").await?;
+        assert_eq!(
+            socket.next().await.ok_or("the banner never arrived")??,
+            Message::Binary(b"login: ".as_slice().into())
+        );
+
+        // A text control frame is accepted and ignored on the console route.
+        socket
+            .send(Message::Text(r#"{"resize":{"rows":24,"cols":80}}"#.into()))
+            .await?;
+        socket
+            .send(Message::Binary(b"root\n".as_slice().into()))
+            .await?;
+        assert_eq!(
+            socket.next().await.ok_or("the echo never arrived")??,
+            Message::Binary(b"root\n".as_slice().into())
+        );
+
+        socket.close(None).await?;
+        broker.abort();
+        server.stop().await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn console_websocket_closes_with_machine_stopped_on_broker_eof() -> TestResult {
+        use futures_util::StreamExt as _;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let dispatcher = ShowDispatcher::arc(firestone_core::MachineStatus::Running)?;
+        let server = UpgradeServer::start(dispatcher).await?;
+        let broker = spawn_fake_broker(&server.paths, "dev", b"OK\n", b"bye", false)?;
+
+        let mut socket = server.connect("/v1/machines/dev/console/ws").await?;
+        assert_eq!(
+            socket.next().await.ok_or("the banner never arrived")??,
+            Message::Binary(b"bye".as_slice().into())
+        );
+        let close = socket
+            .next()
+            .await
+            .ok_or("the close frame never arrived")??;
+        match close {
+            Message::Close(Some(frame)) => {
+                assert_eq!(frame.reason.as_str(), "machine stopped");
+                assert_eq!(u16::from(frame.code), 1000);
+            }
+            other => return Err(format!("expected a close frame, got {other:?}").into()),
+        }
+
+        broker.abort();
+        server.stop().await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn console_websocket_busy_broker_answers_409_without_upgrading() -> TestResult {
+        let dispatcher = ShowDispatcher::arc(firestone_core::MachineStatus::Running)?;
+        let server = UpgradeServer::start(dispatcher).await?;
+        let broker = spawn_fake_broker(&server.paths, "dev", b"BUSY\n", b"", false)?;
+
+        let error = server
+            .connect("/v1/machines/dev/console/ws")
+            .await
+            .err()
+            .ok_or("a busy broker must not upgrade")?;
+        match error {
+            tokio_tungstenite::tungstenite::Error::Http(response) => {
+                assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+                let body = response.body().as_ref().ok_or("the 409 carried no body")?;
+                let envelope: serde_json::Value = serde_json::from_slice(body)?;
+                assert_eq!(envelope["error"]["kind"], "busy");
+                let hint = envelope["error"]["hint"]
+                    .as_str()
+                    .ok_or("the 409 carried no hint")?;
+                assert!(hint.contains("firestone console dev"), "{hint}");
+            }
+            other => return Err(format!("expected an HTTP rejection, got {other:?}").into()),
+        }
+
+        broker.abort();
+        server.stop().await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn console_websocket_without_a_broker_reports_the_not_running_error() -> TestResult {
+        let dispatcher = ShowDispatcher::arc(firestone_core::MachineStatus::Stopped)?;
+        let server = UpgradeServer::start(dispatcher).await?;
+
+        let error = server
+            .connect("/v1/machines/dev/console/ws")
+            .await
+            .err()
+            .ok_or("a stopped machine must not upgrade")?;
+        match error {
+            tokio_tungstenite::tungstenite::Error::Http(response) => {
+                let body = response
+                    .body()
+                    .as_ref()
+                    .ok_or("the error carried no body")?;
+                let envelope: serde_json::Value = serde_json::from_slice(body)?;
+                assert_eq!(envelope["error"]["kind"], "not_running");
+            }
+            other => return Err(format!("expected an HTTP rejection, got {other:?}").into()),
+        }
+
+        server.stop().await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shell_websocket_refuses_a_machine_that_is_not_running() -> TestResult {
+        let dispatcher = ShowDispatcher::arc(firestone_core::MachineStatus::Stopped)?;
+        let server = UpgradeServer::start(dispatcher).await?;
+
+        let error = server
+            .connect("/v1/machines/dev/shell/ws")
+            .await
+            .err()
+            .ok_or("a stopped machine must not upgrade")?;
+        match error {
+            tokio_tungstenite::tungstenite::Error::Http(response) => {
+                let body = response
+                    .body()
+                    .as_ref()
+                    .ok_or("the error carried no body")?;
+                let envelope: serde_json::Value = serde_json::from_slice(body)?;
+                assert_eq!(envelope["error"]["kind"], "not_running");
+                let hint = envelope["error"]["hint"]
+                    .as_str()
+                    .ok_or("the error carried no hint")?;
+                assert!(hint.contains("firestone start dev"), "{hint}");
+            }
+            other => return Err(format!("expected an HTTP rejection, got {other:?}").into()),
+        }
+
+        server.stop().await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shell_websocket_upgrades_a_running_machine_and_ends_with_a_close_frame() -> TestResult
+    {
+        use futures_util::StreamExt as _;
+
+        let dispatcher = ShowDispatcher::arc(firestone_core::MachineStatus::Running)?;
+        let server = UpgradeServer::start(dispatcher).await?;
+        // `shell_ssh_plan` writes the Firestone SSH identity and resolves the
+        // machine's known_hosts file, so both directories must exist.
+        std::fs::create_dir_all(server.paths.machine_dir("dev")?)?;
+
+        // The handshake must reach 101: the PTY and the OpenSSH child are
+        // allocated only after the upgrade. The session then ends on its own,
+        // because this machine has no reachable vsock proxy.
+        let mut socket = server.connect("/v1/machines/dev/shell/ws").await?;
+        let ended = tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(message) = socket.next().await {
+                match message {
+                    Ok(tokio_tungstenite::tungstenite::Message::Close(_)) | Err(_) => return true,
+                    Ok(_) => {}
+                }
+            }
+            true
+        })
+        .await;
+        assert!(ended.is_ok(), "the shell session never terminated");
+
         server.stop().await
     }
 }

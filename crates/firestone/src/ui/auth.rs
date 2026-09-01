@@ -225,6 +225,47 @@ impl LoopbackGate {
             || origin == format!("http://localhost:{port}")
             || origin == format!("http://[::1]:{port}")
     }
+
+    /// Whether this request provably came from the Firestone page itself.
+    ///
+    /// `Sec-Fetch-Site` is authoritative when the browser sent it; otherwise
+    /// the request must carry an `Origin` in the same loopback allowlist the
+    /// `Host` check uses. A request carrying neither is not proven same-site,
+    /// which is why this is only demanded where a cross-site request would be
+    /// dangerous.
+    fn is_same_site(&self, headers: &HeaderMap) -> bool {
+        let site = headers
+            .get("sec-fetch-site")
+            .and_then(|value| value.to_str().ok());
+        match site {
+            Some(site) => matches!(site, "same-origin" | "none"),
+            None => headers
+                .get(header::ORIGIN)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|origin| self.origin_is_loopback(origin)),
+        }
+    }
+}
+
+/// Whether this request is asking to leave HTTP for another protocol.
+///
+/// Both headers are checked because either one alone is enough for a server
+/// to complete an upgrade, and this gate must not be narrower than the
+/// upgrade path it protects. Values are comma-separated lists compared
+/// case-insensitively, exactly as RFC 9110 defines them.
+fn is_protocol_upgrade(headers: &HeaderMap) -> bool {
+    header_list_contains(headers, &header::UPGRADE, "websocket")
+        || header_list_contains(headers, &header::CONNECTION, "upgrade")
+}
+
+fn header_list_contains(headers: &HeaderMap, name: &header::HeaderName, token: &str) -> bool {
+    headers.get_all(name).iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            value
+                .split(',')
+                .any(|entry| entry.trim().eq_ignore_ascii_case(token))
+        })
+    })
 }
 
 /// Wraps `app` with the loopback gate (when one is supplied) and the shared
@@ -363,7 +404,22 @@ fn decide(gate: &LoopbackGate, method: &Method, uri: &Uri, headers: &HeaderMap) 
         return Decision::Reject(unauthorized());
     }
 
-    // 4. Cross-origin defense on mutations. Token-bearing non-browser clients
+    // 4. Cross-origin defense on protocol upgrades. A WebSocket handshake is
+    //    a GET, but it opens a long-lived bidirectional channel to a
+    //    machine's console or shell, so it takes the same-origin rule too.
+    //    The `SameSite=Strict` session cookie already fails closed
+    //    cross-site; this is the second lock on the same door. Browsers do
+    //    not attach `Sec-Fetch-*` to a WebSocket handshake, so in practice
+    //    the `Origin` allowlist is what answers here.
+    if is_protocol_upgrade(headers) && !gate.is_same_site(headers) {
+        return Decision::Reject(Rejection {
+            status: StatusCode::FORBIDDEN,
+            message: "the protocol upgrade was not proven to come from this origin",
+            hint: "open the terminal from the Firestone UI page, or send Origin: http://127.0.0.1:PORT",
+        });
+    }
+
+    // 5. Cross-origin defense on mutations. Token-bearing non-browser clients
     //    send neither header and are already gated above.
     if !matches!(*method, Method::GET | Method::HEAD) {
         let site = headers
@@ -937,6 +993,130 @@ mod tests {
             .header(header::AUTHORIZATION, format!("Bearer {hex}"))
             .body(Body::empty())?;
         assert_eq!(send(&app, headerless).await?.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_gate_table_matches_the_documented_decisions() -> TestResult {
+        struct Case {
+            name: &'static str,
+            token: bool,
+            upgrade_header: bool,
+            connection_header: bool,
+            site: Option<&'static str>,
+            origin: Option<&'static str>,
+            expected: StatusCode,
+        }
+
+        let hex = sample_token().to_hex();
+        let cases = [
+            Case {
+                name: "no token",
+                token: false,
+                upgrade_header: true,
+                connection_header: true,
+                site: None,
+                origin: Some("http://127.0.0.1:47318"),
+                expected: StatusCode::UNAUTHORIZED,
+            },
+            Case {
+                name: "cross-site origin",
+                token: true,
+                upgrade_header: true,
+                connection_header: true,
+                site: None,
+                origin: Some("http://evil.example.com"),
+                expected: StatusCode::FORBIDDEN,
+            },
+            Case {
+                name: "cross-site fetch metadata beats a loopback origin",
+                token: true,
+                upgrade_header: true,
+                connection_header: true,
+                site: Some("cross-site"),
+                origin: Some("http://127.0.0.1:47318"),
+                expected: StatusCode::FORBIDDEN,
+            },
+            Case {
+                name: "no origin and no fetch metadata",
+                token: true,
+                upgrade_header: true,
+                connection_header: true,
+                site: None,
+                origin: None,
+                expected: StatusCode::FORBIDDEN,
+            },
+            Case {
+                name: "Connection: upgrade alone is still an upgrade",
+                token: true,
+                upgrade_header: false,
+                connection_header: true,
+                site: None,
+                origin: Some("http://evil.example.com"),
+                expected: StatusCode::FORBIDDEN,
+            },
+            Case {
+                name: "loopback origin",
+                token: true,
+                upgrade_header: true,
+                connection_header: true,
+                site: None,
+                origin: Some("http://127.0.0.1:47318"),
+                expected: StatusCode::OK,
+            },
+            Case {
+                name: "same-origin fetch metadata",
+                token: true,
+                upgrade_header: true,
+                connection_header: true,
+                site: Some("same-origin"),
+                origin: None,
+                expected: StatusCode::OK,
+            },
+            Case {
+                name: "navigation fetch metadata",
+                token: true,
+                upgrade_header: true,
+                connection_header: true,
+                site: Some("none"),
+                origin: None,
+                expected: StatusCode::OK,
+            },
+            Case {
+                name: "a plain GET keeps carrying no origin proof",
+                token: true,
+                upgrade_header: false,
+                connection_header: false,
+                site: None,
+                origin: None,
+                expected: StatusCode::OK,
+            },
+        ];
+
+        let app = app(Some(gate()));
+        for case in cases {
+            let mut builder = Request::builder()
+                .method("GET")
+                .uri("/")
+                .header(header::HOST, "127.0.0.1:47318");
+            if case.token {
+                builder = builder.header(header::COOKIE, format!("firestone_session={hex}"));
+            }
+            if case.upgrade_header {
+                builder = builder.header(header::UPGRADE, "websocket");
+            }
+            if case.connection_header {
+                builder = builder.header(header::CONNECTION, "keep-alive, Upgrade");
+            }
+            if let Some(site) = case.site {
+                builder = builder.header("sec-fetch-site", site);
+            }
+            if let Some(origin) = case.origin {
+                builder = builder.header(header::ORIGIN, origin);
+            }
+            let response = send(&app, builder.body(Body::empty())?).await?;
+            assert_eq!(response.status(), case.expected, "{}", case.name);
+        }
         Ok(())
     }
 

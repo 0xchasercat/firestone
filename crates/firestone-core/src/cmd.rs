@@ -4,9 +4,12 @@ use std::{
     ffi::{OsStr, OsString},
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    os::unix::{
-        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-        process::{CommandExt, ExitStatusExt},
+    os::{
+        fd::{BorrowedFd, OwnedFd},
+        unix::{
+            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+            process::{CommandExt, ExitStatusExt},
+        },
     },
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
@@ -717,6 +720,77 @@ impl Cmd {
             },
         })
     }
+    /// Starts a child on an already-allocated pseudo-terminal slave.
+    ///
+    /// Stdin, stdout and stderr are all the supplied terminal, so the child
+    /// sees one real TTY on every descriptor — which is what OpenSSH needs
+    /// before it will negotiate a remote pty. The child is a process-group
+    /// leader so the caller can end the whole session with one `killpg`.
+    ///
+    /// The caller keeps ownership of `terminal` and must drop its own copy
+    /// right after this returns: while any host descriptor still holds the
+    /// slave open, the master never reports end of file.
+    pub fn spawn_terminal_process_group(
+        &self,
+        terminal: BorrowedFd<'_>,
+    ) -> Result<ManagedProcess, FirestoneError> {
+        if matches!(self.stdin, CmdStdin::Bytes(_))
+            || self.stderr_log.is_some()
+            || self.stdout_append.is_some()
+            || self.stderr_append.is_some()
+        {
+            return Err(FirestoneError::new(
+                ErrorKind::Generic,
+                "terminal process groups cannot use buffered input or log redirection",
+            )
+            .with_hint("give the terminal command a pseudo-terminal and no log routing"));
+        }
+
+        let stdin = duplicate_terminal(terminal, self.error_kind)?;
+        let stdout = duplicate_terminal(terminal, self.error_kind)?;
+        let stderr = duplicate_terminal(terminal, self.error_kind)?;
+
+        let logged_argv = std::iter::once(self.program.as_os_str())
+            .chain(self.args.iter().map(|arg| arg.logged.as_os_str()))
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        tracing::debug!(
+            argv = ?logged_argv,
+            cwd = ?self.cwd,
+            "starting terminal-attached external process"
+        );
+
+        let deadline = self.timeout.map(|timeout| Instant::now() + timeout);
+        let mut command = Command::new(&self.program);
+        command.args(self.args.iter().map(|arg| &arg.value));
+        command
+            .stdin(Stdio::from(stdin))
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .process_group(0);
+        if let Some(cwd) = &self.cwd {
+            command.current_dir(cwd);
+        }
+        if self.clear_env {
+            command.env_clear();
+        }
+        command.envs(&self.env);
+
+        let child = spawn_with_busy_retry(&mut command, deadline)
+            .map_err(|source| command_start_error(self.error_kind, &self.program, source))?;
+        let process_group = Some(child.id());
+        Ok(ManagedProcess {
+            child,
+            process_group,
+            reaped: false,
+            diagnostic: ProcessDiagnostic {
+                program: self.program.clone(),
+                kind: self.error_kind,
+                log: None,
+            },
+        })
+    }
+
     /// Starts a terminal-facing process in its own process group.
     ///
     /// The caller owns signal forwarding and reaping. Stdin follows the
@@ -1036,6 +1110,8 @@ pub enum ProcessSignal {
     Quit,
     Terminate,
     Kill,
+    /// `SIGWINCH`: the terminal this process reads has been resized.
+    WindowChange,
 }
 
 impl ProcessSignal {
@@ -1046,7 +1122,27 @@ impl ProcessSignal {
             Self::Quit => Signal::SIGQUIT,
             Self::Terminate => Signal::SIGTERM,
             Self::Kill => Signal::SIGKILL,
+            Self::WindowChange => Signal::SIGWINCH,
         }
+    }
+}
+
+/// Signals a process group whose id was taken from a [`ManagedProcess`].
+///
+/// The owner of a long-running child sometimes has to signal it from a place
+/// that cannot hold the child itself — a WebSocket relay task delivering a
+/// terminal resize while the supervising task waits on the session. Signaling
+/// a group that has already exited is not an error, exactly as it is not for
+/// [`ManagedProcess::signal_group`].
+pub fn signal_process_group(group: u32, signal: ProcessSignal) -> Result<(), FirestoneError> {
+    let group = process_pid(group)?;
+    match killpg(group, signal.as_nix()) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(source) => Err(FirestoneError::new(
+            ErrorKind::Generic,
+            format!("cannot signal process group {}", group.as_raw()),
+        )
+        .with_source(std::io::Error::from_raw_os_error(source as i32))),
     }
 }
 
@@ -1351,6 +1447,20 @@ fn read_process_log_tail(path: &Path) -> Result<Vec<String>, std::io::Error> {
     );
     file.take(PROCESS_LOG_TAIL_BYTES).read_to_end(&mut bytes)?;
     Ok(last_lines(&bytes, 10))
+}
+
+fn duplicate_terminal(
+    terminal: BorrowedFd<'_>,
+    kind: ErrorKind,
+) -> Result<OwnedFd, FirestoneError> {
+    terminal.try_clone_to_owned().map_err(|source| {
+        FirestoneError::new(
+            kind,
+            "cannot duplicate the pseudo-terminal for a child descriptor",
+        )
+        .with_hint("check the process file-descriptor limit and retry")
+        .with_source(source)
+    })
 }
 
 fn open_log(path: &Path, kind: ErrorKind) -> Result<File, FirestoneError> {
@@ -1972,5 +2082,53 @@ mod tests {
         assert!(!debug.contains("PRIVATE_KEY_MATERIAL"));
         assert!(!debug.contains("ENVIRONMENT_SECRET"));
         assert!(!debug.contains("CLOUD_INIT_SECRET"));
+    }
+
+    #[test]
+    fn terminal_process_group_child_sees_a_tty_and_its_own_group()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::{Read as _, Write as _};
+
+        use crate::{ProcessSignal, pty::PtyPair, signal_process_group};
+
+        let directory = TempDir::new()?;
+        let script = executable(
+            &directory,
+            "report",
+            "if [ -t 0 ] && [ -t 1 ] && [ -t 2 ]; then echo TTY; else echo NOTTY; fi\ncat",
+        )?;
+
+        let pair = PtyPair::open()?;
+        let mut child = Cmd::new(script).spawn_terminal_process_group(pair.slave())?;
+        let group = child
+            .process_group()
+            .ok_or("a terminal child has a group")?;
+        assert_eq!(group, child.id());
+
+        let (master, slave) = pair.into_parts();
+        // The parent's slave copy must go, or the master never sees hangup.
+        drop(slave);
+        let mut master = std::fs::File::from(master);
+
+        let mut seen = Vec::new();
+        let mut buffer = [0_u8; 256];
+        while !seen.windows(3).any(|window| window == b"TTY") {
+            let read = master.read(&mut buffer)?;
+            assert!(read > 0, "the child produced no output");
+            seen.extend_from_slice(&buffer[..read]);
+        }
+        assert!(
+            !seen.windows(5).any(|window| window == b"NOTTY"),
+            "{}",
+            String::from_utf8_lossy(&seen)
+        );
+
+        // Signaling the group is safe both while the child lives and after it
+        // is reaped, exactly like `ManagedProcess::signal_group`.
+        signal_process_group(group, ProcessSignal::WindowChange)?;
+        master.write_all(b"\x04")?;
+        signal_process_group(group, ProcessSignal::Kill)?;
+        child.wait()?;
+        Ok(())
     }
 }
