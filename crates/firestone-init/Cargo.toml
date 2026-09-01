@@ -1,0 +1,48 @@
+[package]
+name = "firestone-init"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "firestone_init"
+path = "src/lib.rs"
+
+[[bin]]
+name = "firestone-init"
+path = "src/main.rs"
+
+[dependencies]
+firestone-initproto.workspace = true
+
+# Linux-only: everything the PID-1 runtime needs. The pure modules (config
+# decoding, environment and user resolution, argv assembly, the DHCP and UDP
+# codecs) compile and test on every host so the workspace gate stays green on
+# macOS, exactly like `shim.rs` (SPEC §10.5).
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.30", features = [
+    "fs",
+    "hostname",
+    "ioctl",
+    "mount",
+    "net",
+    "poll",
+    "process",
+    "reboot",
+    "signal",
+    "socket",
+    "user",
+] }
+
+# SPEC §10.5 unsafe policy: this crate may not inherit the workspace
+# `unsafe_code = "forbid"` because ioctls and `AF_PACKET` addressing have no
+# safe wrapper in `nix`. Unsafe stays confined to `src/ffi.rs`, which is
+# `deny(unsafe_op_in_unsafe_fn)` and documents every block; `unwrap`/`expect`
+# remain denied everywhere.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+expect_used = "deny"
+unwrap_used = "deny"

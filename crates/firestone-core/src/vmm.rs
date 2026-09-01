@@ -355,8 +355,17 @@ fn base_vm_config(
                 image_type: ImageType::Qcow2,
                 backing_files: Some(true),
             },
+            // §9.2 `disks[1]`: the cloud-init seed for a firmware machine, the
+            // `firestone-init` config disk for an OCI machine (§10.5). The slot
+            // count never changes, and both are declared `readonly: true` with
+            // an explicit `"image_type": "Raw"` because Cloud Hypervisor v53
+            // disables sector-0 writes on an autodetected raw image (§9.5).
             DiskConfig {
-                path: paths.machine_seed_image(input.name)?,
+                path: if input.image_kind.is_oci() {
+                    paths.machine_config_image(input.name)?
+                } else {
+                    paths.machine_seed_image(input.name)?
+                },
                 readonly: Some(true),
                 image_type: ImageType::Raw,
                 backing_files: None,
@@ -1917,6 +1926,46 @@ sha256 = "{kernel_sha}"
             );
             assert!(!text.contains("cmdline"));
         }
+        Ok(())
+    }
+
+    /// SPEC §10.5: an OCI machine puts the `firestone-init` config disk in the
+    /// §9.2 seed slot, still `readonly: true` and explicitly `Raw` (§9.5), and
+    /// the disk count is unchanged.
+    #[test]
+    fn oci_machine_seed_slot_carries_the_readonly_raw_config_disk()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let paths = paths_for_root(PathBuf::from("/firestone"))?;
+        let spec = MachineSpec::default();
+        let state = state(&paths)?;
+        let payload = PayloadConfig {
+            firmware: None,
+            kernel: Some(PathBuf::from("/firestone/data/bin/bzImage-ch-test")),
+            cmdline: Some(super::DIRECT_BOOT_CMDLINE.to_owned()),
+        };
+
+        let typed = base_vm_config(&paths, input_oci(&spec, &state, Arch::X86_64), payload)?;
+        let mut value = serde_json::to_value(typed)?;
+        super::sort_json(&mut value);
+        let text = String::from_utf8(serde_json::to_vec(&value)?)?;
+
+        assert!(text.contains(
+            "\"disks\":[{\"backing_files\":true,\"image_type\":\"Qcow2\",\"path\":\"/firestone/data/machines/demo/disk.qcow2\"},\
+{\"image_type\":\"Raw\",\"path\":\"/firestone/data/machines/demo/config.img\",\"readonly\":true}]"
+        ));
+        assert!(!text.contains("seed.img"));
+
+        let disk = base_vm_config(
+            &paths,
+            input(&spec, &state, Arch::X86_64, None),
+            PayloadConfig {
+                firmware: None,
+                kernel: Some(PathBuf::from("/firestone/data/bin/hypervisor-fw-0.5.0")),
+                cmdline: None,
+            },
+        )?;
+        assert_eq!(disk.disks.len(), 2);
+        assert!(disk.disks[1].path.ends_with("machines/demo/seed.img"));
         Ok(())
     }
 

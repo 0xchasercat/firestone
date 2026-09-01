@@ -648,10 +648,71 @@ fn validate_mounts(
     Ok(())
 }
 
+/// The first `[cloud_init]` key the spec actually sets, in §7.1 order.
+///
+/// Defaults are not inputs: `ssh_pwauth` counts only when it is `true` and
+/// `provisioning` only when it is `false`, so an untouched `[cloud_init]` table
+/// names nothing.
+fn first_cloud_init_input(cloud_init: &super::CloudInitSpec) -> Option<&'static str> {
+    if cloud_init.user_data.is_some() {
+        return Some("cloud_init.user_data");
+    }
+    if cloud_init.user_data_inline.is_some() {
+        return Some("cloud_init.user_data_inline");
+    }
+    if cloud_init.network_config.is_some() {
+        return Some("cloud_init.network_config");
+    }
+    if !cloud_init.ssh_keys.is_empty() {
+        return Some("cloud_init.ssh_keys");
+    }
+    if !cloud_init.ssh_authorized_keys.is_empty() {
+        return Some("cloud_init.ssh_authorized_keys");
+    }
+    if cloud_init.password.is_some() {
+        return Some("cloud_init.password");
+    }
+    if cloud_init.ssh_pwauth {
+        return Some("cloud_init.ssh_pwauth");
+    }
+    if !cloud_init.provisioning {
+        return Some("cloud_init.provisioning");
+    }
+    None
+}
+
+/// Whether the spec's (already normalized) image reference is an OCI one.
+fn image_is_oci(reference: &str) -> bool {
+    crate::oci::classify(reference).is_some()
+        && crate::oci::OciReference::parse(reference)
+            .is_ok_and(|parsed| parsed.to_string() == reference)
+}
+
+/// SPEC §10.5: an OCI guest runs `firestone-init`, not cloud-init, so any
+/// `[cloud_init]` input is refused here — before any registry request, image
+/// pull, or boot — rather than being silently ignored.
+fn refuse_cloud_init_on_oci(spec: &MachineSpec) -> Result<(), FirestoneError> {
+    if !image_is_oci(spec.image.as_str()) {
+        return Ok(());
+    }
+    let Some(field) = first_cloud_init_input(&spec.cloud_init) else {
+        return Ok(());
+    };
+    Err(invalid(
+        field,
+        format!(
+            "{field} cannot be used by an OCI machine: image '{}' boots firestone-init, not cloud-init",
+            spec.image.as_str()
+        ),
+        "remove the cloud_init keys; an OCI machine takes its hostname, network, disk size, entrypoint, cmd, env, workdir and user from the config disk",
+    ))
+}
+
 fn validate_cloud_init(
     spec: &MachineSpec,
     context: &ValidationContext<'_>,
 ) -> Result<(), FirestoneError> {
+    refuse_cloud_init_on_oci(spec)?;
     if spec.cloud_init.user_data.is_some() && spec.cloud_init.user_data_inline.is_some() {
         return Err(invalid(
             "cloud_init.user_data_inline",
@@ -1207,6 +1268,111 @@ mod tests {
         let host = FakeHost::default();
         let mut spec = MachineSpec::default();
         assert!(validate_machine_spec(&mut spec, &host.context())?.is_empty());
+        Ok(())
+    }
+
+    /// SPEC §10.5: an OCI guest has no cloud-init, so every `[cloud_init]`
+    /// input is an `invalid_spec` error naming the offending key, decided at
+    /// validation time — before any registry request or pull.
+    #[test]
+    fn oci_image_with_a_cloud_init_input_returns_invalid_spec_naming_the_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut host = FakeHost::default();
+        host.add_file("/work/authorized.pub", Vec::new());
+
+        for (field, apply) in [
+            (
+                "cloud_init.user_data",
+                Box::new(|spec: &mut MachineSpec| {
+                    spec.cloud_init.user_data = Some(PathBuf::from("/work/user-data.yaml"));
+                }) as Box<dyn Fn(&mut MachineSpec)>,
+            ),
+            (
+                "cloud_init.user_data_inline",
+                Box::new(|spec: &mut MachineSpec| {
+                    spec.cloud_init.user_data_inline = Some("#cloud-config\n".to_owned());
+                }),
+            ),
+            (
+                "cloud_init.network_config",
+                Box::new(|spec: &mut MachineSpec| {
+                    spec.cloud_init.network_config = Some(PathBuf::from("/work/net.yaml"));
+                }),
+            ),
+            (
+                "cloud_init.ssh_keys",
+                Box::new(|spec: &mut MachineSpec| {
+                    spec.cloud_init.ssh_keys = vec![PathBuf::from("/work/authorized.pub")];
+                }),
+            ),
+            (
+                "cloud_init.ssh_authorized_keys",
+                Box::new(|spec: &mut MachineSpec| {
+                    spec.cloud_init.ssh_authorized_keys = vec!["ssh-ed25519 AAAA x".to_owned()];
+                }),
+            ),
+            (
+                "cloud_init.password",
+                Box::new(|spec: &mut MachineSpec| {
+                    spec.cloud_init.password = Some("hunter2".to_owned());
+                }),
+            ),
+            (
+                "cloud_init.ssh_pwauth",
+                Box::new(|spec: &mut MachineSpec| spec.cloud_init.ssh_pwauth = true),
+            ),
+            (
+                "cloud_init.provisioning",
+                Box::new(|spec: &mut MachineSpec| spec.cloud_init.provisioning = false),
+            ),
+        ] {
+            let mut spec = MachineSpec {
+                image: "docker://nginx".into(),
+                ..MachineSpec::default()
+            };
+            apply(&mut spec);
+
+            let error = validate_machine_spec(&mut spec, &host.context())
+                .err()
+                .ok_or("an OCI machine must refuse cloud-init inputs")?;
+
+            assert_eq!(error.kind(), ErrorKind::InvalidSpec);
+            assert_eq!(error.field(), Some(field));
+            assert!(
+                error.message().contains("firestone-init"),
+                "{}",
+                error.message()
+            );
+            assert!(
+                error.hint().unwrap_or_default().contains("config disk"),
+                "{:?}",
+                error.hint()
+            );
+        }
+        Ok(())
+    }
+
+    /// The refusal is scoped to inputs: an untouched `[cloud_init]` table and a
+    /// non-OCI image both validate unchanged.
+    #[test]
+    fn oci_image_without_cloud_init_inputs_and_disk_images_validate_unchanged()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut host = FakeHost::default();
+        host.add_file("/work/user-data.yaml", b"#cloud-config\n".to_vec());
+
+        let mut oci = MachineSpec {
+            image: "docker://nginx:1.27".into(),
+            ..MachineSpec::default()
+        };
+        assert!(validate_machine_spec(&mut oci, &host.context())?.is_empty());
+        assert_eq!(oci.image.as_str(), "docker.io/library/nginx:1.27");
+
+        let mut disk = MachineSpec {
+            image: "ubuntu:24.04".into(),
+            ..MachineSpec::default()
+        };
+        disk.cloud_init.user_data = Some(PathBuf::from("/work/user-data.yaml"));
+        validate_machine_spec(&mut disk, &host.context())?;
         Ok(())
     }
 

@@ -70,6 +70,19 @@ fn main() {
     write_generated(&output_dir.join("embedded_helpers.rs"), &helpers);
 }
 
+/// Helpers that a standalone release must always carry.
+const REQUIRED_HELPERS: [&str; 3] = ["cloud-hypervisor", "passt", "qemu-img"];
+
+/// Helpers that a standalone release carries only once they exist.
+///
+/// SPEC §10.5/§17.2: `firestone-init` is a Firestone-owned build artifact, not
+/// a third-party download, and its standalone release is not pinned yet. The
+/// seam is here so that the day `deps.toml` gains a `[dependency.firestone-init]`
+/// entry and the build directory holds the asset, the payload is hash-verified
+/// and embedded exactly like the other three; until then the build stays green
+/// and `firestone_init_payload()` reports the missing dependency at runtime.
+const OPTIONAL_HELPERS: [&str; 1] = ["firestone-init"];
+
 fn required_env(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| panic!("Cargo did not set {name}"))
 }
@@ -82,7 +95,7 @@ fn verify_helpers(manifest_path: &Path, input_dir: &Path) -> Vec<VerifiedHelper>
     let manifest = toml::from_str::<Manifest>(manifest_text)
         .unwrap_or_else(|error| panic!("cannot parse {}: {error}", manifest_path.display()));
 
-    ["cloud-hypervisor", "passt", "qemu-img"]
+    let mut helpers = REQUIRED_HELPERS
         .into_iter()
         .map(|dependency| {
             let entry = manifest
@@ -93,63 +106,110 @@ fn verify_helpers(manifest_path: &Path, input_dir: &Path) -> Vec<VerifiedHelper>
                 .x86_64
                 .as_ref()
                 .unwrap_or_else(|| panic!("deps.toml has no dependency.{dependency}.x86_64 entry"));
-            let path = input_dir.join(&artifact.asset);
-            println!("cargo:rerun-if-changed={}", path.display());
-            let bytes = fs::read(&path).unwrap_or_else(|error| {
-                panic!(
-                    "cannot read embedded {dependency} at {}: {error}",
-                    path.display()
-                )
-            });
-            let actual = format!("{:x}", Sha256::digest(&bytes));
-            if actual != artifact.sha256 {
-                panic!(
-                    "embedded {dependency} checksum mismatch for {}: expected {}, got {actual}",
-                    path.display(),
-                    artifact.sha256
-                );
-            }
-            VerifiedHelper {
-                dependency: dependency.to_owned(),
-                version: entry.version.clone(),
-                install_name: artifact.install_name.clone(),
-                sha256: artifact.sha256.clone(),
-                path,
-            }
+            verify_one(dependency, entry, artifact, input_dir)
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    for dependency in OPTIONAL_HELPERS {
+        // Both halves must be present: a `deps.toml` pin and the built asset.
+        // A pin with no asset, or an asset with no pin, is a mistake rather
+        // than a payload, so each is reported instead of silently ignored.
+        let entry = manifest.dependency.get(dependency);
+        let artifact = entry.and_then(|entry| entry.x86_64.as_ref());
+        let path = artifact.map(|artifact| input_dir.join(&artifact.asset));
+        if let Some(path) = &path {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+        match (entry, artifact, path) {
+            (Some(entry), Some(artifact), Some(path)) => {
+                if !path.exists() {
+                    panic!(
+                        "deps.toml pins dependency.{dependency} but {} is missing",
+                        path.display()
+                    );
+                }
+                helpers.push(verify_one(dependency, entry, artifact, input_dir));
+            }
+            (Some(_), None, _) | (Some(_), Some(_), None) => {
+                panic!("deps.toml has no dependency.{dependency}.x86_64 entry");
+            }
+            (None, _, _) => {}
+        }
+    }
+    helpers
+}
+
+fn verify_one(
+    dependency: &str,
+    entry: &Dependency,
+    artifact: &Artifact,
+    input_dir: &Path,
+) -> VerifiedHelper {
+    let path = input_dir.join(&artifact.asset);
+    println!("cargo:rerun-if-changed={}", path.display());
+    let bytes = fs::read(&path).unwrap_or_else(|error| {
+        panic!(
+            "cannot read embedded {dependency} at {}: {error}",
+            path.display()
+        )
+    });
+    let actual = format!("{:x}", Sha256::digest(&bytes));
+    if actual != artifact.sha256 {
+        panic!(
+            "embedded {dependency} checksum mismatch for {}: expected {}, got {actual}",
+            path.display(),
+            artifact.sha256
+        );
+    }
+    VerifiedHelper {
+        dependency: dependency.to_owned(),
+        version: entry.version.clone(),
+        install_name: artifact.install_name.clone(),
+        sha256: artifact.sha256.clone(),
+        path,
+    }
 }
 
 fn write_generated(path: &Path, helpers: &[VerifiedHelper]) {
-    let mut generated = String::from(
-        "const BUILD_EMBEDDED_CLOUD_HYPERVISOR: Option<EmbeddedHelper> = None;\n\
-         const BUILD_EMBEDDED_PASST: Option<EmbeddedHelper> = None;\n\
-         const BUILD_EMBEDDED_QEMU_IMG: Option<EmbeddedHelper> = None;\n",
-    );
-    if !helpers.is_empty() {
-        generated.clear();
-        for helper in helpers {
-            let constant = match helper.dependency.as_str() {
-                "cloud-hypervisor" => "BUILD_EMBEDDED_CLOUD_HYPERVISOR",
-                "passt" => "BUILD_EMBEDDED_PASST",
-                "qemu-img" => "BUILD_EMBEDDED_QEMU_IMG",
-                other => panic!("unsupported embedded helper {other}"),
-            };
-            let kind = match helper.dependency.as_str() {
-                "cloud-hypervisor" => "InternalHelper::CloudHypervisor",
-                "passt" => "InternalHelper::Passt",
-                "qemu-img" => "InternalHelper::QemuImg",
-                _ => unreachable!(),
-            };
-            generated.push_str(&format!(
+    // Every constant is emitted on every build: an absent payload is `None`,
+    // never a missing symbol, so `embedded_helper` stays total.
+    let mut generated = String::new();
+    for dependency in REQUIRED_HELPERS.into_iter().chain(OPTIONAL_HELPERS) {
+        let constant = constant_name(dependency);
+        match helpers.iter().find(|helper| helper.dependency == dependency) {
+            Some(helper) => generated.push_str(&format!(
                 "const {constant}: Option<EmbeddedHelper> = Some(EmbeddedHelper::new({kind}, {version:?}, {install_name:?}, {sha256:?}, include_bytes!({path:?})));\n",
+                kind = helper_kind(dependency),
                 version = helper.version,
                 install_name = helper.install_name,
                 sha256 = helper.sha256,
                 path = helper.path,
-            ));
+            )),
+            None => generated.push_str(&format!(
+                "const {constant}: Option<EmbeddedHelper> = None;\n"
+            )),
         }
     }
     fs::write(path, generated)
         .unwrap_or_else(|error| panic!("cannot write {}: {error}", path.display()));
+}
+
+fn constant_name(dependency: &str) -> &'static str {
+    match dependency {
+        "cloud-hypervisor" => "BUILD_EMBEDDED_CLOUD_HYPERVISOR",
+        "passt" => "BUILD_EMBEDDED_PASST",
+        "qemu-img" => "BUILD_EMBEDDED_QEMU_IMG",
+        "firestone-init" => "BUILD_EMBEDDED_FIRESTONE_INIT",
+        other => panic!("unsupported embedded helper {other}"),
+    }
+}
+
+fn helper_kind(dependency: &str) -> &'static str {
+    match dependency {
+        "cloud-hypervisor" => "InternalHelper::CloudHypervisor",
+        "passt" => "InternalHelper::Passt",
+        "qemu-img" => "InternalHelper::QemuImg",
+        "firestone-init" => "InternalHelper::FirestoneInit",
+        other => panic!("unsupported embedded helper {other}"),
+    }
 }

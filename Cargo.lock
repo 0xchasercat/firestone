@@ -572,6 +572,7 @@ name = "firestone-core"
 version = "0.1.4"
 dependencies = [
  "fatfs",
+ "firestone-initproto",
  "flate2",
  "fs2",
  "jiff",
@@ -594,6 +595,22 @@ dependencies = [
  "tracing",
  "url",
  "wait-timeout",
+]
+
+[[package]]
+name = "firestone-init"
+version = "0.1.4"
+dependencies = [
+ "firestone-initproto",
+ "nix",
+]
+
+[[package]]
+name = "firestone-initproto"
+version = "0.1.4"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

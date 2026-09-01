@@ -2,6 +2,8 @@
 members = [
     "crates/firestone",
     "crates/firestone-core",
+    "crates/firestone-init",
+    "crates/firestone-initproto",
 ]
 resolver = "3"
 
@@ -17,6 +19,7 @@ clap_complete = "=4.6.9"
 console = "=0.16.4"
 dialoguer = { version = "=0.12.0", default-features = false }
 fatfs = { version = "=0.3.6", default-features = false, features = ["std", "alloc"] }
+firestone-initproto = { path = "crates/firestone-initproto" }
 flate2 = "=1.1.9"
 fs2 = "0.4"
 futures-util = { version = "=0.3.34", default-features = false, features = ["async-await", "std"] }
@@ -56,6 +59,16 @@ wait-timeout = "0.2"
 codegen-units = 1
 lto = "fat"
 strip = "symbols"
+
+# SPEC §10.5/§17.2. `firestone-init` is a guest payload, so it is tuned for size
+# rather than speed. Cargo accepts `opt-level` per package but not `lto` or
+# `panic`, which are profile-wide settings; the standalone musl build in
+# `build/firestone-init` supplies those on its own command line.
+[profile.release.package.firestone-init]
+opt-level = "z"
+
+[profile.release.package.firestone-initproto]
+opt-level = "z"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

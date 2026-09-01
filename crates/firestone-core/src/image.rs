@@ -31,9 +31,11 @@ use crate::{
     bounded::{self, BoundedReadError},
     catalog::{SshdPath, parse_https_url},
     embedded_helpers::install_pinned_artifact_with,
-    oci::{OciClassification, OciReference},
+    oci::{OciClassification, OciReference, layers::OciImageConfig},
 };
 const IMAGE_METADATA_VERSION: u32 = 1;
+/// The only `oci.boot` value SPEC §8.5 defines in v0.2.
+pub const FIRESTONE_INIT_BOOT: &str = "firestone-init";
 const IMAGE_ID_PREFIX: &str = "image-";
 const IMAGE_ID_HEX_LENGTH: usize = 64;
 const IMAGE_BUFFER_SIZE: usize = 1024 * 1024;
@@ -124,6 +126,42 @@ impl ImageKind {
     }
 }
 
+/// The image runtime configuration a sidecar `oci` object carries (SPEC §8.5).
+///
+/// This is the read side only: the OCI pull pipeline owns the write side. It is
+/// what feeds the `firestone-init` config disk of §10.5, so an OCI machine boots
+/// the entrypoint the image declared rather than a guess.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OciSidecar {
+    pub registry_ref: String,
+    pub manifest_digest: String,
+    pub config_digest: String,
+    #[serde(default)]
+    pub entrypoint: Vec<String>,
+    #[serde(default)]
+    pub cmd: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<String>,
+    pub workdir: Option<String>,
+    pub user: Option<String>,
+    pub boot: String,
+}
+
+impl OciSidecar {
+    /// The runtime fields the config-disk writer consumes (§10.5).
+    #[must_use]
+    pub fn runtime_config(&self) -> OciImageConfig {
+        OciImageConfig {
+            env: self.env.clone(),
+            entrypoint: self.entrypoint.clone(),
+            cmd: self.cmd.clone(),
+            working_dir: self.workdir.clone(),
+            user: self.user.clone(),
+        }
+    }
+}
+
 /// Strict version-one contents of an image sidecar.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ImageMetadata {
@@ -132,6 +170,9 @@ pub struct ImageMetadata {
     /// Read side of the sidecar `kind` field: absent means `disk` (§9.5).
     #[serde(default, skip_serializing_if = "ImageKind::is_disk")]
     pub kind: ImageKind,
+    /// Read side of the sidecar `oci` object; absent on every disk image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oci: Option<OciSidecar>,
     pub generation: u64,
     pub source_ref: String,
     pub source_url: Option<String>,
@@ -164,6 +205,8 @@ impl<'de> Deserialize<'de> for ImageMetadata {
             id: String,
             #[serde(default)]
             kind: ImageKind,
+            #[serde(default)]
+            oci: Option<OciSidecar>,
             generation: u64,
             source_ref: String,
             source_url: RequiredNullable<String>,
@@ -186,6 +229,7 @@ impl<'de> Deserialize<'de> for ImageMetadata {
             version: wire.version,
             id: wire.id,
             kind: wire.kind,
+            oci: wire.oci,
             generation: wire.generation,
             source_ref: wire.source_ref,
             source_url: wire.source_url.0,
@@ -248,6 +292,44 @@ impl ImageMetadata {
                 &self.id,
                 "pulled_at must be an RFC 3339 timestamp",
             ));
+        }
+        // §8.5: the `oci` object is present exactly when `kind` is `oci`. A
+        // disk sidecar carrying one is corrupt. The reverse — an `oci` sidecar
+        // with no runtime object — is tolerated here and refused at start,
+        // because the pull pipeline that writes it lands separately.
+        if let Some(oci) = &self.oci {
+            if !self.kind.is_oci() {
+                return Err(invalid_sidecar(
+                    &self.id,
+                    "a disk image must not carry an oci object",
+                ));
+            }
+            if oci.boot != FIRESTONE_INIT_BOOT {
+                return Err(invalid_sidecar(
+                    &self.id,
+                    "oci boot must be \"firestone-init\"",
+                ));
+            }
+            if oci.registry_ref != self.source_ref {
+                return Err(invalid_sidecar(
+                    &self.id,
+                    "oci registry_ref must equal source_ref",
+                ));
+            }
+            for (field, digest) in [
+                ("manifest_digest", &oci.manifest_digest),
+                ("config_digest", &oci.config_digest),
+            ] {
+                if digest
+                    .strip_prefix("sha256:")
+                    .is_none_or(|hex| !is_lower_hex(hex, 64))
+                {
+                    return Err(invalid_sidecar(
+                        &self.id,
+                        &format!("oci {field} must be a sha256 digest"),
+                    ));
+                }
+            }
         }
         if let Some(source_url) = &self.source_url {
             if self.kind.is_oci() {
@@ -1510,6 +1592,7 @@ impl ImageStore {
             // This path publishes disk images only; the OCI pull pipeline owns
             // the `oci` write side (§8.5).
             kind: ImageKind::Disk,
+            oci: None,
             generation,
             source_ref: source.source_ref.clone(),
             source_url: source.source_url.clone(),
@@ -2326,6 +2409,13 @@ impl ImageStore {
         metadata: &ImageMetadata,
         source_base: &Path,
     ) -> Result<String, FirestoneError> {
+        if metadata.kind.is_oci() {
+            // §8.5: an OCI image's immutable source is its normalized
+            // reference. It has no `source_url` and it is never a local path,
+            // so it must not be resolved against the machine's source base.
+            return Ok(OciReference::parse(reference)
+                .map_or_else(|_| reference.to_owned(), |parsed| parsed.to_string()));
+        }
         if metadata.source_url.is_none() {
             return self.absolute_local_reference(reference, source_base);
         }
@@ -4697,6 +4787,236 @@ else:
                 error.message()
             );
         }
+        Ok(())
+    }
+
+    /// Publishes one OCI image pair straight into the store, the way the pull
+    /// pipeline will once M6-15 lands, so `prepare_start` can be driven through
+    /// its OCI branch with the fake VMM today (SPEC §8.5, §10.5).
+    fn write_stored_oci_image(
+        fixture: &Fixture,
+        reference: &str,
+        oci: Option<OciSidecar>,
+    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        let bytes = b"QFI\xFBOCI-ROOTFS".to_vec();
+        let digest = sha256_bytes(&bytes);
+        let id = stable_image_id(reference, None, Arch::X86_64, &digest);
+        let metadata = ImageMetadata {
+            version: ImageMetadataVersion,
+            id: id.clone(),
+            kind: ImageKind::Oci,
+            oci,
+            generation: 1,
+            source_ref: reference.to_owned(),
+            source_url: None,
+            source_sha256: digest.clone(),
+            stored_sha256: digest.clone(),
+            architecture: Arch::X86_64,
+            firmware: None,
+            sshd_path: SshdPath::default(),
+            source_format: ImageFormat::Qcow2,
+            stored_format: ImageFormat::Qcow2,
+            verification_algorithm: None,
+            verification_digest: None,
+            size: bytes.len() as u64,
+            pulled_at: FIXED_TIME.to_owned(),
+        };
+        fixture.paths.ensure_owned_data_directory(
+            fixture.paths.data_dir(),
+            "data directory",
+            true,
+        )?;
+        fixture.paths.ensure_owned_data_directory(
+            &fixture.paths.images_dir(),
+            "images directory",
+            false,
+        )?;
+        let base = fixture.paths.image_base(&id)?;
+        fs::write(&base, &bytes)?;
+        fs::set_permissions(&base, fs::Permissions::from_mode(BASE_FILE_MODE))?;
+        let sidecar = fixture.paths.image_metadata(&id)?;
+        fs::write(&sidecar, serde_json::to_vec(&metadata)?)?;
+        fs::set_permissions(&sidecar, fs::Permissions::from_mode(SIDECAR_FILE_MODE))?;
+        Ok((id, digest))
+    }
+
+    fn oci_sidecar(reference: &str) -> OciSidecar {
+        OciSidecar {
+            registry_ref: reference.to_owned(),
+            manifest_digest: format!("sha256:{}", "1".repeat(64)),
+            config_digest: format!("sha256:{}", "2".repeat(64)),
+            entrypoint: vec!["/docker-entrypoint.sh".to_owned()],
+            cmd: vec![
+                "nginx".to_owned(),
+                "-g".to_owned(),
+                "daemon off;".to_owned(),
+            ],
+            env: vec!["PATH=/usr/sbin:/usr/bin:/sbin:/bin".to_owned()],
+            workdir: Some("/".to_owned()),
+            user: Some("root".to_owned()),
+            boot: crate::image::FIRESTONE_INIT_BOOT.to_owned(),
+        }
+    }
+
+    /// SPEC §10.5: `prepare_start` branches on the pinned image's kind. An OCI
+    /// machine publishes the `firestone-init` config disk into the §9.2 seed
+    /// slot and never renders a cloud-init seed.
+    #[test]
+    fn prepare_start_oci_image_publishes_the_config_disk_instead_of_a_seed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let kernel = b"pinned-direct-boot-kernel";
+        let url = "https://kernel.example.invalid/bzImage-x86_64";
+        let manifest = direct_boot_kernel_manifest(url, kernel, None)?;
+        fixture.http.push(
+            url,
+            kernel.to_vec(),
+            Some(kernel.len() as u64),
+            Some("application/octet-stream"),
+        )?;
+        let reference = "docker.io/library/nginx:latest";
+        let (id, digest) =
+            write_stored_oci_image(&fixture, reference, Some(oci_sidecar(reference)))?;
+        let name = "oci-config";
+        let state = machine_state(
+            &fixture.paths,
+            name,
+            StateImage {
+                r#ref: reference.to_owned(),
+                id: Some(id),
+                sha256: Some(digest),
+            },
+        )?;
+        let spec = MachineSpec {
+            image: ImageRef::new(reference),
+            arch: Some(Arch::X86_64),
+            network: NetworkSpec {
+                mode: NetMode::None,
+                ..NetworkSpec::default()
+            },
+            vmm: VmmSpec {
+                binary: Some(fixture.store.qemu_img.clone()),
+                ..VmmSpec::default()
+            },
+            ..MachineSpec::default()
+        };
+        let mut events = Vec::new();
+        let lock = create_machine(&fixture.paths, name, &state, &mut events)?;
+
+        let prepared = prepare_start(
+            &fixture.paths,
+            &fixture.store,
+            &manifest,
+            name,
+            &spec,
+            state,
+            &fixture.root,
+            &lock,
+            &mut events,
+            ShimTimeouts::default(),
+        )?;
+
+        let config_image = fixture.paths.machine_config_image(name)?;
+        assert!(config_image.exists());
+        assert!(!fixture.paths.machine_seed_image(name)?.exists());
+        assert!(!fixture.paths.machine_seed_dir(name)?.exists());
+        let document = fixture.paths.machine_config_file(name, "config.json")?;
+        let inspected: serde_json::Value = serde_json::from_slice(&fs::read(&document)?)?;
+        assert_eq!(inspected["hostname"], name);
+        assert_eq!(inspected["network"], "none");
+        assert_eq!(inspected["entrypoint"][0], "/docker-entrypoint.sh");
+
+        let decoded = firestone_initproto::decode_frame(&fs::read(&config_image)?)?;
+        assert_eq!(decoded.hostname, name);
+        assert_eq!(decoded.user.as_deref(), Some("root"));
+
+        let identity = prepared
+            .state()
+            .instance_id
+            .clone()
+            .ok_or("an OCI start records a config identity")?;
+        assert!(identity.starts_with("iid-oci-config-"));
+        assert!(prepared.seed_rewritten());
+
+        let vmconfig: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.paths.machine_vmconfig(name)?)?)?;
+        assert_eq!(
+            vmconfig["disks"][1]["path"],
+            config_image.to_string_lossy().as_ref()
+        );
+        assert_eq!(vmconfig["disks"][1]["readonly"], true);
+        assert_eq!(vmconfig["disks"][1]["image_type"], "Raw");
+        assert_eq!(vmconfig["disks"].as_array().map(Vec::len), Some(2));
+        Ok(())
+    }
+
+    /// An `oci` sidecar with no runtime object cannot describe a child, so the
+    /// start fails with a dependency error naming the re-pull rather than
+    /// booting a machine with an empty entrypoint (SPEC §8.5, §10.5).
+    #[test]
+    fn prepare_start_oci_image_without_a_runtime_config_reports_a_dependency()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let kernel = b"pinned-direct-boot-kernel";
+        let url = "https://kernel.example.invalid/bzImage-x86_64";
+        let manifest = direct_boot_kernel_manifest(url, kernel, None)?;
+        fixture.http.push(
+            url,
+            kernel.to_vec(),
+            Some(kernel.len() as u64),
+            Some("application/octet-stream"),
+        )?;
+        let reference = "docker.io/library/alpine:3.22";
+        let (id, digest) = write_stored_oci_image(&fixture, reference, None)?;
+        let name = "oci-bare";
+        let state = machine_state(
+            &fixture.paths,
+            name,
+            StateImage {
+                r#ref: reference.to_owned(),
+                id: Some(id),
+                sha256: Some(digest),
+            },
+        )?;
+        let spec = MachineSpec {
+            image: ImageRef::new(reference),
+            arch: Some(Arch::X86_64),
+            network: NetworkSpec {
+                mode: NetMode::None,
+                ..NetworkSpec::default()
+            },
+            vmm: VmmSpec {
+                binary: Some(fixture.store.qemu_img.clone()),
+                ..VmmSpec::default()
+            },
+            ..MachineSpec::default()
+        };
+        let mut events = Vec::new();
+        let lock = create_machine(&fixture.paths, name, &state, &mut events)?;
+
+        let error = prepare_start(
+            &fixture.paths,
+            &fixture.store,
+            &manifest,
+            name,
+            &spec,
+            state,
+            &fixture.root,
+            &lock,
+            &mut events,
+            ShimTimeouts::default(),
+        )
+        .err()
+        .ok_or("an OCI image without a runtime config must refuse to start")?;
+
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert!(
+            error.message().contains("no OCI runtime configuration"),
+            "{}",
+            error.message()
+        );
+        assert!(!fixture.paths.machine_config_image(name)?.exists());
+        assert!(!fixture.paths.machine_vmconfig(name)?.exists());
         Ok(())
     }
 
@@ -7091,6 +7411,7 @@ sshd_path = "{}"
                 version: ImageMetadataVersion,
                 id,
                 kind: ImageKind::Disk,
+                oci: None,
                 generation: 1,
                 source_ref,
                 source_url: Some(url.to_owned()),
