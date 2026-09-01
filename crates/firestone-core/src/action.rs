@@ -91,6 +91,31 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         memory: Option<ByteSize>,
     },
+    SnapshotCreate {
+        name: String,
+        /// Snapshot identifier. Absent asks for `snap-<yyyymmdd>-<hhmmss>`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        snapshot: Option<String>,
+    },
+    SnapshotList {
+        name: String,
+    },
+    SnapshotRestore {
+        name: String,
+        snapshot: String,
+        /// Stop a running machine before restoring instead of refusing.
+        #[serde(default)]
+        force: bool,
+        /// Start the machine after a cold restore. Warm restores always start.
+        #[serde(default)]
+        start: bool,
+        /// Deadline for the stop `force` performs.
+        timeout: Duration,
+    },
+    SnapshotRemove {
+        name: String,
+        snapshot: String,
+    },
 }
 
 /// One bounded, Firestone-owned machine log selected by the CLI or API.
@@ -354,6 +379,83 @@ mod tests {
             })
         );
         assert_eq!(serde_json::from_value::<Action>(encoded)?, fresh);
+        Ok(())
+    }
+
+    #[test]
+    fn action_snapshot_variants_round_trip_with_optional_name_and_flags()
+    -> Result<(), serde_json::Error> {
+        let automatic = serde_json::from_value::<Action>(json!({
+            "type": "SnapshotCreate",
+            "name": "dev"
+        }))?;
+        assert_eq!(
+            automatic,
+            Action::SnapshotCreate {
+                name: "dev".to_owned(),
+                snapshot: None,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&automatic)?,
+            json!({"type": "SnapshotCreate", "name": "dev"})
+        );
+
+        let named = Action::SnapshotCreate {
+            name: "dev".to_owned(),
+            snapshot: Some("before-upgrade".to_owned()),
+        };
+        assert_eq!(
+            serde_json::to_value(&named)?,
+            json!({"type": "SnapshotCreate", "name": "dev", "snapshot": "before-upgrade"})
+        );
+
+        let list = Action::SnapshotList {
+            name: "dev".to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_value(&list)?,
+            json!({"type": "SnapshotList", "name": "dev"})
+        );
+
+        let restore = Action::SnapshotRestore {
+            name: "dev".to_owned(),
+            snapshot: "before-upgrade".to_owned(),
+            force: true,
+            start: true,
+            timeout: std::time::Duration::from_secs(30),
+        };
+        let encoded = serde_json::to_value(&restore)?;
+        assert_eq!(encoded["type"], "SnapshotRestore");
+        assert_eq!(encoded["force"], true);
+        assert_eq!(encoded["start"], true);
+        assert_eq!(serde_json::from_value::<Action>(encoded)?, restore);
+
+        let defaults = serde_json::from_value::<Action>(json!({
+            "type": "SnapshotRestore",
+            "name": "dev",
+            "snapshot": "before-upgrade",
+            "timeout": {"secs": 30, "nanos": 0}
+        }))?;
+        assert_eq!(
+            defaults,
+            Action::SnapshotRestore {
+                name: "dev".to_owned(),
+                snapshot: "before-upgrade".to_owned(),
+                force: false,
+                start: false,
+                timeout: std::time::Duration::from_secs(30),
+            }
+        );
+
+        let remove = Action::SnapshotRemove {
+            name: "dev".to_owned(),
+            snapshot: "before-upgrade".to_owned(),
+        };
+        assert_eq!(
+            serde_json::from_value::<Action>(serde_json::to_value(&remove)?)?,
+            remove
+        );
         Ok(())
     }
 

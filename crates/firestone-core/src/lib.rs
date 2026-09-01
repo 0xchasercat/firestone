@@ -23,6 +23,7 @@ pub mod pty;
 pub mod readiness;
 pub mod result;
 pub mod shim;
+pub mod snapshot;
 pub mod spec;
 pub mod ssh;
 pub mod state;
@@ -94,10 +95,21 @@ pub use result::{
     SpecWarningPayload, SshConfigResult, StartResult, StopResult, VersionDependency,
     VersionIdentity, VersionPaths, VersionResult,
 };
+pub use result::{
+    SnapshotListResult, SnapshotRemoveResult, SnapshotRestoreResult, SnapshotResult,
+    SnapshotSummary,
+};
 pub use shim::{
     PreparedStart, ShimClient, ShimPids, ShimStatus, ShimTimeouts, cancel_prepared,
     launch_prepared, launch_prepared_cancellable, prepare_start, recover_shim, run_shim,
     stop_unsupervised,
+};
+pub use snapshot::{
+    MAX_SNAPSHOT_NAME_BYTES, RestoreRequest, SNAPSHOT_DIR_MODE, SNAPSHOT_FILE_MODE,
+    SNAPSHOT_SCHEMA_VERSION, SnapshotKind, SnapshotMetadata, SparseCopy, allocated_bytes,
+    auto_snapshot_name, available_bytes, create_snapshot_directory, ensure_snapshot_directory,
+    read_restore_request, read_snapshot_metadata, snapshot_document_digest, snapshot_file_url,
+    sparse_copy_file, validate_snapshot_name,
 };
 pub use spec::{
     Arch, ByteSize, CloudInitSpec, CloudInitSpecPatch, ColorMode, Firmware, GlobalConfig,

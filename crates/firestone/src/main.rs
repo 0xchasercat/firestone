@@ -35,7 +35,7 @@ use firestone_core::{
 use crate::{
     cli::{
         Cli, Command, CpArgs, CreateDraft, CreateRequest, ImageCommand, ListenAddress, RunArgs,
-        ShellArgs, UiArgs, derive_machine_name, parse_hidden_vsock_proxy,
+        ShellArgs, SnapshotCommand, UiArgs, derive_machine_name, parse_hidden_vsock_proxy,
     },
     render::{RenderOptions, Renderer, error_exit_code},
     serve::{BoundListener, ServeListener},
@@ -503,6 +503,33 @@ where
                     renderer,
                 )
                 .await
+        }
+        Command::Snapshot(arguments) => {
+            let (global, catalog) = load_user_configuration(&paths)?;
+            let stop_timeout = global.stop.timeout.get();
+            let dispatcher =
+                LocalDispatcher::new(paths, global, catalog).with_source_base(source_base);
+            let action = match arguments.command {
+                SnapshotCommand::Create(arguments) => Action::SnapshotCreate {
+                    name: arguments.name,
+                    snapshot: arguments.snapshot,
+                },
+                SnapshotCommand::List(arguments) => Action::SnapshotList {
+                    name: arguments.name,
+                },
+                SnapshotCommand::Restore(arguments) => Action::SnapshotRestore {
+                    name: arguments.name,
+                    snapshot: arguments.snapshot,
+                    force: arguments.force || yes,
+                    start: arguments.start,
+                    timeout: stop_timeout,
+                },
+                SnapshotCommand::Remove(arguments) => Action::SnapshotRemove {
+                    name: arguments.name,
+                    snapshot: arguments.snapshot,
+                },
+            };
+            dispatcher.run(action, renderer).await
         }
         Command::Resize(arguments) => {
             let (global, catalog) = load_user_configuration(&paths)?;

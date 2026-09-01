@@ -128,6 +128,82 @@ pub enum Command {
 
     /// Copy a stopped machine's spec and disk to a new machine.
     Clone(CloneArgs),
+
+    /// Capture, list, restore, and remove machine snapshots.
+    Snapshot(SnapshotArgs),
+}
+
+/// Arguments accepted by firestone snapshot.
+#[derive(Debug, Args)]
+pub struct SnapshotArgs {
+    #[command(subcommand)]
+    pub command: SnapshotCommand,
+}
+
+/// Snapshot commands.
+#[derive(Debug, Subcommand)]
+pub enum SnapshotCommand {
+    /// Capture one immutable snapshot of a machine.
+    Create(SnapshotCreateArgs),
+
+    /// List a machine's snapshots.
+    #[command(visible_alias = "ls")]
+    List(SnapshotListArgs),
+
+    /// Roll a machine back to one of its snapshots.
+    Restore(SnapshotRestoreArgs),
+
+    /// Remove one snapshot.
+    #[command(name = "rm")]
+    Remove(SnapshotRemoveArgs),
+}
+
+/// Arguments accepted by firestone snapshot create.
+#[derive(Debug, Args)]
+#[command(
+    after_help = "A stopped or created machine yields a cold snapshot: its spec and overlay.\nA running machine yields a warm snapshot, which also captures guest memory by\npausing the machine, writing its VM state, and resuming it."
+)]
+pub struct SnapshotCreateArgs {
+    pub name: String,
+
+    /// Snapshot name. Defaults to snap-<yyyymmdd>-<hhmmss>.
+    #[arg(value_name = "SNAPSHOT")]
+    pub snapshot: Option<String>,
+}
+
+/// Arguments accepted by firestone snapshot list.
+#[derive(Debug, Args)]
+pub struct SnapshotListArgs {
+    pub name: String,
+}
+
+/// Arguments accepted by firestone snapshot restore.
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Restore is a whole-machine rollback: the snapshot's disk, firestone.toml and\nVmConfig replace the machine's own. Restoring a warm snapshot always resumes\nthe machine from the captured guest memory."
+)]
+pub struct SnapshotRestoreArgs {
+    pub name: String,
+
+    #[arg(value_name = "SNAPSHOT")]
+    pub snapshot: String,
+
+    /// Stop the machine first instead of refusing a running machine.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Start the machine after restoring a cold snapshot.
+    #[arg(long)]
+    pub start: bool,
+}
+
+/// Arguments accepted by firestone snapshot rm.
+#[derive(Debug, Args)]
+pub struct SnapshotRemoveArgs {
+    pub name: String,
+
+    #[arg(value_name = "SNAPSHOT")]
+    pub snapshot: String,
 }
 
 /// Arguments accepted by firestone clone.

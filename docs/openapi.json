@@ -4,7 +4,7 @@
   "info": {
     "title": "Firestone REST API",
     "version": "0.1.0",
-    "description": "Static contract for the existing Firestone v0.1 REST adapter. The API is HTTP/1.1 over a private Unix-domain socket; it has no TCP listener and no bearer-token mode. Socket ownership and mode 0600 are the authentication boundary. The document lists the 23 methods explicitly authored in the Firestone router. Axum also performs its normal implicit HEAD handling for GET registrations, but those incidental HEAD variants are not separate Firestone operations. Unknown paths and unsupported methods both return the stable 404 ErrorEnvelope. JSON successes and errors use application/json without a charset; action progress defaults to application/x-ndjson; logs use text/plain. Closing a mutation stream stops delivery while the shared action continues to a safe point; closing a followed log stream cancels that open-ended read."
+    "description": "Static contract for the existing Firestone v0.1 REST adapter. The API is HTTP/1.1 over a private Unix-domain socket; it has no TCP listener and no bearer-token mode. Socket ownership and mode 0600 are the authentication boundary. The document lists the 27 methods explicitly authored in the Firestone router. Axum also performs its normal implicit HEAD handling for GET registrations, but those incidental HEAD variants are not separate Firestone operations. Unknown paths and unsupported methods both return the stable 404 ErrorEnvelope. JSON successes and errors use application/json without a charset; action progress defaults to application/x-ndjson; logs use text/plain. Closing a mutation stream stops delivery while the shared action continues to a safe point; closing a followed log stream cancels that open-ended read."
   },
   "servers": [
     {
@@ -1543,6 +1543,298 @@
         "parameters": [
           {
             "$ref": "#/components/parameters/MachineName"
+          }
+        ]
+      }
+    },
+    "/v1/machines/{name}/snapshots": {
+      "get": {
+        "tags": [
+          "Machines"
+        ],
+        "operationId": "listMachineSnapshots",
+        "summary": "List machine snapshots",
+        "description": "Returns every published snapshot of one machine, ordered by identifier, projected from each snapshot's metadata.json. A snapshot still being written is invisible here. Request bodies and undocumented query fields are ignored.",
+        "responses": {
+          "200": {
+            "description": "Published snapshots of the machine.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SnapshotListResult"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/SnapshotList"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Error504"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineName"
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Machines"
+        ],
+        "operationId": "createMachineSnapshot",
+        "summary": "Capture a machine snapshot",
+        "description": "Captures one immutable snapshot. A stopped or created machine yields a cold snapshot: the spec, the published VmConfig when one exists, and a qcow2 overlay copy on the same base image. A running machine yields a warm snapshot, which also pauses the machine, writes its Cloud Hypervisor VM state, copies the overlay while paused, and resumes it. A machine that is starting, stopping, or failed returns 409, as does a snapshot name that is already taken.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSnapshotRequest"
+              },
+              "examples": {
+                "default": {
+                  "$ref": "#/components/examples/CreateSnapshotRequest"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Snapshot progress and the terminal snapshot result.",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string",
+                  "description": "LF-delimited compact JSON records. Progress records arrive as produced. Success ends with exactly one typed Result record; a dispatcher failure after progress ends with one ErrorEnvelope record under HTTP 200.",
+                  "x-ndjson-item-schema": {
+                    "oneOf": [
+                      {
+                        "$ref": "#/components/schemas/NonTerminalEvent"
+                      },
+                      {
+                        "$ref": "#/components/schemas/SnapshotResultEvent"
+                      },
+                      {
+                        "$ref": "#/components/schemas/ErrorEnvelope"
+                      }
+                    ]
+                  },
+                  "x-firestone-terminal-records": [
+                    "SnapshotResultEvent",
+                    "ErrorEnvelope"
+                  ]
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/SnapshotCreateNdjson"
+                  }
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SnapshotResultDispatchOutput"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/SnapshotCreateAggregate"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ActionError400"
+          },
+          "404": {
+            "$ref": "#/components/responses/ActionError404"
+          },
+          "409": {
+            "$ref": "#/components/responses/ActionError409"
+          },
+          "500": {
+            "$ref": "#/components/responses/ActionError500"
+          },
+          "502": {
+            "$ref": "#/components/responses/ActionError502"
+          },
+          "503": {
+            "$ref": "#/components/responses/ActionError503"
+          },
+          "504": {
+            "$ref": "#/components/responses/ActionError504"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineName"
+          }
+        ],
+        "x-firestone-aggregation-accept": "application/json"
+      }
+    },
+    "/v1/machines/{name}/snapshots/{snapshot}/restore": {
+      "post": {
+        "tags": [
+          "Machines"
+        ],
+        "operationId": "restoreMachineSnapshot",
+        "summary": "Restore a machine from a snapshot",
+        "description": "Whole-machine rollback: the snapshot's overlay, firestone.toml and vmconfig.json replace the machine's own. A running machine returns 409 unless force is true, which stops it first. A cold restore leaves the machine stopped unless start is true. A warm restore writes the machine's restore marker and always starts the machine, so the next launch resumes the captured guest memory instead of booting.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RestoreSnapshotRequest"
+              },
+              "examples": {
+                "default": {
+                  "$ref": "#/components/examples/RestoreSnapshotRequest"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Restore progress and the terminal restore result.",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string",
+                  "description": "LF-delimited compact JSON records. Progress records arrive as produced. Success ends with exactly one typed Result record; a dispatcher failure after progress ends with one ErrorEnvelope record under HTTP 200.",
+                  "x-ndjson-item-schema": {
+                    "oneOf": [
+                      {
+                        "$ref": "#/components/schemas/NonTerminalEvent"
+                      },
+                      {
+                        "$ref": "#/components/schemas/SnapshotRestoreResultEvent"
+                      },
+                      {
+                        "$ref": "#/components/schemas/ErrorEnvelope"
+                      }
+                    ]
+                  },
+                  "x-firestone-terminal-records": [
+                    "SnapshotRestoreResultEvent",
+                    "ErrorEnvelope"
+                  ]
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/SnapshotRestoreNdjson"
+                  }
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SnapshotRestoreResultDispatchOutput"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/SnapshotRestoreAggregate"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ActionError400"
+          },
+          "404": {
+            "$ref": "#/components/responses/ActionError404"
+          },
+          "409": {
+            "$ref": "#/components/responses/ActionError409"
+          },
+          "500": {
+            "$ref": "#/components/responses/ActionError500"
+          },
+          "502": {
+            "$ref": "#/components/responses/ActionError502"
+          },
+          "503": {
+            "$ref": "#/components/responses/ActionError503"
+          },
+          "504": {
+            "$ref": "#/components/responses/ActionError504"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineName"
+          },
+          {
+            "$ref": "#/components/parameters/SnapshotName"
+          }
+        ],
+        "x-firestone-aggregation-accept": "application/json"
+      }
+    },
+    "/v1/machines/{name}/snapshots/{snapshot}": {
+      "delete": {
+        "tags": [
+          "Machines"
+        ],
+        "operationId": "deleteMachineSnapshot",
+        "summary": "Delete one machine snapshot",
+        "description": "The request body and Accept header are ignored. Progress and the internal SnapshotRemoveResult are discarded; success is always empty 204. A snapshot named by a pending warm restore returns 409.",
+        "responses": {
+          "204": {
+            "description": "Snapshot removed. Empty body and no Content-Type header."
+          },
+          "400": {
+            "$ref": "#/components/responses/Error400"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error409"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          },
+          "504": {
+            "$ref": "#/components/responses/Error504"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MachineName"
+          },
+          {
+            "$ref": "#/components/parameters/SnapshotName"
           }
         ]
       }
@@ -5300,6 +5592,255 @@
           "events",
           "result"
         ]
+      },
+      "SnapshotKind": {
+        "type": "string",
+        "enum": [
+          "cold",
+          "warm"
+        ],
+        "description": "cold snapshots copy the spec and overlay of a stopped or created machine. warm snapshots also capture guest memory by pausing a running machine, writing its Cloud Hypervisor VM state, and resuming it."
+      },
+      "CreateSnapshotRequest": {
+        "type": "object",
+        "properties": {
+          "snapshot": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[A-Za-z0-9_][A-Za-z0-9._-]*$",
+            "description": "Snapshot identifier. Absent or null asks Firestone for snap-<yyyymmdd>-<hhmmss> in UTC."
+          }
+        },
+        "additionalProperties": false,
+        "description": "Optional JSON body. An absent body is the same as {}."
+      },
+      "RestoreSnapshotRequest": {
+        "type": "object",
+        "properties": {
+          "force": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "default": false,
+            "description": "Stop a running machine before restoring instead of refusing with 409."
+          },
+          "start": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "default": false,
+            "description": "Start the machine after restoring a cold snapshot. A warm snapshot always starts the machine, because its restore is a resume."
+          },
+          "timeout_s": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 3600,
+            "description": "Deadline for the stop that force performs. Defaults to the configured stop timeout."
+          }
+        },
+        "additionalProperties": false,
+        "description": "Optional JSON body. An absent body is the same as {}."
+      },
+      "SnapshotResult": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "snapshot": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SnapshotKind"
+          },
+          "disk_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "Virtual size of the copied overlay, or zero when the machine had none yet."
+          },
+          "memory_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "Guest memory captured by a warm snapshot. Omitted entirely for a cold snapshot."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "snapshot",
+          "kind",
+          "disk_bytes"
+        ]
+      },
+      "SnapshotSummary": {
+        "type": "object",
+        "properties": {
+          "snapshot": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SnapshotKind"
+          },
+          "created_at": {
+            "type": "string",
+            "description": "RFC 3339 UTC instant the snapshot was published."
+          },
+          "image_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Stored image the snapshot overlay backs onto. Null when the machine had no pinned image. A non-null value pins the image against images rm and images prune."
+          },
+          "disk_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          },
+          "memory_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "snapshot",
+          "kind",
+          "created_at",
+          "image_id",
+          "disk_bytes"
+        ]
+      },
+      "SnapshotListResult": {
+        "type": "object",
+        "properties": {
+          "snapshots": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SnapshotSummary"
+            },
+            "description": "Published snapshots ordered by identifier. Partially written snapshots are never listed."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "snapshots"
+        ]
+      },
+      "SnapshotRestoreResult": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "snapshot": {
+            "type": "string"
+          },
+          "started": {
+            "type": "boolean",
+            "description": "True when the machine is running again after the restore."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "snapshot",
+          "started"
+        ]
+      },
+      "SnapshotResultEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "Result"
+          },
+          "action": {
+            "type": "string",
+            "const": "snapshot-create"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/SnapshotResult"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "action",
+          "payload"
+        ]
+      },
+      "SnapshotResultDispatchOutput": {
+        "type": "object",
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NonTerminalEvent"
+            }
+          },
+          "result": {
+            "$ref": "#/components/schemas/SnapshotResultEvent"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "events",
+          "result"
+        ]
+      },
+      "SnapshotRestoreResultEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "Result"
+          },
+          "action": {
+            "type": "string",
+            "const": "snapshot-restore"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/SnapshotRestoreResult"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "action",
+          "payload"
+        ]
+      },
+      "SnapshotRestoreResultDispatchOutput": {
+        "type": "object",
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NonTerminalEvent"
+            }
+          },
+          "result": {
+            "$ref": "#/components/schemas/SnapshotRestoreResultEvent"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "events",
+          "result"
+        ]
       }
     },
     "parameters": {
@@ -5368,6 +5909,19 @@
           "maximum": 100000,
           "default": 200
         }
+      },
+      "SnapshotName": {
+        "name": "snapshot",
+        "in": "path",
+        "required": true,
+        "description": "Percent-decoded snapshot identifier: 1 to 64 characters from A-Z a-z 0-9 . _ - that do not start with '.' or '-'.",
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9_][A-Za-z0-9._-]*$"
+        },
+        "example": "snap-20260902-123456"
       }
     },
     "responses": {
@@ -6426,6 +6980,97 @@
               "applied_live": true,
               "cpus": 4,
               "memory": "4G"
+            }
+          }
+        }
+      },
+      "CreateSnapshotRequest": {
+        "value": {
+          "snapshot": "before-upgrade"
+        }
+      },
+      "RestoreSnapshotRequest": {
+        "value": {
+          "force": true,
+          "start": false
+        }
+      },
+      "SnapshotList": {
+        "value": {
+          "snapshots": [
+            {
+              "snapshot": "before-upgrade",
+              "kind": "cold",
+              "created_at": "2026-09-02T12:34:56Z",
+              "image_id": "image-0000000000000000000000000000000000000000000000000000000000000000",
+              "disk_bytes": 21474836480
+            },
+            {
+              "snapshot": "snap-20260902-125959",
+              "kind": "warm",
+              "created_at": "2026-09-02T12:59:59Z",
+              "image_id": "image-0000000000000000000000000000000000000000000000000000000000000000",
+              "disk_bytes": 21474836480,
+              "memory_bytes": 2147483648
+            }
+          ]
+        }
+      },
+      "SnapshotCreateNdjson": {
+        "value": "{\"type\":\"StepStart\",\"id\":\"snapshot\",\"label\":\"capturing cold snapshot before-upgrade of dev\"}\n{\"type\":\"StepDone\",\"id\":\"snapshot\",\"detail\":\"cold snapshot before-upgrade\",\"elapsed_ms\":815}\n{\"type\":\"Result\",\"action\":\"snapshot-create\",\"payload\":{\"name\":\"dev\",\"snapshot\":\"before-upgrade\",\"kind\":\"cold\",\"disk_bytes\":21474836480}}\n"
+      },
+      "SnapshotCreateAggregate": {
+        "value": {
+          "events": [
+            {
+              "type": "StepStart",
+              "id": "snapshot",
+              "label": "capturing cold snapshot before-upgrade of dev"
+            },
+            {
+              "type": "StepDone",
+              "id": "snapshot",
+              "detail": "cold snapshot before-upgrade",
+              "elapsed_ms": 815
+            }
+          ],
+          "result": {
+            "type": "Result",
+            "action": "snapshot-create",
+            "payload": {
+              "name": "dev",
+              "snapshot": "before-upgrade",
+              "kind": "cold",
+              "disk_bytes": 21474836480
+            }
+          }
+        }
+      },
+      "SnapshotRestoreNdjson": {
+        "value": "{\"type\":\"StepStart\",\"id\":\"restore\",\"label\":\"restoring dev from before-upgrade\"}\n{\"type\":\"StepDone\",\"id\":\"restore\",\"detail\":\"cold snapshot before-upgrade\",\"elapsed_ms\":734}\n{\"type\":\"Result\",\"action\":\"snapshot-restore\",\"payload\":{\"name\":\"dev\",\"snapshot\":\"before-upgrade\",\"started\":false}}\n"
+      },
+      "SnapshotRestoreAggregate": {
+        "value": {
+          "events": [
+            {
+              "type": "StepStart",
+              "id": "restore",
+              "label": "restoring dev from before-upgrade"
+            },
+            {
+              "type": "StepDone",
+              "id": "restore",
+              "detail": "cold snapshot before-upgrade",
+              "elapsed_ms": 734
+            }
+          ],
+          "result": {
+            "type": "Result",
+            "action": "snapshot-restore",
+            "payload": {
+              "name": "dev",
+              "snapshot": "before-upgrade",
+              "started": false
             }
           }
         }

@@ -663,6 +663,154 @@ _arguments "${_arguments_options[@]}" : \
 ':dest -- New machine name:_default' \
 && ret=0
 ;;
+(snapshot)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_firestone__subcmd__snapshot_commands" \
+"*::: :->snapshot" \
+&& ret=0
+
+    case $state in
+    (snapshot)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:firestone-snapshot-command-$line[1]:"
+        case $line[1] in
+            (create)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':name:_default' \
+'::snapshot -- Snapshot name. Defaults to snap-<yyyymmdd>-<hhmmss>:_default' \
+&& ret=0
+;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':name:_default' \
+&& ret=0
+;;
+(ls)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':name:_default' \
+&& ret=0
+;;
+(restore)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--force[Stop the machine first instead of refusing a running machine]' \
+'--start[Start the machine after restoring a cold snapshot]' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':name:_default' \
+':snapshot:_default' \
+&& ret=0
+;;
+(rm)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':name:_default' \
+':snapshot:_default' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_firestone__subcmd__snapshot__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:firestone-snapshot-help-command-$line[1]:"
+        case $line[1] in
+            (create)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(restore)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(rm)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_firestone__subcmd__help_commands" \
@@ -803,6 +951,38 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(snapshot)
+_arguments "${_arguments_options[@]}" : \
+":: :_firestone__subcmd__help__subcmd__snapshot_commands" \
+"*::: :->snapshot" \
+&& ret=0
+
+    case $state in
+    (snapshot)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:firestone-help-snapshot-command-$line[1]:"
+        case $line[1] in
+            (create)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(restore)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(rm)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -845,6 +1025,7 @@ _firestone_commands() {
 'serve:Run the stateless REST API over a private Unix socket or loopback port' \
 'ui:Open the Firestone web interface on a loopback port' \
 'clone:Copy a stopped machine'\''s spec and disk to a new machine' \
+'snapshot:Capture, list, restore, and remove machine snapshots' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'firestone commands' commands "$@"
@@ -916,6 +1097,7 @@ _firestone__subcmd__help_commands() {
 'serve:Run the stateless REST API over a private Unix socket or loopback port' \
 'ui:Open the Firestone web interface on a loopback port' \
 'clone:Copy a stopped machine'\''s spec and disk to a new machine' \
+'snapshot:Capture, list, restore, and remove machine snapshots' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'firestone help commands' commands "$@"
@@ -1050,6 +1232,36 @@ _firestone__subcmd__help__subcmd__shell_commands() {
 _firestone__subcmd__help__subcmd__show_commands() {
     local commands; commands=()
     _describe -t commands 'firestone help show commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__snapshot_commands] )) ||
+_firestone__subcmd__help__subcmd__snapshot_commands() {
+    local commands; commands=(
+'create:Capture one immutable snapshot of a machine' \
+'list:List a machine'\''s snapshots' \
+'restore:Roll a machine back to one of its snapshots' \
+'rm:Remove one snapshot' \
+    )
+    _describe -t commands 'firestone help snapshot commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__snapshot__subcmd__create_commands] )) ||
+_firestone__subcmd__help__subcmd__snapshot__subcmd__create_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help snapshot create commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__snapshot__subcmd__list_commands] )) ||
+_firestone__subcmd__help__subcmd__snapshot__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help snapshot list commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__snapshot__subcmd__restore_commands] )) ||
+_firestone__subcmd__help__subcmd__snapshot__subcmd__restore_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help snapshot restore commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__snapshot__subcmd__rm_commands] )) ||
+_firestone__subcmd__help__subcmd__snapshot__subcmd__rm_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help snapshot rm commands' commands "$@"
 }
 (( $+functions[_firestone__subcmd__help__subcmd__ssh-config_commands] )) ||
 _firestone__subcmd__help__subcmd__ssh-config_commands() {
@@ -1204,6 +1416,74 @@ _firestone__subcmd__shell_commands() {
 _firestone__subcmd__show_commands() {
     local commands; commands=()
     _describe -t commands 'firestone show commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__snapshot_commands] )) ||
+_firestone__subcmd__snapshot_commands() {
+    local commands; commands=(
+'create:Capture one immutable snapshot of a machine' \
+'list:List a machine'\''s snapshots' \
+'ls:List a machine'\''s snapshots' \
+'restore:Roll a machine back to one of its snapshots' \
+'rm:Remove one snapshot' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'firestone snapshot commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__snapshot__subcmd__create_commands] )) ||
+_firestone__subcmd__snapshot__subcmd__create_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone snapshot create commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__snapshot__subcmd__help_commands] )) ||
+_firestone__subcmd__snapshot__subcmd__help_commands() {
+    local commands; commands=(
+'create:Capture one immutable snapshot of a machine' \
+'list:List a machine'\''s snapshots' \
+'restore:Roll a machine back to one of its snapshots' \
+'rm:Remove one snapshot' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'firestone snapshot help commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__snapshot__subcmd__help__subcmd__create_commands] )) ||
+_firestone__subcmd__snapshot__subcmd__help__subcmd__create_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone snapshot help create commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__snapshot__subcmd__help__subcmd__help_commands] )) ||
+_firestone__subcmd__snapshot__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone snapshot help help commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__snapshot__subcmd__help__subcmd__list_commands] )) ||
+_firestone__subcmd__snapshot__subcmd__help__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone snapshot help list commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__snapshot__subcmd__help__subcmd__restore_commands] )) ||
+_firestone__subcmd__snapshot__subcmd__help__subcmd__restore_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone snapshot help restore commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__snapshot__subcmd__help__subcmd__rm_commands] )) ||
+_firestone__subcmd__snapshot__subcmd__help__subcmd__rm_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone snapshot help rm commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__snapshot__subcmd__list_commands] )) ||
+_firestone__subcmd__snapshot__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone snapshot list commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__snapshot__subcmd__restore_commands] )) ||
+_firestone__subcmd__snapshot__subcmd__restore_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone snapshot restore commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__snapshot__subcmd__rm_commands] )) ||
+_firestone__subcmd__snapshot__subcmd__rm_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone snapshot rm commands' commands "$@"
 }
 (( $+functions[_firestone__subcmd__ssh-config_commands] )) ||
 _firestone__subcmd__ssh-config_commands() {

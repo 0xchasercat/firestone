@@ -151,6 +151,9 @@ define_rest_routes! {
     "/v1/images/prune" => post(prune_images);
     "/v1/images/{id}" => delete(remove_image);
     "/v1/machines/{name}/clone" => post(clone_machine);
+    "/v1/machines/{name}/snapshots" => get(machine_snapshots).post(create_machine_snapshot);
+    "/v1/machines/{name}/snapshots/{snapshot}/restore" => post(restore_machine_snapshot);
+    "/v1/machines/{name}/snapshots/{snapshot}" => delete(remove_machine_snapshot);
 }
 
 /// Builds the complete v1 REST router over the shared action dispatcher.
@@ -228,6 +231,46 @@ struct CloneMachineBody {
     name: String,
     #[serde(default)]
     fresh_disk: Option<bool>,
+}
+
+/// Path parameters of the two snapshot item routes.
+#[derive(Debug)]
+struct ApiSnapshotPath {
+    name: String,
+    snapshot: String,
+}
+
+impl<S> FromRequestParts<S> for ApiSnapshotPath
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        Path::<(String, String)>::from_request_parts(parts, state)
+            .await
+            .map(|Path((name, snapshot))| Self { name, snapshot })
+            .map_err(|_| {
+                error_response(
+                    FirestoneError::new(ErrorKind::Usage, "the route path is not valid UTF-8")
+                        .with_hint("percent-encode one UTF-8 machine name and snapshot name"),
+                )
+            })
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct CreateSnapshotBody {
+    snapshot: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RestoreSnapshotBody {
+    force: Option<bool>,
+    start: Option<bool>,
+    timeout_s: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -466,6 +509,83 @@ async fn clone_machine(
         aggregate,
     )
     .await
+}
+
+async fn machine_snapshots(State(state): State<ApiState>, ApiPath(name): ApiPath) -> Response {
+    payload_response(
+        &state,
+        Action::SnapshotList { name },
+        "snapshot-list",
+        StatusCode::OK,
+    )
+    .await
+}
+
+async fn create_machine_snapshot(
+    State(state): State<ApiState>,
+    ApiPath(name): ApiPath,
+    request: Request<Body>,
+) -> Response {
+    let aggregate = accepts_json(request.headers());
+    let body = match parse_optional_json::<CreateSnapshotBody>(request, "create snapshot").await {
+        Ok(body) => body,
+        Err(error) => return error_response(error),
+    };
+    action_response(
+        &state,
+        Action::SnapshotCreate {
+            name,
+            snapshot: body.snapshot,
+        },
+        "snapshot-create",
+        aggregate,
+    )
+    .await
+}
+
+async fn restore_machine_snapshot(
+    State(state): State<ApiState>,
+    ApiSnapshotPath { name, snapshot }: ApiSnapshotPath,
+    request: Request<Body>,
+) -> Response {
+    let aggregate = accepts_json(request.headers());
+    let body = match parse_optional_json::<RestoreSnapshotBody>(request, "restore snapshot").await {
+        Ok(body) => body,
+        Err(error) => return error_response(error),
+    };
+    let timeout = match request_timeout(body.timeout_s, state.config.stop_timeout) {
+        Ok(timeout) => timeout,
+        Err(error) => return error_response(error),
+    };
+    action_response(
+        &state,
+        Action::SnapshotRestore {
+            name,
+            snapshot,
+            force: body.force.unwrap_or(false),
+            start: body.start.unwrap_or(false),
+            timeout,
+        },
+        "snapshot-restore",
+        aggregate,
+    )
+    .await
+}
+
+async fn remove_machine_snapshot(
+    State(state): State<ApiState>,
+    ApiSnapshotPath { name, snapshot }: ApiSnapshotPath,
+) -> Response {
+    match collect_action(
+        &state,
+        Action::SnapshotRemove { name, snapshot },
+        "snapshot-rm",
+    )
+    .await
+    {
+        Ok(_) => empty_response(StatusCode::NO_CONTENT),
+        Err(error) => error_response(error),
+    }
 }
 
 async fn resize_machine(

@@ -31,6 +31,13 @@ use firestone_core::{
     wait_for_ssh_ready,
 };
 use firestone_core::{CloneResult, StepId};
+use firestone_core::{
+    RestoreRequest, SNAPSHOT_FILE_MODE, SNAPSHOT_SCHEMA_VERSION, SnapshotKind, SnapshotListResult,
+    SnapshotMetadata, SnapshotRemoveResult, SnapshotRestoreResult, SnapshotResult, SnapshotSummary,
+    allocated_bytes, auto_snapshot_name, available_bytes, create_snapshot_directory,
+    ensure_snapshot_directory, read_snapshot_metadata, snapshot_document_digest as sha256_hex,
+    snapshot_file_url, sparse_copy_file, validate_snapshot_name,
+};
 
 const SPEC_TEMPLATE: &str = include_str!("../../../templates/firestone.toml");
 /// `firestone.toml` may hold a plaintext guest password (§10.5), so it is
@@ -651,6 +658,672 @@ impl LocalDispatcher {
             elapsed_ms: elapsed_millis(started.elapsed()),
         })?;
         Ok(overlay.virtual_size)
+    }
+
+    /// Publishes one immutable snapshot of a machine (SPEC section 23).
+    ///
+    /// The snapshot is assembled inside `.partial-<snapshot>` and published
+    /// with a single rename, so a partial snapshot is never listed, restored,
+    /// or counted as an image reference.
+    fn snapshot_create(
+        &self,
+        name: &str,
+        snapshot: Option<String>,
+        events: &mut dyn EventSink,
+    ) -> Result<(), FirestoneError> {
+        self.validate_machine_storage()?;
+        let machine_dir = self.paths.machine_dir(name)?;
+        ensure_machine_exists(&self.paths, name, &machine_dir)?;
+        let snapshot = match snapshot {
+            Some(value) => {
+                validate_snapshot_name(&value)?;
+                value
+            }
+            None => auto_snapshot_name(jiff::Timestamp::now()),
+        };
+
+        let snapshots_dir = self.paths.machine_snapshots_dir(name)?;
+        ensure_snapshot_directory(&snapshots_dir)?;
+        let snapshot_lock =
+            MachineLock::acquire(name, &self.paths.machine_snapshot_lock(name)?, events)?;
+
+        let published = self.paths.machine_snapshot_dir(name, &snapshot)?;
+        if published.exists() {
+            return Err(FirestoneError::new(
+                ErrorKind::AlreadyExists,
+                format!("machine `{name}` already has a snapshot named `{snapshot}`"),
+            )
+            .with_hint(format!(
+                "choose another name or run `firestone snapshot rm {name} {snapshot}`"
+            )));
+        }
+
+        // A running machine's shim owns the machine lock for its whole
+        // lifetime, so the warm path deliberately takes no machine lock: it
+        // writes only inside `snapshots/`, which nothing else touches, and the
+        // snapshot lock above serializes it against other snapshot work.
+        let preliminary = self.read_live_state(name)?;
+        let kind = snapshot_kind_for(name, preliminary.state.status)?;
+        let machine_lock = if kind == SnapshotKind::Cold {
+            let lock = MachineLock::acquire(name, &self.paths.machine_lock(name)?, events)?;
+            ensure_machine_exists(&self.paths, name, &machine_dir)?;
+            Some(lock)
+        } else {
+            None
+        };
+        let live = match &machine_lock {
+            Some(lock) => self.read_live_state_locked(name, lock)?,
+            None => preliminary,
+        };
+        if snapshot_kind_for(name, live.state.status)? != kind {
+            return Err(FirestoneError::new(
+                ErrorKind::Conflict,
+                format!("machine `{name}` changed lifecycle state during snapshot"),
+            )
+            .with_hint(format!("retry `firestone snapshot create {name}`")));
+        }
+        let spec = self.load_machine_spec(name, &live.state)?;
+
+        let partial = self.paths.machine_snapshot_partial_dir(name, &snapshot)?;
+        self.clear_snapshot_directory(&partial)?;
+        let outcome =
+            self.build_snapshot(name, &snapshot, kind, &partial, &live.state, &spec, events);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = self.clear_snapshot_directory(&partial);
+                return Err(error);
+            }
+        };
+
+        fs::rename(&partial, &published).map_err(|source| {
+            filesystem_error(
+                ErrorKind::Generic,
+                format!("cannot publish snapshot `{snapshot}` of machine `{name}`"),
+                "check the machine snapshots directory permissions",
+                source,
+            )
+        })?;
+        sync_directory(&snapshots_dir)?;
+        drop(machine_lock);
+        drop(snapshot_lock);
+        emit_result(
+            events,
+            "snapshot-create",
+            &SnapshotResult {
+                name: name.to_owned(),
+                snapshot,
+                kind,
+                disk_bytes: outcome.disk_bytes,
+                memory_bytes: outcome.memory_bytes,
+            },
+        )
+    }
+
+    /// Fills one partial snapshot directory with everything it must carry.
+    #[allow(clippy::too_many_arguments)]
+    fn build_snapshot(
+        &self,
+        name: &str,
+        snapshot: &str,
+        kind: SnapshotKind,
+        partial: &Path,
+        state: &MachineState,
+        spec: &MachineSpec,
+        events: &mut dyn EventSink,
+    ) -> Result<SnapshotOutcome, FirestoneError> {
+        create_snapshot_directory(partial)?;
+        let started = Instant::now();
+        events.emit(Event::StepStart {
+            id: StepId::from("snapshot"),
+            label: format!("capturing {kind} snapshot {snapshot} of {name}"),
+        })?;
+
+        let spec_document = read_file(
+            &self.paths.machine_spec(name)?,
+            "machine spec",
+            ErrorKind::NotFound,
+        )?;
+        atomic::write_with_mode(
+            &Paths::snapshot_spec(partial),
+            &spec_document,
+            SNAPSHOT_FILE_MODE,
+        )?;
+        let vmconfig_path = self.paths.machine_vmconfig(name)?;
+        if owned_file_ready(&vmconfig_path)? {
+            let vmconfig = read_file(&vmconfig_path, "machine VmConfig", ErrorKind::NotFound)?;
+            atomic::write_with_mode(
+                &Paths::snapshot_vmconfig(partial),
+                &vmconfig,
+                SNAPSHOT_FILE_MODE,
+            )?;
+        } else if kind == SnapshotKind::Warm {
+            return Err(FirestoneError::new(
+                ErrorKind::Conflict,
+                format!("running machine `{name}` has no published VmConfig"),
+            )
+            .with_hint(format!("restart machine {name} and retry the snapshot")));
+        }
+
+        let outcome = match kind {
+            SnapshotKind::Cold => self.capture_cold_snapshot(name, partial, state)?,
+            SnapshotKind::Warm => self.capture_warm_snapshot(name, partial, spec, events)?,
+        };
+
+        atomic::write_json_with_mode(
+            &Paths::snapshot_metadata(partial),
+            &SnapshotMetadata {
+                schema_version: SNAPSHOT_SCHEMA_VERSION,
+                kind,
+                created_at: jiff::Timestamp::now().to_string(),
+                image_id: state.image.id.clone(),
+                firestone_version: env!("CARGO_PKG_VERSION").to_owned(),
+                disk_bytes: outcome.disk_bytes,
+                memory_bytes: outcome.memory_bytes,
+            },
+            SNAPSHOT_FILE_MODE,
+        )?;
+        sync_directory(partial)?;
+        events.emit(Event::StepDone {
+            id: StepId::from("snapshot"),
+            detail: Some(format!("{kind} snapshot {snapshot}")),
+            elapsed_ms: elapsed_millis(started.elapsed()),
+        })?;
+        Ok(outcome)
+    }
+
+    /// Copies a stopped machine's overlay onto the same base image.
+    fn capture_cold_snapshot(
+        &self,
+        name: &str,
+        partial: &Path,
+        state: &MachineState,
+    ) -> Result<SnapshotOutcome, FirestoneError> {
+        let disk = self.paths.machine_disk(name)?;
+        if !owned_file_ready(&disk)? {
+            return Ok(SnapshotOutcome {
+                disk_bytes: 0,
+                memory_bytes: None,
+            });
+        }
+        let (Some(id), Some(_)) = (&state.image.id, &state.image.sha256) else {
+            return Err(FirestoneError::new(
+                ErrorKind::Conflict,
+                format!("machine `{name}` has a disk but no pinned image identity"),
+            )
+            .with_hint("repair state.json so image id and sha256 are both present"));
+        };
+        let overlay = self.image_store()?.copy_overlay(
+            &disk,
+            &Paths::snapshot_disk_partial(partial),
+            &self.paths.image_base(id)?,
+        )?;
+        Ok(SnapshotOutcome {
+            disk_bytes: overlay.virtual_size,
+            memory_bytes: None,
+        })
+    }
+
+    /// Pauses a running machine, captures VM state and the overlay, resumes it.
+    ///
+    /// Resume is attempted on every failure after the pause. A machine that
+    /// cannot be resumed is marked degraded rather than silently left paused.
+    fn capture_warm_snapshot(
+        &self,
+        name: &str,
+        partial: &Path,
+        spec: &MachineSpec,
+        events: &mut dyn EventSink,
+    ) -> Result<SnapshotOutcome, FirestoneError> {
+        let disk = self.paths.machine_disk(name)?;
+        if !owned_file_ready(&disk)? {
+            return Err(FirestoneError::new(
+                ErrorKind::Conflict,
+                format!("running machine `{name}` has no overlay to snapshot"),
+            )
+            .with_hint("restart the machine and retry the snapshot"));
+        }
+        let memory_bytes = spec.memory.as_bytes();
+        self.check_warm_snapshot_space(name, partial, &disk, memory_bytes)?;
+
+        let vmstate = Paths::snapshot_vmstate_dir(partial);
+        // Cloud Hypervisor v53 refuses `vm.snapshot` with HTTP 500 and
+        // "Destination is not a directory" unless the destination already
+        // exists, so Firestone pre-creates it.
+        create_snapshot_directory(&vmstate)?;
+        let destination = snapshot_file_url(&vmstate)?;
+        let api_socket = self.paths.machine_api_socket(name)?;
+        let api = VmmApi::new(&api_socket, ShimTimeouts::default().api);
+
+        api.vm_pause()?;
+        let captured = (|| -> Result<u64, FirestoneError> {
+            api.vm_snapshot(&destination)?;
+            sparse_copy_file(&disk, &Paths::snapshot_disk(partial), SNAPSHOT_FILE_MODE)?;
+            overlay_virtual_size(&self.qemu_img_program()?, &Paths::snapshot_disk(partial))?
+                .ok_or_else(|| {
+                    FirestoneError::new(
+                        ErrorKind::Generic,
+                        format!("snapshot overlay copy for machine `{name}` disappeared"),
+                    )
+                    .with_hint("retry the snapshot")
+                })
+        })();
+        let resumed = api.vm_resume();
+        match (captured, resumed) {
+            (Ok(disk_bytes), Ok(())) => Ok(SnapshotOutcome {
+                disk_bytes,
+                memory_bytes: Some(memory_bytes),
+            }),
+            (captured, Err(resume_error)) => {
+                self.mark_resume_degraded(name, events)?;
+                let message = match captured {
+                    Ok(_) => format!(
+                        "machine `{name}` stayed paused after its snapshot: {}",
+                        resume_error.message()
+                    ),
+                    Err(error) => format!(
+                        "machine `{name}` snapshot failed ({}) and it stayed paused: {}",
+                        error.message(),
+                        resume_error.message()
+                    ),
+                };
+                Err(FirestoneError::new(ErrorKind::Conflict, message)
+                    .with_hint(format!(
+                        "the machine is degraded and its vCPUs are stopped; run `firestone restart {name}`"
+                    ))
+                    .with_source(resume_error))
+            }
+            (Err(error), Ok(())) => Err(error),
+        }
+    }
+
+    /// Refuses a warm snapshot that cannot fit guest memory plus the overlay.
+    fn check_warm_snapshot_space(
+        &self,
+        name: &str,
+        partial: &Path,
+        disk: &Path,
+        memory_bytes: u64,
+    ) -> Result<(), FirestoneError> {
+        let required = memory_bytes.saturating_add(allocated_bytes(disk)?);
+        let available = available_bytes(partial)?;
+        if available >= required {
+            return Ok(());
+        }
+        Err(FirestoneError::new(
+            ErrorKind::Conflict,
+            format!(
+                "a warm snapshot of machine `{name}` needs about {required} bytes but only {available} bytes are free"
+            ),
+        )
+        .with_hint("free disk space, or take a cold snapshot after stopping the machine"))
+    }
+
+    /// Records that a machine's vCPUs stayed paused after a failed resume.
+    fn mark_resume_degraded(
+        &self,
+        name: &str,
+        events: &mut dyn EventSink,
+    ) -> Result<(), FirestoneError> {
+        let store = StateStore::new(self.paths.machine_state(name)?);
+        let mut state = store.read()?;
+        let marker = "vmm paused after a failed snapshot resume".to_owned();
+        if !state.degraded.contains(&marker) {
+            state.degraded.push(marker);
+        }
+        store.write_from_shim(&state)?;
+        events.emit(Event::Log {
+            level: Level::Error,
+            message: format!("machine `{name}` could not be resumed and is degraded"),
+        })
+    }
+
+    /// Lists every published snapshot of one machine, ordered by identifier.
+    fn snapshot_list(&self, name: &str, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
+        self.validate_machine_storage()?;
+        let machine_dir = self.paths.machine_dir(name)?;
+        ensure_machine_exists(&self.paths, name, &machine_dir)?;
+        let mut snapshots = Vec::new();
+        for snapshot in self.published_snapshot_names(name)? {
+            let directory = self.paths.machine_snapshot_dir(name, &snapshot)?;
+            let metadata = read_snapshot_metadata(&Paths::snapshot_metadata(&directory))?;
+            snapshots.push(SnapshotSummary {
+                snapshot,
+                kind: metadata.kind,
+                created_at: metadata.created_at,
+                image_id: metadata.image_id,
+                disk_bytes: metadata.disk_bytes,
+                memory_bytes: metadata.memory_bytes,
+            });
+        }
+        emit_result(events, "snapshot-list", &SnapshotListResult { snapshots })
+    }
+
+    /// Rolls one machine back to a snapshot (SPEC section 23).
+    fn snapshot_restore(
+        &self,
+        name: &str,
+        snapshot: &str,
+        force: bool,
+        start: bool,
+        timeout: Duration,
+        events: &mut dyn EventSink,
+    ) -> Result<(), FirestoneError> {
+        self.validate_machine_storage()?;
+        validate_snapshot_name(snapshot)?;
+        let machine_dir = self.paths.machine_dir(name)?;
+        ensure_machine_exists(&self.paths, name, &machine_dir)?;
+        let snapshots_dir = self.paths.machine_snapshots_dir(name)?;
+        ensure_snapshot_directory(&snapshots_dir)?;
+        let snapshot_lock =
+            MachineLock::acquire(name, &self.paths.machine_snapshot_lock(name)?, events)?;
+        let directory = self.paths.machine_snapshot_dir(name, snapshot)?;
+        let metadata = self.read_published_snapshot(name, snapshot, &directory)?;
+
+        // A running machine holds its own machine lock through its shim, so the
+        // stop must happen before this action takes it.
+        if self.read_live_state(name)?.state.status.is_active() {
+            if !force {
+                return Err(FirestoneError::new(
+                    ErrorKind::Conflict,
+                    format!("machine `{name}` is running and cannot be restored"),
+                )
+                .with_hint(format!(
+                    "stop {name} first, or retry `firestone snapshot restore {name} {snapshot} --force`"
+                )));
+            }
+            self.stop_machine(name, timeout, false, events)?;
+        }
+
+        let machine_lock = MachineLock::acquire(name, &self.paths.machine_lock(name)?, events)?;
+        ensure_machine_exists(&self.paths, name, &machine_dir)?;
+        let live = self.read_live_state_locked(name, &machine_lock)?;
+        if live.state.status.is_active() {
+            return Err(FirestoneError::new(
+                ErrorKind::Conflict,
+                format!("machine `{name}` became active during restore"),
+            )
+            .with_hint(format!("stop {name} and retry the restore")));
+        }
+
+        let started = Instant::now();
+        events.emit(Event::StepStart {
+            id: StepId::from("restore"),
+            label: format!("restoring {name} from {snapshot}"),
+        })?;
+        // Any earlier pending restore is replaced: exactly one marker can be
+        // waiting for the next launch.
+        remove_candidate(&self.paths.machine_restore_request(name)?)?;
+        self.restore_machine_disk(name, &directory)?;
+        atomic::write_with_mode(
+            &self.paths.machine_spec(name)?,
+            &read_file(
+                &Paths::snapshot_spec(&directory),
+                "snapshot spec",
+                ErrorKind::NotFound,
+            )?,
+            MACHINE_SPEC_FILE_MODE,
+        )?;
+        let vmconfig = Paths::snapshot_vmconfig(&directory);
+        let vmconfig_bytes = if owned_file_ready(&vmconfig)? {
+            let bytes = read_file(&vmconfig, "snapshot VmConfig", ErrorKind::NotFound)?;
+            atomic::write(&self.paths.machine_vmconfig(name)?, &bytes)?;
+            Some(bytes)
+        } else {
+            remove_candidate(&self.paths.machine_vmconfig(name)?)?;
+            None
+        };
+
+        let mut state = live.state;
+        if state.status == MachineStatus::Failed {
+            state.status = MachineStatus::Stopped;
+        }
+        state.degraded.clear();
+        StateStore::new(self.paths.machine_state(name)?)
+            .write_from_locked_action(&state, &machine_lock)?;
+
+        let warm = metadata.kind == SnapshotKind::Warm;
+        if warm {
+            let bytes = vmconfig_bytes.ok_or_else(|| {
+                FirestoneError::new(
+                    ErrorKind::Conflict,
+                    format!("warm snapshot `{snapshot}` of machine `{name}` has no VmConfig"),
+                )
+                .with_hint("remove the damaged snapshot and take a new one")
+            })?;
+            atomic::write_json_with_mode(
+                &self.paths.machine_restore_request(name)?,
+                &RestoreRequest {
+                    schema_version: SNAPSHOT_SCHEMA_VERSION,
+                    snapshot: snapshot.to_owned(),
+                    snapshot_dir: directory.clone(),
+                    vmstate_dir: Paths::snapshot_vmstate_dir(&directory),
+                    vmconfig_sha256: sha256_hex(&bytes),
+                    created_at: jiff::Timestamp::now().to_string(),
+                },
+                SNAPSHOT_FILE_MODE,
+            )?;
+        }
+        sync_directory(&machine_dir)?;
+        events.emit(Event::StepDone {
+            id: StepId::from("restore"),
+            detail: Some(format!("{} snapshot {snapshot}", metadata.kind)),
+            elapsed_ms: elapsed_millis(started.elapsed()),
+        })?;
+        drop(machine_lock);
+        drop(snapshot_lock);
+
+        // A warm snapshot only means something resumed: its restore always
+        // starts the machine, and the shim consumes the marker on that launch.
+        if warm && !start {
+            events.emit(Event::Log {
+                level: Level::Warn,
+                message: format!(
+                    "warm snapshot `{snapshot}` restores by resuming machine `{name}`; starting it"
+                ),
+            })?;
+        }
+        let started_machine = if warm || start {
+            self.start(name, false, self.global.start.timeout.get(), events)?;
+            true
+        } else {
+            false
+        };
+        emit_result(
+            events,
+            "snapshot-restore",
+            &SnapshotRestoreResult {
+                name: name.to_owned(),
+                snapshot: snapshot.to_owned(),
+                started: started_machine,
+            },
+        )
+    }
+
+    /// Copies one snapshot's overlay back over the machine's live overlay.
+    fn restore_machine_disk(&self, name: &str, directory: &Path) -> Result<(), FirestoneError> {
+        let disk = self.paths.machine_disk(name)?;
+        let source = Paths::snapshot_disk(directory);
+        if !owned_file_ready(&source)? {
+            // The snapshot was taken before the machine ever had an overlay, so
+            // the rollback removes the one it grew since.
+            return remove_candidate(&disk);
+        }
+        let partial = self.paths.machine_disk_partial(name)?;
+        remove_candidate(&partial)?;
+        sparse_copy_file(&source, &partial, 0o600)?;
+        fs::rename(&partial, &disk).map_err(|error| {
+            filesystem_error(
+                ErrorKind::Generic,
+                format!("cannot restore the overlay of machine `{name}`"),
+                "check the machine directory permissions",
+                error,
+            )
+        })
+    }
+
+    /// Deletes one published snapshot.
+    fn snapshot_remove(
+        &self,
+        name: &str,
+        snapshot: &str,
+        events: &mut dyn EventSink,
+    ) -> Result<(), FirestoneError> {
+        self.validate_machine_storage()?;
+        validate_snapshot_name(snapshot)?;
+        let machine_dir = self.paths.machine_dir(name)?;
+        ensure_machine_exists(&self.paths, name, &machine_dir)?;
+        let snapshots_dir = self.paths.machine_snapshots_dir(name)?;
+        ensure_snapshot_directory(&snapshots_dir)?;
+        let snapshot_lock =
+            MachineLock::acquire(name, &self.paths.machine_snapshot_lock(name)?, events)?;
+        let directory = self.paths.machine_snapshot_dir(name, snapshot)?;
+        let _ = self.read_published_snapshot(name, snapshot, &directory)?;
+
+        let marker = self.paths.machine_restore_request(name)?;
+        if owned_file_ready(&marker)?
+            && firestone_core::read_restore_request(&marker)?.snapshot == snapshot
+        {
+            return Err(FirestoneError::new(
+                ErrorKind::Conflict,
+                format!("machine `{name}` has a pending restore of snapshot `{snapshot}`"),
+            )
+            .with_hint(format!(
+                "start {name} to finish the restore, or restore another snapshot first"
+            )));
+        }
+
+        validate_removal_tree(&self.paths, &directory, "snapshot directory")?;
+        let tombstone = self.paths.machine_snapshot_removal_dir(name, snapshot)?;
+        self.clear_snapshot_directory(&tombstone)?;
+        fs::rename(&directory, &tombstone).map_err(|source| {
+            filesystem_error(
+                ErrorKind::Generic,
+                format!("cannot unpublish snapshot `{snapshot}` of machine `{name}`"),
+                "check the machine snapshots directory permissions",
+                source,
+            )
+        })?;
+        sync_directory(&snapshots_dir)?;
+        self.clear_snapshot_directory(&tombstone)?;
+        drop(snapshot_lock);
+        emit_result(
+            events,
+            "snapshot-rm",
+            &SnapshotRemoveResult {
+                name: name.to_owned(),
+                snapshot: snapshot.to_owned(),
+            },
+        )
+    }
+
+    /// Reads one published snapshot's metadata, or explains that it is absent.
+    fn read_published_snapshot(
+        &self,
+        name: &str,
+        snapshot: &str,
+        directory: &Path,
+    ) -> Result<SnapshotMetadata, FirestoneError> {
+        match fs::symlink_metadata(directory) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                read_snapshot_metadata(&Paths::snapshot_metadata(directory))
+            }
+            Ok(_) => Err(FirestoneError::new(
+                ErrorKind::Conflict,
+                format!(
+                    "snapshot path {} is not a snapshot directory",
+                    directory.display()
+                ),
+            )
+            .with_hint("move the conflicting path aside and retry")),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                Err(FirestoneError::new(
+                    ErrorKind::NotFound,
+                    format!("machine `{name}` has no snapshot named `{snapshot}`"),
+                )
+                .with_hint(format!("run `firestone snapshot list {name}`")))
+            }
+            Err(source) => Err(filesystem_error(
+                ErrorKind::Dependency,
+                format!("cannot inspect snapshot {}", directory.display()),
+                "check the machine snapshots directory permissions",
+                source,
+            )),
+        }
+    }
+
+    /// Sorted identifiers of every published snapshot of one machine.
+    ///
+    /// Names beginning with a dot are Firestone's own partial, removal, and
+    /// lock entries; a snapshot identifier can never start with one.
+    fn published_snapshot_names(&self, name: &str) -> Result<Vec<String>, FirestoneError> {
+        let snapshots_dir = self.paths.machine_snapshots_dir(name)?;
+        let entries = match fs::read_dir(&snapshots_dir) {
+            Ok(entries) => entries,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(filesystem_error(
+                    ErrorKind::Dependency,
+                    format!("cannot read snapshots of machine `{name}`"),
+                    "check the machine directory permissions",
+                    source,
+                ));
+            }
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| {
+                filesystem_error(
+                    ErrorKind::Dependency,
+                    format!("cannot read snapshots of machine `{name}`"),
+                    "check the machine directory permissions",
+                    source,
+                )
+            })?;
+            let Some(snapshot) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+                continue;
+            };
+            if snapshot.starts_with('.') {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|source| {
+                filesystem_error(
+                    ErrorKind::Dependency,
+                    format!("cannot inspect snapshot {}", entry.path().display()),
+                    "check the machine snapshots directory permissions",
+                    source,
+                )
+            })?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                names.push(snapshot);
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    /// Removes one owned snapshot working directory if it exists.
+    fn clear_snapshot_directory(&self, directory: &Path) -> Result<(), FirestoneError> {
+        match fs::symlink_metadata(directory) {
+            Ok(_) => {
+                validate_removal_tree(&self.paths, directory, "snapshot working directory")?;
+                fs::remove_dir_all(directory).map_err(|source| {
+                    filesystem_error(
+                        ErrorKind::Generic,
+                        format!("cannot clear snapshot directory {}", directory.display()),
+                        "remove the owned directory and retry",
+                        source,
+                    )
+                })
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(filesystem_error(
+                ErrorKind::Dependency,
+                format!("cannot inspect snapshot directory {}", directory.display()),
+                "check the machine snapshots directory permissions",
+                source,
+            )),
+        }
     }
 
     fn list(&self, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
@@ -1606,6 +2279,24 @@ impl LocalDispatcher {
             validate_removal_tree(&self.paths, &machine_dir, "machine directory")?;
         }
 
+        if !force {
+            // Snapshots live inside the machine directory and go with it, so
+            // the only honest thing to do is say so before deleting them.
+            for name in names {
+                let snapshots = self.published_snapshot_names(name)?;
+                if !snapshots.is_empty() {
+                    events.emit(Event::Log {
+                        level: Level::Warn,
+                        message: format!(
+                            "machine `{name}` has {} snapshot(s) that are removed with it: {}",
+                            snapshots.len(),
+                            snapshots.join(", ")
+                        ),
+                    })?;
+                }
+            }
+        }
+
         let mut removed = Vec::with_capacity(names.len());
         for name in names {
             let live = self.read_live_state(name)?;
@@ -2080,6 +2771,20 @@ impl Dispatcher for LocalDispatcher {
                     fresh_disk,
                 } => self.clone_machine(&source, &dest, fresh_disk, events),
                 Action::Resize { name, cpus, memory } => self.resize(&name, cpus, memory, events),
+                Action::SnapshotCreate { name, snapshot } => {
+                    self.snapshot_create(&name, snapshot, events)
+                }
+                Action::SnapshotList { name } => self.snapshot_list(&name, events),
+                Action::SnapshotRestore {
+                    name,
+                    snapshot,
+                    force,
+                    start,
+                    timeout,
+                } => self.snapshot_restore(&name, &snapshot, force, start, timeout, events),
+                Action::SnapshotRemove { name, snapshot } => {
+                    self.snapshot_remove(&name, &snapshot, events)
+                }
             }
         })
     }
@@ -2137,6 +2842,37 @@ fn ensure_startable(name: &str, state: &MachineState) -> Result<(), FirestoneErr
 }
 
 /// Only a machine that owns no running processes can be copied consistently.
+/// Byte counts one captured snapshot reports and records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotOutcome {
+    disk_bytes: u64,
+    memory_bytes: Option<u64>,
+}
+
+/// Maps a machine's lifecycle state onto the snapshot tier it supports.
+///
+/// A stopped or created machine yields a guaranteed cold snapshot. A running
+/// machine yields a warm one. A machine in transition or failed has no
+/// coherent disk to copy, so it is refused rather than guessed at.
+fn snapshot_kind_for(name: &str, status: MachineStatus) -> Result<SnapshotKind, FirestoneError> {
+    match status {
+        MachineStatus::Created | MachineStatus::Stopped => Ok(SnapshotKind::Cold),
+        MachineStatus::Running => Ok(SnapshotKind::Warm),
+        MachineStatus::Starting | MachineStatus::Stopping | MachineStatus::Failed => {
+            Err(FirestoneError::new(
+                ErrorKind::Conflict,
+                format!(
+                    "machine `{name}` is {} and cannot be snapshotted",
+                    machine_status_word(status)
+                ),
+            )
+            .with_hint(format!(
+                "wait for machine {name} to settle, or stop it and take a cold snapshot"
+            )))
+        }
+    }
+}
+
 fn ensure_clonable(name: &str, status: MachineStatus) -> Result<(), FirestoneError> {
     if matches!(status, MachineStatus::Created | MachineStatus::Stopped) {
         return Ok(());

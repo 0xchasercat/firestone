@@ -469,6 +469,96 @@ impl Paths {
             .join(format!("virtiofsd-{index}.log")))
     }
 
+    /// Directory holding every published snapshot of one machine (SPEC §23).
+    pub fn machine_snapshots_dir(&self, name: &str) -> Result<PathBuf, FirestoneError> {
+        Ok(self.machine_dir(name)?.join("snapshots"))
+    }
+
+    /// Published directory of one immutable snapshot.
+    pub fn machine_snapshot_dir(
+        &self,
+        name: &str,
+        snapshot: &str,
+    ) -> Result<PathBuf, FirestoneError> {
+        checked_join(
+            &self.machine_snapshots_dir(name)?,
+            "snapshot name",
+            snapshot,
+        )
+    }
+
+    /// Directory one snapshot is assembled in before its publishing rename.
+    ///
+    /// The leading dot keeps a partial snapshot out of `snapshot list`.
+    pub fn machine_snapshot_partial_dir(
+        &self,
+        name: &str,
+        snapshot: &str,
+    ) -> Result<PathBuf, FirestoneError> {
+        checked_join(
+            &self.machine_snapshots_dir(name)?,
+            "snapshot partial name",
+            &format!(".partial-{snapshot}"),
+        )
+    }
+
+    /// Directory one snapshot is renamed into before it is deleted.
+    pub fn machine_snapshot_removal_dir(
+        &self,
+        name: &str,
+        snapshot: &str,
+    ) -> Result<PathBuf, FirestoneError> {
+        checked_join(
+            &self.machine_snapshots_dir(name)?,
+            "snapshot removal name",
+            &format!(".removing-{snapshot}"),
+        )
+    }
+
+    /// Advisory lock serializing snapshot operations on one machine.
+    ///
+    /// A running machine's shim owns the machine lock for its whole lifetime,
+    /// so warm snapshots cannot take that lock; this one keeps two snapshot
+    /// operations on the same machine from interleaving.
+    pub fn machine_snapshot_lock(&self, name: &str) -> Result<PathBuf, FirestoneError> {
+        Ok(self.machine_snapshots_dir(name)?.join(".lock"))
+    }
+
+    /// Marker that turns the next launch of one machine into a warm restore.
+    pub fn machine_restore_request(&self, name: &str) -> Result<PathBuf, FirestoneError> {
+        Ok(self.machine_dir(name)?.join("restore-request.json"))
+    }
+
+    #[must_use]
+    pub fn snapshot_metadata(snapshot_dir: &Path) -> PathBuf {
+        snapshot_dir.join("metadata.json")
+    }
+
+    #[must_use]
+    pub fn snapshot_disk(snapshot_dir: &Path) -> PathBuf {
+        snapshot_dir.join("disk.qcow2")
+    }
+
+    #[must_use]
+    pub fn snapshot_disk_partial(snapshot_dir: &Path) -> PathBuf {
+        snapshot_dir.join("disk.qcow2.partial")
+    }
+
+    #[must_use]
+    pub fn snapshot_spec(snapshot_dir: &Path) -> PathBuf {
+        snapshot_dir.join("spec.toml")
+    }
+
+    #[must_use]
+    pub fn snapshot_vmconfig(snapshot_dir: &Path) -> PathBuf {
+        snapshot_dir.join("vmconfig.json")
+    }
+
+    #[must_use]
+    pub fn snapshot_vmstate_dir(snapshot_dir: &Path) -> PathBuf {
+        snapshot_dir.join("vmstate")
+    }
+
     #[must_use]
     pub fn serve_socket(&self) -> PathBuf {
         self.runtime_dir.join("serve.sock")

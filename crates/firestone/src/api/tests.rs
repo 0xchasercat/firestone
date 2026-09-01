@@ -235,6 +235,7 @@ async fn openapi_routes_and_methods_match_the_axum_contract() -> TestResult {
         let uri = route
             .path
             .replace("{name}", "contract")
+            .replace("{snapshot}", "contract")
             .replace("{id}", "contract");
         let response = send(&app, request(probe.clone(), &uri, Body::empty())?).await?;
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");

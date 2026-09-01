@@ -28,6 +28,7 @@ Anything not in it is out of scope until it is added to the decision log (§21).
 20. Assumptions to verify before relying on them
 21. Decision log
 22. Milestones
+23. Snapshots
 24. Clone
 Appendix A. Example session
 Appendix B. Suggested `CLAUDE.md`
@@ -356,9 +357,11 @@ machines/<name>/
   vmm.log            cloud-hypervisor's own log
   shim.log           the shim's log
   passt.log  virtiofsd-0.log …
+  snapshots/         immutable snapshots of this machine (§23)
+  restore-request.json  present only while a warm restore is waiting for the next launch (§23)
 ```
 
-`firestone rm` deletes the whole directory. Nothing about a machine lives anywhere else except its sockets in the runtime dir and its base image (shared, reference-counted by `images prune` scanning `state.json` files).
+`firestone rm` deletes the whole directory, snapshots included, and warns first when the machine has any. Nothing about a machine lives anywhere else except its sockets in the runtime dir and its base image (shared, reference-counted by `images prune` scanning `state.json` files and snapshot `metadata.json` files, §23).
 
 Creation takes the per-machine lock before writing the `.creating` publication marker. A complete machine is published only after its spec and state are durable. If a prior creator died before publication, a later `create` may acquire the unlocked incomplete directory, revalidate every owned path, remove only that stale incomplete publication, and retry. A locked creation is busy; Firestone never removes an active creation or a directory containing a complete machine.
 
@@ -1288,6 +1291,10 @@ Global flags on every command: `--json` (NDJSON events on stdout, human output o
 | `resize NAME [--cpus N] [--memory SIZE]` | change CPU and memory; live within the booted headroom, otherwise on next start (§9.5) |
 | `rm NAME… [--force]` | stop if needed, delete everything |
 | `clone SRC DEST [--fresh-disk]` | copy a stopped or created machine's spec and disk to a new machine (§24) |
+| `snapshot create NAME [SNAPSHOT]` | capture one immutable snapshot; cold when stopped or created, warm when running (§23) |
+| `snapshot list NAME` (alias `ls`) | table of the machine's published snapshots (§23) |
+| `snapshot restore NAME SNAPSHOT [--force] [--start]` | whole-machine rollback to one snapshot (§23) |
+| `snapshot rm NAME SNAPSHOT` | delete one snapshot (§23) |
 | `ls` (alias `list`) | table of machines (§15.3) |
 | `show NAME [--vmconfig]` | spec + state (+ generated VmConfig) |
 | `edit NAME` | open `firestone.toml` in the selected editor; validate on save, re-open on error |
@@ -1413,9 +1420,9 @@ The server holds no state and takes the same machine locks as the CLI. `curl --u
 
 The server holds no state and takes the same machine locks as the CLI. `curl --unix-socket … http://firestone/v1/machines` is the smoke test.
 
-[`docs/openapi.json`](docs/openapi.json) is the dependency-free OpenAPI 3.1 contract for the existing routes. It records exact request and response schemas, Unix-socket transport, aggregation and stream framing, limits, statuses, nullability, and examples. It is a static artifact, not a runtime endpoint. A behavior-level test parses it and compares its 23 explicitly authored operations with the configured axum router; axum's synthesized `HEAD` handling for `GET` remains framework behavior rather than a separately authored Firestone operation.
-[`docs/openapi.json`](docs/openapi.json) is the dependency-free OpenAPI 3.1 contract for the existing routes. It records exact request and response schemas, Unix-socket transport, aggregation and stream framing, limits, statuses, nullability, and examples. It is a static artifact, not a runtime endpoint. A behavior-level test parses it and compares its explicitly authored operations (19 as of M6-03) with the configured axum router; axum's synthesized `HEAD` handling for `GET` remains framework behavior rather than a separately authored Firestone operation.
-[`docs/openapi.json`](docs/openapi.json) is the dependency-free OpenAPI 3.1 contract for the existing routes. It records exact request and response schemas, Unix-socket transport, aggregation and stream framing, limits, statuses, nullability, and examples. It is a static artifact, not a runtime endpoint. A behavior-level test parses it and compares its 23 explicitly authored operations with the configured axum router; axum's synthesized `HEAD` handling for `GET` remains framework behavior rather than a separately authored Firestone operation.
+[`docs/openapi.json`](docs/openapi.json) is the dependency-free OpenAPI 3.1 contract for the existing routes. It records exact request and response schemas, Unix-socket transport, aggregation and stream framing, limits, statuses, nullability, and examples. It is a static artifact, not a runtime endpoint. A behavior-level test parses it and compares its 27 explicitly authored operations with the configured axum router; axum's synthesized `HEAD` handling for `GET` remains framework behavior rather than a separately authored Firestone operation.
+[`docs/openapi.json`](docs/openapi.json) is the dependency-free OpenAPI 3.1 contract for the existing routes. It records exact request and response schemas, Unix-socket transport, aggregation and stream framing, limits, statuses, nullability, and examples. It is a static artifact, not a runtime endpoint. A behavior-level test parses it and compares its 27 explicitly authored operations with the configured axum router; axum's synthesized `HEAD` handling for `GET` remains framework behavior rather than a separately authored Firestone operation.
+[`docs/openapi.json`](docs/openapi.json) is the dependency-free OpenAPI 3.1 contract for the existing routes. It records exact request and response schemas, Unix-socket transport, aggregation and stream framing, limits, statuses, nullability, and examples. It is a static artifact, not a runtime endpoint. A behavior-level test parses it and compares its 27 explicitly authored operations with the configured axum router; axum's synthesized `HEAD` handling for `GET` remains framework behavior rather than a separately authored Firestone operation.
 
 ### 16.2 Routes
 
@@ -1433,6 +1440,10 @@ The server holds no state and takes the same machine locks as the CLI. `curl --u
 | POST | `/v1/machines/{name}/stop` | `{timeout_s?, force?}` | event stream → `Result` |
 | POST | `/v1/machines/{name}/restart` | | event stream → `Result` |
 | POST | `/v1/machines/{name}/clone` | `{name, fresh_disk?}` | event stream → `Result` (§24) |
+| GET | `/v1/machines/{name}/snapshots` | | `{snapshots: [SnapshotSummary]}` (§23) |
+| POST | `/v1/machines/{name}/snapshots` | `{snapshot?}` | event stream → `Result {name, snapshot, kind, disk_bytes, memory_bytes?}` (§23) |
+| POST | `/v1/machines/{name}/snapshots/{snapshot}/restore` | `{force?, start?, timeout_s?}` | event stream → `Result {name, snapshot, started}` (§23) |
+| DELETE | `/v1/machines/{name}/snapshots/{snapshot}` | | 204 (§23) |
 | POST | `/v1/machines/{name}/resize` | `{cpus?, memory?}` (at least one) | event stream → `Result {name, applied_live, cpus, memory}` |
 | GET | `/v1/machines/{name}/logs?source=&follow=&lines=` | | `text/plain`, chunked |
 | GET | `/v1/machines/{name}/vmconfig` | | generated VmConfig JSON |
@@ -1633,6 +1644,8 @@ firestone/
 - vsock proxy: handshake against a fake unix server (`OK`, error line, EOF).
 - Renderer: `insta` snapshots for TTY and non‑TTY output of a canned event stream; `--json` is byte‑exact NDJSON.
 - REST: axum handlers with a mocked `Dispatcher`; NDJSON framing; error mapping (§16.4); static OpenAPI JSON parsing and behavior-level route/method drift against the configured router.
+- Snapshots (§23): the sparse copy over a holey source; snapshot-name validation including traversal and hidden names; the automatic `snap-<yyyymmdd>-<hhmmss>` identifier; metadata kind/memory agreement and schema-version refusal; the image-reference extension that lets a snapshot's `metadata.json` pin a base against `images rm` and `images prune`; the four `Action` and result payload round-trips; and the `vm.pause`/`vm.resume`/`vm.snapshot`/`vm.restore` request lines and bodies against the fake VMM server.
+- Snapshots over the fake VMM (§23): a cold round trip with real `qemu-img` argv in temporary directories; the warm path with pause → `vm.snapshot` → resume ordering assertions; a warm restore that reaches `vm.restore` plus `vm.resume` and never `vm.create` or `vm.boot`, with the console rotated and the marker consumed; byte-equality failure injection through a drifted snapshot spec; refusals for a running machine without `--force`, a missing snapshot, an invalid identifier, a duplicate name, and partial directories that stay invisible to `list` and `rm`; and REST equivalence for the four routes.
 
 ### 19.2 End-to-end (KVM required)
 
@@ -1698,6 +1711,9 @@ Do these in the first milestone, against the pinned versions, and record results
 |---|---|---|---|
 | Direct kernel boot selection | The pinned image decides: the sidecar's `kind` (`disk` by default, so version-one sidecars are untouched) drives one branch in payload resolution that ignores the firmware policy, emits `payload.cmdline` as a skip-if-absent field, and swaps the pinned firmware artifact for the pinned kernel in the same locked publisher slot. The §9.5 overlay boundary adds exactly one check — a `cmdline` added to a firmware machine — because the existing required-subset invariant already rejects changing or removing `payload.cmdline` and removing `payload.kernel` | a `boot = "direct"` machine-spec key; a second `Firmware::DirectKernel` variant; always emitting `payload.cmdline` and accepting new `vm.create` bytes for every machine; a separate installer for non-executable artifacts; an explicit allowlist of every payload pointer | Boot mode is a fact about the image, not a user preference: deriving it from the sidecar means an OCI machine cannot be misconfigured into a firmware boot and a disk machine cannot accidentally request a kernel, and a spec key would have to be validated against the image anyway. Skipping the absent field keeps every existing machine's `vm.create` bytes and identity stable, which the §9.2 byte test pins. Reusing the firmware publisher gives the kernel the same lock, no-follow, exact hash, fsync, and no-replace guarantees for free, with mode 0644 coming from the manifest's own executable classification. |
 | OCI registry auth and transport scope | One `HttpSource` seam shared with the image pull path, extended with request headers and an unmapped status code; anonymous Bearer with exactly one token fetch and one retry per request; static Basic credentials from `auths` only, sent over HTTPS only; every authentication failure reported as kind `dependency`; plain HTTP only for a literal `images.insecure_registries` entry, and a plain-HTTP token realm only when it stays on that same allow-listed host and port | a second reqwest client stack for the registry; credential helpers and `identitytoken`; a new `permission` error kind; a cached token reused across requests; an HTTPS-to-HTTP fallback when TLS fails | A second client would mean a second set of timeouts, redirect rules, and size caps to keep in sync, and the pull path's discipline is exactly what a registry read needs. §15.5 and §15.6 define no `permission` kind and adding one would change every exit-code and REST error mapping, so the closest honest kind is `dependency`, whose hint can still name `docker login`. Helpers execute arbitrary binaries for credentials, which a bounded read-only client should not do. One token per request keeps the flow auditable and bounded — no token lifetime tracking, no silent reuse across scopes — and no fallback path means a downgrade can only ever come from an entry a human wrote down. |
+| Snapshot restore scope | Whole-machine rollback: `disk.qcow2`, `firestone.toml` and `vmconfig.json` are all replaced from the snapshot, and the shim verifies the republished VmConfig byte for byte against the snapshot's before it restores | restore the disk only; restore the disk plus the spec but re-derive the VmConfig; store a diff of the spec | A disk captured under one configuration is not restorable into another: the snapshot's `config.json` bakes absolute paths for the disk, seed, `net.sock`, `vsock.sock` and the serial file, and a resumed guest expects exactly the devices it was paused with. Byte equality is the cheapest check that proves it, and it fails loudly before Cloud Hypervisor is spawned instead of producing a VM that is subtly not the one that was captured. |
+| Snapshot tiers | Two named tiers: cold is guaranteed and is a file copy of a stopped or created machine; warm is verified against the pinned VMM, captures guest memory, and always resumes on restore. The result payload says which was taken | one tier that silently falls back to a disk copy when the machine is running; refuse to snapshot a running machine at all | A snapshot people cannot reason about is worse than no snapshot. A disk copy of a running guest is crash-consistent at best, so calling it the same thing as a stopped-machine copy would be a lie; refusing a running machine would throw away the one capability that makes snapshots useful for a daily driver. Naming the tier in the result and in `snapshot list` puts the guarantee where the user reads it. |
+| Warm snapshot locking | `api.sock` is driven directly for `vm.pause`, `vm.snapshot` and `vm.resume` under a dedicated `snapshots/.lock`, not the machine lock; process spawning still goes through the shim, and cold snapshots take the machine lock as usual | take the machine lock for every snapshot; add a shim control operation for pause/snapshot/resume | A running machine's shim owns the machine lock for the machine's whole lifetime (§4.3), so a warm snapshot that took it would deadlock every time — the same reason live `resize` takes no lock. The warm path writes only inside `snapshots/`, which nothing else touches, and the snapshot lock keeps two snapshot operations on one machine from interleaving a pause with a resume. A new shim operation would put a long file copy inside the supervisor's control loop for no isolation the lock does not already give. |
 | OCI registry client | Hand-rolled Registry V2 subset over the blocking `reqwest` client Firestone already uses for image pulls: three GET endpoints, one anonymous Bearer retry, `auths`-only basic auth, index platform selection, digest-verified blob streaming | the `oci-client` crate; `oci-distribution`; shelling out to `skopeo` or `crane` | Every OCI crate is async and pulls tokio into `firestone-core`, which the architecture rules forbid, and each adds a large transitive surface for three read-only endpoints. The hand-rolled client reuses the existing bounded HTTPS transport, its limits, and its error kinds, and stays auditable in a few hundred lines. |
 | OCI layer compression in v0.2 | gzip and uncompressed tar layers only; a `+zstd` layer is a clean `dependency` error naming the media type | add a zstd decompressor now; silently skip zstd layers; fall back to a `zstd` host binary | Registries overwhelmingly still publish gzip, and a partially applied layer set is a corrupt rootfs, not a degraded one. A named error tells the user exactly why their image is unsupported and leaves adding zstd a purely additive change. |
 | `mkfs.ext4` distribution | Firestone-owned static e2fsprogs 1.47.3 helper, pinned in `deps.toml` and downloaded on the first OCI pull | embed it in the binary like passt and qemu-img; require a host `e2fsprogs`; build ext4 images in Rust | Only OCI users need it, so embedding it would grow every standalone release for a feature most machines never touch. The same locked, hash-verified, no-replace publisher that installs firmware installs it, so laziness costs no integrity. |
@@ -2042,6 +2058,104 @@ with the 30-minute conversion timeout, under the image-store lock, followed by t
 Because the MAC and the instance id are derived from the machine name and are only materialized at start, the clone allocates its own on its first boot; nothing is carried over in `state.json`. A source spec that pins `network.mac` explicitly is the one exception: the clone inherits that address verbatim with the rest of the document, and Firestone emits a warning naming both machines. Change `network.mac` in the clone before running both machines on the same L2 segment.
 
 Known limitation: a copied overlay carries the guest's `/etc/machine-id`, `/etc/hostname` contents written by the source's first boot, and any other in-guest state. Two clones of the same source therefore present the same `/etc/machine-id` to DHCP servers and to systemd-journal upload. Firestone does not rewrite guest filesystems; run `systemd-firstboot --setup-machine-id` (or delete `/etc/machine-id` and reboot) inside the clone when a unique guest identity matters. `--fresh-disk` avoids the issue entirely by re-provisioning from the base image.
+
+---
+
+## 23. Snapshots (normative)
+
+A snapshot is an immutable copy of one machine at one instant. Firestone offers two tiers with different guarantees and says which one it took:
+
+| Tier | Machine status | Captures | Restores to |
+|---|---|---|---|
+| **cold** | `created` or `stopped` | spec, published VmConfig when one exists, and a qcow2 overlay copy on the same base image | a stopped machine that boots from the captured disk |
+| **warm** | `running` | everything cold captures, plus the Cloud Hypervisor VM state written while the machine was paused | the same running machine, resumed at the captured instruction |
+
+Cold is guaranteed: it is a file copy of a quiescent machine. Warm is *verified* rather than guaranteed — it depends on Cloud Hypervisor's own snapshot and restore, and it refuses to run at all unless the machine directory and runtime layout the snapshot baked in are unchanged (§23.6). A machine that is `starting`, `stopping`, or `failed` has no coherent disk to copy and is refused with `conflict`.
+
+### 23.1 Surfaces
+
+| Surface | Form |
+|---|---|
+| CLI | `firestone snapshot create NAME [SNAPSHOT]` · `snapshot list NAME` · `snapshot restore NAME SNAPSHOT [--force] [--start]` · `snapshot rm NAME SNAPSHOT` |
+| REST | `POST`/`GET /v1/machines/{name}/snapshots` · `POST /v1/machines/{name}/snapshots/{snapshot}/restore` · `DELETE /v1/machines/{name}/snapshots/{snapshot}` |
+| Action | `Action::SnapshotCreate { name, snapshot }` · `SnapshotList { name }` · `SnapshotRestore { name, snapshot, force, start, timeout }` · `SnapshotRemove { name, snapshot }` |
+| Result | `SnapshotResult { name, snapshot, kind, disk_bytes, memory_bytes? }` under `snapshot-create` · `SnapshotListResult { snapshots: [{snapshot, kind, created_at, image_id, disk_bytes, memory_bytes?}] }` under `snapshot-list` · `SnapshotRestoreResult { name, snapshot, started }` under `snapshot-restore` · `SnapshotRemoveResult { name, snapshot }` under `snapshot-rm` |
+
+`kind` is the lowercase word `cold` or `warm`. `memory_bytes` is present only on a warm snapshot. `DELETE` discards the remove result and answers `204`, exactly like `DELETE /v1/images/{id}`.
+
+`snapshot` is optional on create. When it is absent Firestone names the snapshot `snap-<yyyymmdd>-<hhmmss>` from the UTC instant of the request. A snapshot identifier is 1 to 64 characters from `A-Z a-z 0-9 . _ -` that do not begin with `.` or `-`; anything else is `invalid_spec` before any path is touched. A name that is already taken is `already_exists`.
+
+### 23.2 Storage layout
+
+```
+machines/<name>/snapshots/<snapshot>/
+  metadata.json   {schema_version, kind, created_at, image_id, firestone_version, disk_bytes, memory_bytes?}
+  disk.qcow2      overlay copy on the machine's own base image
+  spec.toml       byte copy of firestone.toml
+  vmconfig.json   byte copy of the published VmConfig, when the machine had one
+  vmstate/        warm only: Cloud Hypervisor's config.json, state.json and memory-ranges
+```
+
+Every snapshot is assembled in `snapshots/.partial-<snapshot>` and published with one `rename`, so a partial snapshot is never listed, never restored, and never counted as an image reference. Removal is the mirror image: `rename` to `snapshots/.removing-<snapshot>`, then delete. Directories are mode `0700` and files mode `0600`. Entries whose name begins with `.` are Firestone's own working directories and the snapshot lock; a snapshot identifier can never start with one, so the two namespaces cannot collide.
+
+`snapshots/.lock` serializes snapshot operations on one machine. It is a second lock because a running machine's shim owns the machine lock for the machine's whole lifetime (§4.3), so a warm snapshot cannot take that lock; it writes only inside `snapshots/` and talks to `api.sock`. A cold snapshot and a restore take the snapshot lock first and then the machine lock, always in that order.
+
+A snapshot's `image_id` pins its base image: `images rm` refuses and `images prune` keeps any base a published snapshot references, exactly as they do for a live `state.json` (§8.4). `firestone rm` deletes the snapshots with the machine directory and warns first, naming them, unless `--force` was given.
+
+### 23.3 Cold create
+
+1. Take the snapshot lock, then the machine lock; re-read the state under it and confirm the machine is still `created` or `stopped`.
+2. Copy `firestone.toml` and, when it exists, `vmconfig.json` into the partial directory byte for byte.
+3. Copy the overlay with the same `qemu-img convert -B <base>` path `clone` uses (§24.3), so the copy shares the machine's base image and is validated the same way. A machine that has never started owns no overlay: the snapshot records `disk_bytes: 0` and carries no `disk.qcow2`.
+4. Write `metadata.json` with `kind: "cold"` and no `memory_bytes`, `fsync` the directory, and publish it with one rename.
+
+### 23.4 Warm create
+
+The warm path never takes the machine lock. Before pausing anything it refuses when the free space on the machines filesystem is below guest memory plus the overlay's allocated size.
+
+1. Pre-create `vmstate/`. Cloud Hypervisor v53 fails `vm.snapshot` with HTTP 500 and `Destination is not a directory` when the destination does not already exist.
+2. `PUT vm.pause`.
+3. `PUT vm.snapshot {"destination_url": "file:///…/vmstate"}`.
+4. Copy the overlay while the machine is paused, preserving its holes (§23.7).
+5. `PUT vm.resume`.
+
+**Resume is attempted on every failure after the pause.** If the resume itself fails the machine is marked `degraded` with `vmm paused after a failed snapshot resume`, the action fails with `conflict`, and the hint names `firestone restart`. A paused machine that Firestone cannot resume is a visible fault, never a silent one.
+
+`memory_bytes` is the machine's configured guest memory. `vmstate/memory-ranges` has an apparent size equal to that memory but is written sparse.
+
+### 23.5 Restore
+
+Restore is a **whole-machine rollback**, not a disk rollback: `disk.qcow2`, `firestone.toml` and `vmconfig.json` are all replaced from the snapshot, so the machine returns to the configuration the disk was captured under. Anything else would restore a disk into a machine whose spec had moved on.
+
+- The target must be `created`, `stopped`, or `failed`. A running machine is refused with `conflict` unless `force` is true, which stops it first, honoring `timeout`; the stop happens before this action takes the machine lock, because the running machine's shim holds it.
+- A snapshot that does not exist is `not_found`.
+- After a cold restore the machine is stopped and startable; `--start` starts it normally. A `failed` machine becomes `stopped`, and `degraded` is cleared.
+- A warm restore writes `machines/<name>/restore-request.json` and then **always starts the machine**, because a memory image only means something resumed. `--start` is redundant there, and asking for `--start false` is answered with a warning, not a refusal.
+- Machine identity survives a restore untouched: the MAC and the cloud-init instance id derive from the machine name (§24.4), and the guest's own SSH host keys live inside the restored overlay, so `known_hosts` stays valid and no re-trust prompt appears.
+
+`restore-request.json` is `{schema_version, snapshot, snapshot_dir, vmstate_dir, vmconfig_sha256, created_at}`. Exactly one may be pending: a new restore replaces it. `snapshot rm` refuses a snapshot a pending marker names.
+
+### 23.6 The shim's restore launch mode
+
+A warm restore is an internal branch of the ordinary launch path, not a new shim control operation. `prepare_start` records the pending snapshot in the launch plan, so the launch and every later recovery derive the same `FIRESTONE_LAUNCH_BINDING` — the restore identity is folded into that binding. The shim then:
+
+1. publishes and reads the canonical VmConfig exactly as it does for a boot, from the restored spec;
+2. **verifies byte equality** with the snapshot's `vmconfig.json`, whose digest the marker pinned. A mismatch is a hard `conflict` before Cloud Hypervisor is spawned, with a hint naming the restore and the spec. The snapshot's `config.json` bakes absolute paths for the disk, seed, `net.sock`, `vsock.sock` and the serial file, so a restore into a different configuration or a moved machine directory cannot be correct;
+3. rotates `console.log` — Cloud Hypervisor truncates the configured serial file when it restores, so history would otherwise be lost;
+4. starts the sidecars as usual. A fresh `passt` listening on the same socket path is what the restored vhost-user device reconnects to, and it must be listening before the restore;
+5. spawns Cloud Hypervisor with only `--api-socket` and `--log-file`, the same argv a boot uses, since Firestone never passes VM configuration on the command line;
+6. `PUT vm.restore {"source_url": "file:///…/vmstate", "prefault": false}` and then `PUT vm.resume`, instead of `vm.create` and `vm.boot`. A restored VM comes back paused;
+7. deletes the marker and records the restore in `shim.log`.
+
+A launch that fails before step 7 leaves the marker in place, so the next `start` retries the same restore; restoring another snapshot, or deleting the marker, is how to change course.
+
+### 23.7 Sparse copies
+
+Cloud Hypervisor writes `memory-ranges` with the guest's full RAM as its apparent size but leaves most of it unallocated — roughly a third is written for an idle guest — and a machine overlay is sparse for the same reason. Firestone therefore copies both with a hole-preserving copy: the source is read in 128 KiB blocks, every all-zero block is skipped with a seek instead of written, and the destination is truncated to the source length so a trailing hole survives. A snapshot of an idle machine costs what the guest actually touched, not what it was promised.
+
+### 23.8 Cloud Hypervisor v53 facts these rules depend on
+
+`vm.pause`, `vm.resume`, `vm.snapshot` and `vm.restore` are all `PUT` and all answer `204` with no body. `vm.snapshot` takes `{"destination_url": "file:///abs/dir"}` and requires the directory to exist. `vm.restore` takes `{"source_url": "file:///abs/dir", "prefault": bool}` and leaves the VM paused. Snapshot output is `config.json`, `state.json` and a sparse `memory-ranges`. The serial file is truncated on restore. vhost-user networking restores against a fresh `passt` on the same socket path, started before the restore.
 
 ---
 

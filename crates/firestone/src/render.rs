@@ -15,7 +15,8 @@ use firestone_core::{
     CatalogEntrySummary, CatalogFirmware, DoctorCheckId, DoctorReport, DoctorStatus, ErrorInfo,
     ErrorKind, Event, EventSink, FirestoneError, Level, LogsResult, MachineRecord, MachineStatus,
     MachineSummary, MachineView, MetricsResult, NetMode, RemoveResult, ResizeResult,
-    SshConfigResult, StartResult, StepId, StopResult, Unit, VersionResult,
+    SnapshotListResult, SnapshotRemoveResult, SnapshotRestoreResult, SnapshotResult,
+    SnapshotSummary, SshConfigResult, StartResult, StepId, StopResult, Unit, VersionResult,
 };
 use owo_colors::OwoColorize as _;
 use unicode_width::UnicodeWidthChar;
@@ -883,6 +884,48 @@ where
                     format_args!("cloned {} to {}", result.source, result.dest),
                 )
             }
+            "snapshot-create" => {
+                let result: SnapshotResult = serde_json::from_value(payload)
+                    .map_err(|error| invalid_result_payload("snapshot-create", error))?;
+                let memory = result
+                    .memory_bytes
+                    .map(|bytes| format!(" · {bytes} bytes memory"))
+                    .unwrap_or_default();
+                write_line(
+                    &mut self.stdout,
+                    format_args!(
+                        "{} snapshot {} of {} · {} bytes disk{memory}",
+                        result.kind, result.snapshot, result.name, result.disk_bytes
+                    ),
+                )
+            }
+            "snapshot-list" => {
+                let result: SnapshotListResult = serde_json::from_value(payload)
+                    .map_err(|error| invalid_result_payload("snapshot-list", error))?;
+                write_snapshot_table(&mut self.stdout, &result.snapshots)
+                    .map_err(write_output_failure)
+            }
+            "snapshot-restore" => {
+                let result: SnapshotRestoreResult = serde_json::from_value(payload)
+                    .map_err(|error| invalid_result_payload("snapshot-restore", error))?;
+                let state = if result.started {
+                    "and is running"
+                } else {
+                    "and is stopped"
+                };
+                write_line(
+                    &mut self.stdout,
+                    format_args!("{} restored from {} {state}", result.name, result.snapshot),
+                )
+            }
+            "snapshot-rm" => {
+                let result: SnapshotRemoveResult = serde_json::from_value(payload)
+                    .map_err(|error| invalid_result_payload("snapshot-rm", error))?;
+                write_line(
+                    &mut self.stdout,
+                    format_args!("removed snapshot {} of {}", result.snapshot, result.name),
+                )
+            }
             "ssh-config" => {
                 let result: SshConfigResult = serde_json::from_value(payload)
                     .map_err(|error| invalid_result_payload("ssh-config", error))?;
@@ -1475,6 +1518,43 @@ fn write_machine_table<W: Write>(writer: &mut W, machines: &[MachineSummary]) ->
         writer.write_all(b"* forwards pending restart\n")?;
     }
 
+    writer.flush()
+}
+
+fn write_snapshot_table<W: Write>(writer: &mut W, snapshots: &[SnapshotSummary]) -> io::Result<()> {
+    let name_width = snapshots
+        .iter()
+        .map(|snapshot| display_width(&snapshot.snapshot))
+        .chain(std::iter::once("SNAPSHOT".len()))
+        .max()
+        .unwrap_or("SNAPSHOT".len());
+    let created_width = snapshots
+        .iter()
+        .map(|snapshot| display_width(&snapshot.created_at))
+        .chain(std::iter::once("CREATED".len()))
+        .max()
+        .unwrap_or("CREATED".len());
+    writeln!(
+        writer,
+        "{:<name_width$}  {:<4}  {:<created_width$}  {:>14}  {:>14}",
+        "SNAPSHOT",
+        "KIND",
+        "CREATED",
+        "DISK BYTES",
+        "MEMORY BYTES",
+        name_width = name_width,
+        created_width = created_width,
+    )?;
+    for snapshot in snapshots {
+        write_safe_cell(writer, &snapshot.snapshot, name_width)?;
+        writer.write_all(b"  ")?;
+        write!(writer, "{:<4}  ", snapshot.kind)?;
+        write_safe_cell(writer, &snapshot.created_at, created_width)?;
+        let memory = snapshot
+            .memory_bytes
+            .map_or_else(|| "-".to_owned(), |bytes| bytes.to_string());
+        writeln!(writer, "  {:>14}  {memory:>14}", snapshot.disk_bytes)?;
+    }
     writer.flush()
 }
 
