@@ -8315,10 +8315,20 @@ sshd_path = "{}"
         assert_eq!(oci.user.as_deref(), Some("app"));
         assert_eq!(oci.boot, FIRESTONE_INIT_BOOT);
 
-        // The published pair round-trips through the strict sidecar reader.
+        // The published pair round-trips through the strict sidecar reader,
+        // and its bytes stay version one with the optional `kind` written.
         let listed = fixture.store.list()?;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].metadata, *metadata);
+        let sidecar: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.paths.image_metadata(&metadata.id)?)?)?;
+        assert_eq!(sidecar["version"], 1);
+        assert_eq!(sidecar["kind"], "oci");
+        assert!(sidecar["source_url"].is_null());
+        assert!(sidecar["firmware"].is_null());
+        assert_eq!(sidecar["source_format"], "raw");
+        assert_eq!(sidecar["verification_algorithm"], "sha256");
+        assert_eq!(sidecar["verification_digest"], sidecar["source_sha256"]);
         assert_eq!(
             fs::symlink_metadata(&pulled.path)?.permissions().mode() & 0o7777,
             BASE_FILE_MODE
