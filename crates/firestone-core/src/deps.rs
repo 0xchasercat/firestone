@@ -13,6 +13,12 @@ pub const DIRECT_BOOT_KERNEL_DEPENDENCY: &str = "cloud-hypervisor-kernel";
 /// Pinned direct-boot kernel release recorded in `deps.toml`.
 pub const PINNED_DIRECT_BOOT_KERNEL_VERSION: &str = "ch-release-v6.16.9-20260508";
 
+/// Manifest name of Firestone's own guest PID 1 payload (SPEC §10.5, §17.2).
+pub const FIRESTONE_INIT_DEPENDENCY: &str = "firestone-init";
+
+/// Pinned `firestone-init` release recorded in `deps.toml`.
+pub const PINNED_FIRESTONE_INIT_VERSION: &str = "v0.1.0";
+
 /// One immutable, architecture-specific dependency artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyArtifact {
@@ -272,6 +278,34 @@ impl DependencyManifest {
                 "pinned direct-boot kernel is classified as an executable payload",
             )
             .with_hint("publish the kernel image as a mode-0644 dependency artifact"));
+        }
+        Ok(artifact)
+    }
+
+    /// Resolves the pinned `firestone-init` payload injected into a packed OCI
+    /// rootfs (SPEC §8.5, §10.5, §17.2).
+    ///
+    /// The payload is data, never an executable published for the host to run:
+    /// the injection gives it its own 0755 tar header inside the guest image.
+    pub fn firestone_init(&self, architecture: &str) -> Result<DependencyArtifact, FirestoneError> {
+        let artifact = self
+            .artifact(FIRESTONE_INIT_DEPENDENCY, architecture)
+            .map_err(|error| {
+                FirestoneError::new(
+                    ErrorKind::Dependency,
+                    format!("pinned firestone-init metadata is unavailable for {architecture}"),
+                )
+                .with_hint(
+                    "regenerate deps.toml with scripts/pin-deps.sh refresh --arch all before packing an OCI image",
+                )
+                .with_source(error)
+            })?;
+        if artifact.executable() {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                "pinned firestone-init is classified as an executable payload",
+            )
+            .with_hint("publish the guest init as a mode-0644 dependency artifact"));
         }
         Ok(artifact)
     }

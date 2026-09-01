@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek as _, SeekFrom, Write},
     os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
@@ -12,7 +13,7 @@ use nix::{
 use sha2::{Digest as _, Sha256};
 use tempfile::Builder as TempBuilder;
 
-use crate::{DependencyArtifact, ErrorKind, FirestoneError, Paths};
+use crate::{DependencyArtifact, DependencyManifest, ErrorKind, FirestoneError, Paths};
 
 const HELPER_LOCK_NAME: &str = ".embedded-helpers.lock";
 const EXECUTABLE_MODE: u32 = 0o755;
@@ -171,21 +172,75 @@ pub const fn embedded_helper(kind: InternalHelper) -> Option<EmbeddedHelper> {
     }
 }
 
+/// Publishes one pinned `deps.toml` artifact and returns its verified path.
+///
+/// [`ImageStore`](crate::ImageStore) implements this with the strict HTTPS
+/// transport and the locked, no-follow publisher that the firmware and the
+/// direct-boot kernel already use. The trait is the seam that keeps this module
+/// free of the HTTP client and lets tests publish from local bytes.
+pub trait PinnedArtifactInstaller {
+    /// Installs `artifact` if it is absent and returns its published path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `dependency` when the artifact cannot be downloaded or published,
+    /// and `checksum` when the bytes do not match the pinned hash.
+    fn install_pinned_artifact(
+        &self,
+        artifact: &DependencyArtifact,
+    ) -> Result<PathBuf, FirestoneError>;
+}
+
 /// Returns the verified `firestone-init` payload for rootfs injection (§8.5).
 ///
-/// The payload is not published into `<data>/bin` like the other helpers: the
-/// pull pipeline writes these bytes straight into the merged tar at
-/// `/sbin/firestone-init`, so the only check that applies is the embedded
-/// checksum. A build with no payload — every development build until the
-/// standalone `firestone-init` release is pinned in `deps.toml` (§17.2) —
-/// returns a `dependency` error that names it.
+/// The payload is resolved in one fixed order (SPEC §10.5, §17.2):
+///
+/// 1. the payload embedded by a standalone release build, hash-checked against
+///    the digest recorded at build time;
+/// 2. otherwise the pinned `[dependency.firestone-init]` artifact of
+///    `deps.toml`, downloaded once through `installer` and read back only after
+///    the publisher has verified its SHA-256.
+///
+/// The pinned copy lands in `<data>/bin` with mode 0644 because it is guest
+/// data, never a host executable: the injection gives it its own 0755 header
+/// inside the merged tar. A build with neither an embedded payload nor a pin
+/// returns a `dependency` error that names both ways out.
 ///
 /// # Errors
 ///
-/// Returns `dependency` when this build carries no payload, and `checksum` when
-/// the embedded bytes do not match the hash recorded at build time.
-pub fn firestone_init_payload() -> Result<&'static [u8], FirestoneError> {
-    let helper = embedded_helper(InternalHelper::FirestoneInit).ok_or_else(|| {
+/// Returns `dependency` when no payload is embedded and none is pinned or
+/// reachable, and `checksum` when either copy fails its hash.
+pub fn firestone_init_payload(
+    paths: &Paths,
+    manifest: &DependencyManifest,
+    architecture: &str,
+    installer: &dyn PinnedArtifactInstaller,
+) -> Result<Cow<'static, [u8]>, FirestoneError> {
+    resolve_firestone_init_payload(
+        embedded_helper(InternalHelper::FirestoneInit),
+        paths,
+        manifest,
+        architecture,
+        installer,
+    )
+}
+
+/// The resolution order of [`firestone_init_payload`], with the embedded
+/// payload supplied by the caller so tests can exercise every branch on a host
+/// whose build embedded nothing.
+fn resolve_firestone_init_payload(
+    embedded: Option<EmbeddedHelper>,
+    paths: &Paths,
+    manifest: &DependencyManifest,
+    architecture: &str,
+    installer: &dyn PinnedArtifactInstaller,
+) -> Result<Cow<'static, [u8]>, FirestoneError> {
+    if let Some(helper) = embedded {
+        verify_payload(helper)?;
+        return Ok(Cow::Borrowed(helper.bytes()));
+    }
+
+    let artifact = manifest.firestone_init(architecture).map_err(|error| {
         FirestoneError::new(
             ErrorKind::Dependency,
             "this build carries no embedded firestone-init payload",
@@ -194,9 +249,68 @@ pub fn firestone_init_payload() -> Result<&'static [u8], FirestoneError> {
             "OCI machines need the guest init: use an x86_64 standalone release, or build the \
              `firestone-init` release asset and pin it in deps.toml",
         )
+        .with_source(error)
     })?;
-    verify_payload(helper)?;
-    Ok(helper.bytes())
+    let installed = installer
+        .install_pinned_artifact(&artifact)
+        .map_err(|error| {
+            let kind = error.kind();
+            FirestoneError::new(
+                kind,
+                format!(
+                    "cannot obtain the pinned firestone-init {} payload for {architecture}",
+                    artifact.version
+                ),
+            )
+            .with_hint(
+                "a build without an embedded payload downloads the guest init once, on first \
+                 OCI use: retry with network access to the pinned release, or use an x86_64 \
+                 standalone release that embeds it",
+            )
+            .with_source(error)
+        })?;
+    read_pinned_payload(paths, &installed, &artifact)
+}
+
+/// Reads a published pinned payload back without following its final path
+/// component, and re-checks its hash before the bytes are used.
+fn read_pinned_payload(
+    paths: &Paths,
+    destination: &Path,
+    artifact: &DependencyArtifact,
+) -> Result<Cow<'static, [u8]>, FirestoneError> {
+    let identity = ArtifactIdentity::pinned(artifact);
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    let mut file = options.open(destination).map_err(|source| {
+        artifact_io_error(identity, "open installed file", destination, source)
+    })?;
+    paths.validate_owned_data_file_handle(
+        destination,
+        &format!("{} {}", identity.origin.adjective(), identity.dependency),
+        identity.mode,
+        &file,
+    )?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|source| {
+        artifact_io_error(identity, "read installed file", destination, source)
+    })?;
+    let actual = sha256_bytes(&bytes);
+    if actual != identity.sha256 {
+        return Err(FirestoneError::new(
+            ErrorKind::Checksum,
+            format!(
+                "pinned '{}' at {} has checksum {actual}; expected {}",
+                identity.dependency,
+                destination.display(),
+                identity.sha256
+            ),
+        )
+        .with_hint(identity.origin.mismatch_hint()));
+    }
+    Ok(Cow::Owned(bytes))
 }
 
 /// Materializes one embedded helper and returns its stable versioned path.
@@ -517,10 +631,15 @@ fn lock_io_error(operation: &str, path: &Path, source: io::Error) -> FirestoneEr
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt as _, sync::Arc, thread};
+    use std::{
+        cell::Cell, fs, os::unix::fs::PermissionsExt as _, path::PathBuf, sync::Arc, thread,
+    };
 
-    use super::{EmbeddedHelper, InternalHelper, materialize};
-    use crate::{ErrorKind, PathInputs, Paths};
+    use super::{
+        DependencyArtifact, EmbeddedHelper, FirestoneError, InternalHelper,
+        PinnedArtifactInstaller, install_pinned_artifact_with, materialize,
+    };
+    use crate::{DependencyManifest, ErrorKind, PathInputs, Paths};
 
     static TEST_BYTES: &[u8] = b"#!/bin/sh\nexit 0\n";
     const TEST_HELPER: EmbeddedHelper = EmbeddedHelper::new(
@@ -530,6 +649,75 @@ mod tests {
         "306c6ca7407560340797866e077e053627ad409277d1b9da58106fce4cf717cb",
         TEST_BYTES,
     );
+
+    /// Stand-in for the pinned `firestone-init` asset.
+    static INIT_BYTES: &[u8] = b"\x7fELF firestone-init payload\n";
+    const INIT_SHA256: &str = "1bdd0e4f2842332f1c7895a67d61877f89dbed5e9130cb610824fc44ab1423b7";
+    /// Stand-in for the payload a standalone release embeds, distinct from the
+    /// pinned bytes so the winner of the resolution order is unambiguous.
+    static EMBEDDED_BYTES: &[u8] = b"\x7fELF embedded firestone-init\n";
+    const EMBEDDED_INIT: EmbeddedHelper = EmbeddedHelper::new(
+        InternalHelper::FirestoneInit,
+        "v0.1.0",
+        "firestone-init-v0.1.0",
+        "7a602cdceb0b0bb36fc79e86360cac6980a232fc86716372ae29b70906a2e85f",
+        EMBEDDED_BYTES,
+    );
+
+    /// Publishes fixed bytes through the real locked publisher, standing in for
+    /// [`crate::ImageStore`]'s HTTPS download, and counts its calls.
+    struct FakeInstaller {
+        paths: Paths,
+        bytes: &'static [u8],
+        calls: Cell<usize>,
+    }
+
+    impl FakeInstaller {
+        fn new(paths: &Paths, bytes: &'static [u8]) -> Self {
+            Self {
+                paths: paths.clone(),
+                bytes,
+                calls: Cell::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.get()
+        }
+    }
+
+    impl PinnedArtifactInstaller for FakeInstaller {
+        fn install_pinned_artifact(
+            &self,
+            artifact: &DependencyArtifact,
+        ) -> Result<PathBuf, FirestoneError> {
+            self.calls.set(self.calls.get() + 1);
+            install_pinned_artifact_with(&self.paths, artifact, |output| {
+                output.write_all(self.bytes).map_err(|source| {
+                    FirestoneError::new(ErrorKind::Dependency, "cannot write the fake payload")
+                        .with_source(source)
+                })
+            })
+        }
+    }
+
+    /// A manifest that pins `firestone-init` for x86_64 only.
+    fn pinned_init_manifest(sha256: &str) -> Result<DependencyManifest, FirestoneError> {
+        DependencyManifest::parse(&format!(
+            r#"
+manifest_version = 1
+[dependency.firestone-init]
+version = "v0.1.0"
+availability = "binary"
+architectures = ["x86_64"]
+[dependency.firestone-init.x86_64]
+asset = "firestone-init-v0.1.0-x86_64-unknown-linux-musl"
+install_name = "firestone-init-v0.1.0"
+url = "https://example.invalid/firestone-init-v0.1.0"
+sha256 = "{sha256}"
+"#
+        ))
+    }
 
     #[test]
     fn internal_helper_names_cover_embedded_vmm_and_sidecars() {
@@ -546,28 +734,151 @@ mod tests {
         assert_eq!(InternalHelper::FirestoneInit.dependency(), "firestone-init");
     }
 
-    /// SPEC §10.5/§17.2. Until the standalone `firestone-init` release is built
-    /// and pinned, every development build answers the injection feed with one
-    /// actionable dependency error rather than an empty or silent payload.
+    /// SPEC §10.5/§17.2. `deps.toml` pins the published `firestone-init` release
+    /// for x86_64 as mode-0644 guest data, and for that architecture only: an
+    /// aarch64 source build reports the dependency instead of downloading an
+    /// x86_64 binary.
     #[test]
-    fn firestone_init_payload_without_an_embedded_release_reports_the_dependency() {
-        match super::firestone_init_payload() {
-            Ok(bytes) => {
-                // A standalone release build does carry the payload; when it
-                // does, it must be non-empty and hash-verified (which
-                // `firestone_init_payload` already checked).
-                assert!(!bytes.is_empty());
-            }
-            Err(error) => {
-                assert_eq!(error.kind(), ErrorKind::Dependency);
-                assert_eq!(
-                    error.message(),
-                    "this build carries no embedded firestone-init payload"
-                );
-                let hint = error.hint().unwrap_or_default();
-                assert!(hint.contains("deps.toml"), "{hint}");
-            }
-        }
+    fn firestone_init_bundled_pin_covers_x86_64_only() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = test_paths(directory.path())?;
+        let manifest = DependencyManifest::bundled()?;
+        let installer = FakeInstaller::new(&paths, INIT_BYTES);
+
+        let artifact = manifest.firestone_init("x86_64")?;
+        assert_eq!(artifact.version, crate::PINNED_FIRESTONE_INIT_VERSION);
+        assert_eq!(artifact.install_name, "firestone-init-v0.1.0");
+        assert_eq!(
+            artifact.asset,
+            "firestone-init-v0.1.0-x86_64-unknown-linux-musl"
+        );
+        assert_eq!(
+            artifact.sha256,
+            "1018c2dceecbf8d761d20ac40a07f28baada0e3cf2c3322af24fe7bb96b67d11"
+        );
+        assert_eq!(artifact.expected_mode(), 0o644);
+
+        let error = match super::resolve_firestone_init_payload(
+            None, &paths, &manifest, "aarch64", &installer,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("aarch64 has no pinned firestone-init payload"),
+        };
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert_eq!(
+            error.message(),
+            "this build carries no embedded firestone-init payload"
+        );
+        assert_eq!(installer.calls(), 0);
+        Ok(())
+    }
+
+    /// The embedded payload wins outright: a standalone release never reaches
+    /// the network for a payload it already carries.
+    #[test]
+    fn firestone_init_payload_embedded_wins_without_touching_the_installer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = test_paths(directory.path())?;
+        let manifest = pinned_init_manifest(INIT_SHA256)?;
+        let installer = FakeInstaller::new(&paths, INIT_BYTES);
+
+        let payload = super::resolve_firestone_init_payload(
+            Some(EMBEDDED_INIT),
+            &paths,
+            &manifest,
+            "x86_64",
+            &installer,
+        )?;
+
+        assert_eq!(payload.as_ref(), EMBEDDED_BYTES);
+        assert_eq!(installer.calls(), 0);
+        Ok(())
+    }
+
+    /// With no embedded payload the pinned manifest entry is materialized once,
+    /// through the same locked publisher, and read back at mode 0644.
+    #[test]
+    fn firestone_init_payload_without_an_embedded_payload_installs_the_pinned_artifact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = test_paths(directory.path())?;
+        let manifest = pinned_init_manifest(INIT_SHA256)?;
+        let installer = FakeInstaller::new(&paths, INIT_BYTES);
+
+        let payload =
+            super::resolve_firestone_init_payload(None, &paths, &manifest, "x86_64", &installer)?;
+
+        assert_eq!(payload.as_ref(), INIT_BYTES);
+        assert_eq!(installer.calls(), 1);
+        let installed = paths.binary_file("firestone-init-v0.1.0")?;
+        assert_eq!(
+            fs::metadata(&installed)?.permissions().mode() & 0o7777,
+            0o644
+        );
+        Ok(())
+    }
+
+    /// Neither an embedded payload nor a pin is a clean dependency error that
+    /// names both ways out, not a panic and not empty bytes.
+    #[test]
+    fn firestone_init_payload_without_an_embedded_payload_or_a_pin_reports_the_dependency()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = test_paths(directory.path())?;
+        let manifest = DependencyManifest::parse(
+            r#"
+manifest_version = 1
+[dependency.virtiofsd]
+version = "v1.14.0"
+availability = "binary"
+[dependency.virtiofsd.x86_64]
+asset = "virtiofsd"
+install_name = "virtiofsd-v1.14.0"
+url = "https://example.invalid/virtiofsd"
+sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"#,
+        )?;
+        let installer = FakeInstaller::new(&paths, INIT_BYTES);
+
+        let error = match super::resolve_firestone_init_payload(
+            None, &paths, &manifest, "x86_64", &installer,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("an unpinned firestone-init payload must fail"),
+        };
+
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert_eq!(
+            error.message(),
+            "this build carries no embedded firestone-init payload"
+        );
+        let hint = error.hint().unwrap_or_default();
+        assert!(hint.contains("deps.toml"), "{hint}");
+        assert!(hint.contains("standalone release"), "{hint}");
+        assert_eq!(installer.calls(), 0);
+        Ok(())
+    }
+
+    /// A pinned payload whose bytes do not match the manifest hash is refused by
+    /// the publisher, so the merged rootfs never sees unverified bytes.
+    #[test]
+    fn firestone_init_payload_pinned_checksum_mismatch_is_refused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = test_paths(directory.path())?;
+        let manifest = pinned_init_manifest(INIT_SHA256)?;
+        let installer = FakeInstaller::new(&paths, b"not the pinned payload\n");
+
+        let error = match super::resolve_firestone_init_payload(
+            None, &paths, &manifest, "x86_64", &installer,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a mismatched pinned payload must fail"),
+        };
+
+        assert_eq!(error.kind(), ErrorKind::Checksum);
+        Ok(())
     }
 
     #[test]
