@@ -20,15 +20,15 @@ use firestone_core::{
     ErrorKind, Event, EventSink, ExtractedPasstHelper, FirestoneError, GlobalConfig,
     ImagePullRequest, ImageStore, InternalHelper, Level, LiveMachineState, LogSource, LogsResult,
     MachineLock, MachineRecord, MachineSpec, MachineSpecPatch, MachineState, MachineStatus,
-    MachineSummary, MachineView, MetricsCpu, MetricsMemory, MetricsResult, Paths, ReadinessOptions,
-    RealValidationHost, RemoveResult, ResizeResult, ShimClient, ShimTimeouts, SpecResult,
-    SpecWarningPayload, StartResult, StateImage, StateStore, StateVersion, StopResult, Supervision,
-    ValidationContext, VersionDependency, VersionIdentity, VersionPaths, VersionResult, VmmApi,
-    atomic, cancel_prepared, classify_cp_operands, disk_shrink_error, forwards_differ,
-    launch_prepared_cancellable, overlay_virtual_size, prepare_start, project_device_counters,
-    read_reconciled_machine_state_live, read_reconciled_machine_state_live_locked, run_doctor,
-    sample_vmm_process, scp_command_plan, stop_unsupervised, validate_machine_spec,
-    wait_for_ssh_ready,
+    MachineSummary, MachineView, MetricsCpu, MetricsMemory, MetricsResult, Paths, PruneItem,
+    PruneKind, PruneResult, ReadinessOptions, RealValidationHost, RemoveResult, ResizeResult,
+    ShimClient, ShimTimeouts, SpecResult, SpecWarningPayload, StartResult, StateImage, StateStore,
+    StateVersion, StopResult, Supervision, ValidationContext, VersionDependency, VersionIdentity,
+    VersionPaths, VersionResult, VmmApi, atomic, cancel_prepared, classify_cp_operands,
+    disk_shrink_error, forwards_differ, launch_prepared_cancellable, overlay_virtual_size,
+    prepare_start, project_device_counters, read_reconciled_machine_state_live,
+    read_reconciled_machine_state_live_locked, run_doctor, sample_vmm_process, scp_command_plan,
+    stop_unsupervised, validate_machine_spec, wait_for_ssh_ready,
 };
 use firestone_core::{CloneResult, StepId};
 use firestone_core::{
@@ -2502,6 +2502,429 @@ impl LocalDispatcher {
         emit_result(events, "images-prune", &self.image_store()?.prune()?)
     }
 
+    /// Machines the destructive prune tier would remove, in list order.
+    ///
+    /// The CLI shows this list before it asks for confirmation, so the names in
+    /// the prompt are exactly the names the action will act on (SPEC §26).
+    pub fn prune_confirmation_names(&self) -> Result<Vec<String>, FirestoneError> {
+        self.validate_machine_storage()?;
+        let mut names = Vec::new();
+        for name in self.prunable_machine_names()? {
+            if prune_removable_status(self.read_live_state(&name)?.state.status) {
+                names.push(name);
+            }
+        }
+        Ok(names)
+    }
+
+    /// Published machines, excluding Firestone's own dot-prefixed entries.
+    ///
+    /// A `.removing-<name>` tombstone still holds a complete machine directory
+    /// and would otherwise read as a machine; prune treats it as the debris it
+    /// is (SPEC §26).
+    fn prunable_machine_names(&self) -> Result<Vec<String>, FirestoneError> {
+        Ok(self
+            .machine_names()?
+            .into_iter()
+            .filter(|name| !name.starts_with('.'))
+            .collect())
+    }
+
+    /// Reclaims disk space held by Firestone's own artifacts (SPEC §26).
+    ///
+    /// The whole plan is built before anything is deleted, so `--dry-run`
+    /// reports exactly the list a real run acts on. Deletions then happen in
+    /// plan order under the same locks every other action takes.
+    fn system_prune(
+        &self,
+        machines: bool,
+        images: bool,
+        force: bool,
+        dry_run: bool,
+        events: &mut dyn EventSink,
+    ) -> Result<(), FirestoneError> {
+        // A dry run removes nothing, so it is the one way to see what the
+        // destructive tier would do before authorizing it (SPEC §26).
+        if machines && !force && !dry_run {
+            return Err(FirestoneError::new(
+                ErrorKind::Usage,
+                "pruning machines requires `force`",
+            )
+            .with_hint(
+                "confirm the listed machines interactively, pass --force or --yes on the CLI, or send \"force\": true in the REST body",
+            ));
+        }
+        self.validate_machine_storage()?;
+
+        let names = self.prunable_machine_names()?;
+        let mut statuses = BTreeMap::new();
+        for name in &names {
+            statuses.insert(name.clone(), self.read_live_state(name)?.state.status);
+        }
+
+        // Bytes already claimed by an inert item inside a machine directory.
+        // The destructive tier subtracts them so one byte is never counted
+        // twice and a dry run reports the same total a real run reclaims.
+        let mut counted: BTreeMap<String, u64> = BTreeMap::new();
+        let mut plan = self.plan_stale_runtime_dirs(&statuses)?;
+        let mut logs = Vec::new();
+        let mut partials = Vec::new();
+        let mut snapshot_partials = Vec::new();
+        // Every machine directory is measured before the first deletion, so
+        // the destructive tier reports the same size in both modes.
+        let mut totals: BTreeMap<String, u64> = BTreeMap::new();
+        for name in &names {
+            totals.insert(
+                name.clone(),
+                allocated_tree_bytes(&self.paths.machine_dir(name)?)?,
+            );
+            let previous = self.paths.machine_console_previous_log(name)?;
+            if let Some(bytes) = owned_regular_file_bytes(&previous)? {
+                add_counted(&mut counted, name, bytes);
+                logs.push(PrunePlanItem {
+                    kind: PruneKind::Log,
+                    id: format!("{name}/console.log.previous"),
+                    bytes,
+                    target: PruneTarget::File(previous),
+                });
+            }
+            for (path, entry) in self.machine_partial_entries(name)? {
+                add_counted(&mut counted, name, entry.bytes);
+                partials.push(PrunePlanItem {
+                    kind: PruneKind::Partial,
+                    id: format!("machines/{name}/{}", entry.file_name),
+                    bytes: entry.bytes,
+                    target: if entry.directory {
+                        PruneTarget::Tree(path)
+                    } else {
+                        PruneTarget::File(path)
+                    },
+                });
+            }
+            for (path, entry) in self.snapshot_partial_entries(name)? {
+                add_counted(&mut counted, name, entry.bytes);
+                snapshot_partials.push(PrunePlanItem {
+                    kind: PruneKind::SnapshotPartial,
+                    id: format!("{name}/snapshots/{}", entry.file_name),
+                    bytes: entry.bytes,
+                    target: PruneTarget::SnapshotTree {
+                        machine: name.clone(),
+                        path,
+                    },
+                });
+            }
+        }
+        partials.extend(self.plan_orphan_removal_dirs()?);
+        plan.extend(logs);
+        plan.extend(partials);
+        plan.extend(snapshot_partials);
+
+        let mut removed = self.execute_prune_plan(&plan, dry_run, events)?;
+
+        // The image store is measured and mutated behind its own lock, so the
+        // two tiers below run as whole steps rather than through the plan.
+        let store = self.image_store()?;
+        for artifact in store.prune_partials(dry_run)? {
+            removed.push(emit_prune_item(
+                events,
+                PruneKind::Partial,
+                format!("images/{}", artifact.id),
+                artifact.bytes,
+                dry_run,
+            )?);
+        }
+        if images {
+            for artifact in store.prune_unreferenced(dry_run)? {
+                removed.push(emit_prune_item(
+                    events,
+                    PruneKind::Image,
+                    artifact.id,
+                    artifact.bytes,
+                    dry_run,
+                )?);
+            }
+        }
+
+        if machines {
+            for name in &names {
+                if !statuses
+                    .get(name)
+                    .copied()
+                    .is_some_and(prune_removable_status)
+                {
+                    continue;
+                }
+                let bytes = totals
+                    .get(name)
+                    .copied()
+                    .unwrap_or_default()
+                    .saturating_sub(counted.get(name).copied().unwrap_or_default());
+                let started = prune_step_start(events, PruneKind::Machine, name)?;
+                if !dry_run {
+                    self.remove_one(name, events)?;
+                }
+                removed.push(prune_step_done(
+                    events,
+                    PruneKind::Machine,
+                    name.clone(),
+                    bytes,
+                    dry_run,
+                    started,
+                )?);
+            }
+        }
+
+        let reclaimed_bytes = removed
+            .iter()
+            .fold(0_u64, |total, item| total.saturating_add(item.bytes));
+        emit_result(
+            events,
+            "system-prune",
+            &PruneResult {
+                dry_run,
+                reclaimed_bytes,
+                removed,
+            },
+        )
+    }
+
+    /// Runtime directories of machines that are not starting, running, or stopping.
+    ///
+    /// A directory whose machine no longer exists is stale by definition. A
+    /// directory whose machine exists but is not readable as a complete
+    /// machine is left alone: only the machine's own lock can settle that.
+    fn plan_stale_runtime_dirs(
+        &self,
+        statuses: &BTreeMap<String, MachineStatus>,
+    ) -> Result<Vec<PrunePlanItem>, FirestoneError> {
+        let runtime_dir = self.paths.runtime_dir().to_path_buf();
+        let entries = match fs::read_dir(&runtime_dir) {
+            Ok(entries) => entries,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(filesystem_error(
+                    ErrorKind::Dependency,
+                    format!("cannot read runtime directory {}", runtime_dir.display()),
+                    "check the Firestone runtime directory permissions",
+                    source,
+                ));
+            }
+        };
+        let mut items = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| {
+                filesystem_error(
+                    ErrorKind::Dependency,
+                    format!("cannot read runtime directory {}", runtime_dir.display()),
+                    "check the Firestone runtime directory permissions",
+                    source,
+                )
+            })?;
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|source| {
+                filesystem_error(
+                    ErrorKind::Dependency,
+                    format!("cannot inspect runtime entry {}", entry.path().display()),
+                    "check the Firestone runtime directory permissions",
+                    source,
+                )
+            })?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                continue;
+            }
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if self.paths.machine_runtime_dir(&name).is_err() {
+                continue;
+            }
+            let published = match statuses.get(&name) {
+                Some(status) => {
+                    if status.is_active() {
+                        continue;
+                    }
+                    true
+                }
+                // An unlisted machine whose directory still exists is either
+                // half-created or unreadable; leave its runtime state alone.
+                None if machine_directory_exists(&self.paths, &name)? => continue,
+                None => false,
+            };
+            items.push(PrunePlanItem {
+                kind: PruneKind::Runtime,
+                id: name.clone(),
+                bytes: allocated_tree_bytes(&entry.path())?,
+                target: PruneTarget::RuntimeDir {
+                    machine: name,
+                    published,
+                },
+            });
+        }
+        items.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(items)
+    }
+
+    /// Interrupted `.partial` artifacts directly inside one machine directory.
+    fn machine_partial_entries(
+        &self,
+        name: &str,
+    ) -> Result<Vec<(PathBuf, PruneDirEntry)>, FirestoneError> {
+        let machine_dir = self.paths.machine_dir(name)?;
+        read_prune_entries(&machine_dir, |entry| entry.ends_with(".partial"))
+    }
+
+    /// Unfinished snapshot working and removal directories of one machine.
+    fn snapshot_partial_entries(
+        &self,
+        name: &str,
+    ) -> Result<Vec<(PathBuf, PruneDirEntry)>, FirestoneError> {
+        let snapshots_dir = self.paths.machine_snapshots_dir(name)?;
+        read_prune_entries(&snapshots_dir, |entry| {
+            entry.starts_with(".partial-") || entry.starts_with(".removing-")
+        })
+    }
+
+    /// Machine removal tombstones an interrupted `rm` left behind.
+    fn plan_orphan_removal_dirs(&self) -> Result<Vec<PrunePlanItem>, FirestoneError> {
+        let machines_dir = self.paths.machines_dir();
+        let mut items = Vec::new();
+        for (path, entry) in
+            read_prune_entries(&machines_dir, |entry| entry.starts_with(".removing-"))?
+        {
+            let Some(machine) = entry.file_name.strip_prefix(".removing-") else {
+                continue;
+            };
+            if machine.is_empty() || self.paths.machine_dir(machine).is_err() {
+                continue;
+            }
+            items.push(PrunePlanItem {
+                kind: PruneKind::Partial,
+                id: format!("machines/{}", entry.file_name),
+                bytes: entry.bytes,
+                target: PruneTarget::MachineRemovalDir {
+                    machine: machine.to_owned(),
+                    path,
+                },
+            });
+        }
+        Ok(items)
+    }
+
+    /// Applies one prune plan in order, or reports it unchanged for a dry run.
+    fn execute_prune_plan(
+        &self,
+        plan: &[PrunePlanItem],
+        dry_run: bool,
+        events: &mut dyn EventSink,
+    ) -> Result<Vec<PruneItem>, FirestoneError> {
+        let mut removed = Vec::with_capacity(plan.len());
+        for item in plan {
+            let started = prune_step_start(events, item.kind, &item.id)?;
+            if !dry_run && !self.apply_prune_item(item, events)? {
+                continue;
+            }
+            removed.push(prune_step_done(
+                events,
+                item.kind,
+                item.id.clone(),
+                item.bytes,
+                dry_run,
+                started,
+            )?);
+        }
+        Ok(removed)
+    }
+
+    /// Deletes one planned artifact, reporting false when it is no longer safe.
+    fn apply_prune_item(
+        &self,
+        item: &PrunePlanItem,
+        events: &mut dyn EventSink,
+    ) -> Result<bool, FirestoneError> {
+        match &item.target {
+            PruneTarget::RuntimeDir { machine, published } => {
+                if *published {
+                    let lock =
+                        MachineLock::acquire(machine, &self.paths.machine_lock(machine)?, events)?;
+                    // The machine may have started between the plan and now.
+                    if self
+                        .read_live_state_locked(machine, &lock)?
+                        .state
+                        .status
+                        .is_active()
+                    {
+                        events.emit(Event::StepSkip {
+                            id: item.kind.as_str().into(),
+                            reason: format!("{machine} is running"),
+                        })?;
+                        return Ok(false);
+                    }
+                    self.paths.clear_machine_runtime_dir(machine, true)?;
+                    drop(lock);
+                } else {
+                    self.paths.clear_machine_runtime_dir(machine, true)?;
+                }
+                Ok(true)
+            }
+            PruneTarget::File(path) => {
+                remove_owned_prune_file(path)?;
+                Ok(true)
+            }
+            PruneTarget::Tree(path) => {
+                self.remove_prune_tree(path)?;
+                Ok(true)
+            }
+            PruneTarget::SnapshotTree { machine, path } => {
+                let lock = MachineLock::acquire(
+                    machine,
+                    &self.paths.machine_snapshot_lock(machine)?,
+                    events,
+                )?;
+                let result = self.remove_prune_tree(path);
+                drop(lock);
+                result?;
+                Ok(true)
+            }
+            PruneTarget::MachineRemovalDir { machine, path } => {
+                // The tombstone usually outlives its machine directory, and a
+                // lock file cannot be created where no directory remains.
+                if machine_directory_exists(&self.paths, machine)? {
+                    let lock =
+                        MachineLock::acquire(machine, &self.paths.machine_lock(machine)?, events)?;
+                    let result = self.remove_prune_tree(path);
+                    drop(lock);
+                    result?;
+                } else {
+                    self.remove_prune_tree(path)?;
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    /// Removes one validated Firestone-owned directory tree.
+    fn remove_prune_tree(&self, path: &Path) -> Result<(), FirestoneError> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => {
+                validate_removal_tree(&self.paths, path, "prune directory")?;
+                fs::remove_dir_all(path).map_err(|source| {
+                    filesystem_error(
+                        ErrorKind::Generic,
+                        format!("cannot remove {}", path.display()),
+                        "remove the owned directory and retry",
+                        source,
+                    )
+                })
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(filesystem_error(
+                ErrorKind::Dependency,
+                format!("cannot inspect {}", path.display()),
+                "check the Firestone data directory permissions",
+                source,
+            )),
+        }
+    }
+
     fn show_vmconfig(&self, name: &str, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
         self.validate_machine_storage()?;
         let machine_dir = self.paths.machine_dir(name)?;
@@ -2787,6 +3210,12 @@ impl Dispatcher for LocalDispatcher {
                 Action::SnapshotRemove { name, snapshot } => {
                     self.snapshot_remove(&name, &snapshot, events)
                 }
+                Action::SystemPrune {
+                    machines,
+                    images,
+                    force,
+                    dry_run,
+                } => self.system_prune(machines, images, force, dry_run, events),
             }
         })
     }
@@ -3717,6 +4146,287 @@ fn machine_not_running(name: &str) -> FirestoneError {
         format!("machine `{name}` is not running"),
     )
     .with_hint(format!("run firestone start {name}"))
+}
+
+/// One deletion system prune planned before it removed anything (SPEC §26).
+#[derive(Debug)]
+struct PrunePlanItem {
+    kind: PruneKind,
+    id: String,
+    bytes: u64,
+    target: PruneTarget,
+}
+
+/// Where a planned prune item lives and which lock protects it.
+#[derive(Debug)]
+enum PruneTarget {
+    /// A per-machine runtime directory. `published` records whether the
+    /// machine still exists and therefore whether a machine lock is taken.
+    RuntimeDir {
+        machine: String,
+        published: bool,
+    },
+    File(PathBuf),
+    Tree(PathBuf),
+    SnapshotTree {
+        machine: String,
+        path: PathBuf,
+    },
+    MachineRemovalDir {
+        machine: String,
+        path: PathBuf,
+    },
+}
+
+/// One measured directory entry a prune scan matched.
+#[derive(Debug)]
+struct PruneDirEntry {
+    file_name: String,
+    bytes: u64,
+    directory: bool,
+}
+
+/// Statuses the destructive prune tier may remove (SPEC §26).
+const fn prune_removable_status(status: MachineStatus) -> bool {
+    matches!(
+        status,
+        MachineStatus::Stopped | MachineStatus::Created | MachineStatus::Failed
+    )
+}
+
+fn add_counted(counted: &mut BTreeMap<String, u64>, name: &str, bytes: u64) {
+    let total = counted.entry(name.to_owned()).or_default();
+    *total = total.saturating_add(bytes);
+}
+
+fn machine_directory_exists(paths: &Paths, name: &str) -> Result<bool, FirestoneError> {
+    let Ok(machine_dir) = paths.machine_dir(name) else {
+        return Ok(false);
+    };
+    match fs::symlink_metadata(&machine_dir) {
+        Ok(_) => Ok(true),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(filesystem_error(
+            ErrorKind::Dependency,
+            format!("cannot inspect machine directory {}", machine_dir.display()),
+            "check the machine directory permissions",
+            source,
+        )),
+    }
+}
+
+/// Matched entries of one directory, measured and sorted by name.
+///
+/// A missing directory yields nothing. Symlinks are never followed and never
+/// matched: prune only ever deletes real Firestone-owned artifacts.
+fn read_prune_entries(
+    directory: &Path,
+    matches: impl Fn(&str) -> bool,
+) -> Result<Vec<(PathBuf, PruneDirEntry)>, FirestoneError> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(filesystem_error(
+                ErrorKind::Dependency,
+                format!("cannot read directory {}", directory.display()),
+                "check the Firestone data directory permissions",
+                source,
+            ));
+        }
+    };
+    let mut matched = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| {
+            filesystem_error(
+                ErrorKind::Dependency,
+                format!("cannot read directory {}", directory.display()),
+                "check the Firestone data directory permissions",
+                source,
+            )
+        })?;
+        let Ok(file_name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !matches(&file_name) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|source| {
+            filesystem_error(
+                ErrorKind::Dependency,
+                format!("cannot inspect {}", path.display()),
+                "check the Firestone data directory permissions",
+                source,
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        let directory_entry = metadata.is_dir();
+        if !directory_entry && !metadata.is_file() {
+            continue;
+        }
+        let bytes = if directory_entry {
+            allocated_tree_bytes(&path)?
+        } else {
+            allocated_metadata_bytes(&metadata)
+        };
+        matched.push((
+            path,
+            PruneDirEntry {
+                file_name,
+                bytes,
+                directory: directory_entry,
+            },
+        ));
+    }
+    matched.sort_by(|(_, left), (_, right)| left.file_name.cmp(&right.file_name));
+    Ok(matched)
+}
+
+/// Bytes one owned regular file occupies, or none when it does not exist.
+fn owned_regular_file_bytes(path: &Path) -> Result<Option<u64>, FirestoneError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            Ok(Some(allocated_metadata_bytes(&metadata)))
+        }
+        Ok(_) => Ok(None),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(filesystem_error(
+            ErrorKind::Dependency,
+            format!("cannot inspect {}", path.display()),
+            "check the Firestone data directory permissions",
+            source,
+        )),
+    }
+}
+
+/// Deletes one planned regular file, refusing anything else in its place.
+fn remove_owned_prune_file(path: &Path) -> Result<(), FirestoneError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            fs::remove_file(path).map_err(|source| {
+                filesystem_error(
+                    ErrorKind::Generic,
+                    format!("cannot remove {}", path.display()),
+                    "remove the owned file and retry",
+                    source,
+                )
+            })
+        }
+        Ok(_) => Err(FirestoneError::new(
+            ErrorKind::Dependency,
+            format!(
+                "refusing to remove {}: it is not a regular file",
+                path.display()
+            ),
+        )
+        .with_hint("remove the symlink or special file manually and retry")),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(filesystem_error(
+            ErrorKind::Dependency,
+            format!("cannot inspect {}", path.display()),
+            "check the Firestone data directory permissions",
+            source,
+        )),
+    }
+}
+
+/// Bytes one metadata record's file occupies on disk, holes excluded.
+fn allocated_metadata_bytes(metadata: &fs::Metadata) -> u64 {
+    metadata.blocks().saturating_mul(512)
+}
+
+/// Bytes one directory tree occupies on disk, including the directories.
+///
+/// Symlinks are counted as their own inodes and never followed.
+fn allocated_tree_bytes(path: &Path) -> Result<u64, FirestoneError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(source) => {
+            return Err(filesystem_error(
+                ErrorKind::Dependency,
+                format!("cannot inspect {}", path.display()),
+                "check the Firestone data directory permissions",
+                source,
+            ));
+        }
+    };
+    let mut total = allocated_metadata_bytes(&metadata);
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Ok(total);
+    }
+    let entries = fs::read_dir(path).map_err(|source| {
+        filesystem_error(
+            ErrorKind::Dependency,
+            format!("cannot read directory {}", path.display()),
+            "check the Firestone data directory permissions",
+            source,
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| {
+            filesystem_error(
+                ErrorKind::Dependency,
+                format!("cannot read directory {}", path.display()),
+                "check the Firestone data directory permissions",
+                source,
+            )
+        })?;
+        total = total.saturating_add(allocated_tree_bytes(&entry.path())?);
+    }
+    Ok(total)
+}
+
+/// Opens one prune step and returns the instant it started.
+fn prune_step_start(
+    events: &mut dyn EventSink,
+    kind: PruneKind,
+    id: &str,
+) -> Result<Instant, FirestoneError> {
+    events.emit(Event::StepStart {
+        id: kind.as_str().into(),
+        label: id.to_owned(),
+    })?;
+    Ok(Instant::now())
+}
+
+/// Closes one prune step and returns the row it contributes to the result.
+fn prune_step_done(
+    events: &mut dyn EventSink,
+    kind: PruneKind,
+    id: String,
+    bytes: u64,
+    dry_run: bool,
+    started: Instant,
+) -> Result<PruneItem, FirestoneError> {
+    if dry_run {
+        events.emit(Event::StepSkip {
+            id: kind.as_str().into(),
+            reason: format!("dry run · {bytes} bytes"),
+        })?;
+    } else {
+        events.emit(Event::StepDone {
+            id: kind.as_str().into(),
+            detail: Some(format!("{bytes} bytes")),
+            elapsed_ms: elapsed_millis(started.elapsed()),
+        })?;
+    }
+    Ok(PruneItem { kind, id, bytes })
+}
+
+/// Reports one already-completed prune step as a start/finish pair.
+fn emit_prune_item(
+    events: &mut dyn EventSink,
+    kind: PruneKind,
+    id: String,
+    bytes: u64,
+    dry_run: bool,
+) -> Result<PruneItem, FirestoneError> {
+    let started = prune_step_start(events, kind, &id)?;
+    prune_step_done(events, kind, id, bytes, dry_run, started)
 }
 
 fn filesystem_error(
@@ -5124,6 +5834,275 @@ esac
         assert_eq!(reconciled.status, firestone_core::MachineStatus::Stopped);
         assert_eq!(reconciled.shim_pid, None);
         assert_eq!(reconciled.vmm_pid, None);
+        Ok(())
+    }
+
+    /// Extracts the terminal prune payload from one action's event stream.
+    fn prune_result(
+        events: &[Event],
+    ) -> Result<firestone_core::PruneResult, Box<dyn std::error::Error>> {
+        for event in events {
+            if let Event::Result { action, payload } = event
+                && action == "system-prune"
+            {
+                return Ok(serde_json::from_value(payload.clone())?);
+            }
+        }
+        Err("the prune action emitted no system-prune result".into())
+    }
+
+    fn prune_action(machines: bool, images: bool, force: bool, dry_run: bool) -> Action {
+        Action::SystemPrune {
+            machines,
+            images,
+            force,
+            dry_run,
+        }
+    }
+
+    /// Writes one of every inert artifact class into a fresh machine.
+    fn seed_prune_debris(paths: &Paths, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        write_owned(&paths.machine_console_previous_log(name)?, &[b'p'; 8192])?;
+        write_owned(&paths.machine_disk_partial(name)?, &[b'd'; 4096])?;
+        let snapshots = paths.machine_snapshots_dir(name)?;
+        firestone_core::ensure_snapshot_directory(&snapshots)?;
+        let partial = paths.machine_snapshot_partial_dir(name, "snap-20260902-123456")?;
+        firestone_core::ensure_snapshot_directory(&partial)?;
+        write_owned(&partial.join("metadata.json"), b"{}")?;
+        Ok(())
+    }
+
+    /// Creates one stale runtime directory whose machine no longer exists.
+    fn seed_ghost_runtime_dir(paths: &Paths, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = paths.ensure_machine_runtime_dir(name)?;
+        write_owned(&directory.join("shim.pid"), b"4242\n")?;
+        Ok(())
+    }
+
+    /// Answers `vmm.ping` on one machine's api socket so it reconciles running.
+    fn spawn_fake_ping(socket: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = std::os::unix::net::UnixListener::bind(socket)?;
+        thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            for _ in 0..64 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buffer = [0_u8; 1024];
+                let _ = stream.read(&mut buffer);
+                let body =
+                    br#"{"build_version":"v53.0","version":"53.0.0","pid":42,"features":["kvm"]}"#;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nServer: Cloud Hypervisor API\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+                let _ = stream.flush();
+            }
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn system_prune_dry_run_lists_exactly_what_the_act_removes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        firestone_core::block_on(create_machine(&dispatcher, "keep", MachineSpec::default()))?;
+        firestone_core::block_on(create_machine(&dispatcher, "old", MachineSpec::default()))?;
+        seed_prune_debris(&paths, "keep")?;
+        seed_ghost_runtime_dir(&paths, "ghost")?;
+        let tombstone = paths.machine_removal_dir("gone")?;
+        fs::create_dir_all(&tombstone)?;
+        fs::set_permissions(&tombstone, fs::Permissions::from_mode(0o700))?;
+        write_owned(&tombstone.join("state.json"), b"{}")?;
+        paths.ensure_owned_data_directory(&paths.images_dir(), "images directory", true)?;
+        let store_partial =
+            paths.image_file(&format!(".pull-{}.stored.partial", "b".repeat(64)))?;
+        write_owned(&store_partial, &[b'i'; 2048])?;
+
+        let mut events = Vec::new();
+        firestone_core::block_on(
+            dispatcher.run(prune_action(true, true, true, true), &mut events),
+        )?;
+        let planned = prune_result(&events)?;
+        assert!(planned.dry_run);
+        assert!(planned.reclaimed_bytes > 0);
+        assert_eq!(
+            planned
+                .removed
+                .iter()
+                .map(|item| (item.kind.to_string(), item.id.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("runtime".to_owned(), "ghost".to_owned()),
+                ("log".to_owned(), "keep/console.log.previous".to_owned()),
+                (
+                    "partial".to_owned(),
+                    "machines/keep/disk.qcow2.partial".to_owned()
+                ),
+                ("partial".to_owned(), "machines/.removing-gone".to_owned()),
+                (
+                    "snapshot-partial".to_owned(),
+                    "keep/snapshots/.partial-snap-20260902-123456".to_owned()
+                ),
+                (
+                    "partial".to_owned(),
+                    format!("images/.pull-{}.stored.partial", "b".repeat(64))
+                ),
+                ("machine".to_owned(), "keep".to_owned()),
+                ("machine".to_owned(), "old".to_owned()),
+            ]
+        );
+        // A dry run is a read: every artifact it named is still there.
+        assert!(store_partial.exists());
+        assert!(tombstone.exists());
+        assert!(paths.machine_dir("keep")?.exists());
+
+        events.clear();
+        firestone_core::block_on(
+            dispatcher.run(prune_action(true, true, true, false), &mut events),
+        )?;
+        let acted = prune_result(&events)?;
+        assert!(!acted.dry_run);
+        assert_eq!(acted.removed, planned.removed);
+        assert_eq!(acted.reclaimed_bytes, planned.reclaimed_bytes);
+        assert!(!store_partial.exists());
+        assert!(!tombstone.exists());
+        assert!(!paths.machine_dir("keep")?.exists());
+        assert!(!paths.machine_dir("old")?.exists());
+        assert!(!paths.machine_runtime_dir("ghost")?.exists());
+
+        // The second act finds nothing left and says so without failing.
+        events.clear();
+        firestone_core::block_on(
+            dispatcher.run(prune_action(true, true, true, false), &mut events),
+        )?;
+        let empty = prune_result(&events)?;
+        assert_eq!(empty.removed, Vec::new());
+        assert_eq!(empty.reclaimed_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn system_prune_machines_without_force_is_refused_before_anything_is_removed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        firestone_core::block_on(create_machine(&dispatcher, "old", MachineSpec::default()))?;
+        seed_prune_debris(&paths, "old")?;
+
+        let mut events = Vec::new();
+        let error = firestone_core::block_on(
+            dispatcher.run(prune_action(true, false, false, false), &mut events),
+        )
+        .err()
+        .ok_or("expected the destructive tier to require force")?;
+        assert_eq!(error.kind(), ErrorKind::Usage);
+        assert!(error.message().contains("force"), "{error}");
+        assert!(
+            error.hint().is_some_and(|hint| hint.contains("force")),
+            "{error:?}"
+        );
+        assert!(events.is_empty(), "{events:?}");
+        assert!(paths.machine_dir("old")?.exists());
+        assert!(paths.machine_console_previous_log("old")?.exists());
+
+        // The preview is exempt: it is the only way to see the tier's effect.
+        let mut events = Vec::new();
+        firestone_core::block_on(
+            dispatcher.run(prune_action(true, false, false, true), &mut events),
+        )?;
+        let planned = prune_result(&events)?;
+        assert!(
+            planned
+                .removed
+                .iter()
+                .any(|item| item.kind == firestone_core::PruneKind::Machine && item.id == "old")
+        );
+        assert!(paths.machine_dir("old")?.exists());
+        assert_eq!(
+            dispatcher.prune_confirmation_names()?,
+            vec!["old".to_owned()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn system_prune_keeps_a_running_machine_runtime_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        firestone_core::block_on(create_machine(&dispatcher, "live", MachineSpec::default()))?;
+        firestone_core::block_on(create_machine(&dispatcher, "idle", MachineSpec::default()))?;
+        let live_runtime = paths.ensure_machine_runtime_dir("live")?;
+        spawn_fake_ping(&paths.machine_api_socket("live")?)?;
+        let idle_runtime = paths.ensure_machine_runtime_dir("idle")?;
+        write_owned(&idle_runtime.join("shim.pid"), b"9\n")?;
+
+        let mut events = Vec::new();
+        firestone_core::block_on(
+            dispatcher.run(prune_action(false, false, false, false), &mut events),
+        )?;
+        let result = prune_result(&events)?;
+
+        let runtime_ids = result
+            .removed
+            .iter()
+            .filter(|item| item.kind == firestone_core::PruneKind::Runtime)
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(runtime_ids, vec!["idle".to_owned()]);
+        assert!(live_runtime.exists());
+        assert!(!idle_runtime.exists());
+        // Neither machine is a candidate without the destructive tier.
+        assert!(paths.machine_dir("live")?.exists());
+        assert!(paths.machine_dir("idle")?.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn system_prune_counts_allocated_bytes_once_per_artifact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        firestone_core::block_on(create_machine(&dispatcher, "sized", MachineSpec::default()))?;
+        let previous = paths.machine_console_previous_log("sized")?;
+        write_owned(&previous, &[b'p'; 8192])?;
+        let expected_log_bytes = fs::symlink_metadata(&previous)?
+            .blocks()
+            .saturating_mul(512);
+        let machine_bytes = super::allocated_tree_bytes(&paths.machine_dir("sized")?)?;
+
+        let mut events = Vec::new();
+        firestone_core::block_on(
+            dispatcher.run(prune_action(true, false, true, true), &mut events),
+        )?;
+        let result = prune_result(&events)?;
+
+        let log = result
+            .removed
+            .iter()
+            .find(|item| item.kind == firestone_core::PruneKind::Log)
+            .ok_or("expected the rotated console log to be reported")?;
+        assert_eq!(log.bytes, expected_log_bytes);
+        assert!(log.bytes >= 8192, "{log:?}");
+        let machine = result
+            .removed
+            .iter()
+            .find(|item| item.kind == firestone_core::PruneKind::Machine)
+            .ok_or("expected the machine to be reported")?;
+        // The rotated log is charged to its own row, never to the machine's.
+        assert_eq!(
+            machine.bytes,
+            machine_bytes.saturating_sub(expected_log_bytes)
+        );
+        assert_eq!(
+            result.reclaimed_bytes,
+            result
+                .removed
+                .iter()
+                .fold(0_u64, |total, item| total + item.bytes)
+        );
+        assert_eq!(result.reclaimed_bytes, machine_bytes);
         Ok(())
     }
 

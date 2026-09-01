@@ -1310,6 +1310,7 @@ Global flags on every command: `--json` (NDJSON events on stdout, human output o
 | `metrics NAME` | one cumulative resource sample for a running machine (§25) |
 | `catalog` | deterministic table of the merged built-in and user catalog, including aliases, effective firmware, and available architectures |
 | `images ls` / `images pull REF [--sha256 HEX]` / `images inspect ID` / `images rm ID [--force]` / `images prune` | image management; `--sha256` is valid only for an HTTPS URL |
+| `system prune [--machines] [--images] [--all] [--force] [--dry-run]` | reclaim Firestone's own storage; inert artifacts by default, `--machines` is destructive and confirmed (§26) |
 | `doctor [--fix]` | diagnose host; `--fix` downloads vendorable binaries and prints the rest |
 | `serve [--listen unix:PATH|tcp:HOST:PORT] [--token FILE]` | REST listener; a TCP listener must be loopback and must carry a token |
 | `ui [--port PORT] [--no-open] [--print-url]` | serve the web UI on an ephemeral loopback port with a per-invocation session token, and open a browser |
@@ -1424,9 +1425,9 @@ The server holds no state and takes the same machine locks as the CLI. `curl --u
 
 The server holds no state and takes the same machine locks as the CLI. `curl --unix-socket … http://firestone/v1/machines` is the smoke test.
 
-[`docs/openapi.json`](docs/openapi.json) is the dependency-free OpenAPI 3.1 contract for the existing routes. It records exact request and response schemas, Unix-socket transport, aggregation and stream framing, limits, statuses, nullability, and examples. It is a static artifact, not a runtime endpoint. A behavior-level test parses it and compares its 27 explicitly authored operations with the configured axum router; axum's synthesized `HEAD` handling for `GET` remains framework behavior rather than a separately authored Firestone operation.
-[`docs/openapi.json`](docs/openapi.json) is the dependency-free OpenAPI 3.1 contract for the existing routes. It records exact request and response schemas, Unix-socket transport, aggregation and stream framing, limits, statuses, nullability, and examples. It is a static artifact, not a runtime endpoint. A behavior-level test parses it and compares its 27 explicitly authored operations with the configured axum router; axum's synthesized `HEAD` handling for `GET` remains framework behavior rather than a separately authored Firestone operation.
-[`docs/openapi.json`](docs/openapi.json) is the dependency-free OpenAPI 3.1 contract for the existing routes. It records exact request and response schemas, Unix-socket transport, aggregation and stream framing, limits, statuses, nullability, and examples. It is a static artifact, not a runtime endpoint. A behavior-level test parses it and compares its 27 explicitly authored operations with the configured axum router; axum's synthesized `HEAD` handling for `GET` remains framework behavior rather than a separately authored Firestone operation.
+[`docs/openapi.json`](docs/openapi.json) is the dependency-free OpenAPI 3.1 contract for the existing routes. It records exact request and response schemas, Unix-socket transport, aggregation and stream framing, limits, statuses, nullability, and examples. It is a static artifact, not a runtime endpoint. A behavior-level test parses it and compares its 28 explicitly authored operations with the configured axum router; axum's synthesized `HEAD` handling for `GET` remains framework behavior rather than a separately authored Firestone operation.
+[`docs/openapi.json`](docs/openapi.json) is the dependency-free OpenAPI 3.1 contract for the existing routes. It records exact request and response schemas, Unix-socket transport, aggregation and stream framing, limits, statuses, nullability, and examples. It is a static artifact, not a runtime endpoint. A behavior-level test parses it and compares its 28 explicitly authored operations with the configured axum router; axum's synthesized `HEAD` handling for `GET` remains framework behavior rather than a separately authored Firestone operation.
+[`docs/openapi.json`](docs/openapi.json) is the dependency-free OpenAPI 3.1 contract for the existing routes. It records exact request and response schemas, Unix-socket transport, aggregation and stream framing, limits, statuses, nullability, and examples. It is a static artifact, not a runtime endpoint. A behavior-level test parses it and compares its 28 explicitly authored operations with the configured axum router; axum's synthesized `HEAD` handling for `GET` remains framework behavior rather than a separately authored Firestone operation.
 
 ### 16.2 Routes
 
@@ -1459,6 +1460,7 @@ The server holds no state and takes the same machine locks as the CLI. `curl --u
 | POST | `/v1/images/pull` | `{ref, sha256?}` | event stream → `Result` |
 | DELETE | `/v1/images/{id}?force=` | | 204 |
 | POST | `/v1/images/prune` | | `{removed, bytes_freed}` |
+| POST | `/v1/system/prune` | `{machines?, images?, force?, dry_run?}` | event stream → `Result {dry_run, reclaimed_bytes, removed}` (§26); `machines` without `force` is a `usage` error unless `dry_run` |
 
 The user's example holds: `POST /v1/machines/ubuntu/start` returns the same events the CLI shows, ending in `{"type":"Result",…}`, and `GET /v1/machines` then reports `running`.
 
@@ -1757,6 +1759,8 @@ Do these in the first milestone, against the pinned versions, and record results
 
 | Decision | Chosen | Alternatives considered | Why |
 |---|---|---|---|
+| System prune safety ladder | Three tiers with one rule each: inert artifacts always, `--images` for unreferenced bases, and `--machines` as the only destructive tier, gated on an interactive confirmation that names the machines or on an explicit `--force` / `"force": true`. `--dry-run` is exempt from the gate. Tiers run in ladder order, so a machine removed by tier 2 does not release its image until the next prune | one `--force` that unlocks everything; a `--yes`-only gate with no per-tier flag; making `--images` destructive enough to need confirmation too; running the machine tier first so one call reclaims the most; letting REST infer intent from a `force` query parameter | A prune that can delete a machine is a different operation from a prune that deletes debris, and one flag for both would mean every future artifact class inherits the strongest permission anyone ever granted. Naming the machines in the prompt is the part that makes the confirmation mean something — a bare "are you sure" teaches people to type `y`. The gate exempts `--dry-run` because a preview that already needs the destructive permission is not a preview; it is the thing it was supposed to protect against. Ladder order is what makes dry-run parity reachable at all: machines-first would let a real run cascade into images a dry run could not have predicted, and a prune whose preview understates itself is worse than no preview. |
+| System prune byte accounting and parity | The whole plan — every path and every byte count, measured as allocated blocks before deletion — is built before the first deletion, and `--dry-run` returns that plan unchanged; a byte inside a machine directory is counted by exactly one row | measure sizes as each artifact is deleted; report apparent size; recompute the list independently for the dry-run path; report only a grand total | Two code paths for "what would happen" and "what happened" diverge the first time either is edited, so parity has to be structural rather than tested into existence. Apparent size would tell someone a sparse 20G overlay frees 20G and then free 2G, which is exactly the lie a prune must not tell. Counting a rotated console log both as its own row and inside its machine's row would inflate the total by whatever the inert tier already reclaimed. |
 | Direct kernel boot selection | The pinned image decides: the sidecar's `kind` (`disk` by default, so version-one sidecars are untouched) drives one branch in payload resolution that ignores the firmware policy, emits `payload.cmdline` as a skip-if-absent field, and swaps the pinned firmware artifact for the pinned kernel in the same locked publisher slot. The §9.5 overlay boundary adds exactly one check — a `cmdline` added to a firmware machine — because the existing required-subset invariant already rejects changing or removing `payload.cmdline` and removing `payload.kernel` | a `boot = "direct"` machine-spec key; a second `Firmware::DirectKernel` variant; always emitting `payload.cmdline` and accepting new `vm.create` bytes for every machine; a separate installer for non-executable artifacts; an explicit allowlist of every payload pointer | Boot mode is a fact about the image, not a user preference: deriving it from the sidecar means an OCI machine cannot be misconfigured into a firmware boot and a disk machine cannot accidentally request a kernel, and a spec key would have to be validated against the image anyway. Skipping the absent field keeps every existing machine's `vm.create` bytes and identity stable, which the §9.2 byte test pins. Reusing the firmware publisher gives the kernel the same lock, no-follow, exact hash, fsync, and no-replace guarantees for free, with mode 0644 coming from the manifest's own executable classification. |
 | OCI registry auth and transport scope | One `HttpSource` seam shared with the image pull path, extended with request headers and an unmapped status code; anonymous Bearer with exactly one token fetch and one retry per request; static Basic credentials from `auths` only, sent over HTTPS only; every authentication failure reported as kind `dependency`; plain HTTP only for a literal `images.insecure_registries` entry, and a plain-HTTP token realm only when it stays on that same allow-listed host and port | a second reqwest client stack for the registry; credential helpers and `identitytoken`; a new `permission` error kind; a cached token reused across requests; an HTTPS-to-HTTP fallback when TLS fails | A second client would mean a second set of timeouts, redirect rules, and size caps to keep in sync, and the pull path's discipline is exactly what a registry read needs. §15.5 and §15.6 define no `permission` kind and adding one would change every exit-code and REST error mapping, so the closest honest kind is `dependency`, whose hint can still name `docker login`. Helpers execute arbitrary binaries for credentials, which a bounded read-only client should not do. One token per request keeps the flow auditable and bounded — no token lifetime tracking, no silent reuse across scopes — and no fallback path means a downgrade can only ever come from an entry a human wrote down. |
 | Snapshot restore scope | Whole-machine rollback: `disk.qcow2`, `firestone.toml` and `vmconfig.json` are all replaced from the snapshot, and the shim verifies the republished VmConfig byte for byte against the snapshot's before it restores | restore the disk only; restore the disk plus the spec but re-derive the VmConfig; store a diff of the spec | A disk captured under one configuration is not restorable into another: the snapshot's `config.json` bakes absolute paths for the disk, seed, `net.sock`, `vsock.sock` and the serial file, and a resumed guest expects exactly the devices it was paused with. Byte equality is the cheapest check that proves it, and it fails loudly before Cloud Hypervisor is spawned instead of producing a VM that is subtly not the one that was captured. |
@@ -2211,6 +2215,64 @@ Cloud Hypervisor writes `memory-ranges` with the guest's full RAM as its apparen
 ### 23.8 Cloud Hypervisor v53 facts these rules depend on
 
 `vm.pause`, `vm.resume`, `vm.snapshot` and `vm.restore` are all `PUT` and all answer `204` with no body. `vm.snapshot` takes `{"destination_url": "file:///abs/dir"}` and requires the directory to exist. `vm.restore` takes `{"source_url": "file:///abs/dir", "prefault": bool}` and leaves the VM paused. Snapshot output is `config.json`, `state.json` and a sparse `memory-ranges`. The serial file is truncated on restore. vhost-user networking restores against a fresh `passt` on the same socket path, started before the restore.
+
+---
+
+## 26. System prune (normative)
+
+`firestone system prune` reclaims disk space that Firestone itself is holding. It never touches anything Firestone did not create, and it is arranged as a ladder: the default scope cannot destroy work, and each flag above it says out loud what it adds.
+
+Surfaces:
+
+- CLI: `firestone system prune [--machines] [--images] [--all] [--force] [--dry-run]`, where `--all` is exactly `--machines --images`.
+- REST: `POST /v1/system/prune` with the optional body `{"machines": bool?, "images": bool?, "force": bool?, "dry_run": bool?}`, streaming NDJSON like every other action route.
+- Action: `Action::SystemPrune { machines, images, force, dry_run }` → `PruneResult { dry_run, reclaimed_bytes, removed: [{kind, id, bytes}] }`.
+
+`firestone images prune` is unchanged and remains the way to prune only the image store.
+
+### 26.1 The ladder (normative)
+
+**Tier 0 — inert artifacts. Always removed, no flag, no confirmation.** These are artifacts whose only possible content is debris from an interrupted or completed operation:
+
+- **`runtime`** — a per-machine runtime directory under the runtime root whose machine's reconciled status is not `starting`, `running`, or `stopping`, or whose machine no longer exists at all. A directory whose machine exists but is not readable as a complete machine (a half-finished `create`) is left alone.
+- **`log`** — a machine's rotated `console.log.previous`. The live `console.log` is never touched.
+- **`partial`** — an unfinished `.partial` artifact directly inside a machine directory, an unfinished `.pull-<digest>.{source,stored}.partial` in the image store, and an orphaned `.removing-<name>` machine directory an interrupted `rm` left behind.
+- **`snapshot-partial`** — an unfinished `.partial-<snapshot>` or `.removing-<snapshot>` directory under a machine's `snapshots/`. A published snapshot is never touched; only its own `snapshot rm` removes one.
+
+Inside Firestone's own directories a leading dot is reserved for Firestone's working entries — `.partial`, `.removing-`, `.creating`, `.lock`. Prune therefore never treats a dot-prefixed entry as a machine, even when it still holds a complete machine directory.
+
+**Tier 1 — `--images` / `"images": true`.** Additionally removes every stored base image that nothing references, using the same extended reference set `images rm` and `images prune` refuse to break: a machine's pinned `state.json` image *and* every published snapshot's `metadata.json` image (§23). An image referenced by either survives.
+
+**Tier 2 — `--machines` / `"machines": true`.** The only destructive tier. It removes every machine whose reconciled status is `stopped`, `created`, or `failed`, with its disk, spec, snapshots, and logs, exactly as `firestone rm` does. A machine that is `starting`, `running`, or `stopping` is never a candidate.
+
+The destructive tier is gated on explicit approval:
+
+- The CLI, on an interactive terminal and without `--force` or `--yes`, prints the exact machine names it would remove and asks for confirmation. Declining is an error and removes nothing. Without a terminal, `--force` or `--yes` is required.
+- REST requires `"machines": true` **and** `"force": true`. A request with `"machines": true` and no `"force"` is refused with a `usage` error naming `force`, before anything is inspected or removed.
+- `--dry-run` is exempt from the gate, because it removes nothing and is the only way to see what the tier would do before authorizing it.
+
+### 26.2 Dry run and ordering (normative)
+
+`--dry-run` / `"dry_run": true` produces the same `removed` list, with the same `kind`, `id`, and `bytes` for every row, and the same `reclaimed_bytes`, that a real run against the same starting state produces — and deletes nothing. This is a hard requirement, not a best effort: the whole plan is built, and every byte count measured, before the first deletion, so both modes read the same filesystem state.
+
+Two ordering rules make that parity reachable:
+
+- The tiers run in ladder order: inert, then images, then machines. A machine removed by tier 2 therefore does **not** release its base image within the same call; the image becomes prunable on the next prune. Doing it the other way would make a real run reclaim more than its own dry run reported.
+- Bytes are counted once. An inert artifact inside a machine directory is reported as its own row, and the `machine` row for that same machine reports the rest of the directory.
+
+`bytes` is the space the artifact actually occupies on disk — allocated blocks, not apparent size — measured immediately before deletion, so a sparse overlay is not reported as its virtual size. `reclaimed_bytes` is the sum of the rows.
+
+`id` identifies the artifact within its `kind`: a machine name for `runtime` and `machine`, a stored image id for `image`, and a path relative to the data directory for `partial`, or relative to the machines directory for `log` and `snapshot-partial`.
+
+### 26.3 Safety (normative)
+
+- Every deletion goes through the same validated helpers `rm` and `images rm` use. Nothing is deleted through a bare recursive removal of an unvalidated path: a tree is refused unless every entry in it is owned by the Firestone uid, is a regular file or a mode-0700 directory, and is not a symbolic link.
+- Symbolic links are never followed and never removed.
+- Liveness is re-checked under the machine's own lock immediately before a runtime directory is removed. A machine that started between the plan and the act is skipped with a `StepSkip`, not removed and not reported. The machine tier removes through the same path `rm` does, which refuses a machine that became active while the lock was taken.
+- A snapshot working directory is removed under the machine's `snapshots/.lock`, and an orphaned removal directory under the machine lock, so a concurrent snapshot or removal cannot be interleaved.
+- The image store is measured and mutated behind its own store lock.
+
+Each removed artifact is one `StepStart` / `StepDone` pair carrying its byte count; a dry run reports `StepStart` / `StepSkip` instead.
 
 ---
 

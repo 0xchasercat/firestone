@@ -64,8 +64,8 @@ pub use event::{Event, Level, StepId, Unit};
 pub use image::{
     ImageInspection, ImageKind, ImageMetadata, ImageMetadataVersion, ImagePruneResult,
     ImagePullRequest, ImageRemoveResult, ImageSourceLocation, ImageStore, ImageVerification,
-    OverlayInfo, PreparedMachineImage, PulledImage, ResolvedImageSource, StoredImage,
-    disk_shrink_error, overlay_virtual_size,
+    OverlayInfo, PreparedMachineImage, PrunedImageArtifact, PulledImage, ResolvedImageSource,
+    StoredImage, disk_shrink_error, overlay_virtual_size,
 };
 pub use lock::MachineLock;
 pub use metrics::{
@@ -95,6 +95,7 @@ pub use result::{
     SpecWarningPayload, SshConfigResult, StartResult, StopResult, VersionDependency,
     VersionIdentity, VersionPaths, VersionResult,
 };
+pub use result::{PruneItem, PruneKind, PruneResult};
 pub use result::{
     SnapshotListResult, SnapshotRemoveResult, SnapshotRestoreResult, SnapshotResult,
     SnapshotSummary,

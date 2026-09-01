@@ -131,6 +131,50 @@ pub enum Command {
 
     /// Capture, list, restore, and remove machine snapshots.
     Snapshot(SnapshotArgs),
+
+    /// Inspect and reclaim host-wide Firestone storage.
+    System(SystemArgs),
+}
+
+/// Arguments accepted by firestone system.
+#[derive(Debug, Args)]
+pub struct SystemArgs {
+    #[command(subcommand)]
+    pub command: SystemCommand,
+}
+
+/// Host-wide maintenance commands.
+#[derive(Debug, Subcommand)]
+pub enum SystemCommand {
+    /// Reclaim disk space held by Firestone's own artifacts.
+    Prune(SystemPruneArgs),
+}
+
+/// Arguments accepted by firestone system prune.
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Without flags, prune removes only inert artifacts: stale runtime directories,\nrotated console logs, unfinished .partial artifacts, and orphaned removal\ndirectories.\n\n--images additionally removes base images no machine and no snapshot\nreferences. --machines is destructive: it removes every machine that is\nstopped, created, or failed, and needs an interactive confirmation or --force."
+)]
+pub struct SystemPruneArgs {
+    /// Also remove machines that are stopped, created, or failed.
+    #[arg(long)]
+    pub machines: bool,
+
+    /// Also remove base images nothing references.
+    #[arg(long)]
+    pub images: bool,
+
+    /// Shorthand for --machines --images.
+    #[arg(long)]
+    pub all: bool,
+
+    /// Approve the destructive machine tier without a prompt.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Report what would be removed without removing anything.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// Arguments accepted by firestone snapshot.
@@ -1390,6 +1434,49 @@ mod tests {
             prune.command,
             Command::Images(arguments) if matches!(arguments.command, ImageCommand::Prune)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn system_prune_parses_every_tier_flag_and_defaults_to_inert_scope() -> Result<(), clap::Error>
+    {
+        let bare = Cli::try_parse_from(["firestone", "system", "prune"])?;
+        match bare.command {
+            Command::System(arguments) => {
+                let crate::cli::SystemCommand::Prune(arguments) = arguments.command;
+                assert!(!arguments.machines);
+                assert!(!arguments.images);
+                assert!(!arguments.all);
+                assert!(!arguments.force);
+                assert!(!arguments.dry_run);
+            }
+            _ => panic!("expected system command"),
+        }
+
+        let every = Cli::try_parse_from([
+            "firestone",
+            "system",
+            "prune",
+            "--machines",
+            "--images",
+            "--all",
+            "--force",
+            "--dry-run",
+        ])?;
+        match every.command {
+            Command::System(arguments) => {
+                let crate::cli::SystemCommand::Prune(arguments) = arguments.command;
+                assert!(arguments.machines);
+                assert!(arguments.images);
+                assert!(arguments.all);
+                assert!(arguments.force);
+                assert!(arguments.dry_run);
+            }
+            _ => panic!("expected system command"),
+        }
+
+        assert!(Cli::try_parse_from(["firestone", "system"]).is_err());
+        assert!(Cli::try_parse_from(["firestone", "system", "prune", "extra"]).is_err());
         Ok(())
     }
 

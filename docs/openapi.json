@@ -21,7 +21,7 @@
   "tags": [
     {
       "name": "System",
-      "description": "Build identity and inspect-only host diagnostics."
+      "description": "Build identity, inspect-only host diagnostics, and host-wide storage reclamation."
     },
     {
       "name": "Machines",
@@ -1837,6 +1837,98 @@
             "$ref": "#/components/parameters/SnapshotName"
           }
         ]
+      }
+    },
+    "/v1/system/prune": {
+      "post": {
+        "tags": [
+          "System"
+        ],
+        "operationId": "pruneSystem",
+        "summary": "Reclaim Firestone storage",
+        "description": "Removes Firestone's own reclaimable artifacts. With no body, and with every member false, only inert artifacts are removed: stale per-machine runtime directories of machines that are not starting, running, or stopping, rotated console.log.previous files, unfinished .partial artifacts in the image store and machine directories, orphaned machine removal directories, and unfinished snapshot directories. images additionally removes stored base images that neither a machine state nor a snapshot metadata document references. machines is the only destructive tier and requires force unless dry_run is true; without it the request is refused with a usage error naming force. The images tier is evaluated against the reference set as it stands when the prune starts, so a machine removed in the same call does not release its image until the next prune. dry_run reports the same removed list and reclaimed_bytes without deleting anything.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PruneSystemRequest"
+              },
+              "examples": {
+                "default": {
+                  "$ref": "#/components/examples/PruneSystemRequest"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Per-artifact progress and the terminal prune result.",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string",
+                  "description": "LF-delimited compact JSON records. Progress records arrive as produced. Success ends with exactly one typed Result record; a dispatcher failure after progress ends with one ErrorEnvelope record under HTTP 200.",
+                  "x-ndjson-item-schema": {
+                    "oneOf": [
+                      {
+                        "$ref": "#/components/schemas/NonTerminalEvent"
+                      },
+                      {
+                        "$ref": "#/components/schemas/PruneResultEvent"
+                      },
+                      {
+                        "$ref": "#/components/schemas/ErrorEnvelope"
+                      }
+                    ]
+                  },
+                  "x-firestone-terminal-records": [
+                    "PruneResultEvent",
+                    "ErrorEnvelope"
+                  ]
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/PruneSystemNdjson"
+                  }
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PruneDispatchOutput"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/PruneSystemAggregate"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/ActionError400"
+          },
+          "404": {
+            "$ref": "#/components/responses/ActionError404"
+          },
+          "409": {
+            "$ref": "#/components/responses/ActionError409"
+          },
+          "500": {
+            "$ref": "#/components/responses/ActionError500"
+          },
+          "502": {
+            "$ref": "#/components/responses/ActionError502"
+          },
+          "503": {
+            "$ref": "#/components/responses/ActionError503"
+          },
+          "504": {
+            "$ref": "#/components/responses/ActionError504"
+          }
+        },
+        "x-firestone-aggregation-accept": "application/json"
       }
     }
   },
@@ -3669,7 +3761,7 @@
           },
           "image_pending": {
             "type": "boolean",
-            "description": "The spec's image reference, resolved through the catalog by the §8.2 rules, names an image other than the one this running machine booted. Catalog aliases and default references resolve first, so a machine created as 'ubuntu' and running 'ubuntu:24.04' is not pending. Always false unless the machine is running."
+            "description": "The spec's image reference, resolved through the catalog by the \u00a78.2 rules, names an image other than the one this running machine booted. Catalog aliases and default references resolve first, so a machine created as 'ubuntu' and running 'ubuntu:24.04' is not pending. Always false unless the machine is running."
           }
         },
         "additionalProperties": false,
@@ -5846,6 +5938,145 @@
           "events",
           "result"
         ]
+      },
+      "PruneSystemRequest": {
+        "type": "object",
+        "properties": {
+          "machines": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Also remove machines whose reconciled status is stopped, created, or failed. This is the only destructive tier: unless dry_run is true it requires force to be true as well, and is otherwise refused with a usage error naming force."
+          },
+          "images": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Also remove stored base images that no machine state and no snapshot metadata references."
+          },
+          "force": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Explicit approval for the destructive machines tier."
+          },
+          "dry_run": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Report the same removed list without deleting anything."
+          }
+        },
+        "additionalProperties": false,
+        "description": "Optional JSON body. An absent body is the same as {}."
+      },
+      "PruneKind": {
+        "type": "string",
+        "enum": [
+          "runtime",
+          "log",
+          "partial",
+          "snapshot-partial",
+          "image",
+          "machine"
+        ],
+        "description": "Artifact class of one prune row. runtime is a stale per-machine runtime directory, log a rotated console.log.previous, partial an unfinished .partial or .removing- artifact, snapshot-partial an unfinished snapshot directory, image an unreferenced stored base image, machine a whole removed machine."
+      },
+      "PruneItem": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/PruneKind"
+          },
+          "id": {
+            "type": "string",
+            "description": "Machine name for runtime and machine rows, stored image id for image rows, and a data-directory relative path otherwise."
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "Bytes the artifact occupied, measured before deletion."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "id",
+          "bytes"
+        ]
+      },
+      "PruneResult": {
+        "type": "object",
+        "properties": {
+          "dry_run": {
+            "type": "boolean",
+            "description": "True when nothing was deleted."
+          },
+          "reclaimed_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "Sum of every row's bytes."
+          },
+          "removed": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PruneItem"
+            }
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "dry_run",
+          "reclaimed_bytes",
+          "removed"
+        ]
+      },
+      "PruneResultEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "Result"
+          },
+          "action": {
+            "type": "string",
+            "const": "system-prune"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/PruneResult"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "action",
+          "payload"
+        ]
+      },
+      "PruneDispatchOutput": {
+        "type": "object",
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NonTerminalEvent"
+            }
+          },
+          "result": {
+            "$ref": "#/components/schemas/PruneResultEvent"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "events",
+          "result"
+        ]
       }
     },
     "parameters": {
@@ -7077,6 +7308,63 @@
               "name": "dev",
               "snapshot": "before-upgrade",
               "started": false
+            }
+          }
+        }
+      },
+      "PruneSystemRequest": {
+        "value": {
+          "images": true,
+          "dry_run": true
+        }
+      },
+      "PruneSystemNdjson": {
+        "value": "{\"type\":\"StepStart\",\"id\":\"log\",\"label\":\"dev/console.log.previous\"}\n{\"type\":\"StepDone\",\"id\":\"log\",\"detail\":\"8192 bytes\",\"elapsed_ms\":1}\n{\"type\":\"StepStart\",\"id\":\"image\",\"label\":\"image-9f2c1d4b7a5e6038c1d4b7a5e60389f2c1d4b7a5e60389f2c1d4b7a5e60389f2\"}\n{\"type\":\"StepDone\",\"id\":\"image\",\"detail\":\"681574400 bytes\",\"elapsed_ms\":34}\n{\"type\":\"Result\",\"action\":\"system-prune\",\"payload\":{\"dry_run\":false,\"reclaimed_bytes\":681582592,\"removed\":[{\"kind\":\"log\",\"id\":\"dev/console.log.previous\",\"bytes\":8192},{\"kind\":\"image\",\"id\":\"image-9f2c1d4b7a5e6038c1d4b7a5e60389f2c1d4b7a5e60389f2c1d4b7a5e60389f2\",\"bytes\":681574400}]}}\n"
+      },
+      "PruneSystemAggregate": {
+        "value": {
+          "events": [
+            {
+              "type": "StepStart",
+              "id": "log",
+              "label": "dev/console.log.previous"
+            },
+            {
+              "type": "StepDone",
+              "id": "log",
+              "detail": "8192 bytes",
+              "elapsed_ms": 1
+            },
+            {
+              "type": "StepStart",
+              "id": "image",
+              "label": "image-9f2c1d4b7a5e6038c1d4b7a5e60389f2c1d4b7a5e60389f2c1d4b7a5e60389f2"
+            },
+            {
+              "type": "StepDone",
+              "id": "image",
+              "detail": "681574400 bytes",
+              "elapsed_ms": 34
+            }
+          ],
+          "result": {
+            "type": "Result",
+            "action": "system-prune",
+            "payload": {
+              "dry_run": false,
+              "reclaimed_bytes": 681582592,
+              "removed": [
+                {
+                  "kind": "log",
+                  "id": "dev/console.log.previous",
+                  "bytes": 8192
+                },
+                {
+                  "kind": "image",
+                  "id": "image-9f2c1d4b7a5e6038c1d4b7a5e60389f2c1d4b7a5e60389f2c1d4b7a5e60389f2",
+                  "bytes": 681574400
+                }
+              ]
             }
           }
         }

@@ -154,6 +154,7 @@ define_rest_routes! {
     "/v1/machines/{name}/snapshots" => get(machine_snapshots).post(create_machine_snapshot);
     "/v1/machines/{name}/snapshots/{snapshot}/restore" => post(restore_machine_snapshot);
     "/v1/machines/{name}/snapshots/{snapshot}" => delete(remove_machine_snapshot);
+    "/v1/system/prune" => post(prune_system);
 }
 
 /// Builds the complete v1 REST router over the shared action dispatcher.
@@ -271,6 +272,16 @@ struct RestoreSnapshotBody {
     force: Option<bool>,
     start: Option<bool>,
     timeout_s: Option<u64>,
+}
+
+/// Optional JSON body of `POST /v1/system/prune` (SPEC §26).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct PruneSystemBody {
+    machines: Option<bool>,
+    images: Option<bool>,
+    force: Option<bool>,
+    dry_run: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -706,6 +717,26 @@ async fn prune_images(State(state): State<ApiState>, request: Request<Body>) -> 
         return error_response(error);
     }
     payload_response(&state, Action::ImagePrune, "images-prune", StatusCode::OK).await
+}
+
+async fn prune_system(State(state): State<ApiState>, request: Request<Body>) -> Response {
+    let aggregate = accepts_json(request.headers());
+    let body = match parse_optional_json::<PruneSystemBody>(request, "prune system").await {
+        Ok(body) => body,
+        Err(error) => return error_response(error),
+    };
+    action_response(
+        &state,
+        Action::SystemPrune {
+            machines: body.machines.unwrap_or(false),
+            images: body.images.unwrap_or(false),
+            force: body.force.unwrap_or(false),
+            dry_run: body.dry_run.unwrap_or(false),
+        },
+        "system-prune",
+        aggregate,
+    )
+    .await
 }
 
 async fn payload_response(
