@@ -431,6 +431,31 @@ impl Paths {
         checked_join(&self.machine_seed_dir(name)?, "seed file name", file_name)
     }
 
+    /// The `firestone-init` config disk of an OCI machine (SPEC §10.5).
+    ///
+    /// It occupies the same `disks[1]` slot as `seed.img` does for a
+    /// firmware machine; exactly one of the two exists per machine.
+    pub fn machine_config_image(&self, name: &str) -> Result<PathBuf, FirestoneError> {
+        Ok(self.machine_dir(name)?.join("config.img"))
+    }
+
+    /// The inspection copy of the config document, beside the disk it framed.
+    pub fn machine_config_dir(&self, name: &str) -> Result<PathBuf, FirestoneError> {
+        Ok(self.machine_dir(name)?.join("config"))
+    }
+
+    pub fn machine_config_file(
+        &self,
+        name: &str,
+        file_name: &str,
+    ) -> Result<PathBuf, FirestoneError> {
+        checked_join(
+            &self.machine_config_dir(name)?,
+            "config file name",
+            file_name,
+        )
+    }
+
     pub fn machine_user_data(&self, name: &str) -> Result<PathBuf, FirestoneError> {
         Ok(self.machine_dir(name)?.join("user-data.yaml"))
     }

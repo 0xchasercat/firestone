@@ -80,6 +80,12 @@ pub enum InternalHelper {
     CloudHypervisor,
     Passt,
     QemuImg,
+    /// The guest PID 1 injected into a packed OCI rootfs (SPEC §10.5, §17.2).
+    ///
+    /// Unlike the other three this is a Firestone-owned build artifact, not a
+    /// third-party download, and it is never materialized into `<data>/bin`:
+    /// its only consumer is the rootfs injection of §8.5.
+    FirestoneInit,
 }
 
 impl InternalHelper {
@@ -89,6 +95,7 @@ impl InternalHelper {
             Self::CloudHypervisor => "cloud-hypervisor",
             Self::Passt => "passt",
             Self::QemuImg => "qemu-img",
+            Self::FirestoneInit => "firestone-init",
         }
     }
 
@@ -160,7 +167,36 @@ pub const fn embedded_helper(kind: InternalHelper) -> Option<EmbeddedHelper> {
         InternalHelper::CloudHypervisor => BUILD_EMBEDDED_CLOUD_HYPERVISOR,
         InternalHelper::Passt => BUILD_EMBEDDED_PASST,
         InternalHelper::QemuImg => BUILD_EMBEDDED_QEMU_IMG,
+        InternalHelper::FirestoneInit => BUILD_EMBEDDED_FIRESTONE_INIT,
     }
+}
+
+/// Returns the verified `firestone-init` payload for rootfs injection (§8.5).
+///
+/// The payload is not published into `<data>/bin` like the other helpers: the
+/// pull pipeline writes these bytes straight into the merged tar at
+/// `/sbin/firestone-init`, so the only check that applies is the embedded
+/// checksum. A build with no payload — every development build until the
+/// standalone `firestone-init` release is pinned in `deps.toml` (§17.2) —
+/// returns a `dependency` error that names it.
+///
+/// # Errors
+///
+/// Returns `dependency` when this build carries no payload, and `checksum` when
+/// the embedded bytes do not match the hash recorded at build time.
+pub fn firestone_init_payload() -> Result<&'static [u8], FirestoneError> {
+    let helper = embedded_helper(InternalHelper::FirestoneInit).ok_or_else(|| {
+        FirestoneError::new(
+            ErrorKind::Dependency,
+            "this build carries no embedded firestone-init payload",
+        )
+        .with_hint(
+            "OCI machines need the guest init: use an x86_64 standalone release, or build the \
+             `firestone-init` release asset and pin it in deps.toml",
+        )
+    })?;
+    verify_payload(helper)?;
+    Ok(helper.bytes())
 }
 
 /// Materializes one embedded helper and returns its stable versioned path.
@@ -507,6 +543,31 @@ mod tests {
         );
         assert_eq!(InternalHelper::Passt.dependency(), "passt");
         assert_eq!(InternalHelper::QemuImg.dependency(), "qemu-img");
+        assert_eq!(InternalHelper::FirestoneInit.dependency(), "firestone-init");
+    }
+
+    /// SPEC §10.5/§17.2. Until the standalone `firestone-init` release is built
+    /// and pinned, every development build answers the injection feed with one
+    /// actionable dependency error rather than an empty or silent payload.
+    #[test]
+    fn firestone_init_payload_without_an_embedded_release_reports_the_dependency() {
+        match super::firestone_init_payload() {
+            Ok(bytes) => {
+                // A standalone release build does carry the payload; when it
+                // does, it must be non-empty and hash-verified (which
+                // `firestone_init_payload` already checked).
+                assert!(!bytes.is_empty());
+            }
+            Err(error) => {
+                assert_eq!(error.kind(), ErrorKind::Dependency);
+                assert_eq!(
+                    error.message(),
+                    "this build carries no embedded firestone-init payload"
+                );
+                let hint = error.hint().unwrap_or_default();
+                assert!(hint.contains("deps.toml"), "{hint}");
+            }
+        }
     }
 
     #[test]

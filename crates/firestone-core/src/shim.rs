@@ -53,13 +53,13 @@ use crate::{
     Arch, Cmd, ConsoleBroker, DependencyManifest, ErrorInfo, ErrorKind, Event, EventSink,
     ExitReason, FirestoneError, ImageStore, InternalHelper, LastExit, MachineLock, MachineSpec,
     MachineState, MachineStatus, ManagedProcess, NetMode, NetworkPlan, NetworkPlanOptions, Paths,
-    ProcessSignal, RealValidationHost, StateStore, StepId, VirtiofsPlan, VirtiofsReadinessPlan,
-    VirtiofsSandbox, VmConfigInput, VmState, VmmApi, VmmApiLivenessProbe, VmmPingProbe, atomic,
-    embedded_helper, ensure_ssh_identity, invalidate_known_hosts_for_seed,
+    PreparedMachineImage, ProcessSignal, RealValidationHost, StateStore, StepId, VirtiofsPlan,
+    VirtiofsReadinessPlan, VirtiofsSandbox, VmConfigInput, VmState, VmmApi, VmmApiLivenessProbe,
+    VmmPingProbe, atomic, embedded_helper, ensure_ssh_identity, invalidate_known_hosts_for_seed,
     materialize_embedded_helper, network::NetworkPlanSnapshot, prepare_network,
-    prepare_virtiofs_plans_with_readiness, publish_seed_with_sshd_path, publish_vm_config,
-    resolve_verified_apparmor_passt, virtiofs::VirtiofsPlanSnapshot,
-    vmm::selected_pinned_boot_artifact,
+    prepare_virtiofs_plans_with_readiness, publish_init_config, publish_seed_with_sshd_path,
+    publish_vm_config, render_init_config, resolve_verified_apparmor_passt,
+    virtiofs::VirtiofsPlanSnapshot, vmm::selected_pinned_boot_artifact,
 };
 
 const PLAN_VERSION: u32 = 2;
@@ -844,6 +844,119 @@ struct StatusResponse<'a> {
     degraded: &'a [String],
 }
 
+/// What step 4 of §9.3 published into the `disks[1]` slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedBootInput {
+    /// The instance identity now recorded in `state.json`.
+    pub identity: String,
+    /// Whether the disk's bytes are new for this machine.
+    pub rewritten: bool,
+}
+
+/// Publishes the cloud-init seed or the `firestone-init` config disk (§10.5).
+///
+/// The branch is a property of the pinned image, exactly like the boot payload
+/// of §9.5: an `oci` sidecar publishes `config.img`, everything else publishes
+/// `seed.img`. Both fill the same `disks[1]` slot, so the disk count never
+/// changes, and both keep the `seed` step id of §9.3.
+///
+/// # Errors
+///
+/// Returns a filesystem error when the machine directory cannot be written, and
+/// `dependency` when an OCI image carries no runtime configuration to render.
+pub fn publish_boot_input(
+    paths: &Paths,
+    name: &str,
+    spec: &MachineSpec,
+    prepared_image: &PreparedMachineImage,
+    state: &mut MachineState,
+    events: &mut dyn EventSink,
+) -> Result<PublishedBootInput, FirestoneError> {
+    let metadata = &prepared_image.image.metadata;
+    let previous_instance_id = state.instance_id.clone();
+
+    if metadata.kind.is_oci() {
+        events.emit(Event::StepStart {
+            id: StepId::from("seed"),
+            label: "render firestone-init config disk".to_owned(),
+        })?;
+        let sidecar = metadata.oci.as_ref().ok_or_else(|| {
+            FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "image `{}` carries no OCI runtime configuration",
+                    metadata.id
+                ),
+            )
+            .with_hint(format!(
+                "pull the image again so its sidecar records the entrypoint: `firestone images pull {}`",
+                metadata.source_ref
+            ))
+        })?;
+        let existed = paths
+            .machine_config_image(name)?
+            .try_exists()
+            .map_err(|source| {
+                filesystem_error(
+                    ErrorKind::Generic,
+                    format!("cannot inspect machine {name} config disk"),
+                    source,
+                )
+            })?;
+        let config = render_init_config(name, spec, &sidecar.runtime_config(), &[]);
+        let published = publish_init_config(paths, name, &config)?;
+        let rewritten =
+            !existed || previous_instance_id.as_deref() != Some(published.identity.as_str());
+        state.instance_id = Some(published.identity.clone());
+        events.emit(Event::StepDone {
+            id: StepId::from("seed"),
+            detail: Some(format!("config {}", published.identity)),
+            elapsed_ms: 0,
+        })?;
+        return Ok(PublishedBootInput {
+            identity: published.identity,
+            rewritten,
+        });
+    }
+
+    events.emit(Event::StepStart {
+        id: StepId::from("seed"),
+        label: "render cloud-init seed".to_owned(),
+    })?;
+    if spec.cloud_init.provisioning {
+        ensure_ssh_identity(paths)?;
+    }
+    let existed = paths
+        .machine_seed_image(name)?
+        .try_exists()
+        .map_err(|source| {
+            filesystem_error(
+                ErrorKind::Generic,
+                format!("cannot inspect machine {name} cloud-init seed"),
+                source,
+            )
+        })?;
+    let rendered = publish_seed_with_sshd_path(paths, name, spec, &metadata.sshd_path)?;
+    invalidate_known_hosts_for_seed(
+        paths,
+        name,
+        previous_instance_id.as_deref(),
+        &rendered.instance_id,
+    )?;
+    let rewritten =
+        !existed || previous_instance_id.as_deref() != Some(rendered.instance_id.as_str());
+    state.instance_id = Some(rendered.instance_id.clone());
+    events.emit(Event::StepDone {
+        id: StepId::from("seed"),
+        detail: Some(format!("instance {}", rendered.instance_id)),
+        elapsed_ms: 0,
+    })?;
+    Ok(PublishedBootInput {
+        identity: rendered.instance_id,
+        rewritten,
+    })
+}
+
 /// Composes the approved image, seed, and canonical VmConfig foundations.
 ///
 /// The caller holds the machine lock. This function leaves lifecycle status at
@@ -1001,48 +1114,16 @@ pub fn prepare_start(
             filesystem_readiness,
         )?;
 
-        events.emit(Event::StepStart {
-            id: StepId::from("seed"),
-            label: "render cloud-init seed".to_owned(),
-        })?;
-        if spec.cloud_init.provisioning {
-            ensure_ssh_identity(paths)?;
-        }
-        let seed_existed = paths
-            .machine_seed_image(name)?
-            .try_exists()
-            .map_err(|source| {
-                filesystem_error(
-                    ErrorKind::Generic,
-                    format!("cannot inspect machine {name} cloud-init seed"),
-                    source,
-                )
-            })?;
-        let previous_instance_id = state.instance_id.clone();
-        let rendered = publish_seed_with_sshd_path(
-            paths,
-            name,
-            spec,
-            &prepared_image.image.metadata.sshd_path,
-        )?;
-        invalidate_known_hosts_for_seed(
-            paths,
-            name,
-            previous_instance_id.as_deref(),
-            &rendered.instance_id,
-        )?;
-        let seed_rewritten =
-            !seed_existed || previous_instance_id.as_deref() != Some(rendered.instance_id.as_str());
-        if seed_rewritten {
+        // §9.3 step 4 fills the `disks[1]` slot. A firmware machine renders the
+        // cloud-init seed; an OCI machine renders the `firestone-init` config
+        // disk instead (§10.5). Both keep the step id, the "rewrite only when
+        // the bytes changed" rule, and the instance identity in `state.json`.
+        let boot_input =
+            publish_boot_input(paths, name, spec, &prepared_image, &mut state, events)?;
+        if boot_input.rewritten {
             timeouts.launch_request = timeouts.first_boot_launch_request;
             timeouts.launch_overall = timeouts.first_boot_launch_overall;
         }
-        state.instance_id = Some(rendered.instance_id.clone());
-        events.emit(Event::StepDone {
-            id: StepId::from("seed"),
-            detail: Some(format!("instance {}", rendered.instance_id)),
-            elapsed_ms: 0,
-        })?;
 
         // §9.5: an OCI machine publishes the pinned direct-boot kernel here
         // instead of a firmware; both go through the same locked publisher.
@@ -1112,7 +1193,7 @@ pub fn prepare_start(
             name: name.to_owned(),
             state,
             previous_status,
-            seed_rewritten,
+            seed_rewritten: boot_input.rewritten,
             timeout: timeouts.launch_overall,
             forwards,
             mounts,

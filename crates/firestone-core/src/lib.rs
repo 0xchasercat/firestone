@@ -14,6 +14,7 @@ pub mod embedded_helpers;
 pub mod error;
 pub mod event;
 pub mod image;
+pub mod initconfig;
 pub mod lock;
 pub mod metrics;
 pub mod network;
@@ -57,15 +58,20 @@ pub use doctor::{
     resolve_verified_apparmor_passt, run_doctor,
 };
 pub use embedded_helpers::{
-    EmbeddedHelper, InternalHelper, embedded_helper, materialize_embedded_helper,
+    EmbeddedHelper, InternalHelper, embedded_helper, firestone_init_payload,
+    materialize_embedded_helper,
 };
 pub use error::{ErrorInfo, ErrorKind, FirestoneError};
 pub use event::{Event, Level, StepId, Unit};
 pub use image::{
     ImageInspection, ImageKind, ImageMetadata, ImageMetadataVersion, ImagePruneResult,
     ImagePullRequest, ImageRemoveResult, ImageSourceLocation, ImageStore, ImageVerification,
-    OverlayInfo, PreparedMachineImage, PulledImage, ResolvedImageSource, StoredImage,
+    OciSidecar, OverlayInfo, PreparedMachineImage, PulledImage, ResolvedImageSource, StoredImage,
     disk_shrink_error, overlay_virtual_size,
+};
+pub use initconfig::{
+    PublishedInitConfig, build_config_disk, config_disk_identity, publish_init_config,
+    render_init_config,
 };
 pub use lock::MachineLock;
 pub use metrics::{
@@ -100,9 +106,9 @@ pub use result::{
     SnapshotSummary,
 };
 pub use shim::{
-    PreparedStart, ShimClient, ShimPids, ShimStatus, ShimTimeouts, cancel_prepared,
-    launch_prepared, launch_prepared_cancellable, prepare_start, recover_shim, run_shim,
-    stop_unsupervised,
+    PreparedStart, PublishedBootInput, ShimClient, ShimPids, ShimStatus, ShimTimeouts,
+    cancel_prepared, launch_prepared, launch_prepared_cancellable, prepare_start,
+    publish_boot_input, recover_shim, run_shim, stop_unsupervised,
 };
 pub use snapshot::{
     MAX_SNAPSHOT_NAME_BYTES, RestoreRequest, SNAPSHOT_DIR_MODE, SNAPSHOT_FILE_MODE,
