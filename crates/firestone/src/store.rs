@@ -4177,14 +4177,14 @@ esac
                     .dependencies
                     .get("passt")
                     .map(|value| value.sha256.as_str()),
-                Some("40e59201765c60a0a5bbd0f2caae1aae3fd8f9a9a0628a835159fb2f17ff7025")
+                Some("a60b0b5e54e6f48caa5984b0a6b21938a9e57ba2222cddb9c0ca021f10e9b10e")
             );
             assert_eq!(
                 result
                     .dependencies
                     .get("qemu-img")
                     .map(|value| value.sha256.as_str()),
-                Some("30bff329fe1001635cafcfebddc68a1c824d25110c66f968b428c4cf4785d75d")
+                Some("7d7f32b1f6861140a95c4daa31c013a888dcc02c04551136f05e7da519d7e0ed")
             );
         }
         let cloud_hypervisor = result
