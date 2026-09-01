@@ -1,0 +1,68 @@
+{# Live utilization for a running machine.
+
+   The server renders the frame and nothing else. Every number and every
+   sparkline point is written by app.js from two samples of
+   GET /v1/machines/{name}/metrics, because those counters are cumulative and
+   a rate is a difference, not a reading. Until two samples exist the strip
+   says so rather than drawing a line through one point.
+
+   The strip deliberately sits outside #fs-detail-live: that region is
+   repolled and swapped every five seconds, and a swap would throw away the
+   ring buffer the sparklines are drawn from. #}
+<div class="fs-metrics" data-fs-metrics="{{ machine.name }}" data-fs-collecting>
+  <div class="fs-metrics__head">
+    <span class="fs-metrics__title">Utilization</span>
+    <span class="fs-metrics__note" data-fs-metrics-note>collecting…</span>
+  </div>
+
+  <div class="fs-metrics__tiles">
+    <div class="fs-tile" data-fs-tile="cpu">
+      <div class="fs-tile__label">CPU</div>
+      <div class="fs-tile__value" data-fs-tile-value>—</div>
+      <div class="fs-tile__sub" data-fs-tile-sub>—</div>
+      <svg class="fs-spark" viewBox="0 0 100 28" preserveAspectRatio="none"
+           aria-hidden="true" focusable="false">
+        <polyline class="fs-spark__line" data-fs-spark="cpu" points=""></polyline>
+      </svg>
+    </div>
+
+    <div class="fs-tile" data-fs-tile="memory">
+      <div class="fs-tile__label">Memory</div>
+      <div class="fs-tile__value" data-fs-tile-value>—</div>
+      <div class="fs-tile__sub" data-fs-tile-sub>—</div>
+      <svg class="fs-meter" viewBox="0 0 100 4" preserveAspectRatio="none"
+           aria-hidden="true" focusable="false">
+        <rect class="fs-meter__fill" data-fs-meter x="0" y="0" width="0" height="4"></rect>
+      </svg>
+      <svg class="fs-spark" viewBox="0 0 100 28" preserveAspectRatio="none"
+           aria-hidden="true" focusable="false">
+        <polyline class="fs-spark__line" data-fs-spark="rss" points=""></polyline>
+      </svg>
+    </div>
+
+    <div class="fs-tile" data-fs-tile="guest">
+      <div class="fs-tile__label">Guest memory</div>
+      <div class="fs-tile__value" data-fs-tile-value>—</div>
+      <div class="fs-tile__sub" data-fs-tile-sub>—</div>
+      <svg class="fs-meter" viewBox="0 0 100 4" preserveAspectRatio="none"
+           aria-hidden="true" focusable="false">
+        <rect class="fs-meter__fill" data-fs-meter x="0" y="0" width="0" height="4"></rect>
+      </svg>
+      <svg class="fs-spark" viewBox="0 0 100 28" preserveAspectRatio="none"
+           aria-hidden="true" focusable="false">
+        <polyline class="fs-spark__line" data-fs-spark="guest" points=""></polyline>
+      </svg>
+    </div>
+
+    <div class="fs-tile" data-fs-tile="disk">
+      <div class="fs-tile__label">Disk I/O</div>
+      <div class="fs-tile__value fs-tile__value--pair" data-fs-tile-value>—</div>
+      <div class="fs-tile__sub" data-fs-tile-sub>—</div>
+      <svg class="fs-spark" viewBox="0 0 100 28" preserveAspectRatio="none"
+           aria-hidden="true" focusable="false">
+        <polyline class="fs-spark__line" data-fs-spark="read" points=""></polyline>
+        <polyline class="fs-spark__line fs-spark__line--alt" data-fs-spark="write" points=""></polyline>
+      </svg>
+    </div>
+  </div>
+</div>

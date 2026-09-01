@@ -60,6 +60,10 @@ const TEMPLATES: &[(&str, &str)] = &[
         include_str!("../../templates/ui/_detail_head.html"),
     ),
     (
+        "ui/_detail_metrics.html",
+        include_str!("../../templates/ui/_detail_metrics.html"),
+    ),
+    (
         "ui/tab_spec.html",
         include_str!("../../templates/ui/tab_spec.html"),
     ),

@@ -1126,6 +1126,10 @@
         state.fg = code - 90 + 8;
       } else if (code >= 100 && code <= 107) {
         state.bg = code - 100 + 8;
+      }
+    }
+  }
+
   /* ==========================================================================
    * SECTION: create-dialog field composition                        (M6-23)
    * ==========================================================================
@@ -1906,6 +1910,603 @@
       composeMounts(mountGroup);
     }
   });
+
+  /* ==========================================================================
+   * SECTION: live utilization                                        (M6-25)
+   * ==========================================================================
+   *
+   * `GET /v1/machines/{name}/metrics` is one sample of cumulative counters.
+   * Firestone runs no metrics daemon and stores no time series, so the rates a
+   * person actually wants — per cent of a vCPU, bytes per second off a disk —
+   * exist only as the difference between two samples. That difference is
+   * derived here, in the client, and the history lives in a 60-sample ring
+   * buffer in this tab. Nothing is persisted; reloading the page starts over,
+   * which is the honest consequence of not storing history on the host.
+   *
+   * Three rules run through the whole section:
+   *
+   *   - A `null` counter means *absent*, never zero. A device that does not
+   *     report `read_bytes` is left out of the sum instead of being counted as
+   *     idle, and a figure with no sample behind it renders as an em dash.
+   *   - A counter that goes backwards is a restarted VMM, not negative work.
+   *     That pair is dropped rather than drawn as a spike.
+   *   - No chart library. Every sparkline is a `<polyline>` whose `points`
+   *     attribute is written from a pure function, and every colour is a
+   *     class: the CSP has no 'unsafe-inline', so nothing here writes a style
+   *     attribute.
+   *
+   * The derivation functions take samples and return numbers. They touch no
+   * DOM, so they can be read — and tested — on their own.
+   */
+
+  /* Detail page cadence. Fast enough to feel live, slow enough that the poll
+   * itself is not what the machine is busy doing. */
+  var METRICS_DETAIL_MS = 3000;
+  /* Overview cadence, and the cap on how many rows poll at all. Eight running
+   * machines at five seconds is the bound on request fan-out from one glance
+   * at the overview; the rest of the fleet reports status only. */
+  var METRICS_OVERVIEW_MS = 5000;
+  var METRICS_OVERVIEW_CAP = 8;
+  /* Backoff after a 409 (the machine stopped) or a failed read. Polling keeps
+   * running slowly so a machine started again recovers on its own. */
+  var METRICS_IDLE_MS = 15000;
+  /* Ring-buffer depth: 60 samples is three minutes at the detail cadence. */
+  var METRICS_SAMPLES = 60;
+  /* Sparkline user units. The SVG scales to its box; these are only the
+   * coordinate space the points are written in. */
+  var SPARK_W = 100;
+  var SPARK_H = 28;
+  var METER_W = 100;
+
+  /* ----------------------------------------------------------- derivation -- */
+
+  /* A counter Firestone could not read is null in the payload and null here.
+   * Anything that is not a finite number is treated the same way. */
+  function metricsCounter(value) {
+    return typeof value === "number" && isFinite(value) ? value : null;
+  }
+
+  /* `sampled_at` is an RFC 3339 timestamp with nanosecond precision. The
+   * ECMAScript date grammar specifies exactly three fractional digits, so the
+   * tail is trimmed rather than left to a lenient parser; an unparseable
+   * timestamp falls back to when the response was read. */
+  function metricsTimestamp(text, fallbackMs) {
+    if (typeof text !== "string") {
+      return fallbackMs;
+    }
+    var parsed = Date.parse(text.replace(/(\.\d{3})\d+/, "$1"));
+    return isFinite(parsed) ? parsed : fallbackMs;
+  }
+
+  /* Normalizes one payload into the flat shape the derivations read. */
+  function metricsSample(payload, receivedMs) {
+    if (!payload || typeof payload !== "object") {
+      return null;
+    }
+    var cpu = payload.cpu || {};
+    var memory = payload.memory || {};
+    var block = Object.create(null);
+    var devices = Array.isArray(payload.block) ? payload.block : [];
+    for (var i = 0; i < devices.length; i++) {
+      var device = devices[i];
+      if (!device || typeof device.device !== "string") {
+        continue;
+      }
+      block[device.device] = {
+        read: metricsCounter(device.read_bytes),
+        written: metricsCounter(device.written_bytes)
+      };
+    }
+    return {
+      atMs: metricsTimestamp(payload.sampled_at, receivedMs),
+      vcpus: metricsCounter(cpu.vcpus),
+      cpuTimeNs: metricsCounter(cpu.cpu_time_ns),
+      rssBytes: metricsCounter(memory.rss_bytes),
+      allocatedBytes: metricsCounter(memory.allocated_bytes),
+      guestActualBytes: metricsCounter(memory.guest_actual_bytes),
+      block: block
+    };
+  }
+
+  /* Per cent of the machine's allocated vCPUs, from the VMM's cumulative
+   * processor time. Clamped to 0-100: the host may schedule the VMM's own
+   * threads beyond the guest's share, and a CPU meter reading 140% teaches the
+   * reader nothing. Null when either sample lacks the counter — which is every
+   * sample on a host without /proc. */
+  function metricsCpuPercent(previous, next) {
+    if (!previous || !next) {
+      return null;
+    }
+    if (previous.cpuTimeNs === null || next.cpuTimeNs === null) {
+      return null;
+    }
+    var elapsedNs = (next.atMs - previous.atMs) * 1e6;
+    if (!(elapsedNs > 0)) {
+      return null;
+    }
+    var delta = next.cpuTimeNs - previous.cpuTimeNs;
+    if (delta < 0) {
+      return null;
+    }
+    var vcpus = next.vcpus !== null && next.vcpus > 0 ? next.vcpus : 1;
+    return Math.max(0, Math.min(100, (delta / elapsedNs / vcpus) * 100));
+  }
+
+  /* Bytes per second summed over every block device that reported the counter
+   * in both samples. A device missing from either sample, or reporting null,
+   * contributes nothing and is not counted as zero; when no device qualifies
+   * the whole figure is absent. */
+  function metricsBlockRate(previous, next, key) {
+    if (!previous || !next) {
+      return null;
+    }
+    var seconds = (next.atMs - previous.atMs) / 1000;
+    if (!(seconds > 0)) {
+      return null;
+    }
+    var total = 0;
+    var seen = false;
+    for (var device in next.block) {
+      if (!Object.prototype.hasOwnProperty.call(next.block, device)) {
+        continue;
+      }
+      var before = previous.block[device];
+      var after = next.block[device];
+      if (!before || !after || before[key] === null || after[key] === null) {
+        continue;
+      }
+      var delta = after[key] - before[key];
+      if (delta < 0) {
+        continue;
+      }
+      total += delta;
+      seen = true;
+    }
+    return seen ? total / seconds : null;
+  }
+
+  /* Every series the tiles draw, derived from one ring buffer in one pass.
+   * Rates come from adjacent pairs, so a buffer of n samples yields at most
+   * n - 1 rate points; levels come from the samples themselves. */
+  function metricsSeries(samples) {
+    var series = { cpu: [], read: [], write: [], rss: [], guest: [] };
+    for (var i = 0; i < samples.length; i++) {
+      if (samples[i].rssBytes !== null) {
+        series.rss.push(samples[i].rssBytes);
+      }
+      if (samples[i].guestActualBytes !== null) {
+        series.guest.push(samples[i].guestActualBytes);
+      }
+      if (i === 0) {
+        continue;
+      }
+      var cpu = metricsCpuPercent(samples[i - 1], samples[i]);
+      if (cpu !== null) {
+        series.cpu.push(cpu);
+      }
+      var read = metricsBlockRate(samples[i - 1], samples[i], "read");
+      if (read !== null) {
+        series.read.push(read);
+      }
+      var written = metricsBlockRate(samples[i - 1], samples[i], "written");
+      if (written !== null) {
+        series.write.push(written);
+      }
+    }
+    return series;
+  }
+
+  /* Maps a series onto a polyline inside a w-by-h box, oldest point at the
+   * left. The scale is the series maximum unless `max` is given: CPU is always
+   * drawn against 0-100 so an idle machine reads as idle, while a byte rate
+   * has no natural ceiling and autoscales. An empty series draws nothing
+   * rather than a line along the floor. */
+  function sparklinePoints(series, w, h, max) {
+    if (!series || series.length === 0) {
+      return "";
+    }
+    var fixed = typeof max === "number" && isFinite(max);
+    var ceiling = fixed ? max : 0;
+    if (!fixed) {
+      for (var i = 0; i < series.length; i++) {
+        if (series[i] > ceiling) {
+          ceiling = series[i];
+        }
+      }
+    }
+    if (!(ceiling > 0)) {
+      ceiling = 1;
+    }
+    var span = series.length > 1 ? series.length - 1 : 1;
+    var points = [];
+    for (var j = 0; j < series.length; j++) {
+      var x = series.length > 1 ? (j / span) * w : 0;
+      var value = Math.max(0, Math.min(ceiling, series[j]));
+      points.push(sparkRound(x) + "," + sparkRound(h - (value / ceiling) * h));
+    }
+    return points.join(" ");
+  }
+
+  function sparkRound(value) {
+    return Math.round(value * 100) / 100;
+  }
+
+  function seriesMax(series) {
+    var max = 0;
+    for (var i = 0; i < series.length; i++) {
+      if (series[i] > max) {
+        max = series[i];
+      }
+    }
+    return max;
+  }
+
+  function lastOf(series) {
+    return series.length ? series[series.length - 1] : null;
+  }
+
+  /* --------------------------------------------------------- formatting -- */
+
+  /* Decimal units with one decimal below a hundred, which is exactly what
+   * `view.rs::format_bytes` prints for an image size. One convention for a
+   * byte count across the CLI, the REST payloads and this page. */
+  function formatByteSize(bytes) {
+    if (bytes === null || !isFinite(bytes)) {
+      return "—";
+    }
+    var units = [["GB", 1e9], ["MB", 1e6], ["kB", 1e3], ["B", 1]];
+    for (var i = 0; i < units.length; i++) {
+      var unit = units[i][0];
+      var scale = units[i][1];
+      if (bytes >= scale) {
+        var whole = Math.floor(bytes / scale);
+        if (unit === "B" || whole >= 100) {
+          return whole + " " + unit;
+        }
+        return whole + "." + Math.floor(((bytes % scale) * 10) / scale) + " " + unit;
+      }
+    }
+    return "0 B";
+  }
+
+  function formatRate(bytesPerSecond) {
+    return bytesPerSecond === null ? "—" : formatByteSize(bytesPerSecond) + "/s";
+  }
+
+  function formatPercent(value) {
+    return value === null ? "—" : value.toFixed(1) + "%";
+  }
+
+  /* ------------------------------------------------------------- polling -- */
+
+  /* One reading: either a sample, or the reason there is none. A 409 is the
+   * documented answer for a machine that is not running and is not an error. */
+  async function readMetrics(name) {
+    var response;
+    try {
+      response = await fetch(
+        "/v1/machines/" + encodeURIComponent(name) + "/metrics",
+        { headers: { Accept: "application/json" } }
+      );
+    } catch (error) {
+      return { state: "unavailable" };
+    }
+    if (response.status === 409) {
+      return { state: "idle" };
+    }
+    if (!response.ok) {
+      return { state: "unavailable" };
+    }
+    var payload;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      return { state: "unavailable" };
+    }
+    var sample = metricsSample(payload, Date.now());
+    return sample ? { state: "ok", sample: sample } : { state: "unavailable" };
+  }
+
+  function pushSample(samples, sample) {
+    samples.push(sample);
+    while (samples.length > METRICS_SAMPLES) {
+      samples.shift();
+    }
+  }
+
+  /* ------------------------------------------------------- detail strip -- */
+
+  var detailMetrics = null;
+
+  function stopDetailMetrics() {
+    if (!detailMetrics) {
+      return;
+    }
+    detailMetrics.stopped = true;
+    window.clearTimeout(detailMetrics.timer);
+    detailMetrics = null;
+  }
+
+  function startDetailMetrics(strip) {
+    stopDetailMetrics();
+    var session = {
+      name: strip.getAttribute("data-fs-metrics") || "",
+      node: strip,
+      samples: [],
+      timer: null,
+      stopped: false
+    };
+    detailMetrics = session;
+    tickDetailMetrics(session);
+  }
+
+  async function tickDetailMetrics(session) {
+    var reading = await readMetrics(session.name);
+    /* The page may have been swapped out while the request was in flight. */
+    if (session.stopped || !session.node.isConnected) {
+      return;
+    }
+
+    var delay = METRICS_DETAIL_MS;
+    if (reading.state === "ok") {
+      pushSample(session.samples, reading.sample);
+    } else {
+      /* A stopped machine has no counters to carry forward, and the next run
+       * is a new process whose counters start again from zero. */
+      session.samples.length = 0;
+      delay = METRICS_IDLE_MS;
+    }
+    renderDetailMetrics(session, reading.state);
+    session.timer = window.setTimeout(function () {
+      tickDetailMetrics(session);
+    }, delay);
+  }
+
+  function tileOf(strip, name) {
+    return qs('[data-fs-tile="' + name + '"]', strip);
+  }
+
+  function setTile(tile, value, sub) {
+    if (!tile) {
+      return;
+    }
+    var valueNode = qs("[data-fs-tile-value]", tile);
+    var subNode = qs("[data-fs-tile-sub]", tile);
+    if (valueNode) {
+      valueNode.textContent = value;
+    }
+    if (subNode) {
+      subNode.textContent = sub;
+    }
+  }
+
+  function setSpark(tile, key, series, max) {
+    if (!tile) {
+      return;
+    }
+    var line = qs('[data-fs-spark="' + key + '"]', tile);
+    if (line) {
+      line.setAttribute("points", sparklinePoints(series, SPARK_W, SPARK_H, max));
+    }
+  }
+
+  /* The meter is an SVG rect whose width is an attribute, not a style: the CSP
+   * forbids the latter in markup, and an attribute needs no exception. */
+  function setMeter(tile, used, total) {
+    if (!tile) {
+      return;
+    }
+    var fill = qs("[data-fs-meter]", tile);
+    if (!fill) {
+      return;
+    }
+    var fraction =
+      used === null || total === null || !(total > 0) ? 0 : used / total;
+    fill.setAttribute(
+      "width",
+      String(sparkRound(Math.max(0, Math.min(1, fraction)) * METER_W))
+    );
+  }
+
+  function renderDetailMetrics(session, state) {
+    var strip = session.node;
+    var samples = session.samples;
+    var latest = samples.length ? samples[samples.length - 1] : null;
+    var series = metricsSeries(samples);
+    var collecting = samples.length < 2;
+
+    strip.toggleAttribute("data-fs-collecting", collecting);
+    var note = qs("[data-fs-metrics-note]", strip);
+    if (note) {
+      if (state === "idle") {
+        note.textContent = "not running";
+      } else if (state === "unavailable") {
+        note.textContent = "metrics unavailable";
+      } else if (collecting) {
+        note.textContent = "collecting…";
+      } else {
+        note.textContent =
+          samples.length +
+          " samples · " +
+          METRICS_DETAIL_MS / 1000 +
+          " s poll · rates derived in this tab";
+      }
+    }
+
+    var cpuTile = tileOf(strip, "cpu");
+    var cpu = lastOf(series.cpu);
+    setTile(
+      cpuTile,
+      formatPercent(cpu),
+      latest === null
+        ? "—"
+        : latest.cpuTimeNs === null
+          ? "vmm cpu time unavailable on this host"
+          : (latest.vcpus === null ? "?" : latest.vcpus) + " vCPU allocated"
+    );
+    setSpark(cpuTile, "cpu", series.cpu, 100);
+
+    var memoryTile = tileOf(strip, "memory");
+    var rss = latest ? latest.rssBytes : null;
+    var allocated = latest ? latest.allocatedBytes : null;
+    setTile(
+      memoryTile,
+      formatByteSize(rss),
+      rss === null
+        ? "vmm rss unavailable on this host"
+        : "of " + formatByteSize(allocated) + " allocated"
+    );
+    setSpark(memoryTile, "rss", series.rss);
+    setMeter(memoryTile, rss, allocated);
+
+    var guestTile = tileOf(strip, "guest");
+    var guest = latest ? latest.guestActualBytes : null;
+    setTile(
+      guestTile,
+      formatByteSize(guest),
+      guest === null
+        ? "the guest reports no balloon figure"
+        : "of " + formatByteSize(allocated) + " allocated"
+    );
+    setSpark(guestTile, "guest", series.guest);
+    setMeter(guestTile, guest, allocated);
+
+    var diskTile = tileOf(strip, "disk");
+    var read = lastOf(series.read);
+    var write = lastOf(series.write);
+    setTile(
+      diskTile,
+      formatRate(read) + " / " + formatRate(write),
+      "read / write · summed over every block device"
+    );
+    var diskMax = Math.max(seriesMax(series.read), seriesMax(series.write));
+    setSpark(diskTile, "read", series.read, diskMax);
+    setSpark(diskTile, "write", series.write, diskMax);
+  }
+
+  /* ---------------------------------------------------- overview figures -- */
+
+  /* The overview panel is repolled by htmx every five seconds and morphed in
+   * place, which would revert any text written here. The last figure per
+   * machine is therefore kept and re-applied after every swap. */
+  var overviewMetrics = {
+    timer: null,
+    previous: Object.create(null),
+    text: Object.create(null)
+  };
+
+  function overviewCpuCells() {
+    return Array.prototype.slice.call(
+      document.querySelectorAll("[data-fs-cpu]")
+    );
+  }
+
+  function stopOverviewMetrics() {
+    window.clearTimeout(overviewMetrics.timer);
+    overviewMetrics.timer = null;
+  }
+
+  function paintOverviewMetrics() {
+    overviewCpuCells().forEach(function (cell) {
+      var name = cell.getAttribute("data-fs-cpu");
+      var text = overviewMetrics.text[name];
+      if (text) {
+        cell.textContent = text;
+      }
+    });
+  }
+
+  async function tickOverviewMetrics() {
+    var names = overviewCpuCells()
+      .map(function (cell) {
+        return cell.getAttribute("data-fs-cpu");
+      })
+      .filter(function (name) {
+        return !!name;
+      })
+      .slice(0, METRICS_OVERVIEW_CAP);
+
+    await Promise.all(
+      names.map(async function (name) {
+        var reading = await readMetrics(name);
+        if (reading.state !== "ok") {
+          delete overviewMetrics.previous[name];
+          delete overviewMetrics.text[name];
+          return;
+        }
+        var previous = overviewMetrics.previous[name];
+        overviewMetrics.previous[name] = reading.sample;
+        var cpu = metricsCpuPercent(previous, reading.sample);
+        if (cpu !== null) {
+          overviewMetrics.text[name] = formatPercent(cpu) + " cpu";
+        }
+      })
+    );
+
+    paintOverviewMetrics();
+    if (overviewMetrics.timer !== null) {
+      overviewMetrics.timer = window.setTimeout(
+        tickOverviewMetrics,
+        METRICS_OVERVIEW_MS
+      );
+    }
+  }
+
+  function startOverviewMetrics() {
+    if (overviewMetrics.timer !== null) {
+      return;
+    }
+    /* A placeholder id so a tick that finishes before the first timeout is
+     * scheduled still knows the poller is meant to be running. */
+    overviewMetrics.timer = -1;
+    tickOverviewMetrics();
+  }
+
+  /* ----------------------------------------------------------- lifecycle -- */
+
+  /* The same hooks the log follower uses: htmx owns navigation, so a swap is
+   * the only event that tells this page it is looking at something else. */
+  function syncMetricsState() {
+    var strip = qs("[data-fs-metrics]");
+    if (!strip) {
+      stopDetailMetrics();
+    } else if (!detailMetrics || detailMetrics.node !== strip) {
+      startDetailMetrics(strip);
+    }
+
+    if (overviewCpuCells().length === 0) {
+      stopOverviewMetrics();
+    } else {
+      paintOverviewMetrics();
+      startOverviewMetrics();
+    }
+  }
+
+  document.body.addEventListener("htmx:beforeSwap", function (event) {
+    var strip = qs("[data-fs-metrics]");
+    if (strip && event.detail.target.contains(strip)) {
+      stopDetailMetrics();
+    }
+  });
+
+  document.body.addEventListener("htmx:afterSwap", syncMetricsState);
+  document.addEventListener("DOMContentLoaded", syncMetricsState);
+  window.addEventListener("beforeunload", function () {
+    stopDetailMetrics();
+    stopOverviewMetrics();
+  });
+
+  /* Exposed so the derivations can be exercised in isolation; nothing else
+   * reads them. */
+  window.firestoneMetrics = {
+    metricsSample: metricsSample,
+    metricsCpuPercent: metricsCpuPercent,
+    metricsBlockRate: metricsBlockRate,
+    metricsSeries: metricsSeries,
+    sparklinePoints: sparklinePoints,
+    formatByteSize: formatByteSize,
+    formatRate: formatRate
+  };
 })();
 
 /* Provisioning section (M6-27).

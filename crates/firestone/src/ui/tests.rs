@@ -1233,3 +1233,142 @@ async fn the_detail_spec_reports_cloud_init_by_shape_and_never_by_value() -> Tes
     assert!(empty.contains("unset"), "an unset password must say so");
     Ok(())
 }
+
+// -------------------------------------------------------- live utilization --
+
+#[tokio::test]
+async fn the_metrics_strip_renders_only_for_a_running_machine() -> TestResult {
+    let running = app(FakeDispatcher::default())?;
+    let (_, _, body) = get(&running, "/machines/web").await?;
+    assert!(
+        body.contains(r#"data-fs-metrics="web""#),
+        "a running machine has no utilization strip"
+    );
+
+    for status in ["stopped", "created", "failed", "starting"] {
+        let router = app(FakeDispatcher {
+            machine: machine_view("web", status),
+            ..FakeDispatcher::default()
+        })?;
+        let (_, _, page) = get(&router, "/machines/web").await?;
+        assert!(
+            !page.contains("data-fs-metrics="),
+            "a {status} machine must not poll for metrics"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_metrics_strip_ships_an_empty_state_and_no_fabricated_numbers() -> TestResult {
+    // Counters are cumulative, so a rate needs two samples. Until the client
+    // holds two, the server renders the frame and nothing that could be read
+    // as a measurement.
+    let router = app(FakeDispatcher::default())?;
+    let (_, _, body) = get(&router, "/machines/web").await?;
+
+    assert!(body.contains("data-fs-collecting"), "no empty state");
+    assert!(
+        body.contains("collecting…"),
+        "the empty state is unlabelled"
+    );
+    for tile in ["cpu", "memory", "guest", "disk"] {
+        assert!(
+            body.contains(&format!(r#"data-fs-tile="{tile}""#)),
+            "the {tile} tile is missing"
+        );
+    }
+    // Every sparkline starts empty and every meter at zero width: a point the
+    // client has not derived is never drawn by the server.
+    assert!(body.contains(r#"data-fs-spark="cpu" points="""#));
+    assert!(body.contains(r#"data-fs-meter x="0" y="0" width="0""#));
+    // Every figure is an em dash until the client derives one.
+    assert_eq!(
+        body.matches("data-fs-tile-value>—<").count(),
+        4,
+        "the server rendered a utilization figure it did not measure"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_metrics_strip_sits_outside_the_polled_detail_region() -> TestResult {
+    // `#fs-detail-live` is swapped every five seconds. The strip must not be
+    // inside it, or each poll would throw away the client's ring buffer.
+    let router = app(FakeDispatcher::default())?;
+    let (_, _, detail) = get(&router, "/machines/web").await?;
+
+    let strip = detail
+        .find("data-fs-metrics=")
+        .ok_or("the running machine rendered no utilization strip")?;
+    let tabs = detail
+        .find(r#"class="fs-tabs""#)
+        .ok_or("the detail page rendered no tabs")?;
+    let live = detail
+        .find(r#"id="fs-detail-live""#)
+        .ok_or("the detail page rendered no live region")?;
+    assert!(strip > live, "the strip must follow the live region");
+    assert!(strip < tabs, "the strip must precede the tabs");
+
+    let (_, _, head) = get_fragment(&router, "/ui/machines/web/head").await?;
+    assert!(
+        !head.contains("data-fs-metrics="),
+        "the polled head fragment must not carry the strip"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_overview_polls_utilization_for_running_rows_only() -> TestResult {
+    let router = app(FakeDispatcher::default())?;
+    let (_, _, body) = get_fragment(&router, "/ui/overview/machines").await?;
+
+    assert!(body.contains(r#"data-fs-cpu="web""#), "no poll attribute");
+    assert!(
+        !body.contains(r#"data-fs-cpu="staging-db""#),
+        "a stopped machine must not be polled"
+    );
+    assert!(
+        !body.contains(r#"data-fs-cpu="mid-flight""#),
+        "a starting machine has no counters to read"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_overview_caps_how_many_rows_poll_for_metrics() -> TestResult {
+    // Every polling row is one request every five seconds against the very
+    // host the numbers describe, so the fan-out is bounded rather than
+    // proportional to the fleet.
+    let fleet: Vec<Value> = (0..12)
+        .map(|index| {
+            json!({
+                "name": format!("node-{index:02}"),
+                "status": "running",
+                "image": "ubuntu:24.04",
+                "cpus": 2,
+                "memory": "2G",
+                "uptime": "1m",
+                "forwards": []
+            })
+        })
+        .collect();
+    let router = app(FakeDispatcher {
+        machines: Value::Array(fleet),
+        ..FakeDispatcher::default()
+    })?;
+
+    let (_, _, body) = get_fragment(&router, "/ui/overview/machines").await?;
+    assert_eq!(
+        body.matches("data-fs-cpu=").count(),
+        super::view::OVERVIEW_METRICS_CAP,
+        "the poll fan-out is not capped"
+    );
+    // The cap reads the list in order, so the same rows poll on every refresh.
+    assert!(body.contains(r#"data-fs-cpu="node-00""#));
+    assert!(body.contains(r#"data-fs-cpu="node-07""#));
+    assert!(!body.contains(r#"data-fs-cpu="node-08""#));
+    // Every machine still has a row; only the utilization figure is capped.
+    assert!(body.contains("node-11"), "a machine was dropped by the cap");
+    Ok(())
+}
