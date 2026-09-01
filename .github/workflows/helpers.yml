@@ -40,6 +40,7 @@ jobs:
           scripts/fetch-helper-inputs.sh
           scripts/pin-deps.sh
           build/helpers/build-in-container.sh
+          build/helpers/tests/test-build-scripts.sh
       - name: Run helper recipe tests
         run: build/helpers/tests/test-build-scripts.sh
 
@@ -67,6 +68,8 @@ jobs:
             'passt 2025_02_17.a1e48a0'
           test "$("$output/qemu-img" --version | sed -n '1p')" = \
             'qemu-img version 8.2.2'
+          test "$("$output/mkfs.ext4" -V 2>&1 | sed -n '1p')" = \
+            'mke2fs 1.47.3 (8-Jul-2025)'
 
           smoke="$RUNNER_TEMP/passt-smoke"
           mkdir "$smoke"
@@ -109,4 +112,30 @@ jobs:
             cat "$smoke/passt.stderr"
           fi
           trap - EXIT
+
+          mkfs_smoke="$RUNNER_TEMP/mkfs-smoke"
+          mkdir -p "$mkfs_smoke/tree/dir"
+          printf 'firestone\n' >"$mkfs_smoke/tree/dir/file.txt"
+          ln -s dir/file.txt "$mkfs_smoke/tree/link"
+          ln "$mkfs_smoke/tree/dir/file.txt" "$mkfs_smoke/tree/hard"
+          sudo mknod "$mkfs_smoke/tree/dev-null" c 1 3
+          chmod 0741 "$mkfs_smoke/tree/dir/file.txt"
+          sudo chown 12345:12345 "$mkfs_smoke/tree/dir/file.txt"
+          sudo tar --numeric-owner --sort=name --format=gnu --mtime=@1739777376 \
+            -cf "$mkfs_smoke/layer.tar" -C "$mkfs_smoke/tree" .
+          "$output/mkfs.ext4" -F -t ext4 -d "$mkfs_smoke/layer.tar" -b 4096 \
+            "$mkfs_smoke/out.img" 64M
+          debugfs_bin=$(command -v debugfs || printf '%s\n' /usr/sbin/debugfs)
+          "$debugfs_bin" -R 'stat dir/file.txt' "$mkfs_smoke/out.img" \
+            >"$mkfs_smoke/file.stat" 2>/dev/null
+          "$debugfs_bin" -R 'stat link' "$mkfs_smoke/out.img" \
+            >"$mkfs_smoke/link.stat" 2>/dev/null
+          "$debugfs_bin" -R 'stat dev-null' "$mkfs_smoke/out.img" \
+            >"$mkfs_smoke/device.stat" 2>/dev/null
+          grep -Eq 'Type: regular[[:space:]]+Mode:[[:space:]]+0741' "$mkfs_smoke/file.stat"
+          grep -Eq 'User:[[:space:]]+12345[[:space:]]+Group:[[:space:]]+12345' "$mkfs_smoke/file.stat"
+          grep -Eq 'Links:[[:space:]]+2' "$mkfs_smoke/file.stat"
+          grep -Fq 'Fast link dest: "dir/file.txt"' "$mkfs_smoke/link.stat"
+          grep -Fq 'Device major/minor number: 01:03' "$mkfs_smoke/device.stat"
+
           cat "$output/helpers.build-info"

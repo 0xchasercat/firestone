@@ -61,8 +61,8 @@ check_lock() {
     [[ $count -eq $expected_count ]] || fail "$lock has $count entries, expected $expected_count"
 }
 
-check_lock "$recipe_root/packages.lock" 91
-check_lock "$recipe_root/sources.lock" 16
+check_lock "$recipe_root/packages.lock" 110
+check_lock "$recipe_root/sources.lock" 25
 grep -F "$PASST_SOURCE_SHA256  $PASST_SOURCE_ASSET  https://github.com/0xchasercat/firestone/releases/download/helpers-v0.1.0-firestone.1/" "$recipe_root/sources.lock" >/dev/null
 aports_mirror_count=$(grep -cF "  https://github.com/0xchasercat/firestone/releases/download/helpers-v0.1.0-firestone.1/aports-" "$recipe_root/sources.lock")
 [[ $aports_mirror_count -eq 6 ]] || fail "expected six pinned aports release mirrors"
@@ -70,6 +70,44 @@ if grep -F "https://gitlab.alpinelinux.org/" "$recipe_root/sources.lock" >/dev/n
     fail "unpinned GitLab aports endpoint remains in the source lock"
 fi
 grep -F "$QEMU_SOURCE_SHA256  $QEMU_SOURCE_ASSET  https://download.qemu.org/" "$recipe_root/sources.lock" >/dev/null
+grep -F "$E2FSPROGS_SOURCE_SHA256  $E2FSPROGS_SOURCE_ASSET  https://cdn.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v$E2FSPROGS_VERSION/" \
+    "$recipe_root/sources.lock" >/dev/null
+grep -F "$LIBARCHIVE_SOURCE_SHA256  $LIBARCHIVE_SOURCE_ASSET  https://distfiles.alpinelinux.org/distfiles/v3.22/" \
+    "$recipe_root/sources.lock" >/dev/null
+for static_source in acl-2.3.2.tar.gz expat-2.8.3.tar.xz xz-5.8.3.tar.gz zstd-1.5.7.tar.gz \
+    lz4-1.10.0.tar.gz bzip2-1.0.8.tar.gz openssl-3.5.8.tar.gz; do
+    grep -F "  $static_source  https://distfiles.alpinelinux.org/distfiles/v3.22/$static_source" \
+        "$recipe_root/sources.lock" >/dev/null ||
+        fail "sources.lock lacks the $static_source corresponding source"
+done
+for static_package in libarchive-static-3.8.3-r0 libarchive-dev-3.8.3-r0 acl-static-2.3.2-r1 \
+    expat-static-2.8.3-r0 bzip2-static-1.0.8-r6 xz-static-5.8.3-r0 zstd-static-1.5.7-r0 \
+    lz4-static-1.10.0-r0 openssl-libs-static-3.5.8-r0; do
+    grep -F "  $static_package.apk  https://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86_64/" \
+        "$recipe_root/packages.lock" >/dev/null ||
+        fail "packages.lock lacks $static_package"
+done
+
+# The proven mkfs.ext4 recipe depends on exact configure and make invariants.
+grep -F -- '--with-libarchive=direct' "$recipe_root/build-in-container.sh" >/dev/null ||
+    fail 'the recipe no longer configures e2fsprogs with --with-libarchive=direct'
+grep -F -- 'make -j1 -C misc mke2fs LIBARCHIVE=' "$recipe_root/build-in-container.sh" >/dev/null ||
+    fail 'the recipe no longer overrides the hardcoded misc/Makefile LIBARCHIVE value'
+grep -F -- 'mke2fs link did not consume the libarchive closure' \
+    "$recipe_root/build-in-container.sh" >/dev/null ||
+    fail 'the recipe no longer records the mke2fs link closure'
+if grep -E '^[[:space:]]*make( -j[0-9]+)? all' "$recipe_root/build-in-container.sh" >/dev/null; then
+    fail 'the recipe must not run make all; debugfs fails its static link'
+fi
+grep -F 'publish/mkfs.ext4' "$recipe_root/build-in-container.sh" >/dev/null ||
+    fail 'the recipe no longer publishes mke2fs under the name mkfs.ext4'
+for smoke_assertion in 'mkfs.ext4 tar input lost numeric ownership' \
+    'mkfs.ext4 tar input lost the hard link' \
+    'mkfs.ext4 tar input lost the symlink target' \
+    'mkfs.ext4 tar input lost the device node'; do
+    grep -F "$smoke_assertion" "$recipe_root/build-in-container.sh" >/dev/null ||
+        fail "the recipe lost the smoke assertion '$smoke_assertion'"
+done
 if grep -R -E '(^|[[:space:]])git (clone|checkout|fetch)' \
     "$repository_root/scripts/build-helpers.sh" \
     "$repository_root/scripts/fetch-helper-inputs.sh" \
@@ -86,18 +124,24 @@ printf 'package bytes\n' >"$downloads/package.apk"
 printf 'passt source\n' >"$downloads/passt.tar.xz"
 printf 'qemu source\n' >"$downloads/qemu.tar.xz"
 printf 'qemu signature\n' >"$downloads/qemu.tar.xz.sig"
+printf 'e2fsprogs source\n' >"$downloads/e2fsprogs.tar.xz"
+printf 'libarchive source\n' >"$downloads/libarchive.tar.xz"
 printf 'test key\n' >"$fixture_recipe/qemu-key.asc"
 
 package_sha=$(sha256_file "$downloads/package.apk")
 passt_sha=$(sha256_file "$downloads/passt.tar.xz")
 qemu_sha=$(sha256_file "$downloads/qemu.tar.xz")
 signature_sha=$(sha256_file "$downloads/qemu.tar.xz.sig")
+e2fsprogs_sha=$(sha256_file "$downloads/e2fsprogs.tar.xz")
+libarchive_sha=$(sha256_file "$downloads/libarchive.tar.xz")
 key_sha=$(sha256_file "$fixture_recipe/qemu-key.asc")
 printf '%s  package.apk  https://example.invalid/package.apk\n' "$package_sha" >"$fixture_recipe/packages.lock"
 cat >"$fixture_recipe/sources.lock" <<EOF
 $passt_sha  passt.tar.xz  https://example.invalid/passt.tar.xz
 $qemu_sha  qemu.tar.xz  https://example.invalid/qemu.tar.xz
 $signature_sha  qemu.tar.xz.sig  https://example.invalid/qemu.tar.xz.sig
+$e2fsprogs_sha  e2fsprogs.tar.xz  https://example.invalid/e2fsprogs.tar.xz
+$libarchive_sha  libarchive.tar.xz  https://example.invalid/libarchive.tar.xz
 EOF
 packages_lock_sha=$(sha256_file "$fixture_recipe/packages.lock")
 sources_lock_sha=$(sha256_file "$fixture_recipe/sources.lock")
@@ -114,6 +158,10 @@ QEMU_SIGNATURE_SHA256=$signature_sha
 QEMU_SIGNING_FINGERPRINT=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 QEMU_SIGNING_KEY_ASSET=qemu-key.asc
 QEMU_SIGNING_KEY_SHA256=$key_sha
+E2FSPROGS_SOURCE_ASSET=e2fsprogs.tar.xz
+E2FSPROGS_SOURCE_SHA256=$e2fsprogs_sha
+LIBARCHIVE_SOURCE_ASSET=libarchive.tar.xz
+LIBARCHIVE_SOURCE_SHA256=$libarchive_sha
 PACKAGES_LOCK_SHA256=$packages_lock_sha
 SOURCES_LOCK_SHA256=$sources_lock_sha
 EOF
@@ -178,6 +226,7 @@ case "${1:-}" in
         mkdir -p "$output/LICENSES"
         printf 'passt\n' >"$output/passt"
         printf 'qemu\n' >"$output/qemu-img"
+        printf 'mkfs\n' >"$output/mkfs.ext4"
         if [[ ${FAKE_DOCKER_MISMATCH:-0} == 1 && $count -eq 2 ]]; then
             printf 'different\n' >>"$output/qemu-img"
         fi
@@ -185,7 +234,7 @@ case "${1:-}" in
         printf 'info\n' >"$output/helpers.build-info"
         printf 'license\n' >"$output/LICENSES/COPYING"
         : >"$output/SHA256SUMS"
-        chmod 0755 "$output/passt" "$output/qemu-img"
+        chmod 0755 "$output/passt" "$output/qemu-img" "$output/mkfs.ext4"
         chmod 0644 "$output/firestone-static-helpers-corresponding-source.tar" \
             "$output/helpers.build-info" "$output/SHA256SUMS" "$output/LICENSES/COPYING"
         exit 0
@@ -220,6 +269,8 @@ FIRESTONE_HELPER_RECIPE_ROOT="$fixture_recipe" \
     "$repository_root/scripts/fetch-helper-inputs.sh" --output-dir "$test_root/input"
 [[ -f $test_root/input/packages/package.apk ]]
 [[ -f $test_root/input/sources/qemu.tar.xz ]]
+[[ -f $test_root/input/sources/e2fsprogs.tar.xz ]]
+[[ -f $test_root/input/sources/libarchive.tar.xz ]]
 grep -F 'pull --platform linux/amd64 example.invalid/builder@sha256:' "$FAKE_DOCKER_LOG" >/dev/null
 
 : >"$FAKE_DOCKER_LOG"
@@ -234,7 +285,7 @@ FIRESTONE_HELPER_RECIPE_ROOT="$fixture_recipe" \
 [[ $(grep -c -- '--pull never' "$FAKE_DOCKER_LOG") -eq 2 ]]
 [[ $(grep -c -- '--env HOST_UID=' "$FAKE_DOCKER_LOG") -eq 2 ]]
 [[ $(grep -c -- '--env HOST_GID=' "$FAKE_DOCKER_LOG") -eq 2 ]]
-[[ -x $test_root/output/passt && -x $test_root/output/qemu-img ]]
+[[ -x $test_root/output/passt && -x $test_root/output/qemu-img && -x $test_root/output/mkfs.ext4 ]]
 
 : >"$FAKE_DOCKER_LOG"
 rm -f "$FAKE_DOCKER_STATE"

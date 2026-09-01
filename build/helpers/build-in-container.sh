@@ -119,11 +119,21 @@ apk info -e "glib-static=$GLIB_PACKAGE_VERSION" || fail 'wrong glib-static packa
 apk info -e "gettext-static=$GETTEXT_STATIC_PACKAGE_VERSION" || fail 'wrong gettext-static package version'
 apk info -e "pcre2-static=$PCRE2_STATIC_PACKAGE_VERSION" || fail 'wrong pcre2-static package version'
 apk info -e "zlib-static=$ZLIB_STATIC_PACKAGE_VERSION" || fail 'wrong zlib-static package version'
+apk info -e "libarchive-dev=$LIBARCHIVE_PACKAGE_VERSION" || fail 'wrong libarchive-dev package version'
+apk info -e "libarchive-static=$LIBARCHIVE_PACKAGE_VERSION" || fail 'wrong libarchive-static package version'
+apk info -e "acl-static=$ACL_STATIC_PACKAGE_VERSION" || fail 'wrong acl-static package version'
+apk info -e "expat-static=$EXPAT_STATIC_PACKAGE_VERSION" || fail 'wrong expat-static package version'
+apk info -e "bzip2-static=$BZIP2_STATIC_PACKAGE_VERSION" || fail 'wrong bzip2-static package version'
+apk info -e "xz-static=$XZ_STATIC_PACKAGE_VERSION" || fail 'wrong xz-static package version'
+apk info -e "zstd-static=$ZSTD_STATIC_PACKAGE_VERSION" || fail 'wrong zstd-static package version'
+apk info -e "lz4-static=$LZ4_STATIC_PACKAGE_VERSION" || fail 'wrong lz4-static package version'
+apk info -e "openssl-libs-static=$OPENSSL_STATIC_PACKAGE_VERSION" || fail 'wrong openssl-libs-static package version'
 require_version gcc "$(gcc -dumpfullversion)" "$GCC_VERSION"
 require_version binutils "$(ld --version | awk 'NR == 1 { print $NF }')" "$BINUTILS_VERSION"
 require_version python "$(python3 -c 'import platform; print(platform.python_version())')" "$PYTHON_VERSION"
 require_version samurai "$(samu --version)" "$SAMURAI_VERSION"
 require_version glib "$(pkg-config --modversion glib-2.0)" "$GLIB_VERSION"
+require_version libarchive "$(pkg-config --modversion libarchive)" "$LIBARCHIVE_VERSION"
 
 export ARFLAGS=crD
 export LANG=C
@@ -136,10 +146,16 @@ common_ldflags='-Wl,--build-id=none -Wl,-z,relro -Wl,-z,now'
 
 passt_source=/work/passt-source
 qemu_source=/work/qemu-source
-mkdir "$passt_source" "$qemu_source"
+e2fsprogs_source=/work/e2fsprogs-source
+mkdir "$passt_source" "$qemu_source" "$e2fsprogs_source"
 tar -xJf "/inputs/sources/$PASST_SOURCE_ASSET" --strip-components=1 -C "$passt_source"
 tar -xJf "/inputs/sources/$QEMU_SOURCE_ASSET" --strip-components=1 -C "$qemu_source"
+tar -xJf "/inputs/sources/$E2FSPROGS_SOURCE_ASSET" --strip-components=1 -C "$e2fsprogs_source"
 [ "$(cat "$qemu_source/VERSION")" = "$QEMU_IMG_VERSION" ] || fail 'QEMU archive VERSION mismatch'
+grep -Fx "#define E2FSPROGS_VERSION \"$E2FSPROGS_VERSION\"" "$e2fsprogs_source/version.h" >/dev/null ||
+    fail 'e2fsprogs archive version.h mismatch'
+grep -Fx "#define E2FSPROGS_DATE \"$E2FSPROGS_DATE\"" "$e2fsprogs_source/version.h" >/dev/null ||
+    fail 'e2fsprogs archive release date mismatch'
 
 printf '%s\n' '-D__builtin_cpu_supports(x)=0' >"$passt_source/firestone-baseline.rsp"
 (
@@ -175,10 +191,42 @@ for linked_archive in libglib-2.0.a libintl.a libatomic.a pcre2-8 libz.a; do
         fail "qemu-img static link closure lacks $linked_archive"
 done
 
+# misc/Makefile hardcodes LIBARCHIVE=-larchive, which cannot satisfy a static
+# link, so the full pkg-config closure is supplied at make time. Only
+# misc/mke2fs is built: `make all` also links debugfs statically and fails.
+libarchive_static_libs=$(pkg-config --static --libs libarchive)
+for required_library in -larchive -lacl -lexpat -lzstd -llz4 -lbz2 -lz -llzma -lcrypto; do
+    case " $libarchive_static_libs " in
+        *" $required_library "*) ;;
+        *) fail "libarchive static closure lacks $required_library" ;;
+    esac
+done
+(
+    cd "$e2fsprogs_source"
+    CFLAGS="$common_cflags" LDFLAGS="-static $common_ldflags" \
+        ./configure \
+            --with-libarchive=direct \
+            --disable-nls \
+            --disable-uuidd \
+            --disable-fuse2fs > /work/e2fsprogs-configure.log
+    make -j1 libs > /work/e2fsprogs-libs.log
+    make -j1 -C misc mke2fs LIBARCHIVE="$libarchive_static_libs" V=1 > /work/e2fsprogs-mke2fs.log
+    make -j1 -C debugfs debugfs LDFLAGS= > /work/e2fsprogs-debugfs.log
+)
+mkfs_binary="$e2fsprogs_source/misc/mke2fs"
+debugfs_binary="$e2fsprogs_source/debugfs/debugfs"
+[ -f "$mkfs_binary" ] || fail 'e2fsprogs build produced no mke2fs binary'
+[ -f "$debugfs_binary" ] || fail 'e2fsprogs build produced no debugfs verification binary'
+grep -F -- '-larchive' /work/e2fsprogs-mke2fs.log >/dev/null ||
+    fail 'mke2fs link did not consume the libarchive closure'
+
 strip --strip-all --remove-section=.comment "$passt_binary" "$qemu_binary"
 chmod 0755 "$passt_binary" "$qemu_binary"
 verify_elf "$passt_binary" 'EXEC (Executable file)' passt
 verify_elf "$qemu_binary" 'DYN (Position-Independent Executable file)' qemu-img
+strip --strip-all --remove-section=.comment "$mkfs_binary"
+chmod 0755 "$mkfs_binary"
+verify_elf "$mkfs_binary" 'EXEC (Executable file)' mkfs.ext4
 
 passt_stderr=/work/passt-version.stderr
 passt_version_output=$("$passt_binary" --version 2>"$passt_stderr")
@@ -206,12 +254,47 @@ grep -Eq '"format"[[:space:]]*:[[:space:]]*"qcow2"' "$smoke/base.json" || fail '
 grep -F "\"backing-filename\": \"$smoke/base.qcow2\"" "$smoke/overlay.json" >/dev/null ||
     fail 'qemu-img overlay did not retain the exact backing path'
 
+mkfs_version_output=$("$mkfs_binary" -V 2>&1 | sed -n '1p')
+require_version mkfs.ext4 "$mkfs_version_output" "mke2fs $E2FSPROGS_VERSION ($E2FSPROGS_DATE)"
+
+# The OCI pipeline feeds a layer tar straight to mke2fs -d, so the smoke test
+# proves tar input keeps ownership, modes, symlinks, hard links and device nodes.
+mkfs_smoke=/work/mkfs-smoke
+mkdir -p "$mkfs_smoke/tree/dir"
+printf 'firestone\n' >"$mkfs_smoke/tree/dir/file.txt"
+ln -s dir/file.txt "$mkfs_smoke/tree/link"
+ln "$mkfs_smoke/tree/dir/file.txt" "$mkfs_smoke/tree/hard"
+mknod "$mkfs_smoke/tree/dev-null" c 1 3 ||
+    fail 'builder container cannot create a device node for the mkfs.ext4 smoke test'
+chmod 0741 "$mkfs_smoke/tree/dir/file.txt"
+chown 12345:12345 "$mkfs_smoke/tree/dir/file.txt"
+tar --numeric-owner --sort=name --format=gnu --mtime="@$SOURCE_DATE_EPOCH" \
+    -cf "$mkfs_smoke/layer.tar" -C "$mkfs_smoke/tree" .
+"$mkfs_binary" -F -t ext4 -d "$mkfs_smoke/layer.tar" -b 4096 "$mkfs_smoke/out.img" 64M \
+    >"$mkfs_smoke/mke2fs.stdout" 2>"$mkfs_smoke/mke2fs.stderr"
+"$debugfs_binary" -R 'stat dir/file.txt' "$mkfs_smoke/out.img" >"$mkfs_smoke/file.stat" 2>/dev/null
+"$debugfs_binary" -R 'stat link' "$mkfs_smoke/out.img" >"$mkfs_smoke/link.stat" 2>/dev/null
+"$debugfs_binary" -R 'stat dev-null' "$mkfs_smoke/out.img" >"$mkfs_smoke/device.stat" 2>/dev/null
+grep -Eq 'Type: regular[[:space:]]+Mode:[[:space:]]+0741' "$mkfs_smoke/file.stat" ||
+    fail 'mkfs.ext4 tar input lost the regular file mode'
+grep -Eq 'User:[[:space:]]+12345[[:space:]]+Group:[[:space:]]+12345' "$mkfs_smoke/file.stat" ||
+    fail 'mkfs.ext4 tar input lost numeric ownership'
+grep -Eq 'Links:[[:space:]]+2' "$mkfs_smoke/file.stat" ||
+    fail 'mkfs.ext4 tar input lost the hard link'
+grep -Fq 'Fast link dest: "dir/file.txt"' "$mkfs_smoke/link.stat" ||
+    fail 'mkfs.ext4 tar input lost the symlink target'
+grep -Fq 'Device major/minor number: 01:03' "$mkfs_smoke/device.stat" ||
+    fail 'mkfs.ext4 tar input lost the device node'
+
 publish=/work/publish
 licenses="$publish/LICENSES"
 mkdir -p "$licenses/passt" "$licenses/qemu" "$licenses/glib" "$licenses/gettext" \
     "$licenses/gcc" "$licenses/pcre2" "$licenses/zlib" "$licenses/musl"
+mkdir -p "$licenses/e2fsprogs" "$licenses/libarchive" "$licenses/acl" "$licenses/expat" \
+    "$licenses/xz" "$licenses/zstd" "$licenses/lz4" "$licenses/bzip2" "$licenses/openssl"
 install -m 0755 "$passt_binary" "$publish/passt"
 install -m 0755 "$qemu_binary" "$publish/qemu-img"
+install -m 0755 "$mkfs_binary" "$publish/mkfs.ext4"
 extract_license "/inputs/sources/$PASST_SOURCE_ASSET" \
     "passt-$PASST_COMMIT/LICENSES/GPL-2.0-or-later.txt" "$licenses/passt/GPL-2.0-or-later.txt"
 extract_license "/inputs/sources/$PASST_SOURCE_ASSET" \
@@ -228,6 +311,22 @@ extract_license /inputs/sources/gcc-14.2.0.tar.xz gcc-14.2.0/COPYING.RUNTIME "$l
 extract_license /inputs/sources/pcre2-10.46.tar.bz2 pcre2-10.46/LICENCE.md "$licenses/pcre2/LICENCE.md"
 extract_license /inputs/sources/zlib-1.3.2.tar.gz zlib-1.3.2/LICENSE "$licenses/zlib/LICENSE"
 extract_license /inputs/sources/musl-1.2.5.tar.gz musl-1.2.5/COPYRIGHT "$licenses/musl/COPYRIGHT"
+extract_license "/inputs/sources/$E2FSPROGS_SOURCE_ASSET" \
+    "e2fsprogs-$E2FSPROGS_VERSION/NOTICE" "$licenses/e2fsprogs/NOTICE"
+extract_license "/inputs/sources/$E2FSPROGS_SOURCE_ASSET" \
+    "e2fsprogs-$E2FSPROGS_VERSION/lib/uuid/COPYING" "$licenses/e2fsprogs/COPYING.libuuid"
+extract_license "/inputs/sources/$LIBARCHIVE_SOURCE_ASSET" \
+    "libarchive-$LIBARCHIVE_VERSION/COPYING" "$licenses/libarchive/COPYING"
+extract_license /inputs/sources/acl-2.3.2.tar.gz acl-2.3.2/doc/COPYING "$licenses/acl/COPYING"
+extract_license /inputs/sources/acl-2.3.2.tar.gz acl-2.3.2/doc/COPYING.LGPL "$licenses/acl/COPYING.LGPL"
+extract_license /inputs/sources/expat-2.8.3.tar.xz expat-2.8.3/COPYING "$licenses/expat/COPYING"
+extract_license /inputs/sources/xz-5.8.3.tar.gz xz-5.8.3/COPYING "$licenses/xz/COPYING"
+extract_license /inputs/sources/xz-5.8.3.tar.gz xz-5.8.3/COPYING.0BSD "$licenses/xz/COPYING.0BSD"
+extract_license /inputs/sources/zstd-1.5.7.tar.gz zstd-1.5.7/LICENSE "$licenses/zstd/LICENSE"
+extract_license /inputs/sources/zstd-1.5.7.tar.gz zstd-1.5.7/COPYING "$licenses/zstd/COPYING"
+extract_license /inputs/sources/lz4-1.10.0.tar.gz lz4-1.10.0/lib/LICENSE "$licenses/lz4/LICENSE"
+extract_license /inputs/sources/bzip2-1.0.8.tar.gz bzip2-1.0.8/LICENSE "$licenses/bzip2/LICENSE"
+extract_license /inputs/sources/openssl-3.5.8.tar.gz openssl-3.5.8/LICENSE.txt "$licenses/openssl/LICENSE.txt"
 
 bundle_stage=/work/source-bundle/firestone-static-helpers-corresponding-source
 mkdir -p "$bundle_stage/sources" "$bundle_stage/packages" "$bundle_stage/recipe/build/helpers" \
@@ -260,6 +359,7 @@ chmod 0644 "$source_bundle"
 
 passt_sha=$(sha256_file "$publish/passt")
 qemu_sha=$(sha256_file "$publish/qemu-img")
+mkfs_sha=$(sha256_file "$publish/mkfs.ext4")
 source_bundle_sha=$(sha256_file "$source_bundle")
 cat >"$publish/helpers.build-info" <<EOF
 schema_version=1
@@ -290,6 +390,19 @@ qemu_img_pt_interp=absent
 qemu_img_dt_needed=absent
 qemu_img_build_id=absent
 qemu_img_sha256=$qemu_sha
+e2fsprogs_version=$E2FSPROGS_VERSION
+e2fsprogs_date=$E2FSPROGS_DATE
+e2fsprogs_source_sha256=$E2FSPROGS_SOURCE_SHA256
+mkfs_ext4_configure=--with-libarchive=direct --disable-nls --disable-uuidd --disable-fuse2fs
+mkfs_ext4_make_targets=libs,misc/mke2fs
+mkfs_ext4_libarchive_closure=$libarchive_static_libs
+mkfs_ext4_elf_type=EXEC
+mkfs_ext4_pt_interp=absent
+mkfs_ext4_dt_needed=absent
+mkfs_ext4_build_id=absent
+mkfs_ext4_sha256=$mkfs_sha
+libarchive_version=$LIBARCHIVE_VERSION
+libarchive_source_sha256=$LIBARCHIVE_SOURCE_SHA256
 corresponding_source_sha256=$source_bundle_sha
 gcc_version=$GCC_VERSION
 binutils_version=$BINUTILS_VERSION
@@ -307,4 +420,4 @@ chmod 0644 "$publish/helpers.build-info"
 )
 chmod 0644 "$publish/SHA256SUMS"
 cp -Rp "$publish/." /output/
-printf 'built passt %s and qemu-img %s\n' "$passt_sha" "$qemu_sha"
+printf 'built passt %s, qemu-img %s and mkfs.ext4 %s\n' "$passt_sha" "$qemu_sha" "$mkfs_sha"

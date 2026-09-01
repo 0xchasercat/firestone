@@ -6,9 +6,9 @@ usage() {
     cat <<'EOF'
 Usage: scripts/fetch-helper-inputs.sh --output-dir DIR
 
-Downloads the exact helper sources and Alpine package closure, verifies every
-SHA-256 and the QEMU release signature, and pulls the pinned amd64 builder
-image. The output directory must be empty.
+Downloads the exact passt, qemu-img and mkfs.ext4 helper sources and the Alpine
+package closure, verifies every SHA-256 and the QEMU release signature, and
+pulls the pinned amd64 builder image. The output directory must be empty.
 EOF
 }
 
@@ -144,6 +144,10 @@ install -m 0644 "$recipe_root/$QEMU_SIGNING_KEY_ASSET" "$staging_dir/$QEMU_SIGNI
     fail 'QEMU source lock and versions.env disagree'
 [[ $(sha256_file "$staging_dir/sources/$QEMU_SIGNATURE_ASSET") == "$QEMU_SIGNATURE_SHA256" ]] ||
     fail 'QEMU signature lock and versions.env disagree'
+[[ $(sha256_file "$staging_dir/sources/$E2FSPROGS_SOURCE_ASSET") == "$E2FSPROGS_SOURCE_SHA256" ]] ||
+    fail 'e2fsprogs source lock and versions.env disagree'
+[[ $(sha256_file "$staging_dir/sources/$LIBARCHIVE_SOURCE_ASSET") == "$LIBARCHIVE_SOURCE_SHA256" ]] ||
+    fail 'libarchive source lock and versions.env disagree'
 
 gnupg_home="$temporary_dir/gnupg"
 mkdir -m 0700 "$gnupg_home"
