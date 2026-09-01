@@ -571,6 +571,17 @@ fn cloud_init_group(cloud_init: &CloudInitSpec) -> SpecGroup {
                 key: "user_data",
                 value: path_or_null(cloud_init.user_data.as_deref()),
             },
+            // Inline user-data is configured content, so it is reported by
+            // size and never by value: this fragment is rendered into a page,
+            // a browser cache and a view-source, none of which SPEC §10.5
+            // counts as the 0600 machine file the user owns.
+            Pair {
+                key: "user_data_inline",
+                value: cloud_init
+                    .user_data_inline
+                    .as_ref()
+                    .map_or_else(null, |inline| format!("{} bytes", inline.len())),
+            },
             Pair {
                 key: "network_config",
                 value: path_or_null(cloud_init.network_config.as_deref()),
@@ -588,7 +599,37 @@ fn cloud_init_group(cloud_init: &CloudInitSpec) -> SpecGroup {
                         .join(", ")
                 },
             },
+            // A public key is not a secret, but a list of them is noise in a
+            // spec table and a fingerprinting surface in a shared screen, so
+            // the count is what the tab reports.
+            Pair {
+                key: "ssh_authorized_keys",
+                value: count_or_empty(cloud_init.ssh_authorized_keys.len(), "key", "keys"),
+            },
+            // Never the value, and never a length either: a password's length
+            // is worth something to whoever is looking over the shoulder.
+            Pair {
+                key: "password",
+                value: if cloud_init.password.is_some() {
+                    "set".to_owned()
+                } else {
+                    "unset".to_owned()
+                },
+            },
+            Pair {
+                key: "ssh_pwauth",
+                value: cloud_init.ssh_pwauth.to_string(),
+            },
         ],
+    }
+}
+
+/// `[]` for nothing, otherwise a count with the right noun.
+fn count_or_empty(count: usize, singular: &str, plural: &str) -> String {
+    match count {
+        0 => "[]".to_owned(),
+        1 => format!("1 {singular}"),
+        _ => format!("{count} {plural}"),
     }
 }
 

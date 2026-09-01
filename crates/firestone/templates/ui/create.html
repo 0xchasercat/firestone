@@ -47,6 +47,8 @@
 
         {{ f.mount_rows(form, errors) }}
 
+        {{ f.provisioning_fields(form, errors, password_cleared) }}
+
         {% if errors.form %}
         <div class="fs-inline-notice fs-inline-notice--fail" role="alert">
           <span>{{ errors.form }}</span>
