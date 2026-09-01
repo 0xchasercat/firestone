@@ -7,8 +7,20 @@
     {% if machine.degraded %}
     <span class="fs-tag" title="{{ machine.degraded }}">degraded</span>
     {% endif %}
+    {# Drift the server can prove: state.json records the image, the MAC and
+       the forwards the running instance applied, so those three can be
+       compared. Everything else the edit dialog marks client-side when it
+       saves it against a running machine. #}
+    {% if machine.drift %}
+    <span class="fs-drift" data-fs-drift="server"
+          title="the running instance is using different values for: {{ machine.drift_summary }} · restart {{ machine.name }} to apply the spec">spec drift · {{ machine.drift_summary }}</span>
+    {% endif %}
   </div>
   <div class="fs-page-head__actions">
+    <button type="button" class="fs-btn"
+            hx-get="/ui/machines/{{ machine.name | urlencode }}/edit"
+            hx-target="#fs-dialog-slot"
+            hx-swap="innerHTML">Edit</button>
     {% if machine.action %}
     <button type="button" class="fs-btn fs-btn--primary"
             data-fs-action="{{ machine.action }}"
