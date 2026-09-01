@@ -10,6 +10,8 @@ use std::fmt;
 
 use crate::error::{ErrorKind, FirestoneError};
 
+pub mod layers;
+
 /// Explicit scheme prefix that always selects the OCI branch.
 pub const OCI_SCHEME_PREFIX: &str = "oci://";
 /// Docker-flavored alias of [`OCI_SCHEME_PREFIX`].
