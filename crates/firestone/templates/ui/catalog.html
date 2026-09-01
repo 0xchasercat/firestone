@@ -27,5 +27,37 @@
   <span class="fs-note fs-note--footer">
     GET /v1/catalog · POST /v1/images/pull streams resolve → download → verify → convert
   </span>
+
+  {# ------------------------------------------------ cached images (M6-26) --
+
+     The catalog above is what this host could run; this is what it has on
+     disk, and it is the only screen with a "reclaim space" affordance. Both
+     prune buttons live here, narrow one first, so an operator sees the
+     bounded command before reaching for the broad one. #}
+  <div class="fs-page-head fs-page-head--section">
+    <div>
+      <h2 class="fs-page-head__title fs-page-head__title--section">Cached images</h2>
+      <div class="fs-page-head__sub">
+        The local image store. A machine pins the exact image it booted, so an
+        image something references is refused rather than silently removed.
+      </div>
+    </div>
+    <div class="fs-page-head__actions" data-fs-notice-slot>
+      <button type="button" class="fs-btn" data-fs-prune="images">Prune unused images</button>
+      <button type="button" class="fs-btn" data-fs-prune="system">Free disk space…</button>
+    </div>
+  </div>
+
+  <div id="fs-catalog-images"
+       hx-get="/ui/catalog/images"
+       hx-trigger="fs:refresh from:body"
+       hx-target="this"
+       hx-swap="morph:innerHTML">
+    {% include "ui/_catalog_images.html" %}
+  </div>
+
+  <span class="fs-note fs-note--footer">
+    GET /v1/images · DELETE /v1/images/{id} · POST /v1/images/prune
+  </span>
 </div>
 <div id="fs-dialog-slot"></div>

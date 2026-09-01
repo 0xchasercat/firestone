@@ -21,7 +21,7 @@ use axum::{
 };
 use firestone_core::{
     Action, CatalogEntrySummary, ErrorKind, FirestoneError, ImageRef, LogSource, MachineSpec,
-    MachineSpecPatch, MachineSummary, MachineView, NetMode, VersionResult,
+    MachineSpecPatch, MachineSummary, MachineView, NetMode, SnapshotListResult, VersionResult,
 };
 use minijinja::{Value, context};
 use serde::Deserialize;
@@ -33,8 +33,8 @@ use crate::{
         render::{render, urlencode},
         view::{
             CachedImage, CatalogCard, CheckInfo, HostInfo, MachineDetail, MachineRow,
-            OverviewMachine, VersionInfo, format_bytes, net_mode_token,
-            overview_machines as overview_machine_rows, stats,
+            OverviewMachine, VersionInfo, format_bytes, image_rows, net_mode_token,
+            overview_machines as overview_machine_rows, snapshot_rows, stats,
         },
     },
 };
@@ -161,7 +161,10 @@ pub async fn catalog(State(state): State<UiState>, headers: HeaderMap) -> Respon
 async fn catalog_body(state: &UiState) -> Result<String, FirestoneError> {
     render(
         "ui/catalog.html",
-        context! { entries => catalog_cards_data(state).await? },
+        context! {
+            entries => catalog_cards_data(state).await?,
+            images => image_rows(&list_images(state).await?),
+        },
     )
 }
 
@@ -344,6 +347,21 @@ pub async fn catalog_cards(State(state): State<UiState>) -> Response {
     fragment(result)
 }
 
+/// The cached-images table on its own, re-read after a delete or a prune.
+///
+/// A read like every other `/ui` fragment: the deletions themselves go from
+/// the browser to `DELETE /v1/images/{id}` and `POST /v1/images/prune`.
+pub async fn catalog_images(State(state): State<UiState>) -> Response {
+    let result = async {
+        render(
+            "ui/_catalog_images.html",
+            context! { images => image_rows(&list_images(&state).await?) },
+        )
+    }
+    .await;
+    fragment(result)
+}
+
 pub async fn palette(State(state): State<UiState>, Query(query): Query<FilterQuery>) -> Response {
     let result = async {
         let needle = query.q.as_deref().unwrap_or_default().trim().to_lowercase();
@@ -382,6 +400,7 @@ pub async fn palette(State(state): State<UiState>, Query(query): Query<FilterQue
                 query => query.q.as_deref().unwrap_or_default(),
                 machines => matched_machines,
                 images => matched_images,
+                actions => palette_actions(&needle, &machines),
             },
         )
     }
@@ -394,6 +413,88 @@ struct PaletteImage {
     reference: String,
     cached: bool,
     note: String,
+}
+
+/// One command the palette can start.
+///
+/// `machine` is empty for a host-wide command. The palette itself only opens
+/// the dialog named by `kind`; every write still goes to `/v1`.
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+struct PaletteAction {
+    kind: &'static str,
+    label: String,
+    note: &'static str,
+    machine: String,
+    /// Whether the named machine is running, so the snapshot dialog can state
+    /// the tier it is about to take without a second read.
+    running: bool,
+}
+
+/// How many machines a verb-matched palette query offers a command for.
+const PALETTE_ACTION_MACHINES: usize = 5;
+
+/// Builds the palette's Actions group.
+///
+/// The two host-wide commands always show, because they are the two an
+/// operator reaches the palette for when nothing in particular is named and
+/// both are dialog-gated. The machine-scoped commands are **verb-first**: they
+/// appear only when the query is reaching for one, so an empty palette is a
+/// list of machines rather than two commands per machine.
+fn palette_actions(needle: &str, machines: &[MachineSummary]) -> Vec<PaletteAction> {
+    let matches = |keywords: &[&str]| {
+        needle.is_empty() || keywords.iter().any(|keyword| keyword.starts_with(needle))
+    };
+
+    let mut actions = Vec::new();
+    if matches(&["prune", "images", "cache"]) {
+        actions.push(PaletteAction {
+            kind: "prune-images",
+            label: "Prune unused images".to_owned(),
+            note: "POST /v1/images/prune",
+            machine: String::new(),
+            running: false,
+        });
+    }
+    if matches(&["prune", "disk", "space", "free", "reclaim"]) {
+        actions.push(PaletteAction {
+            kind: "prune-system",
+            label: "Free disk space".to_owned(),
+            note: "previews before it removes",
+            machine: String::new(),
+            running: false,
+        });
+    }
+
+    // Verb-first, and never on an empty query: "snap" and "clone" are what an
+    // operator types, and a machine name alone is a request to open it.
+    for (verb, kind, note) in [
+        ("snapshot", "snapshot", "POST …/snapshots"),
+        ("clone", "clone", "POST …/clone"),
+    ] {
+        if needle.is_empty() || !verb.starts_with(needle) {
+            continue;
+        }
+        for machine in machines.iter() {
+            // A clone of a running machine is refused before it starts
+            // (§24.2), so the palette does not offer one at all: an entry that
+            // can only fail is worse than an entry that is absent.
+            if kind == "clone" && !crate::ui::view::is_clonable(&machine.status) {
+                continue;
+            }
+            if actions.iter().filter(|entry| entry.kind == kind).count() >= PALETTE_ACTION_MACHINES
+            {
+                break;
+            }
+            actions.push(PaletteAction {
+                kind,
+                label: format!("{verb} {}", machine.name),
+                note,
+                machine: machine.name.clone(),
+                running: machine.status == "running",
+            });
+        }
+    }
+    actions
 }
 
 // ----------------------------------------------------------------- create --
@@ -1072,10 +1173,25 @@ pub async fn edit_form(State(state): State<UiState>, Path(name): Path<String>) -
 
 // ------------------------------------------------------------------- tabs --
 
-fn tab_template(tab: &str) -> &'static str {
+/// Resolves a requested tab name to the one tab that will actually render.
+///
+/// One function decides this, so the strip and the panel can never disagree:
+/// an unknown name is the spec tab in both, which is what keeps exactly one
+/// tab marked active for any input a URL can carry.
+fn resolve_tab(tab: &str) -> &'static str {
     match tab {
+        "logs" => "logs",
+        "vmconfig" => "vmconfig",
+        "snapshots" => "snapshots",
+        _ => "spec",
+    }
+}
+
+fn tab_template(tab: &str) -> &'static str {
+    match resolve_tab(tab) {
         "logs" => "ui/tab_logs.html",
         "vmconfig" => "ui/tab_vmconfig.html",
+        "snapshots" => "ui/tab_snapshots.html",
         _ => "ui/tab_spec.html",
     }
 }
@@ -1089,15 +1205,17 @@ struct Tab {
 }
 
 fn tabs(name: &str, active: &str) -> Vec<Tab> {
+    let selected = resolve_tab(active);
     [
         ("spec", "Spec"),
         ("logs", "Logs"),
+        ("snapshots", "Snapshots"),
         ("vmconfig", "VM Config"),
     ]
     .into_iter()
     .map(|(id, label)| Tab {
         label,
-        active: id == active || (active != "logs" && active != "vmconfig" && id == "spec"),
+        active: id == selected,
         href: format!("/machines/{}?tab={id}", urlencode(name)),
         fragment: format!("/ui/machines/{}/tab/{id}", urlencode(name)),
     })
@@ -1148,6 +1266,32 @@ async fn tab_context(
             ctx.insert("vmconfig".to_owned(), Value::from(config));
             ctx.insert("unavailable".to_owned(), Value::from(unavailable));
         }
+        // A read like every other tab: `Action::SnapshotList` is the same
+        // action `GET /v1/machines/{name}/snapshots` dispatches, and every
+        // write the tab offers goes from the browser to those `/v1` routes.
+        "snapshots" => {
+            let list = list_snapshots(state, name).await?;
+            ctx.insert(
+                "snapshots".to_owned(),
+                Value::from_serialize(snapshot_rows(&list.snapshots)),
+            );
+            // §23 tiers: what a create takes here depends on the machine's own
+            // state, and the button says which one rather than implying both.
+            ctx.insert(
+                "snapshot_kind".to_owned(),
+                Value::from(if machine.is_running { "warm" } else { "cold" }),
+            );
+            // A machine that is starting, stopping or failed has no coherent
+            // disk to copy and is refused with `conflict` (§23), so the button
+            // is withheld rather than offered as a request that cannot work.
+            ctx.insert(
+                "can_snapshot".to_owned(),
+                Value::from(matches!(
+                    machine.status.as_str(),
+                    "running" | "stopped" | "created"
+                )),
+            );
+        }
         _ => {}
     }
     Ok(ctx)
@@ -1178,6 +1322,21 @@ async fn list_images(state: &UiState) -> Result<Vec<CachedImage>, FirestoneError
     decode(
         api::dispatch_payload(&state.dispatcher, Action::ImageList, "images-ls").await?,
         "image list",
+    )
+}
+
+/// The same read `GET /v1/machines/{name}/snapshots` performs (§23.1).
+async fn list_snapshots(state: &UiState, name: &str) -> Result<SnapshotListResult, FirestoneError> {
+    decode(
+        api::dispatch_payload(
+            &state.dispatcher,
+            Action::SnapshotList {
+                name: name.to_owned(),
+            },
+            "snapshot-list",
+        )
+        .await?,
+        "snapshot list",
     )
 }
 

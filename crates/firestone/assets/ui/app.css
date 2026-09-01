@@ -2889,3 +2889,290 @@ textarea {
   padding: 3px 10px;
   white-space: nowrap;
 }
+
+/* ==================== snapshots, clone, images, prune (M6-26) ============= */
+
+/* The machines table grew a per-row overflow menu, so the last track carries
+ * two controls instead of one. Declared here, after the original rule and
+ * after its narrow-viewport override, so both are replaced together. */
+.fs-table {
+  --fs-cols: minmax(74px, 1.1fr) minmax(70px, 0.9fr) minmax(80px, 1.1fr)
+    minmax(96px, 1.2fr) minmax(70px, 1.4fr) minmax(46px, 0.7fr) 96px;
+}
+
+@media (max-width: 860px) {
+  .fs-table {
+    --fs-cols: minmax(74px, 1.2fr) minmax(70px, 1fr) minmax(80px, 1.1fr)
+      minmax(96px, 1.2fr) 96px;
+  }
+}
+
+.fs-row__actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  overflow: visible;
+}
+
+/* A <details> menu, so open, close and Escape are the platform's job and no
+ * inline handler is needed — the CSP forbids one anyway. */
+.fs-menu {
+  position: relative;
+}
+
+.fs-menu > summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 3px 7px;
+  line-height: 1;
+}
+
+.fs-menu > summary::-webkit-details-marker {
+  display: none;
+}
+
+/* The table panel clips, which would cut the last row's menu in half. It stops
+ * clipping only while a menu is actually open, so the rounded corners and the
+ * row separators are unchanged the rest of the time. */
+.fs-panel--clip:has(.fs-menu[open]) {
+  overflow: visible;
+}
+
+.fs-menu__list {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 20;
+  min-width: 156px;
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  gap: 2px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.18);
+}
+
+.fs-menu__item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 7px 9px;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 12.5px;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.fs-menu__item:hover:not([disabled]) {
+  background: var(--panel2);
+}
+
+.fs-menu__item[disabled] {
+  color: var(--text3);
+  cursor: not-allowed;
+}
+
+/* Forward chips. A linkified chip is the only one that looks clickable, which
+ * is the whole point: a UDP forward and a stopped machine's forwards read as
+ * data, because that is what they are. */
+.fs-chips {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.fs-chip {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 2px 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text2);
+  white-space: nowrap;
+}
+
+.fs-chip--empty {
+  border-color: transparent;
+  padding-left: 0;
+}
+
+.fs-chip--link {
+  color: var(--accent, var(--text));
+  border-color: var(--accent, var(--line));
+  text-decoration: none;
+}
+
+.fs-chip--link:hover {
+  background: var(--panel2);
+  text-decoration: underline;
+}
+
+.fs-chip--pending {
+  color: var(--warn);
+  background: var(--warn-bg);
+  border-color: transparent;
+  font-family: var(--sans, inherit);
+  font-weight: 600;
+}
+
+.fs-meta__forwards {
+  grid-column: 1 / -1;
+}
+
+/* Snapshot tier and OCI badge: a stable word in a stable box, never a colour
+ * on its own. */
+.fs-tier {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--text2);
+  white-space: nowrap;
+}
+
+.fs-tier[data-fs-tier="warm"] {
+  color: var(--warn);
+  background: var(--warn-bg);
+  border-color: transparent;
+}
+
+.fs-tier[data-fs-tier="oci"] {
+  margin-left: 6px;
+}
+
+.fs-table--snapshots {
+  --fs-cols: minmax(120px, 1.6fr) minmax(56px, 0.5fr) minmax(120px, 1.2fr)
+    minmax(60px, 0.6fr) minmax(60px, 0.6fr) 148px;
+}
+
+.fs-table--images {
+  --fs-cols: minmax(120px, 1.8fr) minmax(90px, 1fr) minmax(60px, 0.6fr)
+    minmax(120px, 1.1fr) 92px;
+}
+
+@media (max-width: 860px) {
+  .fs-cell--memory,
+  .fs-cell--pulled,
+  .fs-table__head span.fs-cell--memory,
+  .fs-table__head span.fs-cell--pulled {
+    display: none;
+  }
+
+  .fs-table--snapshots {
+    --fs-cols: minmax(120px, 1.6fr) minmax(56px, 0.5fr) minmax(110px, 1.2fr)
+      minmax(60px, 0.6fr) 148px;
+  }
+
+  .fs-table--images {
+    --fs-cols: minmax(120px, 1.8fr) minmax(90px, 1fr) minmax(60px, 0.6fr) 92px;
+  }
+}
+
+/* A row in these tables is not a link to anywhere, so it must not pretend. */
+.fs-row--static {
+  cursor: default;
+}
+
+.fs-row--static:hover {
+  background: transparent;
+}
+
+.fs-subhead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 4px 0 14px;
+}
+
+.fs-subhead__title {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.fs-subhead__sub {
+  color: var(--text2);
+  font-size: 12.5px;
+  margin-top: 4px;
+  max-width: 70ch;
+}
+
+.fs-page-head--section {
+  margin-top: 34px;
+}
+
+.fs-page-head__title--section {
+  font-size: 16px;
+}
+
+/* The prune preview. It is a list of facts the server produced, so it reads
+ * as one: monospaced, itemised, with the total last. */
+.fs-prune-preview {
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: var(--panel2);
+}
+
+.fs-prune-preview__state {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.fs-prune-preview__rows {
+  margin-top: 8px;
+  max-height: 220px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.fs-prune-row {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr) auto;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text2);
+}
+
+.fs-prune-row__id {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fs-prune-row__bytes {
+  text-align: right;
+}
+
+.fs-prune-preview__total {
+  margin-top: 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.fs-dialog--wide {
+  max-width: 640px;
+}
+
+.fs-field__opt {
+  font-weight: 400;
+  color: var(--text3);
+}

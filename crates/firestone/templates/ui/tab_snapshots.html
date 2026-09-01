@@ -1,0 +1,84 @@
+{# Snapshots (SPEC §23).
+
+   A read, like every other tab: the rows come from `Action::SnapshotList`,
+   the same action `GET /v1/machines/{name}/snapshots` dispatches. Every write
+   below is a data attribute app.js turns into a request against the
+   documented `/v1` routes, so this template declares no hx-post, hx-delete or
+   form of its own — see `the_ui_never_offers_a_second_mutation_surface`. #}
+<div class="fs-tabbody" data-fs-snapshots="{{ machine.name }}" data-fs-notice-slot>
+  <div class="fs-subhead">
+    <div>
+      <div class="fs-subhead__title">Snapshots</div>
+      <div class="fs-subhead__sub">
+        {% if machine.is_running %}
+        A snapshot of a running machine is <strong>warm</strong>: Firestone pauses
+        the guest, writes its memory and disk, then resumes it. The pause is brief
+        but it is real, and the guest observes it.
+        {% else %}
+        A snapshot of a machine that is not running is <strong>cold</strong>: a file
+        copy of a quiescent machine, and guaranteed as such.
+        {% endif %}
+      </div>
+    </div>
+    {% if can_snapshot %}
+    <button type="button" class="fs-btn fs-btn--primary"
+            data-fs-snapshot-action="create"
+            data-fs-machine="{{ machine.name }}"
+            data-fs-snapshot-kind="{{ snapshot_kind }}">
+      {% if machine.is_running %}Snapshot (brief pause){% else %}Take snapshot{% endif %}
+    </button>
+    {% else %}
+    <span class="fs-note" data-fs-snapshot-blocked>
+      a {{ machine.status }} machine has no coherent disk to copy
+    </span>
+    {% endif %}
+  </div>
+
+  {% if snapshots %}
+  <div class="fs-panel fs-panel--clip fs-table fs-table--snapshots">
+    <div class="fs-table__head" role="row">
+      <span>Snapshot</span><span>Tier</span><span>Created</span>
+      <span>Disk</span><span class="fs-cell--memory">Memory</span>
+      <span><span class="fs-visually-hidden">Actions</span></span>
+    </div>
+    {% for snap in snapshots %}
+    <div class="fs-row fs-row--static" data-fs-snapshot-row="{{ snap.snapshot }}">
+      <span class="fs-cell fs-cell--mono fs-cell--name" title="{{ snap.snapshot }}">{{ snap.snapshot }}</span>
+      <span class="fs-cell">
+        <span class="fs-tier" data-fs-tier="{{ snap.kind }}">{{ snap.kind }}</span>
+      </span>
+      <span class="fs-cell fs-cell--mono fs-cell--muted fs-cell--small">{{ snap.created }}</span>
+      <span class="fs-cell fs-cell--mono">{{ snap.size }}</span>
+      <span class="fs-cell fs-cell--mono fs-cell--muted fs-cell--memory">{{ snap.memory }}</span>
+      <span class="fs-cell fs-row__actions">
+        <button type="button" class="fs-btn fs-btn--sm"
+                data-fs-snapshot-action="restore"
+                data-fs-machine="{{ machine.name }}"
+                data-fs-snapshot="{{ snap.snapshot }}"
+                data-fs-snapshot-kind="{{ snap.kind }}"
+                data-fs-confirm="restore"
+                data-fs-running="{{ 'true' if machine.is_running else 'false' }}">Restore</button>
+        <button type="button" class="fs-btn fs-btn--sm fs-btn--danger"
+                data-fs-snapshot-action="delete"
+                data-fs-machine="{{ machine.name }}"
+                data-fs-snapshot="{{ snap.snapshot }}"
+                data-fs-confirm="delete">Delete</button>
+      </span>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="fs-empty" data-fs-snapshot-empty>
+    <div class="fs-empty__title">No snapshots yet</div>
+    <div class="fs-empty__body">
+      A snapshot copies this machine's disk, its spec and — while it runs — its
+      guest memory. Restoring one replaces all three, so a machine comes back to
+      the configuration its disk was captured under.
+    </div>
+  </div>
+  {% endif %}
+
+  <span class="fs-note fs-note--footer">
+    GET /v1/machines/{{ machine.name }}/snapshots · create and restore stream application/x-ndjson
+  </span>
+</div>
