@@ -1642,15 +1642,17 @@ mod tests {
             path: &str,
         ) -> Result<
             tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-            tokio_tungstenite::tungstenite::Error,
+            Box<tokio_tungstenite::tungstenite::Error>,
         > {
             use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
-            let request = self.url(path).into_client_request()?;
+            let request = self.url(path).into_client_request().map_err(Box::new)?;
             let stream = tokio::net::TcpStream::connect(self.address)
                 .await
-                .map_err(tokio_tungstenite::tungstenite::Error::Io)?;
-            let (socket, _) = tokio_tungstenite::client_async(request, stream).await?;
+                .map_err(|source| Box::new(tokio_tungstenite::tungstenite::Error::Io(source)))?;
+            let (socket, _) = tokio_tungstenite::client_async(request, stream)
+                .await
+                .map_err(Box::new)?;
             Ok(socket)
         }
 
@@ -1838,7 +1840,7 @@ mod tests {
             .await
             .err()
             .ok_or("a busy broker must not upgrade")?;
-        match error {
+        match *error {
             tokio_tungstenite::tungstenite::Error::Http(response) => {
                 assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
                 let body = response.body().as_ref().ok_or("the 409 carried no body")?;
@@ -1866,7 +1868,7 @@ mod tests {
             .await
             .err()
             .ok_or("a stopped machine must not upgrade")?;
-        match error {
+        match *error {
             tokio_tungstenite::tungstenite::Error::Http(response) => {
                 let body = response
                     .body()
@@ -1891,7 +1893,7 @@ mod tests {
             .await
             .err()
             .ok_or("a stopped machine must not upgrade")?;
-        match error {
+        match *error {
             tokio_tungstenite::tungstenite::Error::Http(response) => {
                 let body = response
                     .body()
