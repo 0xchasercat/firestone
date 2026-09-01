@@ -31,6 +31,10 @@ pub struct MachineSummary {
     pub memory: String,
     pub uptime: Option<String>,
     pub forwards: Vec<String>,
+    /// Spec forwards differ from the forwards this running machine applied at
+    /// spawn; always false when the machine is not running (§12.4).
+    #[serde(default)]
+    pub forwards_pending: bool,
 }
 
 /// Machine spec and state shared by show and the REST item route.
@@ -39,6 +43,10 @@ pub struct MachineView {
     pub spec: MachineSpec,
     pub state: MachineState,
     pub supervision: Option<Supervision>,
+    /// Spec forwards differ from the forwards this running machine applied at
+    /// spawn; always false when the machine is not running (§12.4).
+    #[serde(default)]
+    pub forwards_pending: bool,
 }
 
 /// Newly-created machine returned by every action surface.

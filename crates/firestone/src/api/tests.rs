@@ -1,6 +1,7 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -15,7 +16,8 @@ use axum::{
 };
 use firestone_core::{
     Action, DispatchFuture, Dispatcher, ErrorKind, Event, EventSink, FirestoneError, GlobalConfig,
-    ImageRef, LogSource, MachineSpec, MachineSpecPatch, StepId,
+    ImageRef, LogSource, MachineSpec, MachineSpecPatch, MachineState, MachineStatus,
+    MachineSummary, MachineView, StateImage, StateVersion, StepId,
 };
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -384,6 +386,87 @@ async fn non_stream_routes_project_exact_actions_statuses_and_payloads() -> Test
             serde_json::to_vec(&payload)?
         );
         assert_eq!(dispatcher.actions()?, vec![case.expected_action]);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn machine_routes_project_forwards_pending_and_the_document_advertises_it() -> TestResult {
+    let summary = MachineSummary {
+        name: "dev".to_owned(),
+        status: "running".to_owned(),
+        image: "ubuntu:24.04".to_owned(),
+        cpus: 2,
+        memory: "2G".to_owned(),
+        uptime: Some("41s".to_owned()),
+        forwards: vec!["8080→80".to_owned()],
+        forwards_pending: true,
+    };
+    let view = MachineView {
+        spec: MachineSpec {
+            image: ImageRef::new("ubuntu:24.04"),
+            ..MachineSpec::default()
+        },
+        state: MachineState {
+            version: StateVersion,
+            status: MachineStatus::Running,
+            image: StateImage {
+                r#ref: "ubuntu:24.04".to_owned(),
+                id: None,
+                sha256: None,
+            },
+            mac: None,
+            cid: 3,
+            instance_id: None,
+            shim_pid: Some(4_200),
+            vmm_pid: Some(4_201),
+            sidecar_pids: BTreeMap::new(),
+            runtime_dir: PathBuf::from("/run/user/1000/firestone/dev"),
+            started_at: Some("2026-08-28T09:12:44Z".to_owned()),
+            forwards: vec!["8080:80".to_owned()],
+            degraded: Vec::new(),
+            last_exit: None,
+        },
+        supervision: None,
+        forwards_pending: true,
+    };
+
+    let cases = [
+        ("list", "/v1/machines", serde_json::to_value(vec![summary])?),
+        ("show", "/v1/machines/dev", serde_json::to_value(view)?),
+    ];
+    for (result_action, uri, payload) in cases {
+        let dispatcher = Arc::new(RecordingDispatcher::success(
+            result_action,
+            payload,
+            Vec::new(),
+        ));
+        let app = app(dispatcher);
+        let response = send(&app, request(Method::GET, uri, Body::empty())?).await?;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let body: Value = serde_json::from_slice(&response_bytes(response).await?)?;
+        let pending = match result_action {
+            "list" => &body[0]["forwards_pending"],
+            _ => &body["forwards_pending"],
+        };
+        assert_eq!(*pending, json!(true), "{uri}");
+    }
+
+    let document: Value = serde_json::from_str(include_str!("../../../../docs/openapi.json"))?;
+    for name in ["MachineSummary", "MachineView"] {
+        let schema = &document["components"]["schemas"][name];
+        assert_eq!(
+            schema["properties"]["forwards_pending"]["type"],
+            json!("boolean"),
+            "{name}"
+        );
+        let required = schema["required"]
+            .as_array()
+            .ok_or_else(|| format!("{name} must declare required properties"))?;
+        assert!(
+            required.iter().any(|value| value == "forwards_pending"),
+            "{name} must require forwards_pending"
+        );
     }
     Ok(())
 }

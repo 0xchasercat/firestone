@@ -23,7 +23,7 @@ use firestone_core::{
     ReadinessOptions, RealValidationHost, RemoveResult, ShimClient, ShimTimeouts, SpecResult,
     SpecWarningPayload, StartResult, StateImage, StateStore, StateVersion, StopResult, Supervision,
     ValidationContext, VersionDependency, VersionIdentity, VersionPaths, VersionResult, atomic,
-    cancel_prepared, launch_prepared_cancellable, prepare_start,
+    cancel_prepared, forwards_differ, launch_prepared_cancellable, prepare_start,
     read_reconciled_machine_state_live, read_reconciled_machine_state_live_locked, run_doctor,
     stop_unsupervised, validate_machine_spec, wait_for_ssh_ready,
 };
@@ -187,6 +187,7 @@ impl LocalDispatcher {
         match (result, cleanup) {
             (Ok(result), Ok(())) => {
                 emit_running_spec_warning(&observed_state.state, events)?;
+                emit_forward_restart_warning(&result.spec, &observed_state.state, events)?;
                 emit_spec_warnings(&result.warnings, events)?;
                 emit_result(events, "edit", &result)
             }
@@ -490,6 +491,7 @@ impl LocalDispatcher {
                     .iter()
                     .map(|forward| display_forward(forward))
                     .collect(),
+                forwards_pending: forwards_pending(&spec, state),
             });
         }
         emit_result(events, "list", &machines)
@@ -497,6 +499,7 @@ impl LocalDispatcher {
 
     fn show(&self, name: &str, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
         let (spec, live) = self.load_machine(name)?;
+        let pending = forwards_pending(&spec, &live.state);
         emit_result(
             events,
             "show",
@@ -504,6 +507,7 @@ impl LocalDispatcher {
                 spec,
                 state: live.state,
                 supervision: live.supervision,
+                forwards_pending: pending,
             },
         )
     }
@@ -526,6 +530,7 @@ impl LocalDispatcher {
         let document = render_spec(&spec)?;
         atomic::write(&self.paths.machine_spec(name)?, document.as_bytes())?;
         emit_running_spec_warning(&observed_state.state, events)?;
+        emit_forward_restart_warning(&spec, &observed_state.state, events)?;
         emit_spec_warnings(&warnings, events)?;
         emit_result(events, "edit", &SpecResult { spec, warnings })
     }
@@ -571,6 +576,7 @@ impl LocalDispatcher {
         let document = render_spec(&loaded.spec)?;
         atomic::write(&self.paths.machine_spec(name)?, document.as_bytes())?;
         emit_running_spec_warning(&observed_state.state, events)?;
+        emit_forward_restart_warning(&loaded.spec, &observed_state.state, events)?;
         emit_spec_warnings(&warnings, events)?;
         emit_result(
             events,
@@ -2216,6 +2222,30 @@ fn emit_running_spec_warning(
     Ok(())
 }
 
+/// Spec forwards that a running machine has not applied yet (§12.4).
+///
+/// passt fixes its forwards at spawn, so a difference against the recorded
+/// state is pending until the next start. A machine that is not running has
+/// nothing applied and is never pending.
+fn forwards_pending(spec: &MachineSpec, state: &MachineState) -> bool {
+    state.status == MachineStatus::Running
+        && forwards_differ(&spec.network.forward, &state.forwards)
+}
+
+fn emit_forward_restart_warning(
+    spec: &MachineSpec,
+    state: &MachineState,
+    events: &mut dyn EventSink,
+) -> Result<(), FirestoneError> {
+    if forwards_pending(spec, state) {
+        events.emit(Event::Log {
+            level: Level::Warn,
+            message: "port forwards apply on restart".to_owned(),
+        })?;
+    }
+    Ok(())
+}
+
 fn emit_spec_warnings(
     warnings: &[SpecWarningPayload],
     events: &mut dyn EventSink,
@@ -2275,14 +2305,15 @@ mod tests {
 
     use firestone_core::{
         Action, Arch, Catalog, Dispatcher, ErrorKind, Event, EventSink, FirestoneError,
-        GlobalConfig, ImageRef, LogSource, MachineLock, MachineSpec, MachineSpecPatch,
+        GlobalConfig, ImageRef, Level, LogSource, MachineLock, MachineSpec, MachineSpecPatch,
         MachineStatus, NetworkSpecPatch, PathInputs, Paths, RealValidationHost, StateStore,
         Supervision, ValidationContext, VersionResult,
     };
 
     use super::{
         LocalDispatcher, MAX_LOG_TAIL_BYTES, display_forward, display_status,
-        format_uptime_seconds, parse_editor_command,
+        emit_forward_restart_warning, format_uptime_seconds, forwards_pending,
+        parse_editor_command,
     };
     struct WaitingSink(mpsc::Sender<()>);
 
@@ -3742,6 +3773,77 @@ esac
             ),
             "running! (unsupervised)"
         );
+    }
+
+    #[tokio::test]
+    async fn forwards_pending_diff_matrix_ignores_order_and_requires_running()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        let mut spec = MachineSpec::default();
+        spec.network.forward.push("8080:80".parse()?);
+        spec.network.forward.push("udp:5353:53".parse()?);
+        create_machine(&dispatcher, "pending", spec.clone()).await?;
+
+        let store = StateStore::new(paths.machine_state("pending")?);
+        let mut state = store.read()?;
+
+        // A machine that never started has applied nothing and is never pending.
+        state.forwards.clear();
+        assert!(!forwards_pending(&spec, &state));
+
+        state.status = MachineStatus::Running;
+        // Same set, opposite configuration order.
+        state.forwards = vec!["udp:5353:53".to_owned(), "8080:80".to_owned()];
+        assert!(!forwards_pending(&spec, &state));
+        // One forward removed from the applied set.
+        state.forwards = vec!["8080:80".to_owned()];
+        assert!(forwards_pending(&spec, &state));
+        // One forward the spec no longer configures.
+        state.forwards = vec![
+            "8080:80".to_owned(),
+            "udp:5353:53".to_owned(),
+            "9090:90".to_owned(),
+        ];
+        assert!(forwards_pending(&spec, &state));
+
+        // The same difference on a stopped machine is not pending.
+        state.status = MachineStatus::Stopped;
+        assert!(!forwards_pending(&spec, &state));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn emit_forward_restart_warning_running_change_emits_one_warning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        let mut spec = MachineSpec::default();
+        spec.network.forward.push("8080:80".parse()?);
+        create_machine(&dispatcher, "warned", spec.clone()).await?;
+
+        let store = StateStore::new(paths.machine_state("warned")?);
+        let mut state = store.read()?;
+        state.status = MachineStatus::Running;
+        state.forwards = vec!["9090:90".to_owned()];
+
+        let mut events = Vec::new();
+        emit_forward_restart_warning(&spec, &state, &mut events)?;
+        assert_eq!(
+            events,
+            vec![Event::Log {
+                level: Level::Warn,
+                message: "port forwards apply on restart".to_owned(),
+            }]
+        );
+
+        // An unchanged forward set, and a stopped machine, stay silent.
+        let mut events = Vec::new();
+        state.forwards = vec!["8080:80".to_owned()];
+        emit_forward_restart_warning(&spec, &state, &mut events)?;
+        state.status = MachineStatus::Stopped;
+        state.forwards = vec!["9090:90".to_owned()];
+        emit_forward_restart_warning(&spec, &state, &mut events)?;
+        assert!(events.is_empty());
+        Ok(())
     }
 
     #[test]
