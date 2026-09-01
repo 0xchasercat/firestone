@@ -89,11 +89,49 @@ impl<'de> Deserialize<'de> for ImageMetadataVersion {
     }
 }
 
+/// Which boot mode a stored image was built for (SPEC §9.5).
+///
+/// The field is absent from version-one sidecars, which are all disk images
+/// booted through a firmware, so it deserializes to `Disk` by default and is
+/// omitted when it is `Disk`: every existing sidecar keeps its exact bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageKind {
+    /// A disk image booted through firmware and provisioned by cloud-init.
+    #[default]
+    Disk,
+    /// An OCI-derived root filesystem booted through the pinned kernel (§8.5).
+    Oci,
+}
+
+impl ImageKind {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Disk => "disk",
+            Self::Oci => "oci",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_disk(&self) -> bool {
+        matches!(self, Self::Disk)
+    }
+
+    #[must_use]
+    pub const fn is_oci(&self) -> bool {
+        matches!(self, Self::Oci)
+    }
+}
+
 /// Strict version-one contents of an image sidecar.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ImageMetadata {
     pub version: ImageMetadataVersion,
     pub id: String,
+    /// Read side of the sidecar `kind` field: absent means `disk` (§9.5).
+    #[serde(default, skip_serializing_if = "ImageKind::is_disk")]
+    pub kind: ImageKind,
     pub generation: u64,
     pub source_ref: String,
     pub source_url: Option<String>,
@@ -124,6 +162,8 @@ impl<'de> Deserialize<'de> for ImageMetadata {
         struct Wire {
             version: ImageMetadataVersion,
             id: String,
+            #[serde(default)]
+            kind: ImageKind,
             generation: u64,
             source_ref: String,
             source_url: RequiredNullable<String>,
@@ -145,6 +185,7 @@ impl<'de> Deserialize<'de> for ImageMetadata {
         Ok(Self {
             version: wire.version,
             id: wire.id,
+            kind: wire.kind,
             generation: wire.generation,
             source_ref: wire.source_ref,
             source_url: wire.source_url.0,
@@ -209,6 +250,12 @@ impl ImageMetadata {
             ));
         }
         if let Some(source_url) = &self.source_url {
+            if self.kind.is_oci() {
+                return Err(invalid_sidecar(
+                    &self.id,
+                    "an oci image must not carry a source_url",
+                ));
+            }
             let Some(parsed) = parse_https_url(source_url) else {
                 return Err(invalid_sidecar(
                     &self.id,
@@ -233,6 +280,21 @@ impl ImageMetadata {
                     &self.id,
                     "catalog image firmware must be present",
                 ));
+            }
+        } else if self.kind.is_oci() {
+            // An OCI image (§8.5) has no source URL and no local path: its
+            // immutable source is the normalized reference itself (§8.6).
+            let normalized = OciReference::parse(&self.source_ref)
+                .ok()
+                .map(|reference| reference.to_string());
+            if normalized.as_deref() != Some(self.source_ref.as_str()) {
+                return Err(invalid_sidecar(
+                    &self.id,
+                    "an oci image source_ref must be a normalized OCI reference",
+                ));
+            }
+            if self.firmware.is_some() {
+                return Err(invalid_sidecar(&self.id, "oci image firmware must be null"));
             }
         } else {
             if !Path::new(&self.source_ref).is_absolute() {
@@ -1269,6 +1331,9 @@ impl ImageStore {
         let metadata = ImageMetadata {
             version: ImageMetadataVersion,
             id: id.clone(),
+            // This path publishes disk images only; the OCI pull pipeline owns
+            // the `oci` write side (§8.5).
+            kind: ImageKind::Disk,
             generation,
             source_ref: source.source_ref.clone(),
             source_url: source.source_url.clone(),
@@ -3847,7 +3912,8 @@ mod tests {
     use super::*;
     use crate::{
         CloudInitSpec, DependencyManifest, Firmware, MachineSpec, MachineStatus, NetMode,
-        NetworkSpec, PathInputs, ShimTimeouts, StateVersion, VmmSpec, prepare_start,
+        NetworkPlan, NetworkSpec, PathInputs, ShimTimeouts, StateVersion, VmConfigInput, VmmSpec,
+        deps::DIRECT_BOOT_KERNEL_DEPENDENCY, prepare_start, publish_vm_config,
     };
 
     const FIXED_TIME: &str = "2026-08-28T09:00:00Z";
@@ -4146,6 +4212,245 @@ else:
         let lock = MachineLock::acquire(name, &paths.machine_lock(name)?, events)?;
         StateStore::new(paths.machine_state(name)?).write_from_locked_action(state, &lock)?;
         Ok(lock)
+    }
+
+    fn direct_boot_kernel_manifest(
+        url: &str,
+        bytes: &[u8],
+        firmware: Option<(&str, &str, &[u8])>,
+    ) -> Result<DependencyManifest, FirestoneError> {
+        let mut text = format!(
+            "manifest_version = 1\n\n[dependency.cloud-hypervisor-kernel]\nversion = \"ch-test\"\navailability = \"binary\"\n[dependency.cloud-hypervisor-kernel.x86_64]\nasset = \"bzImage-x86_64\"\ninstall_name = \"bzImage-ch-test\"\nurl = \"{url}\"\nsha256 = \"{}\"\n",
+            sha256_bytes(bytes)
+        );
+        if let Some((install_name, firmware_url, firmware_bytes)) = firmware {
+            let _ = write!(
+                text,
+                "\n[dependency.cloud-hypervisor-edk2]\nversion = \"ch-test\"\navailability = \"binary\"\n[dependency.cloud-hypervisor-edk2.x86_64]\nasset = \"CLOUDHV.fd\"\ninstall_name = \"{install_name}\"\nurl = \"{firmware_url}\"\nsha256 = \"{}\"\n",
+                sha256_bytes(firmware_bytes)
+            );
+        }
+        DependencyManifest::parse(&text)
+    }
+
+    /// SPEC §9.5: an OCI start publishes the pinned kernel through the same
+    /// locked, hash-verified publisher as a firmware, mode 0644, before
+    /// `vmconfig.json` exists. This drives the exact sequence the shim runs
+    /// (§9.3 step 6c) without KVM; the OCI pull itself lands with M6-15.
+    #[test]
+    fn oci_start_publishes_the_pinned_kernel_before_vmconfig()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let kernel = b"pinned-direct-boot-kernel";
+        let url = "https://kernel.example.invalid/bzImage-x86_64";
+        let manifest = direct_boot_kernel_manifest(url, kernel, None)?;
+        fixture.http.push(
+            url,
+            kernel.to_vec(),
+            Some(kernel.len() as u64),
+            Some("application/octet-stream"),
+        )?;
+        let name = "oci-boot";
+        let state = machine_state(
+            &fixture.paths,
+            name,
+            StateImage {
+                r#ref: "docker.io/library/nginx:latest".to_owned(),
+                id: None,
+                sha256: None,
+            },
+        )?;
+        let mut events = Vec::new();
+        let _lock = create_machine(&fixture.paths, name, &state, &mut events)?;
+        let spec = MachineSpec {
+            image: ImageRef::new("docker.io/library/nginx:latest"),
+            arch: Some(Arch::X86_64),
+            network: NetworkSpec {
+                mode: NetMode::None,
+                ..NetworkSpec::default()
+            },
+            ..MachineSpec::default()
+        };
+        let input = VmConfigInput {
+            name,
+            spec: &spec,
+            state: &state,
+            network: &NetworkPlan::None,
+            filesystems: &[],
+            architecture: Arch::X86_64,
+            catalog_firmware: None,
+            image_kind: ImageKind::Oci,
+        };
+
+        // Without the install, the direct-boot payload cannot be published.
+        let error = publish_vm_config(&fixture.paths, &manifest, input)
+            .err()
+            .ok_or("an uninstalled kernel must refuse vmconfig publication")?;
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert!(!fixture.paths.machine_vmconfig(name)?.exists());
+
+        let artifact = crate::vmm::selected_pinned_boot_artifact(
+            &manifest,
+            &spec.vmm.firmware,
+            Arch::X86_64,
+            None,
+            ImageKind::Oci,
+        )?
+        .ok_or("an OCI start must select the pinned kernel")?;
+        assert_eq!(artifact.dependency, DIRECT_BOOT_KERNEL_DEPENDENCY);
+        let installed = fixture.store.ensure_pinned_artifact(&artifact)?;
+
+        assert_eq!(fs::read(&installed)?, kernel);
+        assert_eq!(
+            fs::symlink_metadata(&installed)?.permissions().mode() & 0o7777,
+            0o644
+        );
+        let config = publish_vm_config(&fixture.paths, &manifest, input)?;
+        let published: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.paths.machine_vmconfig(name)?)?)?;
+        assert_eq!(
+            published["payload"]["kernel"],
+            installed.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            published["payload"]["cmdline"],
+            "console=hvc0 console=ttyS0 root=/dev/vda rw init=/sbin/firestone-init"
+        );
+        assert!(published["payload"].get("firmware").is_none());
+        assert_eq!(
+            fs::read(fixture.paths.machine_vmconfig(name)?)?,
+            config.as_bytes()
+        );
+        Ok(())
+    }
+
+    /// A firmware machine never fetches the direct-boot kernel: the scripted
+    /// transport would fail the start if it tried (§9.5).
+    #[test]
+    fn firmware_start_never_installs_the_direct_boot_kernel()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let kernel = b"unused-direct-boot-kernel";
+        let kernel_url = "https://kernel.example.invalid/bzImage-x86_64";
+        let firmware = b"disk-machine-edk2";
+        let firmware_url = "https://firmware.example.invalid/CLOUDHV.fd";
+        let manifest = direct_boot_kernel_manifest(
+            kernel_url,
+            kernel,
+            Some(("CLOUDHV-disk-start.fd", firmware_url, firmware)),
+        )?;
+        fixture.http.push(
+            firmware_url,
+            firmware.to_vec(),
+            Some(firmware.len() as u64),
+            Some("application/octet-stream"),
+        )?;
+
+        prepare_firmware_start(&fixture, "disk-start", Firmware::EDK2, &manifest)?;
+
+        let kernel_artifact = manifest.direct_boot_kernel("x86_64")?;
+        assert!(
+            !fixture
+                .paths
+                .binary_file(&kernel_artifact.install_name)?
+                .exists()
+        );
+        let vmconfig: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.paths.machine_vmconfig("disk-start")?)?)?;
+        assert_eq!(
+            vmconfig["payload"]["firmware"],
+            fixture
+                .paths
+                .binary_file("CLOUDHV-disk-start.fd")?
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert!(vmconfig["payload"].get("cmdline").is_none());
+        Ok(())
+    }
+
+    /// A version-one sidecar has no `kind`, reads as a disk image, and keeps
+    /// its exact bytes; an `oci` sidecar round-trips and validates (§9.5).
+    #[test]
+    fn sidecar_without_kind_reads_as_disk_and_an_oci_kind_round_trips()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let digest = sha256_bytes(b"oci-rootfs");
+        let reference = "docker.io/library/nginx:latest";
+        let local = "/srv/images/base.qcow2";
+        let sidecar = |kind: &str, source_ref: &str, source_url: &str, firmware: &str| {
+            let id = stable_image_id(
+                source_ref,
+                (source_url != "null").then_some(source_url),
+                Arch::X86_64,
+                &digest,
+            );
+            format!(
+                r#"{{"version":1,{kind}"id":"{id}","generation":1,"source_ref":"{source_ref}","source_url":{source_url},"source_sha256":"{digest}","stored_sha256":"{digest}","architecture":"x86_64","firmware":{firmware},"source_format":"qcow2","stored_format":"qcow2","verification_algorithm":null,"verification_digest":null,"size":8,"pulled_at":"{FIXED_TIME}"}}"#
+            )
+        };
+
+        let disk = serde_json::from_str::<ImageMetadata>(&sidecar("", local, "null", "null"))?;
+        assert_eq!(disk.kind, ImageKind::Disk);
+        assert_eq!(disk.kind.as_str(), "disk");
+        disk.validate()?;
+        assert!(!String::from_utf8(serde_json::to_vec(&disk)?)?.contains("kind"));
+
+        let oci = serde_json::from_str::<ImageMetadata>(&sidecar(
+            r#""kind":"oci","#,
+            reference,
+            "null",
+            "null",
+        ))?;
+        assert_eq!(oci.kind, ImageKind::Oci);
+        assert_eq!(oci.kind.as_str(), "oci");
+        oci.validate()?;
+        assert!(String::from_utf8(serde_json::to_vec(&oci)?)?.contains(r#""kind":"oci""#));
+
+        for (kind, source_ref, source_url, firmware, reason) in [
+            (
+                r#""kind":"oci","#,
+                local,
+                "null",
+                "null",
+                "an oci image source_ref must be a normalized OCI reference",
+            ),
+            (
+                r#""kind":"oci","#,
+                "nginx:latest",
+                "null",
+                "null",
+                "an oci image source_ref must be a normalized OCI reference",
+            ),
+            (
+                r#""kind":"oci","#,
+                reference,
+                r#""https://images.example.invalid/base.qcow2""#,
+                "null",
+                "an oci image must not carry a source_url",
+            ),
+            (
+                r#""kind":"oci","#,
+                reference,
+                "null",
+                r#""edk2""#,
+                "oci image firmware must be null",
+            ),
+        ] {
+            let metadata = serde_json::from_str::<ImageMetadata>(&sidecar(
+                kind, source_ref, source_url, firmware,
+            ))?;
+            let error = metadata
+                .validate()
+                .err()
+                .ok_or("an inconsistent oci sidecar must be rejected")?;
+            assert_eq!(error.kind(), ErrorKind::Dependency);
+            assert!(
+                error.message().contains(reason),
+                "unexpected message: {}",
+                error.message()
+            );
+        }
+        Ok(())
     }
 
     fn firmware_manifest(
@@ -6367,6 +6672,7 @@ sshd_path = "{}"
             ImageMetadata {
                 version: ImageMetadataVersion,
                 id,
+                kind: ImageKind::Disk,
                 generation: 1,
                 source_ref,
                 source_url: Some(url.to_owned()),

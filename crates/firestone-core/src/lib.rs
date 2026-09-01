@@ -61,10 +61,10 @@ pub use embedded_helpers::{
 pub use error::{ErrorInfo, ErrorKind, FirestoneError};
 pub use event::{Event, Level, StepId, Unit};
 pub use image::{
-    ImageInspection, ImageMetadata, ImageMetadataVersion, ImagePruneResult, ImagePullRequest,
-    ImageRemoveResult, ImageSourceLocation, ImageStore, ImageVerification, OverlayInfo,
-    PreparedMachineImage, PulledImage, ResolvedImageSource, StoredImage, disk_shrink_error,
-    overlay_virtual_size,
+    ImageInspection, ImageKind, ImageMetadata, ImageMetadataVersion, ImagePruneResult,
+    ImagePullRequest, ImageRemoveResult, ImageSourceLocation, ImageStore, ImageVerification,
+    OverlayInfo, PreparedMachineImage, PulledImage, ResolvedImageSource, StoredImage,
+    disk_shrink_error, overlay_virtual_size,
 };
 pub use lock::MachineLock;
 pub use metrics::{

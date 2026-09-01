@@ -9,10 +9,17 @@ use serde_json::{Map, Value};
 
 use crate::{
     Arch, CatalogFirmware, DependencyArtifact, DependencyManifest, ErrorKind, FirestoneError,
-    Firmware, MacAddr, MachineSpec, MachineState, NetworkPlan, Paths, VirtiofsPlan, atomic,
+    Firmware, ImageKind, MacAddr, MachineSpec, MachineState, NetworkPlan, Paths, VirtiofsPlan,
+    atomic,
     embedded_helpers::verified_pinned_artifact,
     virtiofs::{VIRTIOFS_NUM_QUEUES, VIRTIOFS_QUEUE_SIZE},
 };
+
+/// The fixed direct-boot command line for an OCI machine (SPEC §9.5). It is
+/// byte-exact: both consoles are listed so kernel output reaches `hvc0` and
+/// `console.log`, and there is deliberately no `ip=` parameter (§10.5).
+pub const DIRECT_BOOT_CMDLINE: &str =
+    "console=hvc0 console=ttyS0 root=/dev/vda rw init=/sbin/firestone-init";
 
 /// Inputs already resolved by image and state preparation before VMM creation.
 #[derive(Debug, Clone, Copy)]
@@ -24,6 +31,9 @@ pub struct VmConfigInput<'a> {
     pub filesystems: &'a [VirtiofsPlan],
     pub architecture: Arch,
     pub catalog_firmware: Option<CatalogFirmware>,
+    /// Boot mode of the machine's pinned image: an OCI image boots the pinned
+    /// kernel directly instead of a firmware (§9.5).
+    pub image_kind: ImageKind,
 }
 
 /// Recursively sorted JSON and the exact compact bytes sent to Cloud Hypervisor.
@@ -98,6 +108,10 @@ struct PayloadConfig {
     firmware: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     kernel: Option<PathBuf>,
+    /// Present only on a direct-kernel OCI machine (§9.5). Omitting it keeps
+    /// every firmware machine's `vm.create` bytes exactly as they were.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cmdline: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -382,6 +396,17 @@ fn resolve_payload(
     manifest: &DependencyManifest,
     input: VmConfigInput<'_>,
 ) -> Result<PayloadConfig, FirestoneError> {
+    if input.image_kind.is_oci() {
+        // §9.5: an OCI machine ignores the firmware policy entirely and boots
+        // the pinned kernel with the fixed command line.
+        require_auto_firmware_for_direct_boot(&input.spec.vmm.firmware)?;
+        let artifact = manifest.direct_boot_kernel(input.architecture.as_str())?;
+        return Ok(PayloadConfig {
+            firmware: None,
+            kernel: Some(installed_firmware(paths, &artifact)?),
+            cmdline: Some(DIRECT_BOOT_CMDLINE.to_owned()),
+        });
+    }
     let effective = effective_firmware(
         &input.spec.vmm.firmware,
         input.architecture,
@@ -395,6 +420,7 @@ fn resolve_payload(
             Ok(PayloadConfig {
                 firmware: None,
                 kernel: Some(path),
+                cmdline: None,
             })
         }
         EffectiveFirmware::Edk2 => {
@@ -404,6 +430,7 @@ fn resolve_payload(
             Ok(PayloadConfig {
                 firmware: Some(path),
                 kernel: None,
+                cmdline: None,
             })
         }
         EffectiveFirmware::Custom(path) => {
@@ -418,6 +445,7 @@ fn resolve_payload(
             Ok(PayloadConfig {
                 firmware: Some(path.to_path_buf()),
                 kernel: None,
+                cmdline: None,
             })
         }
     }
@@ -445,6 +473,39 @@ fn effective_firmware(
         CatalogFirmware::Rhf => EffectiveFirmware::Rhf,
         CatalogFirmware::Edk2 => EffectiveFirmware::Edk2,
     }
+}
+
+/// Refuses a firmware policy on a direct-kernel machine (§9.5). `auto` is
+/// accepted and ignored; anything else names a boot mode the image cannot use.
+fn require_auto_firmware_for_direct_boot(firmware: &Firmware) -> Result<(), FirestoneError> {
+    if *firmware == Firmware::AUTO {
+        return Ok(());
+    }
+    Err(FirestoneError::new(
+        ErrorKind::InvalidSpec,
+        format!(
+            "vmm.firmware `{firmware}` cannot be used by an OCI machine: it boots the pinned kernel directly"
+        ),
+    )
+    .with_field("vmm.firmware")
+    .with_hint("remove vmm.firmware, or leave it `auto`, for an OCI machine"))
+}
+
+/// Resolves the one Firestone-owned boot artifact this start must publish
+/// before `vmconfig.json`: the pinned direct-boot kernel for an OCI machine
+/// (§9.5), otherwise the selected firmware.
+pub(crate) fn selected_pinned_boot_artifact(
+    manifest: &DependencyManifest,
+    firmware: &Firmware,
+    architecture: Arch,
+    catalog_firmware: Option<CatalogFirmware>,
+    image_kind: ImageKind,
+) -> Result<Option<DependencyArtifact>, FirestoneError> {
+    if image_kind.is_oci() {
+        require_auto_firmware_for_direct_boot(firmware)?;
+        return manifest.direct_boot_kernel(architecture.as_str()).map(Some);
+    }
+    selected_pinned_firmware(manifest, firmware, architecture, catalog_firmware)
 }
 
 /// Resolves the one Firestone-owned firmware artifact needed for this start.
@@ -541,6 +602,12 @@ fn validate_required_invariants(
         }
         if required_payload.contains_key("firmware") && payload.contains_key("kernel") {
             return Err(required_overlay_error("payload.kernel"));
+        }
+        // §9.5: the direct-boot command line is Firestone-owned. `required_subset`
+        // already rejects changing or removing it on an OCI machine; adding one
+        // to a firmware machine is the remaining boot-mode flip.
+        if !required_payload.contains_key("cmdline") && payload.contains_key("cmdline") {
+            return Err(required_overlay_error("payload.cmdline"));
         }
     }
     Ok(())
@@ -699,10 +766,10 @@ mod tests {
         canonical_vm_config, publish_vm_config,
     };
     use crate::{
-        Arch, CatalogFirmware, DependencyManifest, ErrorKind, Firmware, MachineSpec, MachineState,
-        MachineStatus, MountSpec, NetMode, NetworkPlan, NetworkPlanOptions, NetworkSpec,
-        PathInputs, Paths, StateImage, StateVersion, TapHost, VirtiofsPlan, VirtiofsSandbox,
-        prepare_network, prepare_virtiofs_plans,
+        Arch, CatalogFirmware, DependencyManifest, ErrorKind, Firmware, ImageKind, MachineSpec,
+        MachineState, MachineStatus, MountSpec, NetMode, NetworkPlan, NetworkPlanOptions,
+        NetworkSpec, PathInputs, Paths, StateImage, StateVersion, TapHost, VirtiofsPlan,
+        VirtiofsSandbox, prepare_network, prepare_virtiofs_plans,
     };
     use serde_json::{Value, json};
     use sha2::{Digest as _, Sha256};
@@ -741,10 +808,12 @@ mod tests {
 
     const FIRMWARE_FIXTURE: &[u8] = b"firmware fixture";
     const VIRTIOFSD_FIXTURE: &[u8] = b"virtiofsd fixture";
+    const KERNEL_FIXTURE: &[u8] = b"direct-boot kernel fixture";
 
     fn fixture_manifest() -> Result<DependencyManifest, crate::FirestoneError> {
         let firmware_sha = format!("{:x}", Sha256::digest(FIRMWARE_FIXTURE));
         let virtiofsd_sha = format!("{:x}", Sha256::digest(VIRTIOFSD_FIXTURE));
+        let kernel_sha = format!("{:x}", Sha256::digest(KERNEL_FIXTURE));
         DependencyManifest::parse(&format!(
             r#"manifest_version = 1
 
@@ -784,6 +853,20 @@ asset = "virtiofsd"
 install_name = "virtiofsd-v1.14.0"
 url = "https://example.invalid/virtiofsd"
 sha256 = "{virtiofsd_sha}"
+
+[dependency.cloud-hypervisor-kernel]
+version = "ch-test"
+availability = "binary"
+[dependency.cloud-hypervisor-kernel.x86_64]
+asset = "bzImage-x86_64"
+install_name = "bzImage-ch-test"
+url = "https://example.invalid/bzImage-x86_64"
+sha256 = "{kernel_sha}"
+[dependency.cloud-hypervisor-kernel.aarch64]
+asset = "Image-arm64"
+install_name = "Image-ch-test"
+url = "https://example.invalid/Image-arm64"
+sha256 = "{kernel_sha}"
 "#,
         ))
     }
@@ -792,6 +875,7 @@ sha256 = "{virtiofsd_sha}"
         match dependency {
             "rust-hypervisor-firmware" | "cloud-hypervisor-edk2" => Ok(FIRMWARE_FIXTURE),
             "virtiofsd" => Ok(VIRTIOFSD_FIXTURE),
+            "cloud-hypervisor-kernel" => Ok(KERNEL_FIXTURE),
             other => Err(io::Error::other(format!(
                 "no fixture bytes for dependency {other}"
             ))),
@@ -859,6 +943,7 @@ sha256 = "{virtiofsd_sha}"
             PayloadConfig {
                 firmware: None,
                 kernel: Some(PathBuf::from("/firestone/data/bin/hypervisor-fw-0.5.0")),
+                cmdline: None,
             },
         )?;
 
@@ -909,6 +994,7 @@ sha256 = "{virtiofsd_sha}"
             PayloadConfig {
                 firmware: None,
                 kernel: Some(PathBuf::from("/firestone/data/bin/hypervisor-fw-0.5.0")),
+                cmdline: None,
             },
         )?;
         let mut value = serde_json::to_value(typed)?;
@@ -947,6 +1033,7 @@ sha256 = "{virtiofsd_sha}"
             PayloadConfig {
                 firmware: None,
                 kernel: Some(PathBuf::from("/firestone/data/bin/hypervisor-fw-0.5.0")),
+                cmdline: None,
             },
         )?;
         let value = serde_json::to_value(typed)?;
@@ -974,6 +1061,7 @@ sha256 = "{virtiofsd_sha}"
             PayloadConfig {
                 firmware: None,
                 kernel: Some(PathBuf::from("/firestone/data/bin/hypervisor-fw-0.5.0")),
+                cmdline: None,
             },
         )?;
 
@@ -1730,6 +1818,292 @@ sha256 = "{virtiofsd_sha}"
         Ok(())
     }
 
+    /// SPEC §9.5: an OCI image ignores the firmware policy and boots the
+    /// pinned kernel with a byte-exact command line on both architectures.
+    #[test]
+    fn oci_image_payload_maps_to_the_pinned_kernel_and_fixed_cmdline()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        for architecture in [Arch::X86_64, Arch::Aarch64] {
+            let kernel = fixture.install("cloud-hypervisor-kernel", architecture)?;
+            let spec = MachineSpec::default();
+            let state = state(&fixture.paths)?;
+
+            let config = canonical_vm_config(
+                &fixture.paths,
+                &fixture.manifest,
+                input_oci(&spec, &state, architecture),
+            )?;
+
+            assert_eq!(
+                config
+                    .as_value()
+                    .pointer("/payload/kernel")
+                    .and_then(Value::as_str),
+                kernel.to_str()
+            );
+            assert_eq!(
+                config
+                    .as_value()
+                    .pointer("/payload/cmdline")
+                    .and_then(Value::as_str),
+                Some("console=hvc0 console=ttyS0 root=/dev/vda rw init=/sbin/firestone-init")
+            );
+            assert!(config.as_value().pointer("/payload/firmware").is_none());
+            let kernel = kernel.to_str().ok_or("kernel path is not UTF-8")?;
+            assert!(std::str::from_utf8(config.as_bytes())?.contains(&format!(
+                "\"payload\":{{\"cmdline\":\"console=hvc0 console=ttyS0 root=/dev/vda rw init=/sbin/firestone-init\",\"kernel\":\"{kernel}\"}}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The command line is a constant, not a rendering: SPEC §9.5 fixes its
+    /// bytes and §10.5 depends on `init=` and on both consoles being present.
+    #[test]
+    fn direct_boot_cmdline_constant_is_byte_exact() {
+        assert_eq!(
+            super::DIRECT_BOOT_CMDLINE,
+            "console=hvc0 console=ttyS0 root=/dev/vda rw init=/sbin/firestone-init"
+        );
+    }
+
+    /// A firmware machine never gains the new `payload.cmdline` key, so the
+    /// `vm.create` bytes of every machine defined before direct kernel boot
+    /// existed stay exactly as they were.
+    #[test]
+    fn firmware_machine_vmconfig_bytes_are_unchanged_by_the_cmdline_field()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let paths = paths_for_root(PathBuf::from("/firestone"))?;
+        let spec = MachineSpec::default();
+        let state = state(&paths)?;
+
+        for (payload, expected_payload) in [
+            (
+                PayloadConfig {
+                    firmware: None,
+                    kernel: Some(PathBuf::from("/firestone/data/bin/hypervisor-fw-0.5.0")),
+                    cmdline: None,
+                },
+                "\"payload\":{\"kernel\":\"/firestone/data/bin/hypervisor-fw-0.5.0\"}",
+            ),
+            (
+                PayloadConfig {
+                    firmware: Some(PathBuf::from("/firestone/data/bin/CLOUDHV-ch-test.fd")),
+                    kernel: None,
+                    cmdline: None,
+                },
+                "\"payload\":{\"firmware\":\"/firestone/data/bin/CLOUDHV-ch-test.fd\"}",
+            ),
+        ] {
+            let typed = base_vm_config(&paths, input(&spec, &state, Arch::X86_64, None), payload)?;
+            let mut value = serde_json::to_value(typed)?;
+            super::sort_json(&mut value);
+            let text = String::from_utf8(serde_json::to_vec(&value)?)?;
+
+            assert_eq!(
+                text,
+                format!(
+                    "{{\"console\":{{\"mode\":\"Pty\"}},\
+\"cpus\":{{\"boot_vcpus\":2,\"max_vcpus\":2}},\
+\"disks\":[{{\"backing_files\":true,\"image_type\":\"Qcow2\",\"path\":\"/firestone/data/machines/demo/disk.qcow2\"}},\
+{{\"image_type\":\"Raw\",\"path\":\"/firestone/data/machines/demo/seed.img\",\"readonly\":true}}],\
+\"memory\":{{\"shared\":true,\"size\":2147483648}},\
+{expected_payload},\
+\"rng\":{{\"src\":\"/dev/urandom\"}},\
+\"serial\":{{\"file\":\"/firestone/data/machines/demo/console.log\",\"mode\":\"File\"}},\
+\"vsock\":{{\"cid\":3,\"socket\":\"/firestone/run/demo/vsock.sock\"}}}}"
+                )
+            );
+            assert!(!text.contains("cmdline"));
+        }
+        Ok(())
+    }
+
+    /// SPEC §9.5: `firmware = "auto"` is accepted and ignored on an OCI
+    /// machine; every other value names a boot mode the image cannot use.
+    #[test]
+    fn oci_machine_with_a_named_firmware_returns_invalid_spec_naming_vmm_firmware()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        fixture.install("cloud-hypervisor-kernel", Arch::X86_64)?;
+        let state = state(&fixture.paths)?;
+
+        for firmware in [
+            Firmware::RHF,
+            Firmware::EDK2,
+            Firmware::path("/opt/custom-firmware.fd")?,
+        ] {
+            let mut spec = MachineSpec::default();
+            spec.vmm.firmware = firmware.clone();
+
+            let error = canonical_vm_config(
+                &fixture.paths,
+                &fixture.manifest,
+                input_oci(&spec, &state, Arch::X86_64),
+            )
+            .err()
+            .ok_or("an OCI machine must refuse a firmware policy")?;
+
+            assert_eq!(error.kind(), ErrorKind::InvalidSpec);
+            assert_eq!(error.field(), Some("vmm.firmware"));
+            assert_eq!(
+                error.message(),
+                format!(
+                    "vmm.firmware `{firmware}` cannot be used by an OCI machine: it boots the pinned kernel directly"
+                )
+            );
+            assert_eq!(
+                error.hint(),
+                Some("remove vmm.firmware, or leave it `auto`, for an OCI machine")
+            );
+        }
+
+        let spec = MachineSpec::default();
+        assert_eq!(spec.vmm.firmware, Firmware::AUTO);
+        assert!(
+            canonical_vm_config(
+                &fixture.paths,
+                &fixture.manifest,
+                input_oci(&spec, &state, Arch::X86_64),
+            )
+            .is_ok()
+        );
+        Ok(())
+    }
+
+    /// The lazily installed artifact is selected by image kind: only an OCI
+    /// start fetches the kernel, and a firmware start never does (§9.5).
+    #[test]
+    fn boot_artifact_selection_follows_the_image_kind() -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = fixture_manifest()?;
+
+        for (architecture, install_name) in [
+            (Arch::X86_64, "bzImage-ch-test"),
+            (Arch::Aarch64, "Image-ch-test"),
+        ] {
+            let artifact = super::selected_pinned_boot_artifact(
+                &manifest,
+                &Firmware::AUTO,
+                architecture,
+                Some(CatalogFirmware::Edk2),
+                ImageKind::Oci,
+            )?
+            .ok_or("an OCI start must install the pinned kernel")?;
+
+            assert_eq!(artifact.dependency, "cloud-hypervisor-kernel");
+            assert_eq!(artifact.install_name, install_name);
+            assert_eq!(artifact.expected_mode(), 0o644);
+        }
+
+        let firmware = super::selected_pinned_boot_artifact(
+            &manifest,
+            &Firmware::AUTO,
+            Arch::X86_64,
+            Some(CatalogFirmware::Edk2),
+            ImageKind::Disk,
+        )?
+        .ok_or("a firmware start must install its firmware")?;
+        assert_eq!(firmware.dependency, "cloud-hypervisor-edk2");
+
+        let error = super::selected_pinned_boot_artifact(
+            &manifest,
+            &Firmware::EDK2,
+            Arch::X86_64,
+            None,
+            ImageKind::Oci,
+        )
+        .err()
+        .ok_or("an OCI start must refuse a firmware policy before downloading")?;
+        assert_eq!(error.kind(), ErrorKind::InvalidSpec);
+        assert_eq!(error.field(), Some("vmm.firmware"));
+        Ok(())
+    }
+
+    /// SPEC §9.5 overlay boundary: `config_overlay` may not touch the direct
+    /// boot command line and may not flip a machine between boot modes.
+    #[test]
+    fn overlay_direct_boot_payload_changes_return_stable_invalid_spec_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        fixture.install("cloud-hypervisor-kernel", Arch::X86_64)?;
+        let rhf = fixture.install("rust-hypervisor-firmware", Arch::X86_64)?;
+        let state = state(&fixture.paths)?;
+
+        for (kind, overlay, field) in [
+            (
+                ImageKind::Oci,
+                json!({"payload": {"cmdline": "console=ttyS0 root=/dev/vda rw"}}),
+                "payload.cmdline",
+            ),
+            (
+                ImageKind::Oci,
+                json!({"payload": {"cmdline": null}}),
+                "payload.cmdline",
+            ),
+            (
+                ImageKind::Oci,
+                json!({"payload": {"firmware": "/opt/CLOUDHV.fd"}}),
+                "payload.firmware",
+            ),
+            (
+                ImageKind::Oci,
+                json!({"payload": {"kernel": null}}),
+                "payload.kernel",
+            ),
+            (
+                ImageKind::Disk,
+                json!({"payload": {"cmdline": super::DIRECT_BOOT_CMDLINE}}),
+                "payload.cmdline",
+            ),
+            (
+                ImageKind::Disk,
+                json!({"payload": {"firmware": "/opt/CLOUDHV.fd"}}),
+                "payload.firmware",
+            ),
+        ] {
+            let mut spec = MachineSpec::default();
+            spec.vmm.config_overlay = Some(overlay);
+            let input = match kind {
+                ImageKind::Oci => input_oci(&spec, &state, Arch::X86_64),
+                ImageKind::Disk => input(&spec, &state, Arch::X86_64, None),
+            };
+
+            let error = canonical_vm_config(&fixture.paths, &fixture.manifest, input)
+                .err()
+                .ok_or("a boot-mode overlay change should fail")?;
+
+            assert_eq!(error.kind(), ErrorKind::InvalidSpec);
+            assert_eq!(
+                error.message(),
+                format!("vmm.config_overlay changes required VmConfig field `{field}`")
+            );
+            assert_eq!(
+                error.hint(),
+                Some("remove that overlay change; Firestone owns required boot and sidecar fields")
+            );
+        }
+
+        // An overlay that leaves the payload alone still applies to an OCI
+        // machine, so the boundary is not a blanket refusal.
+        let mut spec = MachineSpec::default();
+        spec.vmm.config_overlay = Some(json!({"watchdog": true}));
+        let config = canonical_vm_config(
+            &fixture.paths,
+            &fixture.manifest,
+            input_oci(&spec, &state, Arch::X86_64),
+        )?;
+        assert_eq!(config.as_value().pointer("/watchdog"), Some(&json!(true)));
+        assert_ne!(
+            config
+                .as_value()
+                .pointer("/payload/kernel")
+                .and_then(Value::as_str),
+            rhf.to_str()
+        );
+        Ok(())
+    }
+
     fn paths_for_root(root: PathBuf) -> Result<Paths, crate::FirestoneError> {
         Paths::from_inputs(&PathInputs {
             current_dir: root.clone(),
@@ -1782,8 +2156,20 @@ sha256 = "{virtiofsd_sha}"
             filesystems: &NO_FILESYSTEMS,
             architecture,
             catalog_firmware,
+            image_kind: ImageKind::Disk,
         }
     }
+    fn input_oci<'a>(
+        spec: &'a MachineSpec,
+        state: &'a MachineState,
+        architecture: Arch,
+    ) -> VmConfigInput<'a> {
+        VmConfigInput {
+            image_kind: ImageKind::Oci,
+            ..input(spec, state, architecture, None)
+        }
+    }
+
     fn input_with_plans<'a>(
         spec: &'a MachineSpec,
         state: &'a MachineState,
@@ -1800,6 +2186,7 @@ sha256 = "{virtiofsd_sha}"
             filesystems,
             architecture,
             catalog_firmware,
+            image_kind: ImageKind::Disk,
         }
     }
 }

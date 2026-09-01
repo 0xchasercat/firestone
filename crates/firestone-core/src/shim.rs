@@ -58,7 +58,8 @@ use crate::{
     embedded_helper, ensure_ssh_identity, invalidate_known_hosts_for_seed,
     materialize_embedded_helper, network::NetworkPlanSnapshot, prepare_network,
     prepare_virtiofs_plans_with_readiness, publish_seed_with_sshd_path, publish_vm_config,
-    resolve_verified_apparmor_passt, virtiofs::VirtiofsPlanSnapshot, vmm::selected_pinned_firmware,
+    resolve_verified_apparmor_passt, virtiofs::VirtiofsPlanSnapshot,
+    vmm::selected_pinned_boot_artifact,
 };
 
 const PLAN_VERSION: u32 = 2;
@@ -1038,13 +1039,16 @@ pub fn prepare_start(
             elapsed_ms: 0,
         })?;
 
-        if let Some(firmware) = selected_pinned_firmware(
+        // §9.5: an OCI machine publishes the pinned direct-boot kernel here
+        // instead of a firmware; both go through the same locked publisher.
+        if let Some(artifact) = selected_pinned_boot_artifact(
             manifest,
             &spec.vmm.firmware,
             architecture,
             prepared_image.image.firmware,
+            prepared_image.image.metadata.kind,
         )? {
-            image_store.ensure_pinned_artifact(&firmware)?;
+            image_store.ensure_pinned_artifact(&artifact)?;
         }
         let config = publish_vm_config(
             paths,
@@ -1057,6 +1061,7 @@ pub fn prepare_start(
                 filesystems: &filesystems,
                 architecture,
                 catalog_firmware: prepared_image.image.firmware,
+                image_kind: prepared_image.image.metadata.kind,
             },
         )?;
         let (vmm_binary, vmm_binary_sha256) =
