@@ -435,17 +435,32 @@ const PALETTE_ACTION_MACHINES: usize = 5;
 
 /// Builds the palette's Actions group.
 ///
-/// The two host-wide commands always show, because they are the two an
-/// operator reaches the palette for when nothing in particular is named and
-/// both are dialog-gated. The machine-scoped commands are **verb-first**: they
-/// appear only when the query is reaching for one, so an empty palette is a
-/// list of machines rather than two commands per machine.
+/// The three host-wide commands always show, because they are what an operator
+/// reaches the palette for when nothing in particular is named, and each of
+/// them opens a dialog rather than writing. The machine-scoped commands are
+/// **verb-first**: they appear only when the query is reaching for one, so an
+/// empty palette is a list of machines rather than four commands per machine.
+///
+/// The whole set is exactly the set the screens themselves offer, and every
+/// entry opens the same dialog or the same page the screen's own control opens
+/// (SPEC §16.5). The palette adds no capability, and in particular offers no
+/// lifecycle command: start, stop, restart and delete render a transition on
+/// the button that dispatched them, and a palette entry has no button.
 fn palette_actions(needle: &str, machines: &[MachineSummary]) -> Vec<PaletteAction> {
     let matches = |keywords: &[&str]| {
         needle.is_empty() || keywords.iter().any(|keyword| keyword.starts_with(needle))
     };
 
     let mut actions = Vec::new();
+    if matches(&["new", "machine", "create"]) {
+        actions.push(PaletteAction {
+            kind: "new-machine",
+            label: "New machine".to_owned(),
+            note: "opens the create dialog",
+            machine: String::new(),
+            running: false,
+        });
+    }
     if matches(&["prune", "images", "cache"]) {
         actions.push(PaletteAction {
             kind: "prune-images",
@@ -470,6 +485,8 @@ fn palette_actions(needle: &str, machines: &[MachineSummary]) -> Vec<PaletteActi
     for (verb, kind, note) in [
         ("snapshot", "snapshot", "POST …/snapshots"),
         ("clone", "clone", "POST …/clone"),
+        ("edit", "edit", "opens the edit dialog"),
+        ("terminal", "terminal", "console and shell"),
     ] {
         if needle.is_empty() || !verb.starts_with(needle) {
             continue;
@@ -477,8 +494,12 @@ fn palette_actions(needle: &str, machines: &[MachineSummary]) -> Vec<PaletteActi
         for machine in machines.iter() {
             // A clone of a running machine is refused before it starts
             // (§24.2), so the palette does not offer one at all: an entry that
-            // can only fail is worse than an entry that is absent.
+            // can only fail is worse than an entry that is absent. Both
+            // terminal transports need a live machine for the same reason.
             if kind == "clone" && !crate::ui::view::is_clonable(&machine.status) {
+                continue;
+            }
+            if kind == "terminal" && machine.status != "running" {
                 continue;
             }
             if actions.iter().filter(|entry| entry.kind == kind).count() >= PALETTE_ACTION_MACHINES

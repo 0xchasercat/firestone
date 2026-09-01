@@ -1,3 +1,4 @@
+{% import "ui/_macros.html" as m %}
 <div class="fs-tabpanel">
   <div class="fs-panel fs-panel--clip">
     <div class="fs-logbar">
@@ -8,13 +9,12 @@
     {% if vmconfig %}
     <pre class="fs-code">{{ vmconfig }}</pre>
     {% else %}
-    <div class="fs-empty">
-      <div class="fs-empty__title">No config published yet</div>
-      <div class="fs-empty__body">
-        Firestone writes the canonical VmConfig when the machine first starts.
-        {% if unavailable %}<br><span class="fs-mono">{{ unavailable }}</span>{% endif %}
-      </div>
-    </div>
+    {{ m.empty(
+        "config",
+        "No config published yet",
+        "Firestone writes the canonical VmConfig when the machine first starts."
+          ~ (" · " ~ unavailable if unavailable else "")
+    ) }}
     {% endif %}
   </div>
   <span class="fs-note fs-note--footer">

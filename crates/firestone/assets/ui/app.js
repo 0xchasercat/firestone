@@ -88,6 +88,110 @@
     }
   }
 
+  /* The shape every failure in this file is reduced to, so one branch can
+   * report a rejected fetch, a torn stream and a real ErrorEnvelope the same
+   * way. It is deliberately the server's own envelope shape: nothing
+   * downstream has to know which of the two it is looking at. */
+  function errorEnvelope(message, hint) {
+    return {
+      error: {
+        kind: "generic",
+        message: String(message),
+        hint: hint === undefined ? null : hint
+      }
+    };
+  }
+
+  /* The slot a screen renders for the dialogs it opens. The palette can reach
+   * a dialog from a screen that has no slot of its own, so one is created on
+   * demand rather than assumed; without this a palette command would open
+   * nothing and say nothing. */
+  function dialogSlot() {
+    var slot = qs("#fs-dialog-slot");
+    if (!slot) {
+      slot = el("div");
+      slot.id = "fs-dialog-slot";
+      document.body.appendChild(slot);
+    }
+    return slot;
+  }
+
+  function clearDialogSlot() {
+    var slot = qs("#fs-dialog-slot");
+    if (slot) {
+      slot.innerHTML = "";
+    }
+  }
+
+  /* Loads a `/ui` read fragment into the dialog slot. Every dialog the UI
+   * opens from a button or from the palette comes through here, so they all
+   * arrive the same way and open through the same htmx:afterSwap hook. */
+  function openDialogFragment(url) {
+    if (!window.htmx) {
+      window.location.assign(url);
+      return;
+    }
+    window.htmx.ajax("GET", url, { target: dialogSlot(), swap: "innerHTML" });
+  }
+
+  /* One confirm flow for every `<dialog>` the shell renders. `prepare` fills
+   * it in; `run` fires only for the confirm button's value, so Escape, the
+   * backdrop and Cancel are indistinguishable from never having opened it —
+   * which is what makes the six dialogs behave identically. A dialog that is
+   * somehow absent must not silently swallow the command, so the fallback
+   * runs it: the server is still the one that decides. */
+  function withDialog(id, prepare, run) {
+    var dialog = qs(id);
+    if (!dialog) {
+      run(null);
+      return;
+    }
+    prepare(dialog);
+    dialog.returnValue = "";
+    dialog.showModal();
+    focusFirstControl(dialog);
+    dialog.addEventListener(
+      "close",
+      function () {
+        if (dialog.returnValue === "confirm") {
+          run(dialog);
+        }
+      },
+      { once: true }
+    );
+  }
+
+  /* A modal opens on its first editable control when it has one, and on its
+   * confirm button when it does not, so the keyboard never lands nowhere. */
+  function focusFirstControl(root) {
+    var first = qs(
+      "input:not([type='hidden']):not([disabled]), select, textarea",
+      root
+    );
+    if (first) {
+      first.focus();
+      return;
+    }
+    var confirm = qs("[value='confirm']", root);
+    if (confirm) {
+      confirm.focus();
+    }
+  }
+
+  function setText(root, selector, value) {
+    var node = qs(selector, root);
+    if (node) {
+      node.textContent = value;
+    }
+    return node;
+  }
+
+  function show(node, visible) {
+    if (node) {
+      node.hidden = !visible;
+    }
+  }
+
   /* ------------------------------------------------------------- records -- */
 
   /* A record is terminal when it is the action's typed Result, or an
@@ -123,13 +227,10 @@
       try {
         failure = await response.json();
       } catch (error) {
-        failure = {
-          error: {
-            kind: "generic",
-            message: "the server returned " + response.status,
-            hint: "check that firestone serve is still running"
-          }
-        };
+        failure = errorEnvelope(
+          "the server returned " + response.status,
+          "check that firestone serve is still running"
+        );
       }
       onRecord(failure);
       return failure;
@@ -274,6 +375,24 @@
     }, TOAST_MS);
   }
 
+  /* Toast phrasing, in one place, because nine feature surfaces written apart
+   * from each other otherwise each invent their own (SPEC §16.5):
+   *
+   *   - a completed mutation is "<past-tense verb> <subject>", lower case,
+   *     with the server's own terminal record on the sub-line;
+   *   - a rejected mutation is "<subject> · <verb> failed", with the
+   *     ErrorEnvelope's message on the sub-line.
+   *
+   * Nothing else raises a toast. A field problem belongs beside its field and
+   * a conflict beside the button that hit it. */
+  function toastDone(title, sub) {
+    toast(title, sub, "ok");
+  }
+
+  function toastFailed(subject, verb, message) {
+    toast(subject + " · " + verb + " failed", message, "fail");
+  }
+
   /* ------------------------------------------------------- inline notices -- */
 
   /* A 400 belongs beside the field that caused it and a 409 beside the action
@@ -310,11 +429,37 @@
 
   /* ------------------------------------------------- lifecycle mutations -- */
 
+  /* `done` is the past-tense verb the success toast is built from, so the four
+   * lifecycle commands read the same way as every other mutation in the UI. */
   var ACTIONS = {
-    start: { path: "/start", method: "POST", transitional: "starting", busy: "Starting…" },
-    stop: { path: "/stop", method: "POST", transitional: "stopping", busy: "Stopping…" },
-    restart: { path: "/restart", method: "POST", transitional: "starting", busy: "Restarting…" },
-    delete: { path: "", method: "DELETE", transitional: "stopping", busy: "Removing…" }
+    start: {
+      path: "/start",
+      method: "POST",
+      transitional: "starting",
+      busy: "Starting…",
+      done: "started"
+    },
+    stop: {
+      path: "/stop",
+      method: "POST",
+      transitional: "stopping",
+      busy: "Stopping…",
+      done: "stopped"
+    },
+    restart: {
+      path: "/restart",
+      method: "POST",
+      transitional: "starting",
+      busy: "Restarting…",
+      done: "restarted"
+    },
+    delete: {
+      path: "",
+      method: "DELETE",
+      transitional: "stopping",
+      busy: "Removing…",
+      done: "removed"
+    }
   };
 
   /* Render the transitional state the moment the request leaves, so the UI
@@ -404,7 +549,7 @@
         pushStreamLine(name, record);
       });
     } catch (error) {
-      toast(name + " · " + kind + " failed", String(error), "fail");
+      toastFailed(name, kind, String(error));
       endTransition(button, name);
       return;
     }
@@ -416,19 +561,18 @@
       var conflict = terminal.error.kind === "conflict";
       inlineNotice(button, terminal, !conflict);
       if (!conflict) {
-        toast(name + " · " + kind + " failed", terminal.error.message, "fail");
+        toastFailed(name, kind, terminal.error.message);
       }
     } else if (kind === "delete") {
       fadeOutRow(name);
-      toast("removed " + name, compactJson(terminal), "ok");
+      toastDone("removed " + name, compactJson(terminal));
       endTransition(button, name, { skipRefresh: onDetailPageFor(name) });
       leaveDeletedMachine(name);
       return;
     } else if (terminal) {
-      toast(
-        name + " · " + kind + " finished in " + formatMs(elapsed),
-        compactJson(terminal),
-        "ok"
+      toastDone(
+        action.done + " " + name,
+        "finished in " + formatMs(elapsed) + " · " + compactJson(terminal)
       );
     }
     endTransition(button, name);
@@ -486,16 +630,14 @@
         }
       );
     } catch (error) {
-      terminal = {
-        error: { kind: "generic", message: String(error), hint: null }
-      };
+      terminal = errorEnvelope(error);
     }
 
     markStreaming("image:" + reference, false);
     if (isErrorEnvelope(terminal)) {
-      toast("pull failed · " + reference, terminal.error.message, "fail");
+      toastFailed(reference, "pull", terminal.error.message);
     } else {
-      toast("pulled " + reference, compactJson(terminal), "ok");
+      toastDone("pulled " + reference, compactJson(terminal));
     }
     refreshFromServer();
   }
@@ -519,7 +661,7 @@
 
     if (record.type === "Progress") {
       if (!record.total) {
-        state.textContent = "downloading " + formatBytes(record.done);
+        state.textContent = "downloading " + formatByteSize(record.done);
         if (bar) {
           bar.classList.add("is-indeterminate");
         }
@@ -548,16 +690,6 @@
         bar.style.width = "100%";
       }
     }
-  }
-
-  function formatBytes(bytes) {
-    if (bytes >= 1e9) {
-      return (bytes / 1e9).toFixed(1) + " GB";
-    }
-    if (bytes >= 1e6) {
-      return Math.round(bytes / 1e6) + " MB";
-    }
-    return Math.round(bytes / 1e3) + " kB";
   }
 
   /* ---------------------------------------------------------- log follow -- */
@@ -822,30 +954,23 @@
     syncFollowState();
   }
 
+  /* The delete confirm goes through the same shared dialog helper the other
+   * five confirms use, so Escape, the backdrop and Cancel mean the same thing
+   * here as they do everywhere else. */
   function confirmDelete(button, name) {
-    var dialog = qs("#fs-confirm");
-    if (!dialog) {
-      runLifecycle(button, name, "delete", false);
-      return;
-    }
-    var target = qs("[data-fs-confirm-name]", dialog);
-    if (target) {
-      target.textContent = name;
-    }
-    var force = qs("#fs-confirm-force", dialog);
-    if (force) {
-      force.checked = false;
-    }
-    dialog.returnValue = "";
-    dialog.showModal();
-    dialog.addEventListener(
-      "close",
-      function () {
-        if (dialog.returnValue === "confirm") {
-          runLifecycle(button, name, "delete", !!(force && force.checked));
+    withDialog(
+      "#fs-confirm",
+      function (dialog) {
+        setText(dialog, "[data-fs-confirm-name]", name);
+        var force = qs("#fs-confirm-force", dialog);
+        if (force) {
+          force.checked = false;
         }
       },
-      { once: true }
+      function (dialog) {
+        var force = dialog && qs("#fs-confirm-force", dialog);
+        runLifecycle(button, name, "delete", !!(force && force.checked));
+      }
     );
   }
 
@@ -923,27 +1048,22 @@
     syncFollowState();
     /* A dialog arrives as ordinary swapped-in markup, then opens itself. That
      * keeps the server rendering plain HTML and leaves the modal semantics —
-     * focus trapping, inert background, Escape — to the platform. */
+     * focus trapping, inert background, Escape — to the platform. Focus lands
+     * through the same helper the shell's own dialogs use. */
     var pending = qs("dialog[data-fs-autoopen]");
     if (pending && !pending.open) {
       pending.removeAttribute("data-fs-autoopen");
       pending.showModal();
-      var first = qs("input, select, textarea", pending);
-      if (first) {
-        first.focus();
-      }
+      focusFirstControl(pending);
     }
   });
 
   /* A form that posts to the UI clears its own slot on success. */
   document.body.addEventListener("fs:created", function (event) {
-    var slot = qs("#fs-dialog-slot");
-    if (slot) {
-      slot.innerHTML = "";
-    }
+    clearDialogSlot();
     var detail = event.detail || {};
     if (detail.name) {
-      toast("created " + detail.name, detail.sub, "ok");
+      toastDone("created " + detail.name, detail.sub);
     }
     refreshFromServer();
   });
@@ -1249,6 +1369,21 @@
     var row = template.content.firstElementChild.cloneNode(true);
     host.appendChild(row);
     return row;
+  }
+
+  /* The repeatable groups' shared empty state: shown only when the group has
+   * no rows *and* is not raw-only, because a group that fell back to raw text
+   * is not empty — it holds a value these rows could not express. */
+  function syncRowsEmpty(group) {
+    if (!group) {
+      return;
+    }
+    var note = qs("[data-fs-rows-empty]", group);
+    if (!note) {
+      return;
+    }
+    var rows = fieldsOf(group, "[data-fs-forward-row], [data-fs-mount-row]");
+    note.hidden = rows.length > 0 || group.hasAttribute("data-fs-raw-only");
   }
 
   function setRawOnly(group, rawOnly, rawSelector) {
@@ -1612,6 +1747,7 @@
       host.textContent = "";
     }
     setRawOnly(group, !complete, "[data-fs-forward-value]");
+    syncRowsEmpty(group);
   }
 
   function composeForwards(group) {
@@ -1691,6 +1827,7 @@
       host.textContent = "";
     }
     setRawOnly(group, !complete, "[data-fs-mount-value]");
+    syncRowsEmpty(group);
   }
 
   function composeMounts(group) {
@@ -1802,6 +1939,7 @@
         setRawOnly(forwards, false, "[data-fs-forward-value]");
         addRow(forwards, "[data-fs-forward-template]", "[data-fs-forward-rows]");
         composeForwards(forwards);
+        syncRowsEmpty(forwards);
       }
       return;
     }
@@ -1813,6 +1951,7 @@
         setRawOnly(mounts, false, "[data-fs-mount-value]");
         addRow(mounts, "[data-fs-mount-template]", "[data-fs-mount-rows]");
         composeMounts(mounts);
+        syncRowsEmpty(mounts);
       }
       return;
     }
@@ -1828,6 +1967,7 @@
       if (owner) {
         composeForwards(owner);
         composeMounts(owner);
+        syncRowsEmpty(owner);
       }
     }
   });
@@ -1878,6 +2018,7 @@
         setRawOnly(group, false, "[data-fs-forward-value], [data-fs-mount-value]");
         hydrateForwards(group);
         hydrateMounts(group);
+        syncRowsEmpty(group);
       }
       return;
     }
@@ -1917,7 +2058,8 @@
     }
   });
 
-  /* ===================================================================   * SECTION: live utilization                                        (M6-25)
+  /* ==========================================================================
+   * SECTION: live utilization                                        (M6-25)
    * ==========================================================================
    *
    * `GET /v1/machines/{name}/metrics` is one sample of cumulative counters.
@@ -2512,109 +2654,109 @@
     formatByteSize: formatByteSize,
     formatRate: formatRate
   };
-})();
 
-/* Provisioning section (M6-27).
- *
- * A self-contained runtime for the create dialog's Provisioning fields, kept
- * apart from the block above so it survives that block being reorganised.
- *
- * It does two things, and deliberately nothing else:
- *
- *   1. Counts the bytes of the inline user-data as it is typed and warns past
- *      32 KiB. This is a courtesy, not a check: shared validation owns the
- *      real limit, the warning never blocks a submission, and the server's
- *      answer is what lands beside the field.
- *   2. Reveals the "provisioning off" warning when the toggle is cleared,
- *      through the hidden attribute, because the CSP forbids inline styles.
- *
- * The password field is untouched here. Nothing in this file reads it, stores
- * it, or copies it anywhere.
- */
-(function () {
-  "use strict";
+  /* Provisioning section (M6-27).
+   *
+   * A self-contained runtime for the create dialog's Provisioning fields, kept
+   * apart from the block above so it survives that block being reorganised.
+   *
+   * It does two things, and deliberately nothing else:
+   *
+   *   1. Counts the bytes of the inline user-data as it is typed and warns past
+   *      32 KiB. This is a courtesy, not a check: shared validation owns the
+   *      real limit, the warning never blocks a submission, and the server's
+   *      answer is what lands beside the field.
+   *   2. Reveals the "provisioning off" warning when the toggle is cleared,
+   *      through the hidden attribute, because the CSP forbids inline styles.
+   *
+   * The password field is untouched here. Nothing in this file reads it, stores
+   * it, or copies it anywhere.
+   */
+  (function () {
+    "use strict";
 
-  var SOFT_CAP_BYTES = 32 * 1024;
+    var SOFT_CAP_BYTES = 32 * 1024;
 
-  function bytesOf(text) {
-    /* The cap is a byte cap, not a character cap, so the counter measures the
-     * UTF-8 the server will actually receive. */
-    if (typeof TextEncoder === "function") {
-      return new TextEncoder().encode(text).length;
+    function bytesOf(text) {
+      /* The cap is a byte cap, not a character cap, so the counter measures the
+       * UTF-8 the server will actually receive. */
+      if (typeof TextEncoder === "function") {
+        return new TextEncoder().encode(text).length;
+      }
+      return unescape(encodeURIComponent(text)).length;
     }
-    return unescape(encodeURIComponent(text)).length;
-  }
 
-  function formatBytes(count) {
-    if (count < 1024) {
-      return count + " B";
+    function formatBytes(count) {
+      if (count < 1024) {
+        return count + " B";
+      }
+      return (count / 1024).toFixed(count < 10240 ? 1 : 0) + " KiB";
     }
-    return (count / 1024).toFixed(count < 10240 ? 1 : 0) + " KiB";
-  }
 
-  function syncUserData(field) {
-    var input = field.querySelector("[data-fs-userdata-value]");
-    var note = field.querySelector("[data-fs-userdata-count]");
-    var over = field.querySelector("[data-fs-userdata-over]");
-    if (!input) {
-      return;
+    function syncUserData(field) {
+      var input = field.querySelector("[data-fs-userdata-value]");
+      var note = field.querySelector("[data-fs-userdata-count]");
+      var over = field.querySelector("[data-fs-userdata-over]");
+      if (!input) {
+        return;
+      }
+      var bytes = bytesOf(input.value);
+      if (note) {
+        note.textContent = bytes === 0 ? "" : formatBytes(bytes) + " of 32 KiB";
+      }
+      if (over) {
+        over.hidden = bytes <= SOFT_CAP_BYTES;
+      }
     }
-    var bytes = bytesOf(input.value);
-    if (note) {
-      note.textContent = bytes === 0 ? "" : formatBytes(bytes) + " of 32 KiB";
-    }
-    if (over) {
-      over.hidden = bytes <= SOFT_CAP_BYTES;
-    }
-  }
 
-  function syncProvisioning(section) {
-    var toggle = section.querySelector("[data-fs-provisioning-toggle]");
-    var warning = section.querySelector("[data-fs-provisioning-warning]");
-    if (toggle && warning) {
-      warning.hidden = toggle.checked;
+    function syncProvisioning(section) {
+      var toggle = section.querySelector("[data-fs-provisioning-toggle]");
+      var warning = section.querySelector("[data-fs-provisioning-warning]");
+      if (toggle && warning) {
+        warning.hidden = toggle.checked;
+      }
     }
-  }
 
-  function sync(root) {
-    var sections = (root || document).querySelectorAll("[data-fs-provisioning]");
-    Array.prototype.forEach.call(sections, function (section) {
-      syncProvisioning(section);
-      var field = section.querySelector("[data-fs-userdata]");
+    function sync(root) {
+      var sections = (root || document).querySelectorAll("[data-fs-provisioning]");
+      Array.prototype.forEach.call(sections, function (section) {
+        syncProvisioning(section);
+        var field = section.querySelector("[data-fs-userdata]");
+        if (field) {
+          syncUserData(field);
+        }
+      });
+    }
+
+    document.addEventListener("DOMContentLoaded", function () {
+      sync(document);
+    });
+
+    document.body.addEventListener("htmx:afterSwap", function () {
+      sync(document);
+    });
+
+    document.addEventListener("input", function (event) {
+      var field =
+        event.target.closest && event.target.closest("[data-fs-userdata]");
       if (field) {
         syncUserData(field);
       }
     });
-  }
 
-  document.addEventListener("DOMContentLoaded", function () {
-    sync(document);
-  });
-
-  document.body.addEventListener("htmx:afterSwap", function () {
-    sync(document);
-  });
-
-  document.addEventListener("input", function (event) {
-    var field =
-      event.target.closest && event.target.closest("[data-fs-userdata]");
-    if (field) {
-      syncUserData(field);
-    }
-  });
-
-  document.addEventListener("change", function (event) {
-    if (!event.target.closest) {
-      return;
-    }
-    if (event.target.closest("[data-fs-provisioning-toggle]")) {
-      var section = event.target.closest("[data-fs-provisioning]");
-      if (section) {
-        syncProvisioning(section);
+    document.addEventListener("change", function (event) {
+      if (!event.target.closest) {
+        return;
       }
-    }
-  });
-=======
+      if (event.target.closest("[data-fs-provisioning-toggle]")) {
+        var section = event.target.closest("[data-fs-provisioning]");
+        if (section) {
+          syncProvisioning(section);
+        }
+      }
+    });
+  })();
+
   /* ========================================================= machine edit ==
    *
    * The edit dialog is the create dialog's fields pointed at a machine that
@@ -3003,13 +3145,10 @@
     }
     return isErrorEnvelope(envelope)
       ? envelope
-      : {
-          error: {
-            kind: "generic",
-            message: "the server returned " + response.status,
-            hint: "check that firestone serve is still running"
-          }
-        };
+      : errorEnvelope(
+          "the server returned " + response.status,
+          "check that firestone serve is still running"
+        );
   }
 
   /* The live half. resize streams NDJSON like every other action, so it uses
@@ -3093,7 +3232,7 @@
         }
       }
     } catch (error) {
-      failed = { error: { kind: "generic", message: String(error) } };
+      failed = errorEnvelope(error);
     } finally {
       markStreaming("edit:" + name, false);
       closeDrawer(name);
@@ -3125,17 +3264,14 @@
     if (dialog) {
       dialog.close();
     }
-    var slot = qs("#fs-dialog-slot");
-    if (slot) {
-      slot.innerHTML = "";
-    }
+    clearDialogSlot();
     /* A resize-only edit applies live *and* persists the spec, so nothing is
      * left pending and the pill would be a lie. Only a spec patch — the fields
      * the running VM cannot take now — raises it. */
     if (running && plan.patches.length) {
       editedWhileRunning[name] = true;
     }
-    toast("saved " + name, applied.join(" · "), "ok");
+    toastDone("saved " + name, applied.join(" · "));
     refreshFromServer();
     applyClientDrift();
   }
@@ -3163,7 +3299,11 @@
       if (!ident || qs("[data-fs-drift]", ident)) {
         return;
       }
-      var pill = el("span", "fs-drift", "spec drift · edited while running");
+      var pill = el(
+        "span",
+        "fs-badge fs-badge--pending fs-badge--sentence",
+        "spec drift · edited while running"
+      );
       pill.setAttribute("data-fs-drift", "client");
       pill.title =
         "the spec was saved while " +
@@ -3221,45 +3361,6 @@
 
   var SYSTEM_PRUNE_URL = "/v1/system/prune";
 
-  function setText(root, selector, value) {
-    var node = qs(selector, root);
-    if (node) {
-      node.textContent = value;
-    }
-    return node;
-  }
-
-  function show(node, visible) {
-    if (node) {
-      node.hidden = !visible;
-    }
-  }
-
-  /* One confirm flow for every dialog in this section. `prepare` fills the
-   * dialog in; `run` fires only for the confirm button's value, so Escape and
-   * Cancel are indistinguishable from never having opened it. A dialog that
-   * is somehow absent must not silently swallow the command, so the fallback
-   * runs it — the server is still the one that decides. */
-  function withDialog(id, prepare, run) {
-    var dialog = qs(id);
-    if (!dialog) {
-      run(null);
-      return;
-    }
-    prepare(dialog);
-    dialog.returnValue = "";
-    dialog.showModal();
-    dialog.addEventListener(
-      "close",
-      function () {
-        if (dialog.returnValue === "confirm") {
-          run(dialog);
-        }
-      },
-      { once: true }
-    );
-  }
-
   /* Streams one machine-scoped action into that machine's own drawer, with
    * the poll suppressed for its duration exactly as a lifecycle button does. */
   async function streamForMachine(name, url, options) {
@@ -3270,7 +3371,7 @@
         pushStreamLine(name, record);
       });
     } catch (error) {
-      terminal = { error: { kind: "generic", message: String(error) } };
+      terminal = errorEnvelope(error);
     } finally {
       markStreaming(name, false);
       closeDrawer(name);
@@ -3350,14 +3451,13 @@
       if (button) {
         inlineNotice(button, terminal, terminal.error.kind !== "conflict");
       }
-      toast(name + " · snapshot failed", terminal.error.message, "fail");
+      toastFailed(name, "snapshot", terminal.error.message);
       return;
     }
     var payload = (terminal && terminal.payload) || {};
-    toast(
-      "snapshot " + (payload.snapshot || "taken"),
-      payload.kind ? payload.kind + " · " + compactJson(terminal) : compactJson(terminal),
-      "ok"
+    toastDone(
+      "took snapshot " + (payload.snapshot || snapshot || "of " + name),
+      payload.kind ? payload.kind + " · " + compactJson(terminal) : compactJson(terminal)
     );
     refreshSnapshots(name);
   }
@@ -3404,14 +3504,13 @@
       if (button) {
         inlineNotice(button, terminal, terminal.error.kind !== "conflict");
       }
-      toast(name + " · restore failed", terminal.error.message, "fail");
+      toastFailed(name, "restore", terminal.error.message);
       return;
     }
     var payload = (terminal && terminal.payload) || {};
-    toast(
+    toastDone(
       "restored " + name + " to " + snapshot,
-      payload.started ? "running again" : "stopped and startable",
-      "ok"
+      payload.started ? "running again" : "stopped and startable"
     );
     refreshSnapshots(name);
   }
@@ -3446,10 +3545,10 @@
       if (button) {
         inlineNotice(button, terminal, true);
       }
-      toast(name + " · delete failed", terminal.error.message, "fail");
+      toastFailed(name, "snapshot delete", terminal.error.message);
       return;
     }
-    toast("removed " + snapshot, "DELETE 204 · " + name, "ok");
+    toastDone("removed snapshot " + snapshot, "DELETE 204 · " + name);
     refreshSnapshots(name);
   }
 
@@ -3468,11 +3567,6 @@
         if (fresh) {
           fresh.checked = false;
         }
-        var error = qs("[data-fs-clone-error]", dialog);
-        if (error) {
-          error.hidden = true;
-          error.textContent = "";
-        }
       },
       function (dialog) {
         var field = dialog && qs("#fs-clone-name", dialog);
@@ -3482,7 +3576,7 @@
           /* The one refusal the browser makes on its own: without a name there
            * is no request body to build. Every other rule about the name is
            * the server's. */
-          toast("clone needs a name", "give the new machine a name", "fail");
+          toastFailed(source, "clone", "give the new machine a name");
           return;
         }
         runClone(button, source, dest, !!(fresh && fresh.checked));
@@ -3504,10 +3598,10 @@
       if (button) {
         inlineNotice(button, terminal, terminal.error.kind !== "conflict");
       }
-      toast(source + " · clone failed", terminal.error.message, "fail");
+      toastFailed(source, "clone", terminal.error.message);
       return;
     }
-    toast("cloned " + source + " to " + dest, compactJson(terminal), "ok");
+    toastDone("cloned " + source + " to " + dest, compactJson(terminal));
     refreshFromServer();
     goToMachine(dest);
   }
@@ -3536,12 +3630,12 @@
         setText(dialog, "[data-fs-imagedelete-ref]", reference || id);
       },
       function () {
-        runImageDelete(button, id);
+        runImageDelete(button, id, reference);
       }
     );
   }
 
-  async function runImageDelete(button, id) {
+  async function runImageDelete(button, id, reference) {
     if (button) {
       clearInlineNotice(button);
       button.disabled = true;
@@ -3554,7 +3648,7 @@
         function () {}
       );
     } catch (error) {
-      terminal = { error: { kind: "generic", message: String(error) } };
+      terminal = errorEnvelope(error);
     }
     if (button && button.isConnected) {
       button.disabled = false;
@@ -3568,10 +3662,10 @@
       if (button) {
         inlineNotice(button, terminal, terminal.error.kind !== "conflict");
       }
-      toast("image not removed", terminal.error.message, "fail");
+      toastFailed(reference || id, "image delete", terminal.error.message);
       return;
     }
-    toast("removed image", "DELETE 204 · " + id, "ok");
+    toastDone("removed image " + (reference || id), "DELETE 204 · " + id);
     refreshFromServer();
   }
 
@@ -3600,7 +3694,7 @@
         function () {}
       );
     } catch (error) {
-      terminal = { error: { kind: "generic", message: String(error) } };
+      terminal = errorEnvelope(error);
     }
     if (button && button.isConnected) {
       button.disabled = false;
@@ -3610,15 +3704,16 @@
       if (button) {
         inlineNotice(button, terminal, true);
       }
-      toast("prune failed", terminal.error.message, "fail");
+      toastFailed("unused images", "prune", terminal.error.message);
       return;
     }
     var payload = prunePayload(terminal) || {};
     var removed = payload.removed ? payload.removed.length : 0;
-    toast(
+    toastDone(
       removed === 1 ? "pruned 1 image" : "pruned " + removed + " images",
-      formatByteSize(payload.bytes_freed || 0) + " reclaimed",
-      "ok"
+      /* `ImagePruneResult` counts in `bytes_freed`; the system prune's
+       * `PruneResult` counts in `reclaimed_bytes`. Two payloads, two names. */
+      formatByteSize(payload.bytes_freed || 0) + " reclaimed"
     );
     refreshFromServer();
   }
@@ -3655,30 +3750,31 @@
     };
   }
 
+  /* The one dialog that reads before it writes, on the same shared helper as
+   * the other five: the only difference is that `prepare` also starts the dry
+   * run whose answer the confirm button waits for. A dialog the shell did not
+   * render must not fall back to running a prune nobody previewed, so this is
+   * the one command whose fallback is to do nothing. */
   function openSystemPruneDialog() {
-    var dialog = qs("#fs-system-prune");
-    if (!dialog) {
+    if (!qs("#fs-system-prune")) {
       return;
     }
-    var machines = qs("#fs-prune-machines", dialog);
-    var images = qs("#fs-prune-images", dialog);
-    if (machines) {
-      machines.checked = false;
-    }
-    if (images) {
-      images.checked = false;
-    }
-    dialog.returnValue = "";
-    dialog.showModal();
-    previewSystemPrune(dialog);
-    dialog.addEventListener(
-      "close",
-      function () {
-        if (dialog.returnValue === "confirm") {
-          runSystemPrune(dialog);
+    withDialog(
+      "#fs-system-prune",
+      function (dialog) {
+        var machines = qs("#fs-prune-machines", dialog);
+        var images = qs("#fs-prune-images", dialog);
+        if (machines) {
+          machines.checked = false;
         }
+        if (images) {
+          images.checked = false;
+        }
+        previewSystemPrune(dialog);
       },
-      { once: true }
+      function (dialog) {
+        runSystemPrune(dialog);
+      }
     );
   }
 
@@ -3718,7 +3814,7 @@
         function () {}
       );
     } catch (error) {
-      record = { error: { kind: "generic", message: String(error) } };
+      record = errorEnvelope(error);
     }
 
     if (isErrorEnvelope(record)) {
@@ -3787,19 +3883,18 @@
         function () {}
       );
     } catch (error) {
-      record = { error: { kind: "generic", message: String(error) } };
+      record = errorEnvelope(error);
     }
 
     if (isErrorEnvelope(record)) {
-      toast("prune failed", record.error.message, "fail");
+      toastFailed("disk space", "prune", record.error.message);
       return;
     }
     var payload = prunePayload(record) || {};
     var removed = payload.removed ? payload.removed.length : 0;
-    toast(
+    toastDone(
       removed === 1 ? "removed 1 item" : "removed " + removed + " items",
-      formatByteSize(payload.reclaimed_bytes || 0) + " reclaimed",
-      "ok"
+      formatByteSize(payload.reclaimed_bytes || 0) + " reclaimed"
     );
     refreshFromServer();
   }
@@ -3899,8 +3994,13 @@
     });
   }
 
+  /* Every palette command opens the same dialog, or navigates to the same
+   * page, the screen's own control opens. Nothing here writes by itself, and
+   * nothing here is reachable only from the palette. */
   function runPaletteAction(kind, machine, running) {
-    if (kind === "prune-images") {
+    if (kind === "new-machine") {
+      openDialogFragment("/ui/machines/new");
+    } else if (kind === "prune-images") {
       openImagePruneDialog(null);
     } else if (kind === "prune-system") {
       openSystemPruneDialog();
@@ -3908,6 +4008,14 @@
       openSnapshotDialog(null, machine, running);
     } else if (kind === "clone" && machine) {
       openCloneDialog(null, machine);
+    } else if (kind === "edit" && machine) {
+      openDialogFragment(
+        "/ui/machines/" + encodeURIComponent(machine) + "/edit"
+      );
+    } else if (kind === "terminal" && machine) {
+      window.location.assign(
+        "/machines/" + encodeURIComponent(machine) + "/terminal"
+      );
     }
   }
 

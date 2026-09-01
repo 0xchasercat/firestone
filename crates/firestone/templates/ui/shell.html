@@ -180,9 +180,13 @@
       </p>
       <label class="fs-field">
         <span class="fs-field__label">New machine name</span>
+        {# `required` inside a method="dialog" form is enough: constraint
+           validation runs before the dialog closes, so an empty name never
+           reaches the confirm handler. Every other rule about the name is the
+           server's, and its refusal is answered beside the button that opened
+           this dialog, like every other rejected write. #}
         <input class="fs-input fs-input--mono" type="text" id="fs-clone-name"
                autocomplete="off" spellcheck="false" placeholder="web-2" required>
-        <span class="fs-field__error" data-fs-clone-error hidden></span>
       </label>
       <label class="fs-checkbox">
         <input type="checkbox" id="fs-clone-fresh">

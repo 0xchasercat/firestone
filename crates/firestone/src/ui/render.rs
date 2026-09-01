@@ -202,6 +202,28 @@ mod tests {
         }
     }
 
+    /// No template ships an unresolved merge conflict.
+    ///
+    /// A marker inside a template is not a compile error — minijinja renders
+    /// it as text — so it would reach the page. Three appended-section merges
+    /// left one in `app.js` and three in `app.css`; this is the same guard for
+    /// the markup.
+    #[test]
+    fn no_embedded_template_carries_a_merge_conflict_marker() {
+        for (name, source) in TEMPLATES {
+            for (number, line) in source.lines().enumerate() {
+                let marker = line.starts_with("<<<<<<<")
+                    || line.starts_with(">>>>>>>")
+                    || line.trim_end() == "=======";
+                assert!(
+                    !marker,
+                    "{name}:{} carries a merge conflict marker",
+                    number + 1
+                );
+            }
+        }
+    }
+
     #[test]
     fn template_names_are_unique() {
         let mut names: Vec<&str> = TEMPLATES.iter().map(|(name, _)| *name).collect();

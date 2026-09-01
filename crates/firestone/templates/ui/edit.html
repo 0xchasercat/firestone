@@ -28,13 +28,17 @@
     <div class="fs-dialog__body">
       <div class="fs-form">
         {% if machine.is_running %}
+        {# One phrasing for when a change takes effect, matching the badges on
+           each group below: `live`, `applies at next start`, `applies after
+           restart`. Three wordings for the same three facts is how a reader
+           stops trusting any of them. #}
         <div class="fs-inline-notice" role="status">
-          <span>{{ machine.name }} is running. vCPUs and memory change live; every other
-                field is written to the spec and takes effect on the next start.</span>
+          <span>{{ machine.name }} is running. vCPUs and memory are live; disk
+                applies at next start; every other field applies after restart.</span>
         </div>
         {% else %}
         <div class="fs-field__hint" data-fs-edit-note>
-          {{ machine.name }} is {{ machine.status }} · every field applies the next time it starts
+          {{ machine.name }} is {{ machine.status }} · every field applies at next start
         </div>
         {% endif %}
 
@@ -42,7 +46,7 @@
           <div class="fs-editgroup__head">
             <span class="fs-editgroup__title">Sizing</span>
             {% if machine.is_running %}
-            <span class="fs-applies fs-applies--live" data-fs-applies="live">live</span>
+            <span class="fs-badge fs-badge--live" data-fs-applies="live">live</span>
             {% endif %}
           </div>
           <div class="fs-form__grid">
@@ -64,7 +68,7 @@
           <div class="fs-editgroup__head">
             <span class="fs-editgroup__title">Disk</span>
             {% if machine.is_running %}
-            <span class="fs-applies" data-fs-applies="next-start">applies at next start</span>
+            <span class="fs-badge fs-badge--later" data-fs-applies="next-start">applies at next start</span>
             {% endif %}
           </div>
           {{ f.size_field(
@@ -77,7 +81,7 @@
           <div class="fs-editgroup__head">
             <span class="fs-editgroup__title">Image and guest user</span>
             {% if machine.is_running %}
-            <span class="fs-applies" data-fs-applies="restart">applies after restart</span>
+            <span class="fs-badge fs-badge--later" data-fs-applies="restart">applies after restart</span>
             {% endif %}
           </div>
           {{ f.text_field(
@@ -93,7 +97,7 @@
           <div class="fs-editgroup__head">
             <span class="fs-editgroup__title">Network</span>
             {% if machine.is_running %}
-            <span class="fs-applies" data-fs-applies="restart">applies after restart</span>
+            <span class="fs-badge fs-badge--later" data-fs-applies="restart">applies after restart</span>
             {% endif %}
           </div>
           {{ f.network_fields(form, errors, net_modes) }}
@@ -103,7 +107,7 @@
           <div class="fs-editgroup__head">
             <span class="fs-editgroup__title">Port forwards</span>
             {% if machine.is_running %}
-            <span class="fs-applies" data-fs-applies="restart">applies after restart</span>
+            <span class="fs-badge fs-badge--later" data-fs-applies="restart">applies after restart</span>
             {% endif %}
           </div>
           {{ f.forward_rows(form, errors) }}
@@ -113,7 +117,7 @@
           <div class="fs-editgroup__head">
             <span class="fs-editgroup__title">Shared folders</span>
             {% if machine.is_running %}
-            <span class="fs-applies" data-fs-applies="restart">applies after restart</span>
+            <span class="fs-badge fs-badge--later" data-fs-applies="restart">applies after restart</span>
             {% endif %}
           </div>
           {# The row grammar is HOST:GUEST[:ro] and has no place for a

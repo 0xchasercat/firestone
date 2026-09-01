@@ -1,6 +1,7 @@
 {# The image store, as opposed to the catalog above it: what is actually on
    this host's disk. A read of `Action::ImageList`; the deletions go from the
    browser to DELETE /v1/images/{id} and POST /v1/images/prune. #}
+{% import "ui/_macros.html" as m %}
 {% if images %}
 <div class="fs-panel fs-panel--clip fs-table fs-table--images">
   <div class="fs-table__head" role="row">
@@ -12,7 +13,8 @@
   <div class="fs-row fs-row--static" data-fs-image-row="{{ image.id }}" data-fs-notice-slot>
     <span class="fs-cell fs-cell--mono fs-cell--name" title="{{ image.reference }}">
       {{ image.reference }}
-      {% if image.oci %}<span class="fs-tier" data-fs-tier="oci" title="built from an OCI reference">OCI</span>{% endif %}
+      {% if image.oci %}<span class="fs-badge fs-badge--gap" data-fs-tier="oci"
+             title="built from an OCI reference">OCI</span>{% endif %}
     </span>
     <span class="fs-cell fs-cell--mono fs-cell--muted fs-cell--small" title="{{ image.id }}">{{ image.short_id }}</span>
     <span class="fs-cell fs-cell--mono">{{ image.size }}</span>
@@ -27,11 +29,11 @@
   {% endfor %}
 </div>
 {% else %}
-<div class="fs-empty" data-fs-images-empty>
-  <div class="fs-empty__title">No images cached</div>
-  <div class="fs-empty__body">
-    Pull a catalog reference above, or create a machine and Firestone resolves
-    and stores the image it needs.
-  </div>
+<div data-fs-images-empty>
+  {{ m.empty(
+      "image",
+      "No images cached",
+      "Pull a catalog reference above, or create a machine and Firestone resolves and stores the image it needs on first start."
+  ) }}
 </div>
 {% endif %}
