@@ -1928,8 +1928,16 @@ mod tests {
         let dispatcher = ShowDispatcher::arc(firestone_core::MachineStatus::Running)?;
         let server = UpgradeServer::start(dispatcher).await?;
         // `shell_ssh_plan` writes the Firestone SSH identity and resolves the
-        // machine's known_hosts file, so both directories must exist.
-        std::fs::create_dir_all(server.paths.machine_dir("dev")?)?;
+        // machine's known_hosts file, so both directories must exist — with
+        // owner-only modes, or the ancestry guard rejects them under a group
+        // umask.
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(server.paths.machine_dir("dev")?)?;
+        }
 
         // The handshake must reach 101: the PTY and the OpenSSH child are
         // allocated only after the upgrade. The session then ends on its own,
