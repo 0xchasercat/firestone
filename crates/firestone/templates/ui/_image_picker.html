@@ -1,0 +1,9 @@
+{# The create dialog's image picker, on its own.
+
+   GET /ui/machines/new/images renders exactly the markup the dialog renders
+   inline, so a pull that finishes inside the dialog can refresh the cached
+   badges without rebuilding the form. It is a read: the hidden `image` field
+   lives outside this fragment, and app.js restores whatever the user had
+   typed or chosen once the new list is in place. #}
+{% import "ui/_spec_fields.html" as f %}
+{{ f.image_list(images, selected, custom) }}

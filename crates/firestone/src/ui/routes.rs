@@ -316,22 +316,33 @@ struct PaletteImage {
 
 pub async fn create_form(State(state): State<UiState>) -> Response {
     let result = async {
-        let entries = list_catalog(&state).await?;
         let defaults = MachineSpec::from_layers(
             &state.create_defaults,
             &MachineSpecPatch::default(),
             &MachineSpecPatch::default(),
         )?;
+        let form = CreateForm::from_defaults(&defaults);
+        let images = picker_images(&state).await?;
         render(
             "ui/create.html",
+            create_context(&form, &BTreeMap::new(), images),
+        )
+    }
+    .await;
+    fragment(result)
+}
+
+/// The image picker on its own, re-read after a pull finishes inside the
+/// dialog. A read, like every other `/ui` fragment: the field the form
+/// actually submits lives outside it and is never rewritten here.
+pub async fn create_form_images(State(state): State<UiState>) -> Response {
+    let result = async {
+        render(
+            "ui/_image_picker.html",
             context! {
-                form => CreateForm::from_defaults(&defaults),
-                errors => BTreeMap::<String, String>::new(),
-                catalog_refs => entries
-                    .iter()
-                    .map(|entry| entry.reference.clone())
-                    .collect::<Vec<_>>(),
-                net_modes => ["passt", "tap", "none"],
+                images => picker_images(&state).await?,
+                selected => "",
+                custom => "",
             },
         )
     }
@@ -380,19 +391,111 @@ async fn create_rejected(
     form: &CreateForm,
     errors: BTreeMap<String, String>,
 ) -> Response {
-    let entries = list_catalog(state).await.unwrap_or_default();
+    let images = picker_images(state).await.unwrap_or_default();
     fragment(render(
         "ui/create.html",
-        context! {
-            form => form,
-            errors => errors,
-            catalog_refs => entries
-                .iter()
-                .map(|entry| entry.reference.clone())
-                .collect::<Vec<_>>(),
-            net_modes => ["passt", "tap", "none"],
-        },
+        create_context(form, &errors, images),
     ))
+}
+
+/// One context builder for both renders of the dialog, so a field that is
+/// offered on the first attempt is still offered after a rejection.
+fn create_context(
+    form: &CreateForm,
+    errors: &BTreeMap<String, String>,
+    images: Vec<PickerImage>,
+) -> Value {
+    // The free-text row holds whatever the catalog list cannot: a URL, a path,
+    // or a reference this host does not know about.
+    let custom_image = if images
+        .iter()
+        .any(|image| image.reference == form.image.trim())
+    {
+        String::new()
+    } else {
+        form.image.trim().to_owned()
+    };
+
+    context! {
+        form => form,
+        errors => errors,
+        images => images,
+        custom_image => custom_image,
+        memory => SizeField::split(&form.memory),
+        disk => SizeField::split(&form.disk),
+        net_modes => ["passt", "tap", "none"],
+    }
+}
+
+/// One catalog entry as the create dialog's picker renders it.
+#[derive(Debug, Clone, serde::Serialize)]
+struct PickerImage {
+    reference: String,
+    aliases: String,
+    cached: bool,
+    cached_id: String,
+    size: String,
+}
+
+/// The same assembly the catalog cards use: catalog entries joined to the
+/// image store so an entry that is already on disk says so, with its size,
+/// rather than offering a pull that would do nothing.
+async fn picker_images(state: &UiState) -> Result<Vec<PickerImage>, FirestoneError> {
+    let entries = list_catalog(state).await?;
+    let images = list_images(state).await?;
+    let cached = cached_by_reference(&images);
+    let ids = cached_ids(&images);
+
+    Ok(entries
+        .iter()
+        .map(|entry| {
+            let size = cached.get(&entry.reference).copied();
+            PickerImage {
+                reference: entry.reference.clone(),
+                aliases: entry.aliases.join(" · "),
+                cached: size.is_some(),
+                cached_id: ids.get(&entry.reference).cloned().unwrap_or_default(),
+                size: size.map(format_bytes).unwrap_or_default(),
+            }
+        })
+        .collect())
+}
+
+/// A size split into the number and unit the dialog edits, beside the exact
+/// string the handler will parse.
+///
+/// `raw` is what gets submitted when nothing is touched, so a value the server
+/// could not parse comes back verbatim rather than being silently rewritten
+/// into something that would fail differently.
+#[derive(Debug, Clone, serde::Serialize)]
+struct SizeField {
+    raw: String,
+    amount: String,
+    unit: &'static str,
+}
+
+impl SizeField {
+    fn split(raw: &str) -> Self {
+        let trimmed = raw.trim();
+        // ByteSize's grammar: a trailing G is GiB, a trailing M is MiB, and a
+        // bare integer is MiB. The unit select must round-trip that exactly.
+        let (digits, unit) = match trimmed.as_bytes().last() {
+            Some(b'G' | b'g') => (&trimmed[..trimmed.len() - 1], "G"),
+            Some(b'M' | b'm') => (&trimmed[..trimmed.len() - 1], "M"),
+            Some(_) => (trimmed, "M"),
+            None => ("", "G"),
+        };
+        let amount = if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            digits.to_owned()
+        } else {
+            String::new()
+        };
+        Self {
+            raw: trimmed.to_owned(),
+            amount,
+            unit,
+        }
+    }
 }
 
 fn created(name: &str) -> Response {
@@ -457,6 +560,12 @@ fn field_errors(error: &FirestoneError) -> BTreeMap<String, String> {
         "forward"
     } else if lowered.contains("user") {
         "user"
+    } else if lowered.contains("mount") || lowered.contains("share") {
+        "mounts"
+    } else if lowered.contains("tap") {
+        "tap"
+    } else if lowered.contains("mac address") {
+        "mac"
     } else {
         "form"
     };
@@ -488,6 +597,13 @@ pub struct CreateForm {
     pub net_mode: String,
     #[serde(default)]
     pub forward: String,
+    #[serde(default)]
+    pub tap: String,
+    #[serde(default)]
+    pub mac: String,
+    /// Newline-separated `HOST:GUEST[:ro]`, the grammar `--mount` already uses.
+    #[serde(default)]
+    pub mounts: String,
 }
 
 impl CreateForm {
@@ -507,6 +623,19 @@ impl CreateForm {
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(", "),
+            tap: spec.network.tap.clone().unwrap_or_default(),
+            mac: spec
+                .network
+                .mac
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            mounts: spec
+                .mounts
+                .iter()
+                .map(mount_line)
+                .collect::<Vec<_>>()
+                .join("\n"),
         }
     }
 
@@ -586,7 +715,43 @@ impl CreateForm {
             }
             network.forward = Some(parsed);
         }
+
+        if !self.tap.trim().is_empty() {
+            network.tap = Some(self.tap.trim().to_owned());
+        }
+        if !self.mac.trim().is_empty() {
+            match self.mac.trim().parse() {
+                Ok(mac) => network.mac = Some(mac),
+                Err(error) => {
+                    errors.insert("mac".to_owned(), format!("{}: {error}", self.mac.trim()));
+                }
+            }
+        }
         patch.network = Some(network);
+
+        // Every bad row is reported, not just the first: a form that answers
+        // one mount at a time costs a round trip per typo.
+        let mut mounts = Vec::new();
+        let mut mount_errors = Vec::new();
+        let mut row = 0usize;
+        for line in self.mounts.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            row += 1;
+            match crate::cli::parse_mount(line) {
+                Ok(mount) => mounts.push(mount),
+                Err(error) => mount_errors.push(format!("row {row}: {error}")),
+            }
+        }
+        if mount_errors.is_empty() {
+            if !mounts.is_empty() {
+                patch.mounts = Some(mounts);
+            }
+        } else {
+            errors.insert("mounts".to_owned(), mount_errors.join("; "));
+        }
 
         if errors.is_empty() {
             Ok(patch)
@@ -594,6 +759,17 @@ impl CreateForm {
             Err(errors)
         }
     }
+}
+
+/// Renders one mount back into the `HOST:GUEST[:ro]` grammar it was parsed
+/// from, so the form round-trips through the same string the CLI accepts.
+fn mount_line(mount: &firestone_core::MountSpec) -> String {
+    format!(
+        "{}:{}{}",
+        mount.host.display(),
+        mount.guest.display(),
+        if mount.readonly { ":ro" } else { "" }
+    )
 }
 
 fn parse_into<T, F>(raw: &str, field: &str, errors: &mut BTreeMap<String, String>, mut apply: F)
@@ -1142,12 +1318,22 @@ mod tests {
             user: "ubuntu".to_owned(),
             net_mode: "passt".to_owned(),
             forward: "nonsense".to_owned(),
+            tap: String::new(),
+            mac: "not-a-mac".to_owned(),
+            mounts: "/srv:/work\nbroken\nalso-broken".to_owned(),
         };
         let errors = form.to_patch().expect_err("the form must be rejected");
-        for field in ["name", "image", "cpus", "memory", "forward"] {
+        for field in [
+            "name", "image", "cpus", "memory", "forward", "mac", "mounts",
+        ] {
             assert!(errors.contains_key(field), "missing error for {field}");
         }
         assert!(!errors.contains_key("disk"), "disk was valid");
+        let mounts = errors.get("mounts").expect("a mount error");
+        assert!(
+            mounts.contains("row 2") && mounts.contains("row 3"),
+            "every bad mount row must be reported, got {mounts}"
+        );
     }
 
     #[test]
@@ -1159,19 +1345,95 @@ mod tests {
             memory: "8G".to_owned(),
             disk: "40G".to_owned(),
             user: "ubuntu".to_owned(),
-            net_mode: "passt".to_owned(),
+            net_mode: "tap".to_owned(),
             forward: "127.0.0.1:8080:80, udp:5353:5353".to_owned(),
+            tap: "tap0".to_owned(),
+            mac: "52:54:00:9a:1f:c3".to_owned(),
+            mounts: "/srv/project:/work:ro\n\n~/code:/code\n".to_owned(),
         };
         let patch = form.to_patch().expect("the form must be accepted");
         assert_eq!(patch.cpus, Some(4));
+        let network = patch.network.as_ref().expect("a network patch");
+        assert_eq!(network.forward.as_ref().map(Vec::len), Some(2));
+        assert_eq!(network.tap.as_deref(), Some("tap0"));
         assert_eq!(
-            patch
-                .network
-                .as_ref()
-                .and_then(|network| network.forward.as_ref())
-                .map(Vec::len),
-            Some(2)
+            network.mac.map(|mac| mac.to_string()).as_deref(),
+            Some("52:54:00:9a:1f:c3")
         );
+
+        let mounts = patch.mounts.as_ref().expect("a mount patch");
+        assert_eq!(mounts.len(), 2, "a blank line is not a mount");
+        assert_eq!(mounts[0].host, std::path::PathBuf::from("/srv/project"));
+        assert_eq!(mounts[0].guest, std::path::PathBuf::from("/work"));
+        assert!(mounts[0].readonly);
+        assert!(mounts[0].tag.is_none());
+        assert!(!mounts[1].readonly);
+    }
+
+    #[test]
+    fn create_form_round_trips_composed_fields_through_the_same_grammar() {
+        // What the dialog composes must parse back into what it composed from,
+        // or the friendly controls and the field the server reads have drifted.
+        let form = CreateForm {
+            name: "web".to_owned(),
+            image: "ubuntu:24.04".to_owned(),
+            forward: "8080:80, udp:127.0.0.1:5353:5353, [::1]:9090:90".to_owned(),
+            mounts: "/srv:/work:ro\n/tmp/x:/x".to_owned(),
+            memory: "1536M".to_owned(),
+            disk: "40G".to_owned(),
+            ..CreateForm::default()
+        };
+        let patch = form.to_patch().expect("the form must be accepted");
+
+        let forwards = patch
+            .network
+            .as_ref()
+            .and_then(|network| network.forward.clone())
+            .expect("a forward patch");
+        assert_eq!(
+            forwards
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+            "8080:80, udp:127.0.0.1:5353:5353, [::1]:9090:90"
+        );
+
+        let mounts = patch.mounts.as_ref().expect("a mount patch");
+        assert_eq!(
+            mounts.iter().map(super::mount_line).collect::<Vec<_>>(),
+            ["/srv:/work:ro", "/tmp/x:/x"]
+        );
+
+        assert_eq!(
+            patch.memory.map(|size| size.to_string()).as_deref(),
+            Some("1536M")
+        );
+        assert_eq!(
+            patch.disk.map(|size| size.to_string()).as_deref(),
+            Some("40G")
+        );
+    }
+
+    #[test]
+    fn size_field_splits_a_canonical_size_into_an_amount_and_a_unit() {
+        for (raw, amount, unit) in [
+            ("8G", "8", "G"),
+            ("512M", "512", "M"),
+            (" 2G ", "2", "G"),
+            // A bare integer is MiB in the ByteSize grammar; the select must
+            // say so rather than quietly promote it to GiB.
+            ("2048", "2048", "M"),
+            ("", "", "G"),
+            // An unparseable value is handed back verbatim, with no amount to
+            // recompose it from.
+            ("nonsense", "", "M"),
+        ] {
+            let field = super::SizeField::split(raw);
+            assert_eq!(field.amount, amount, "{raw} amount");
+            assert_eq!(field.unit, unit, "{raw} unit");
+            assert_eq!(field.raw, raw.trim(), "{raw} raw");
+        }
     }
 
     #[test]

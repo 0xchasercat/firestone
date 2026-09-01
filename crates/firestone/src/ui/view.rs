@@ -8,7 +8,8 @@
 
 use firestone_core::{
     CloudInitSpec, DoctorCheck, DoctorReport, DoctorStatus, MachineSpec, MachineState,
-    MachineStatus, MachineSummary, MachineView, NetMode, NetworkSpec, VersionResult, VmmSpec,
+    MachineStatus, MachineSummary, MachineView, MountSpec, NetMode, NetworkSpec, VersionResult,
+    VmmSpec,
 };
 use serde::{Deserialize, Serialize};
 
@@ -483,9 +484,41 @@ fn spec_groups(spec: &MachineSpec) -> Vec<SpecGroup> {
             ],
         },
         network_group(&spec.network),
+        mounts_group(&spec.mounts),
         cloud_init_group(&spec.cloud_init),
         vmm_group(&spec.vmm),
     ]
+}
+
+/// Shared folders, rendered in the same `HOST:GUEST[:ro]` grammar the CLI and
+/// the create form accept, with the tag the guest will actually see. The tag
+/// is derived rather than shown as null, because `share<i>` is what virtiofs
+/// is given when the field is unset.
+fn mounts_group(mounts: &[MountSpec]) -> SpecGroup {
+    SpecGroup {
+        title: "Mounts",
+        rows: if mounts.is_empty() {
+            vec![Pair {
+                key: "mount",
+                value: "[]".to_owned(),
+            }]
+        } else {
+            mounts
+                .iter()
+                .enumerate()
+                .map(|(index, mount)| Pair {
+                    key: "mount",
+                    value: format!(
+                        "{}:{}{} · tag {}",
+                        mount.host.display(),
+                        mount.guest.display(),
+                        if mount.readonly { ":ro" } else { "" },
+                        mount.effective_tag(index)
+                    ),
+                })
+                .collect()
+        },
+    }
 }
 
 fn network_group(network: &NetworkSpec) -> SpecGroup {

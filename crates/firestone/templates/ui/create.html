@@ -1,11 +1,16 @@
 {# Rendered into #fs-dialog-slot and opened by app.js. The form posts to the
    UI rather than straight to /v1/machines so that a 400 or 409 can be
-   rendered against the field that caused it instead of thrown as a toast. #}
-<dialog class="fs-dialog" id="fs-create" data-fs-autoopen aria-labelledby="fs-create-title">
+   rendered against the field that caused it instead of thrown as a toast.
+
+   Every control comes from ui/_spec_fields.html so the machine edit surface
+   can render the same fields against the same names. #}
+{% import "ui/_spec_fields.html" as f %}
+<dialog class="fs-dialog fs-dialog--wide" id="fs-create" data-fs-autoopen aria-labelledby="fs-create-title">
   <form hx-post="/ui/machines"
         hx-target="#fs-create"
         hx-swap="outerHTML"
-        hx-disabled-elt="find button[type='submit']">
+        hx-disabled-elt="find button[type='submit']"
+        data-fs-create-form>
     <div class="fs-dialog__head">
       <div class="fs-dialog__title" id="fs-create-title">New machine</div>
       <span class="fs-panel__note">POST /v1/machines</span>
@@ -13,88 +18,34 @@
 
     <div class="fs-dialog__body">
       <div class="fs-form">
-        <div>
-          <label class="fs-field__label" for="fs-create-name">Name</label>
-          <input class="fs-input" id="fs-create-name" name="name" required
-                 autocomplete="off" spellcheck="false" value="{{ form.name }}"
-                 {% if errors.name %}aria-invalid="true" aria-describedby="fs-create-name-error"{% endif %}>
-          {% if errors.name %}
-          <div class="fs-field__error" id="fs-create-name-error">{{ errors.name }}</div>
-          {% else %}
-          <div class="fs-field__hint">lowercase letters, digits and dashes</div>
-          {% endif %}
-        </div>
+        {{ f.text_field(
+            "fs-create-name", "name", "Name", form.name, errors.name,
+            "lowercase letters, digits and dashes", "", false, true
+        ) }}
 
-        <div>
-          <label class="fs-field__label" for="fs-create-image">Image</label>
-          <input class="fs-input fs-input--mono" id="fs-create-image" name="image" required
-                 list="fs-image-options" autocomplete="off" spellcheck="false"
-                 value="{{ form.image }}"
-                 placeholder="ubuntu:24.04"
-                 {% if errors.image %}aria-invalid="true" aria-describedby="fs-create-image-error"{% endif %}>
-          <datalist id="fs-image-options">
-            {% for reference in catalog_refs %}<option value="{{ reference }}"></option>{% endfor %}
-          </datalist>
-          {% if errors.image %}
-          <div class="fs-field__error" id="fs-create-image-error">{{ errors.image }}</div>
-          {% else %}
-          <div class="fs-field__hint">a catalog reference, an https:// URL, or a local path</div>
-          {% endif %}
-        </div>
+        {{ f.image_picker(form, errors, images, custom_image) }}
 
         <div class="fs-form__grid">
-          <div>
+          <div class="fs-field">
             <label class="fs-field__label" for="fs-create-cpus">vCPUs</label>
             <input class="fs-input fs-input--mono" id="fs-create-cpus" name="cpus"
                    type="number" min="1" max="255" value="{{ form.cpus }}"
                    {% if errors.cpus %}aria-invalid="true"{% endif %}>
             {% if errors.cpus %}<div class="fs-field__error">{{ errors.cpus }}</div>{% endif %}
           </div>
-          <div>
-            <label class="fs-field__label" for="fs-create-memory">Memory</label>
-            <input class="fs-input fs-input--mono" id="fs-create-memory" name="memory"
-                   autocomplete="off" value="{{ form.memory }}" placeholder="2G"
-                   {% if errors.memory %}aria-invalid="true"{% endif %}>
-            {% if errors.memory %}<div class="fs-field__error">{{ errors.memory }}</div>{% endif %}
-          </div>
-          <div>
-            <label class="fs-field__label" for="fs-create-disk">Disk</label>
-            <input class="fs-input fs-input--mono" id="fs-create-disk" name="disk"
-                   autocomplete="off" value="{{ form.disk }}" placeholder="20G"
-                   {% if errors.disk %}aria-invalid="true"{% endif %}>
-            {% if errors.disk %}<div class="fs-field__error">{{ errors.disk }}</div>{% endif %}
-          </div>
+          {{ f.size_field("fs-create-memory", "memory", "Memory", memory, errors.memory, "G is GiB · 1024 MiB") }}
+          {{ f.size_field("fs-create-disk", "disk", "Disk", disk, errors.disk, "G is GiB · 1024 MiB") }}
         </div>
 
-        <div class="fs-form__grid">
-          <div>
-            <label class="fs-field__label" for="fs-create-user">Guest user</label>
-            <input class="fs-input fs-input--mono" id="fs-create-user" name="user"
-                   autocomplete="off" value="{{ form.user }}"
-                   {% if errors.user %}aria-invalid="true"{% endif %}>
-            {% if errors.user %}<div class="fs-field__error">{{ errors.user }}</div>{% endif %}
-          </div>
-          <div>
-            <label class="fs-field__label" for="fs-create-net">Network</label>
-            <select class="fs-input fs-input--mono" id="fs-create-net" name="net_mode">
-              {% for mode in net_modes %}
-              <option value="{{ mode }}"{% if mode == form.net_mode %} selected{% endif %}>{{ mode }}</option>
-              {% endfor %}
-            </select>
-          </div>
-          <div>
-            <label class="fs-field__label" for="fs-create-forward">Port forwards</label>
-            <input class="fs-input fs-input--mono" id="fs-create-forward" name="forward"
-                   autocomplete="off" spellcheck="false" value="{{ form.forward }}"
-                   placeholder="127.0.0.1:8080:80"
-                   {% if errors.forward %}aria-invalid="true"{% endif %}>
-            {% if errors.forward %}
-            <div class="fs-field__error">{{ errors.forward }}</div>
-            {% else %}
-            <div class="fs-field__hint">comma separated · [proto:][bind:]HOST:GUEST</div>
-            {% endif %}
-          </div>
-        </div>
+        {{ f.text_field(
+            "fs-create-user", "user", "Guest user", form.user, errors.user, "", "", true, false
+        ) }}
+
+        {{ f.network_fields(form, errors, net_modes) }}
+
+        {{ f.forward_rows(form, errors) }}
+
+        {{ f.mount_rows(form, errors) }}
 
         {% if errors.form %}
         <div class="fs-inline-notice fs-inline-notice--fail" role="alert">

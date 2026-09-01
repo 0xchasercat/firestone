@@ -26,6 +26,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 struct FakeDispatcher {
     machines: Value,
     machine: Value,
+    catalog: Value,
     /// Injected to prove failures render as pages and fragments rather than
     /// panicking or leaking a blank response.
     fail: Option<ErrorKind>,
@@ -64,6 +65,11 @@ impl Default for FakeDispatcher {
                 }
             ]),
             machine: machine_view("web", "running"),
+            catalog: json!([{
+                "reference": "ubuntu:24.04",
+                "aliases": ["noble"],
+                "architectures": [{ "architecture": "x86_64", "firmware": "edk2" }]
+            }]),
             fail: None,
         }
     }
@@ -108,6 +114,18 @@ fn machine_view(name: &str, status: &str) -> Value {
     })
 }
 
+/// The same view with one read-only shared folder, for the Mounts group.
+fn machine_view_with_mounts(name: &str, status: &str) -> Value {
+    let mut view = machine_view(name, status);
+    view["spec"]["mount"] = json!([{
+        "host": "/srv/project",
+        "guest": "/work",
+        "readonly": true,
+        "tag": null
+    }]);
+    view
+}
+
 impl Dispatcher for FakeDispatcher {
     fn run<'a>(&'a self, action: Action, events: &'a mut dyn EventSink) -> DispatchFuture<'a> {
         Box::pin(async move {
@@ -148,14 +166,7 @@ impl Dispatcher for FakeDispatcher {
                         "path": "/data/images/sha256-abc.qcow2"
                     }]),
                 ),
-                Action::CatalogList => (
-                    "catalog",
-                    json!([{
-                        "reference": "ubuntu:24.04",
-                        "aliases": ["noble"],
-                        "architectures": [{ "architecture": "x86_64", "firmware": "edk2" }]
-                    }]),
-                ),
+                Action::CatalogList => ("catalog", self.catalog.clone()),
                 Action::Doctor { .. } => (
                     "doctor",
                     json!({
@@ -554,6 +565,156 @@ async fn a_successful_create_closes_the_dialog_and_navigates() -> TestResult {
 }
 
 #[tokio::test]
+async fn the_image_picker_reports_cached_entries_and_offers_a_pull_for_the_rest() -> TestResult {
+    // The fake store holds ubuntu:24.04 and nothing else, so one catalog entry
+    // must read as cached with its size and the other must offer a pull.
+    let router = app(FakeDispatcher {
+        catalog: json!([
+            {
+                "reference": "ubuntu:24.04",
+                "aliases": ["noble"],
+                "architectures": [{ "architecture": "x86_64", "firmware": "edk2" }]
+            },
+            {
+                "reference": "debian:12",
+                "aliases": [],
+                "architectures": [{ "architecture": "x86_64", "firmware": "edk2" }]
+            }
+        ]),
+        ..FakeDispatcher::default()
+    })?;
+
+    for uri in ["/ui/machines/new", "/ui/machines/new/images"] {
+        let (status, _, body) = get_fragment(&router, uri).await?;
+        assert_eq!(status, StatusCode::OK, "{uri} did not render");
+        assert!(body.contains("fs-picker__list"), "{uri} has no picker");
+        assert!(
+            body.contains(r#"value="ubuntu:24.04""#),
+            "{uri} lost the cached entry"
+        );
+        assert!(body.contains("noble"), "{uri} does not show the aliases");
+        assert!(
+            body.contains("642 MB") && body.contains("fs-cached"),
+            "{uri} does not badge the cached entry with its size"
+        );
+        assert!(
+            body.contains(r#"data-fs-pull-picker="debian:12""#),
+            "{uri} does not offer a pull for the uncached entry"
+        );
+        assert!(
+            !body.contains(r#"data-fs-pull-picker="ubuntu:24.04""#),
+            "{uri} offers a pull for an image that is already cached"
+        );
+        // The free-text row takes a URL, a path, or anything else.
+        assert!(
+            body.contains("data-fs-picker-custom"),
+            "{uri} has no free row"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_create_form_composes_every_friendly_control_into_one_named_field() -> TestResult {
+    let router = app(FakeDispatcher::default())?;
+    let (_, _, body) = get_fragment(&router, "/ui/machines/new").await?;
+
+    // Sizes: a number and a unit over the hidden canonical string. The units
+    // are labelled GiB and MiB because that is what the grammar means.
+    assert!(body.contains(r#"id="fs-create-memory-amount""#));
+    assert!(body.contains(">GiB</option>") && body.contains(">MiB</option>"));
+    assert!(!body.contains(">GB<"), "a GiB unit must not be labelled GB");
+    assert!(body.contains(r#"name="memory" value="2G""#));
+
+    // The tap device is present but hidden until the mode selects it, and the
+    // MAC lives behind Advanced. Both toggle by attribute, never by style.
+    assert!(body.contains("data-fs-tap-field hidden"));
+    assert!(body.contains(r#"name="tap""#) && body.contains(r#"name="mac""#));
+    assert!(!body.contains(" style=\""), "the dialog emitted a style");
+
+    // Repeatable rows over the canonical composed fields.
+    for marker in [
+        "data-fs-forward-template",
+        "data-fs-forward-add",
+        "data-fs-mount-template",
+        "data-fs-mount-add",
+        "data-fs-row-remove",
+        "data-fs-raw-toggle",
+    ] {
+        assert!(body.contains(marker), "{marker} is missing");
+    }
+    assert!(body.contains(r#"name="forward""#));
+    assert!(body.contains(r#"name="mounts""#));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_submitted_mount_list_reaches_the_spec_and_bad_rows_answer_inline() -> TestResult {
+    let router = app(FakeDispatcher::default())?;
+    let (status, _, body) = request(
+        &router,
+        Request::builder()
+            .method("POST")
+            .uri("/ui/machines")
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(
+                "name=web&image=ubuntu%3A24.04&mounts=%2Fsrv%3A%2Fwork%3Aro%0Anonsense\
+                 &forward=bad&mac=zz",
+            ))?,
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::OK, "the dialog is re-rendered");
+    // Every new field collects its own problem in the same pass.
+    assert!(body.contains(r#"id="fs-create-mounts-error""#));
+    assert!(body.contains(r#"id="fs-create-forward-error""#));
+    assert!(body.contains(r#"id="fs-create-mac-error""#));
+    // The rejected values come back verbatim so nothing the user typed is lost
+    // (paths are HTML-escaped, so this reads the slash-free tail).
+    assert!(body.contains("work:ro"), "the mount rows were not returned");
+    assert!(!body.contains("fs:toast"), "a field problem is not a toast");
+
+    let ok = request(
+        &router,
+        Request::builder()
+            .method("POST")
+            .uri("/ui/machines")
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(
+                "name=web&image=ubuntu%3A24.04&net_mode=tap&tap=tap0\
+                 &mounts=%2Fsrv%3A%2Fwork%3Aro&forward=udp%3A5353%3A5353",
+            ))?,
+    )
+    .await?;
+    assert_eq!(ok.0, StatusCode::OK);
+    assert!(ok.2.is_empty(), "a valid submission renders no dialog");
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_detail_spec_renders_the_mounts_group() -> TestResult {
+    let router = app(FakeDispatcher {
+        machine: machine_view_with_mounts("web", "running"),
+        ..FakeDispatcher::default()
+    })?;
+    let (_, _, spec) = get_fragment(&router, "/ui/machines/web/tab/spec").await?;
+    assert!(spec.contains("Mounts"), "the Mounts group is missing");
+    // Paths are HTML-escaped, so the assertion reads the slash-free tail of
+    // the same `HOST:GUEST[:ro]` string the CLI and the create form use.
+    assert!(
+        spec.contains("work:ro · tag share0"),
+        "the mount row does not render its grammar and effective tag"
+    );
+
+    // A machine with no shared folders still gets the group, reported as empty
+    // rather than silently absent.
+    let bare = app(FakeDispatcher::default())?;
+    let (_, _, empty) = get_fragment(&bare, "/ui/machines/web/tab/spec").await?;
+    assert!(empty.contains("Mounts"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn the_palette_matches_machines_and_catalog_entries() -> TestResult {
     let router = app(FakeDispatcher::default())?;
     let (_, _, all) = get_fragment(&router, "/ui/palette").await?;
@@ -846,6 +1007,30 @@ async fn the_ui_never_offers_a_second_mutation_surface() -> TestResult {
                 "{uri} declares {forbidden}, forking the mutation contract"
             );
         }
+    }
+
+    // The create dialog and its picker fragment are held to the same rule. The
+    // dialog's own POST /ui/machines is the one documented exception; the
+    // picker is a read and must declare no write at all, and the in-dialog
+    // pull goes to /v1/images/pull through app.js like every other pull.
+    for uri in ["/ui/machines/new", "/ui/machines/new/images"] {
+        let (_, _, body) = get_fragment(&router, uri).await?;
+        for forbidden in [
+            "hx-post=\"/ui/machines/",
+            "hx-delete=",
+            "hx-put=",
+            "hx-patch=",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "{uri} declares {forbidden}, forking the mutation contract"
+            );
+        }
+        assert_eq!(
+            body.matches("hx-post=").count(),
+            usize::from(uri == "/ui/machines/new"),
+            "{uri} declares an unexpected write"
+        );
     }
     Ok(())
 }

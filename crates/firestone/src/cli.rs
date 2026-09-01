@@ -790,7 +790,9 @@ fn parse_net_mode(value: &str) -> Result<NetMode, String> {
     }
 }
 
-fn parse_mount(value: &str) -> Result<MountSpec, String> {
+/// Shared with the web UI's create form: both surfaces accept the one
+/// `HOST:GUEST[:ro]` grammar rather than growing a second, divergent parser.
+pub(crate) fn parse_mount(value: &str) -> Result<MountSpec, String> {
     let mut components = value.split(':');
     let (Some(host), Some(guest)) = (components.next(), components.next()) else {
         return Err("mount must have the form HOST:GUEST[:ro]".to_owned());
