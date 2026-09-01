@@ -425,6 +425,8 @@ pub struct OverlayInfo {
     pub backing_path: PathBuf,
     pub virtual_size: u64,
     pub cached: bool,
+    /// True when this start grew an existing overlay to a larger spec `disk`.
+    pub grown: bool,
 }
 
 /// The image and overlay prepared atomically with respect to image-store mutation.
@@ -1124,6 +1126,7 @@ impl ImageStore {
             backing_path: backing.to_path_buf(),
             virtual_size: info.virtual_size,
             cached: false,
+            grown: false,
         })
     }
 
@@ -1668,6 +1671,24 @@ impl ImageStore {
             .with_hint("retry so Firestone can recover the incomplete image pair")),
         }
     }
+    /// Grows one owned qcow2 overlay to `bytes` with pinned qemu-img 8.2.2.
+    ///
+    /// Only growth is ever requested: qcow2 shrink would discard guest data and
+    /// is refused before this point. Growing the container leaves the guest
+    /// partition untouched; cloud-init `growpart` extends it on the next boot.
+    pub fn resize_overlay(&self, path: &Path, bytes: u64) -> Result<(), FirestoneError> {
+        Cmd::new(self.qemu_img.as_os_str())
+            .arg("resize")
+            .arg("-f")
+            .arg("qcow2")
+            .arg(path.as_os_str())
+            .arg(bytes.to_string())
+            .timeout(QEMU_CREATE_TIMEOUT)
+            .error_kind(ErrorKind::Dependency)
+            .run()?;
+        Ok(())
+    }
+
     /// Uses the pinned qemu-img 8.2.2 raw conversion argv from verify 4.
     fn convert_raw(&self, source: &Path, target: &Path) -> Result<(), FirestoneError> {
         Cmd::new(self.qemu_img.as_os_str())
@@ -1686,48 +1707,7 @@ impl ImageStore {
 
     /// Uses the pinned qemu-img 8.2.2 JSON inspection argv from verify 4/5.
     fn qemu_info(&self, path: &Path) -> Result<QemuInfo, FirestoneError> {
-        let output = Cmd::new(self.qemu_img.as_os_str())
-            .arg("info")
-            .arg("--output=json")
-            .arg("-f")
-            .arg("qcow2")
-            .arg(path.as_os_str())
-            .timeout(QEMU_INFO_TIMEOUT)
-            .error_kind(ErrorKind::Dependency)
-            .run()?;
-        let value =
-            serde_json::from_slice::<serde_json::Value>(output.stdout()).map_err(|source| {
-                FirestoneError::new(
-                    ErrorKind::Dependency,
-                    format!("qemu-img returned invalid JSON for '{}'", path.display()),
-                )
-                .with_hint("install qemu-img 8.2.2 or a compatible release")
-                .with_source(source)
-            })?;
-        reject_hidden_qemu_dependencies(&value, path)?;
-        let format = required_qemu_string(&value, "format", path)?;
-        let virtual_size = value
-            .get("virtual-size")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| missing_qemu_info_field(path, "virtual-size"))?;
-        let backing_filename = optional_qemu_string(&value, "backing-filename", path)?;
-        let backing_filename_format =
-            optional_qemu_string(&value, "backing-filename-format", path)?;
-        let full_backing_filename = optional_qemu_string(&value, "full-backing-filename", path)?;
-        let dirty_flag = optional_qemu_bool(&value, "dirty-flag", path)?;
-        let format_specific = parse_qcow2_format_specific(&value, path)?;
-        Ok(QemuInfo {
-            format,
-            virtual_size,
-            backing_filename,
-            backing_filename_format,
-            full_backing_filename,
-            dirty_flag,
-            corrupt: format_specific.corrupt,
-            compat: format_specific.compat,
-            data_file: format_specific.data_file,
-            data_file_raw: format_specific.data_file_raw,
-        })
+        qemu_info_with(&self.qemu_img, path)
     }
 
     fn list_locked(&self) -> Result<Vec<StoredImage>, FirestoneError> {
@@ -2106,13 +2086,25 @@ impl ImageStore {
                     OVERLAY_FILE_MODE,
                     false,
                 )?;
-                let info = self.qemu_info(&overlay)?;
-                validate_overlay_info(&overlay, &stored.path, disk_size.as_bytes(), &info)?;
+                let mut info = self.qemu_info(&overlay)?;
+                let requested = disk_size.as_bytes();
+                let mut grown = false;
+                if info.virtual_size > requested {
+                    return Err(disk_shrink_error(name, info.virtual_size, requested));
+                }
+                if info.virtual_size < requested {
+                    self.resize_overlay(&overlay, requested)?;
+                    sync_file(&overlay, "machine overlay")?;
+                    info = self.qemu_info(&overlay)?;
+                    grown = true;
+                }
+                validate_overlay_info(&overlay, &stored.path, requested, &info)?;
                 return Ok(OverlayInfo {
                     path: overlay,
                     backing_path: stored.path,
                     virtual_size: info.virtual_size,
                     cached: true,
+                    grown,
                 });
             }
             Err(source) if source.kind() == io::ErrorKind::NotFound => {}
@@ -2160,6 +2152,7 @@ impl ImageStore {
             backing_path: stored.path,
             virtual_size: info.virtual_size,
             cached: false,
+            grown: false,
         })
     }
 
@@ -3627,6 +3620,81 @@ fn validate_overlay_info(
         .with_hint("remove the invalid overlay and retry start"));
     }
     Ok(())
+}
+
+/// Uses the pinned qemu-img 8.2.2 JSON inspection argv from verify 4/5.
+fn qemu_info_with(qemu_img: &Path, path: &Path) -> Result<QemuInfo, FirestoneError> {
+    let output = Cmd::new(qemu_img.as_os_str())
+        .arg("info")
+        .arg("--output=json")
+        .arg("-f")
+        .arg("qcow2")
+        .arg(path.as_os_str())
+        .timeout(QEMU_INFO_TIMEOUT)
+        .error_kind(ErrorKind::Dependency)
+        .run()?;
+    let value = serde_json::from_slice::<serde_json::Value>(output.stdout()).map_err(|source| {
+        FirestoneError::new(
+            ErrorKind::Dependency,
+            format!("qemu-img returned invalid JSON for '{}'", path.display()),
+        )
+        .with_hint("install qemu-img 8.2.2 or a compatible release")
+        .with_source(source)
+    })?;
+    reject_hidden_qemu_dependencies(&value, path)?;
+    let format = required_qemu_string(&value, "format", path)?;
+    let virtual_size = value
+        .get("virtual-size")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| missing_qemu_info_field(path, "virtual-size"))?;
+    let backing_filename = optional_qemu_string(&value, "backing-filename", path)?;
+    let backing_filename_format = optional_qemu_string(&value, "backing-filename-format", path)?;
+    let full_backing_filename = optional_qemu_string(&value, "full-backing-filename", path)?;
+    let dirty_flag = optional_qemu_bool(&value, "dirty-flag", path)?;
+    let format_specific = parse_qcow2_format_specific(&value, path)?;
+    Ok(QemuInfo {
+        format,
+        virtual_size,
+        backing_filename,
+        backing_filename_format,
+        full_backing_filename,
+        dirty_flag,
+        corrupt: format_specific.corrupt,
+        compat: format_specific.compat,
+        data_file: format_specific.data_file,
+        data_file_raw: format_specific.data_file_raw,
+    })
+}
+
+/// Reports one machine overlay's virtual size, or `None` when the machine
+/// has never been started and therefore owns no overlay yet.
+///
+/// Spec validation needs this before an image store exists, so it takes the
+/// resolved qemu-img program directly.
+pub fn overlay_virtual_size(
+    qemu_img: &Path,
+    overlay: &Path,
+) -> Result<Option<u64>, FirestoneError> {
+    match fs::symlink_metadata(overlay) {
+        Ok(_) => Ok(Some(qemu_info_with(qemu_img, overlay)?.virtual_size)),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(image_file_error("inspect", overlay, source)),
+    }
+}
+
+/// The one refusal shared by spec validation and the start-time grow path.
+///
+/// qcow2 shrink truncates the guest filesystem, so Firestone never performs it.
+pub fn disk_shrink_error(name: &str, current: u64, requested: u64) -> FirestoneError {
+    FirestoneError::new(
+        ErrorKind::InvalidSpec,
+        format!(
+            "disk shrink is not supported: machine `{name}` already has a {current}-byte overlay and disk requests {requested} bytes"
+        ),
+    )
+    .with_hint(format!(
+        "set disk to {current} bytes or more, or create a new machine with the smaller disk"
+    ))
 }
 
 fn missing_qemu_info_field(path: &Path, field: &str) -> FirestoneError {

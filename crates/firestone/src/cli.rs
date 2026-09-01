@@ -66,6 +66,9 @@ pub enum Command {
     /// Stop and start a machine.
     Restart(RestartArgs),
 
+    /// Change a machine's CPU count or memory.
+    Resize(ResizeArgs),
+
     /// Stop and remove one or more machines.
     #[command(name = "rm")]
     Remove(RemoveArgs),
@@ -341,6 +344,23 @@ pub struct RestartArgs {
     pub name: String,
 }
 
+/// Arguments accepted by firestone resize.
+#[derive(Debug, Args)]
+#[command(
+    after_help = "A running machine is resized live only within the cpus_max and memory_max\nheadroom it booted with. Otherwise the values are written to the spec and\napply on the next start."
+)]
+pub struct ResizeArgs {
+    pub name: String,
+
+    /// Set the number of virtual CPUs.
+    #[arg(long, value_name = "COUNT")]
+    pub cpus: Option<u8>,
+
+    /// Set guest memory, for example 4G or 4096M.
+    #[arg(long, value_name = "SIZE")]
+    pub memory: Option<ByteSize>,
+}
+
 /// Arguments accepted by firestone rm.
 #[derive(Debug, Args)]
 pub struct RemoveArgs {
@@ -586,9 +606,17 @@ pub struct SpecArgs {
     #[arg(long, value_name = "COUNT")]
     pub cpus: Option<u8>,
 
+    /// Reserve vCPU hotplug headroom for `resize`; must be at least --cpus.
+    #[arg(long = "cpus-max", value_name = "COUNT")]
+    pub cpus_max: Option<u8>,
+
     /// Set guest memory, for example 2G or 2048M.
     #[arg(long, value_name = "SIZE")]
     pub memory: Option<ByteSize>,
+
+    /// Reserve memory hotplug headroom for `resize`; must be at least --memory.
+    #[arg(long = "memory-max", value_name = "SIZE")]
+    pub memory_max: Option<ByteSize>,
 
     /// Set writable disk capacity, for example 20G.
     #[arg(long, value_name = "SIZE")]
@@ -662,7 +690,9 @@ impl SpecArgs {
         let Self {
             arch,
             cpus,
+            cpus_max,
             memory,
+            memory_max,
             disk,
             user,
             net,
@@ -733,7 +763,9 @@ impl SpecArgs {
             image: None,
             arch,
             cpus,
+            cpus_max,
             memory,
+            memory_max,
             disk,
             user,
             network,

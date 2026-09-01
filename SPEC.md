@@ -189,8 +189,10 @@ pub struct MachineSpec {
     pub image: ImageRef,             // "ubuntu:24.04" | URL | path
     pub arch: Option<Arch>,          // default: host arch; validation: must equal host arch
     pub cpus: u8,                    // default 2
+    pub cpus_max: Option<u8>,        // optional vCPU hotplug ceiling; >= cpus
     pub memory: ByteSize,            // default 2G
-    pub disk: ByteSize,              // default 20G (virtual size of the overlay)
+    pub memory_max: Option<ByteSize>,// optional memory hotplug ceiling; >= memory
+    pub disk: ByteSize,              // default 20G (virtual size of the overlay); grows only
     pub user: String,                // default "root"; who `shell` logs in as
     pub network: NetworkSpec,
     #[serde(default, rename = "mount")]
@@ -259,6 +261,7 @@ pub enum Action {
     ImageRemove { id: String, force: bool }, ImagePrune,
     Doctor { fix: bool },
     Version,
+    Resize { name: String, cpus: Option<u8>, memory: Option<ByteSize> },  // §9.5
 }
 ```
 
@@ -404,8 +407,10 @@ All files firestone writes that another process may read (`state.json`, `firesto
 
 image  = "ubuntu:24.04"    # catalog ref "distro[:version]", https URL, or local path (qcow2/raw)
 cpus   = 2                 # 1..=host cpus (warn above host count; hard error above 255)
+# cpus_max   = 8           # optional vCPU hotplug ceiling for `resize`; must be >= cpus
 memory = "2G"              # "512M", "4G", "4096M", or integer MiB
-disk   = "20G"             # virtual size of the overlay; must be >= base image virtual size
+# memory_max = "8G"        # optional memory hotplug ceiling for `resize`; must be >= memory
+disk   = "20G"             # virtual size of the overlay; must be >= base image virtual size; grows on next start, never shrinks
 user   = "root"            # login user for `shell`; root works because provisioning enables it
 # clear = ["network.tap"] # explicitly clear inherited optional or vector fields
 
@@ -448,6 +453,8 @@ Validation runs on every load. Errors carry the TOML key path.
 - `image` follows §8.2 order: an existing local candidate wins, then a strict `https://` URL, then catalog resolution. Arbitrary URLs reject parser violations, userinfo, whitespace, a missing host and fragments. A missing-path hint is emitted only after catalog resolution fails.
 - `arch`: if set, must equal the host architecture; message explains that cross‑arch emulation is a non‑goal.
 - `cpus` ≥ 1. `memory` ≥ 128M. `disk` ≥ base image virtual size (checked at overlay creation, where the base size is known).
+- `cpus_max`, when set, ≥ `cpus`; `memory_max`, when set, ≥ `memory`. Both are optional and default to absent, meaning "no hotplug headroom" (§9.2). Errors carry the `cpus_max` / `memory_max` key.
+- `disk` may grow but never shrink. Once a machine owns an overlay, a `PUT`, `PATCH`, or `resize` that resolves to a `disk` below the overlay's current virtual size is rejected with `invalid_spec` "disk shrink is not supported" and a hint naming the current size. A machine that has never started owns no overlay and may still change `disk` freely.
 - `network.mode = "tap"` requires `network.tap`; the device must exist (`/sys/class/net/<tap>`), and `/dev/net/tun` must be openable. Firestone never creates it.
 - `forward` entries parse per §12.4; guest ports 1–65535; host ports 1–65535 (ports < 1024 are allowed and will fail at passt start without privileges; passt's error is surfaced, not pre‑empted).
 - At most 16 `mount` entries. Each `mount.host` is an existing canonical UTF-8 absolute directory owned by the current user, without symlink/alias components or group/world write; each ancestor is current-user/root-owned and not renameable by another uid, with root-owned sticky directories allowed. Host sources are pairwise disjoint after canonicalization. Each `mount.guest` is a canonical UTF-8 absolute non-root path, and guest paths are pairwise disjoint. Host and guest paths obey Linux's 4,095-byte path and 255-byte component limits. Effective tags are unique, 1 through 36 safe ASCII bytes, and default to `share<i>`.
@@ -457,7 +464,7 @@ Validation runs on every load. Errors carry the TOML key path.
 - `user`: `[a-z_][a-z0-9_-]*`.
 - `vmm.firmware = "edk2"` on x86_64 uses `CLOUDHV.fd`; on aarch64 `CLOUDHV_EFI.fd`; a custom path must identify a readable regular file.
 - `vmm.binary`, when set, must identify a bounded regular file executable by the current user, owned by root or the current uid, and not writable by group or other. Start imports the bytes from one no-follow descriptor into the machine-owned mode-0700 `vmm.bin` before hashing or execution. ELF binaries, shebang scripts, and wrappers remain valid; supervision records the actual post-`exec` executable and argv together with the immutable launch artifact and hash.
-- Spec changes while running are accepted and saved with a `Log` warning "takes effect on next start". Nothing is applied live in v0.1.
+- Spec changes while running are accepted and saved with a `Log` warning "takes effect on next start". `Action::Resize` (§9.5) is the one exception: it applies CPU and memory live when the running machine has headroom. A spec change that alters `user` or any `cloud_init` field on a running machine additionally emits a `Log` warning naming those fields, because cloud-init reprovisions only when the instance identity changes on the next start (§10.4).
 
 ### 7.3 Global config `~/.config/firestone/config.toml`
 
@@ -491,6 +498,8 @@ Generated from `MachineSpecPatch`. Rule: `a.b` → `--a-b`; vectors are repeatab
 | Field | Flag |
 |---|---|
 | `image` | positional on `run`/`create`, or `--image` |
+| `cpus_max` | `--cpus-max COUNT` |
+| `memory_max` | `--memory-max SIZE` |
 | `network.mode` | `--net passt\|tap\|none` |
 | `network.forward[]` | `-p, --forward SPEC` (repeatable) |
 | `network.tap` | `--tap DEV` |
@@ -702,6 +711,8 @@ The pinned Cloud Hypervisor v53.0 OpenAPI document at `vmm/src/api/openapi/cloud
 Rules:
 
 - `memory.shared = true` is mandatory whenever any vhost‑user device (passt, virtiofsd) is attached. Always set it; the cost is negligible and it removes a class of "works without mounts, breaks with mounts" bugs.
+- `cpus.boot_vcpus` is `cpus`. `cpus.max_vcpus` is `cpus_max` when set, otherwise `cpus`: the default machine keeps the two equal.
+- `memory.hotplug_size` is emitted **only** when `memory_max` is set, and equals `memory_max - memory` in bytes. `memory.shared` stays `true`. Cloud Hypervisor v53 requires the headroom at boot, so a machine without `memory_max` produces byte-identical `vm.create` input to a machine defined before these fields existed. A unit test asserts that exact byte sequence.
 - `network.mode = "tap"` → `"net": [{ "tap": "<dev>", "mac": "…" }]` with no `ip`/`mask` so the VMM does not try to configure the device **[verify 8]**.
 - `network.mode = "none"` → no `net` entry.
 - Each mount → one `fs` entry with its own virtiofsd socket.
@@ -771,6 +782,23 @@ Rules:
 - **Overlay boundary.** Extending the §21 canonical-overlay invariant: `config_overlay` may not add, change, or remove `payload.cmdline`, and may not flip a machine between boot modes — it may not introduce `payload.firmware` on an OCI machine, nor `payload.kernel` or `payload.cmdline` on a firmware machine. A violation fails before `vm.create` with the existing overlay invariant error naming the offending pointer.
 - **Kernel installation.** Before `vmconfig.json` is published, start resolves `cloud-hypervisor-kernel` for the host architecture from `deps.toml` and publishes it through the same locked, no-follow, exact length/hash/mode, fsynced, no-replace publisher used for the selected firmware (§17.2). The kernel is data, not an executable: its published mode is 0644. Only the kernel is fetched for an OCI start; no firmware artifact is downloaded. A firmware machine never fetches the kernel.
 - **Explicit raw disk types.** Cloud Hypervisor v53 disables sector-0 writes on a raw disk image whose type it autodetected, which silently corrupts the first sector's writes. Every disk Firestone emits therefore declares `image_type` explicitly — `"Qcow2"` for the overlay, `"Raw"` for the config disk (§10.5) and for any raw auxiliary disk — and `config_overlay` may not remove an `image_type` field.
+### 9.5 Resize (normative)
+
+`Action::Resize { name, cpus, memory }` changes one machine's CPU count, memory, or both. At least one must be present; a request that names neither is `usage`. `disk` is deliberately not part of this action: disk capacity is a spec field that grows at the next start (below).
+
+1. Read reconciled state. `starting` and `stopping` are `conflict`: the machine has no settled sizing to change.
+2. Layer `{cpus, memory}` over the machine's `firestone.toml` exactly as `PATCH` does, validate the result (§7.2), and refuse a `disk` shrink the file may already contain. The effective spec is what the rest of the action uses.
+3. **Not running** → this is exactly a spec patch. Persist it under the machine lock, and answer `applied_live: false`.
+4. **Running** → the machine's shim owns the machine lock for its whole lifetime, so the live path takes no lock. It changes only the VMM's live sizing and `firestone.toml`, which the shim never writes.
+   1. Read the published `machines/<name>/vmconfig.json` — the exact bytes the running VM booted with — and parse `cpus.boot_vcpus`, `cpus.max_vcpus`, `memory.size`, and the optional `memory.hotplug_size`. A machine whose VmConfig is missing, non-canonical, or missing those fields is `dependency` with a hint to restart.
+   2. Refuse, as `conflict` with the hint `set cpus_max/memory_max and restart <name>`, any request above `max_vcpus`, above `memory.size + hotplug_size`, or below `memory.size`. Headroom is a property of the boot configuration, not of the current spec: raising `cpus_max` in the file does not widen a machine that is already running.
+   3. `PUT /api/v1/vm.resize` with `{"desired_vcpus": u32?, "desired_ram": u64?}`, omitting whatever the caller did not ask for. v53 answers `204` with no body.
+   4. Persist the same values to `firestone.toml` so desired state matches observed state, and answer `applied_live: true`.
+5. `Result { name, applied_live, cpus, memory }` carries the effective values either way.
+
+Guest-side consequences, verified against Cloud Hypervisor v53 on Ubuntu 24.04 x86_64: hotplugged memory auto-onlines, while hotplugged vCPUs arrive **offline**. Firestone's cloud-init part therefore installs `/etc/udev/rules.d/80-firestone-hotplug-cpu.rules` (`ACTION=="add", SUBSYSTEM=="cpu", ATTR{online}="1"`) and reloads udev, so a live CPU resize reaches the guest scheduler without a login.
+
+**Disk grow.** `disk` is not resized live. Raising it in the spec and starting the machine grows the overlay: when the existing `disk.qcow2` reports a virtual size below `disk`, start runs `qemu-img resize <overlay> <bytes>` before validating the overlay, and the `disk` step reports `grown to <size> overlay`. Lowering `disk` below the overlay's virtual size is rejected at validation time (§7.2); qcow2 shrink would truncate the guest filesystem. Growing the container does not grow the guest partition: cloud-init's `growpart` (already in Firestone's part, §10.3) extends the root partition and filesystem on the next boot.
 
 ---
 
@@ -855,6 +883,10 @@ write_files:
       ExecStart={{ sshd_path }} -i
       StandardInput=socket
       StandardError=journal
+  - path: /etc/udev/rules.d/80-firestone-hotplug-cpu.rules
+    permissions: "0644"
+    content: |
+      ACTION=="add", SUBSYSTEM=="cpu", ATTR{online}="1"
   - path: /etc/systemd/system/serial-getty@hvc0.service.d/firestone-autologin.conf
     permissions: "0644"
     content: |
@@ -868,6 +900,7 @@ mounts:
 {%- endfor %}
 {%- endif %}
 runcmd:
+  - udevadm control --reload
   - systemctl daemon-reload
   - systemctl enable --now firestone-sshd.socket
   - systemctl is-active --quiet sshd-vsock.socket || systemctl is-active --quiet firestone-sshd.socket
@@ -883,6 +916,7 @@ Notes:
 - On guests with systemd ≥ 256, the generated `/run/systemd/generator/sshd-vsock.socket` owns vsock port 22. `firestone-sshd.socket` is ordered after it and has the inverse path condition, so the Firestone socket starts only when the native unit is absent. The final `is-active` command requires one listener; unrelated bind/start failures remain failures **[verify 11]**.
 - The per-connection service owns and preserves `/run/sshd`, which stock OpenSSH requires before `sshd -i`; its `ExecStart` is not failure-prefixed.
 - The `sshd` path differs between distros only rarely (`/usr/sbin/sshd` on Debian/Ubuntu/Fedora); the typed catalog entry may override `sshd_path`, which must be a safe absolute POSIX executable path.
+- The hotplug-cpu udev rule exists because Cloud Hypervisor v53 brings hotplugged vCPUs up **offline** (§9.5). Adding it changed the rendered user-data bytes, and therefore the instance id (§10.4), for every machine: the next start of an existing machine reprovisions it and invalidates its `known_hosts`. The goldens were regenerated deliberately.
 - Templates are rendered with `minijinja`; multipart bytes and deterministic seed images are golden-tested per typed input.
 
 ### 10.4 Instance id and re-provisioning
@@ -1176,6 +1210,7 @@ Global flags on every command: `--json` (NDJSON events on stdout, human output o
 | `start NAME [--no-wait] [--timeout D]` | boot and wait for ssh |
 | `stop NAME [--timeout D] [--force]` | graceful ACPI stop, escalate on timeout |
 | `restart NAME` | stop + start |
+| `resize NAME [--cpus N] [--memory SIZE]` | change CPU and memory; live within the booted headroom, otherwise on next start (§9.5) |
 | `rm NAME… [--force]` | stop if needed, delete everything |
 | `clone SRC DEST [--fresh-disk]` | copy a stopped or created machine's spec and disk to a new machine (§24) |
 | `ls` (alias `list`) | table of machines (§15.3) |
@@ -1302,7 +1337,8 @@ The server holds no state and takes the same machine locks as the CLI. `curl --u
 
 The server holds no state and takes the same machine locks as the CLI. `curl --unix-socket … http://firestone/v1/machines` is the smoke test.
 
-[`docs/openapi.json`](docs/openapi.json) is the dependency-free OpenAPI 3.1 contract for the existing routes. It records exact request and response schemas, Unix-socket transport, aggregation and stream framing, limits, statuses, nullability, and examples. It is a static artifact, not a runtime endpoint. A behavior-level test parses it and compares its 20 explicitly authored operations with the configured axum router; axum's synthesized `HEAD` handling for `GET` remains framework behavior rather than a separately authored Firestone operation.
+[`docs/openapi.json`](docs/openapi.json) is the dependency-free OpenAPI 3.1 contract for the existing routes. It records exact request and response schemas, Unix-socket transport, aggregation and stream framing, limits, statuses, nullability, and examples. It is a static artifact, not a runtime endpoint. A behavior-level test parses it and compares its 21 explicitly authored operations with the configured axum router; axum's synthesized `HEAD` handling for `GET` remains framework behavior rather than a separately authored Firestone operation.
+[`docs/openapi.json`](docs/openapi.json) is the dependency-free OpenAPI 3.1 contract for the existing routes. It records exact request and response schemas, Unix-socket transport, aggregation and stream framing, limits, statuses, nullability, and examples. It is a static artifact, not a runtime endpoint. A behavior-level test parses it and compares its explicitly authored operations (19 as of M6-03) with the configured axum router; axum's synthesized `HEAD` handling for `GET` remains framework behavior rather than a separately authored Firestone operation.
 
 ### 16.2 Routes
 
@@ -1320,6 +1356,7 @@ The server holds no state and takes the same machine locks as the CLI. `curl --u
 | POST | `/v1/machines/{name}/stop` | `{timeout_s?, force?}` | event stream → `Result` |
 | POST | `/v1/machines/{name}/restart` | | event stream → `Result` |
 | POST | `/v1/machines/{name}/clone` | `{name, fresh_disk?}` | event stream → `Result` (§24) |
+| POST | `/v1/machines/{name}/resize` | `{cpus?, memory?}` (at least one) | event stream → `Result {name, applied_live, cpus, memory}` |
 | GET | `/v1/machines/{name}/logs?source=&follow=&lines=` | | `text/plain`, chunked |
 | GET | `/v1/machines/{name}/vmconfig` | | generated VmConfig JSON |
 | GET | `/v1/machines/{name}/metrics` | | `MetricsResult` (§25); 409 when the machine is not running |
@@ -1566,6 +1603,9 @@ Do these in the first milestone, against the pinned versions, and record results
 | `cp` transport and operand grammar | Wrap the system `scp` through the existing vsock `ProxyCommand`, sharing one option block with `shell` and the readiness probe. Exactly one operand is remote, and an operand is remote only when the text before its first colon is a machine name (`[a-z0-9-]+`); `./` keeps an ambiguous local path local in both directions. `Action::Cp` returns the planned argv and the CLI alone execs it, so `cp` publishes no REST route. | implement a Firestone file-transfer protocol over vsock; require `firestone cp NAME SRC DST` with no `<machine>:<path>` grammar; accept any text before a colon as a host, as `scp` does; add `POST /v1/machines/{name}/files` | `scp` already speaks the guest's SFTP subsystem, and reusing the one option block means host-key trust, identity, and proxy policy cannot drift from `shell`. The colon grammar is what users already type for `scp` and `rsync`, while the machine-name charset makes classification decidable without asking the store, and `./` is OpenSSH's own escape. A REST route would have to stream a transfer the CLI performs by becoming `scp`, which is the same reason `shell` and `console` stay CLI-only; the §5.4 drift test compares routes to `docs/openapi.json` and is unaffected. |
 | Machine metrics sampling (M6-01) | One on-demand `Action::Metrics` sample per call: reconciled state and spec, `/proc/<vmm_pid>/stat` fields 14+15 and `VmRSS` (Linux only, `null` elsewhere), plus v53 `vm.counters` and `vm.info`; counters stay cumulative, `u64::MAX`-family sentinels are projected as absent, block counters are typed while network counters pass through under `net: null` when the VMM reports none | run a sampling daemon or ring buffer; compute rates on the host; surface raw v53 counter maps verbatim; type network counters from their presumed names; report `0` for an unavailable figure | A daily-driver metric needs no background process: both sources are already open for a running machine, and two client samples give a rate without Firestone owning a time series. Publishing `u64::MAX` latency sentinels or a fabricated `0` would poison every derived rate, and the verified v53 fact that vhost-user `passt` emits no network entries means typed network fields would be unverified invention. |
 | `clone` disk semantics | Copy the source's qcow2 overlay with `qemu-img convert -B <base>` by default so installed guest state carries over while the immutable base stays shared; require the source to be `created` or `stopped`; offer `--fresh-disk` for an empty overlay on the same base; copy `firestone.toml` byte for byte and never copy `state.json`, `known_hosts`, seed artifacts, logs or snapshots | reference the source overlay as a new backing file; copy the whole machine directory; snapshot-and-restore into the destination; allow cloning a running machine | A copied overlay is a real independent disk: removing the source cannot corrupt the clone, which a backing-file chain would allow. Refusing a running source is the only way to get a crash-consistent copy without a VMM-level quiesce, and the M6-04 snapshot work reuses the same `copy_overlay` primitive. Excluding runtime files keeps MAC and cloud-init instance id derived from the destination name, so the clone is a new machine by construction; the duplicated guest `/etc/machine-id` is documented in §24.4 rather than papered over by rewriting guest filesystems. |
+| M6-03 resize headroom is opt-in and read back from the boot config | Add optional `cpus_max`/`memory_max` to `MachineSpec`. Map them to `cpus.max_vcpus` and `memory.hotplug_size`, emitting `hotplug_size` only when `memory_max` is set. Validate a live `Action::Resize` against the published `vmconfig.json` — the bytes the VM actually booted with — never against the current spec file, and refuse anything outside it as `conflict` with the hint `set cpus_max/memory_max and restart <name>`. The live path takes no machine lock, because the shim holds that lock for the machine's whole lifetime; it changes only the VMM's live sizing and `firestone.toml`, which the shim never writes. Persist the same values so desired state matches observed state. | always reserve headroom (e.g. `max_vcpus = host cpus`); infer headroom from the current spec; query `vm.info` for the ceiling; take the machine lock and fail `busy` on every running machine; report live success without persisting the spec | Verified on bare metal against Cloud Hypervisor v53: both resize calls return 204 instantly and `vm.info` reflects the change, but RAM hotplug requires `hotplug_size` **declared at boot**. Headroom is therefore a property of the boot configuration and reading it from anywhere else can only lie. Making it opt-in keeps the default machine's `vm.create` bytes byte-identical to before this feature — asserted by a regression test — so no existing machine is disturbed. A `conflict` naming the two fields and the restart tells the user the exact next action instead of surfacing a VMM 500. |
+| M6-03 hotplugged CPUs are onlined by a udev rule in Firestone's cloud-init part | Ship `/etc/udev/rules.d/80-firestone-hotplug-cpu.rules` (`ACTION=="add", SUBSYSTEM=="cpu", ATTR{online}="1"`) plus `udevadm control --reload` in the rendered Firestone part, and regenerate the multipart and seed goldens. | online CPUs from the host over SSH after each resize; document a manual `chcpu -e`; a systemd path unit or a polling service; leave hotplugged CPUs offline | The v53 probe showed hotplugged RAM auto-onlines on Ubuntu 24.04 while hotplugged **vCPUs arrive offline**, so without this a successful `vm.resize` would add CPUs the guest scheduler never uses — a resize that reports success and does nothing. udev is the mechanism the kernel already fires for the event, needs no host round-trip, and works on a machine with no network. The cost is real and is accepted deliberately: the rendered user-data bytes changed, so §10.4 instance ids changed, so the next start of an existing machine reprovisions it and invalidates its `known_hosts`. |
+| M6-03 disk grows at start and never shrinks | Refuse any `PUT`/`PATCH`/`resize` whose effective `disk` is below the existing overlay's virtual size (`invalid_spec`, "disk shrink is not supported"). On start, when the overlay is smaller than `disk`, run `qemu-img resize` before overlay validation and report `grown to <size> overlay`. Leave the guest partition to cloud-init `growpart`. | resize the overlay live through the VMM; shrink with a warning or `--force`; grow the guest filesystem from the host; refuse the grow and make the user recreate the machine | qcow2 shrink truncates the guest filesystem, and there is no safe way to know the guest has freed those blocks — so it is not a flag, it is a refusal. Growing the container is safe and offline, and `growpart` is already in Firestone's part, so the partition follows on the next boot with no new host tooling. Doing it at start keeps `disk` a plain spec field instead of a fourth lifecycle verb. |
 | M6 interface contracts frozen up front | Snapshot, clone, resize, metrics, prune, and terminal WS routes plus spec additions are fixed before implementation (route shapes recorded in the M6 milestone's feature sections as they land); UI work proceeds against the contracts in parallel | design each surface inside its implementation PR; a single serialized workstream | Parallel agents need a stable seam; freezing the action names, REST paths and payload shapes first lets core and UI land independently while the drift gate keeps `docs/openapi.json` honest. |
 | First-start pinned firmware | Before `vmconfig.json` publication, install only the effective built-in `auto`/`rhf`/`edk2` artifact through the shared locked, no-follow, exact hash/mode, fsynced, no-replace publisher; reverify it for VmConfig; never install or modify a custom firmware path | require a broad `doctor --fix` preflight; download every vendored artifact; trust an existing regular file; rewrite custom firmware | A direct first start from an empty home gets the one firmware it needs without unrelated host repair. The manifest identity and secure publisher keep VMM input inside Firestone's owned dependency boundary, while the custom path remains authoritative. |
 | Passt runtime isolation diagnosis | Probe the exact foreground, one-off vhost-user mode with repair disabled; classify both `Couldn't create user namespace` and `Failed to detach isolating namespaces` as fatal; offer the existing AppArmor repair when host facts support it; runtime selects only the verified literal root-owned pinned copy after repair | treat later detach failure as available because the first userns succeeded; use generic `unshare`; disable AppArmor or a sysctl; accept a user-writable profiled path | Passt cannot serve Cloud Hypervisor after either fatal exit. Matching runtime argv closes the false-ok gap, and verified literal-path selection proves the repair authorizes only the pinned binary. |

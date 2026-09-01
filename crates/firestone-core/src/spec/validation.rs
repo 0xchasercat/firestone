@@ -526,12 +526,33 @@ fn validate_capacity(
             ),
         });
     }
+    if let Some(cpus_max) = spec.cpus_max {
+        if cpus_max < spec.cpus {
+            return Err(invalid(
+                "cpus_max",
+                format!("cpus_max {cpus_max} is below the boot cpus {}", spec.cpus),
+                format!("set cpus_max to {} or more, or remove it", spec.cpus),
+            ));
+        }
+    }
     if spec.memory < ByteSize::MINIMUM_MEMORY {
         return Err(invalid(
             "memory",
             format!("memory {} is below the 128M minimum", spec.memory),
             "set memory to at least '128M'",
         ));
+    }
+    if let Some(memory_max) = spec.memory_max {
+        if memory_max < spec.memory {
+            return Err(invalid(
+                "memory_max",
+                format!(
+                    "memory_max {memory_max} is below the boot memory {}",
+                    spec.memory
+                ),
+                format!("set memory_max to at least '{}', or remove it", spec.memory),
+            ));
+        }
     }
     if let Some(base_size) = context.base_image_virtual_size {
         if spec.disk < base_size {
@@ -1228,6 +1249,43 @@ mod tests {
         };
         let error = validate_machine_spec(&mut spec, &host.context()).expect_err("low memory");
         assert_invalid_key(&error, "memory");
+    }
+
+    #[test]
+    fn resize_headroom_below_boot_capacity_returns_keyed_errors() {
+        let host = FakeHost::default();
+        let gib = |value| ByteSize::from_gib(value).expect("test size");
+
+        for (cpus_max, memory_max, key) in [
+            (Some(1_u8), None, "cpus_max"),
+            (None, Some(gib(1)), "memory_max"),
+        ] {
+            let mut spec = MachineSpec {
+                cpus: 2,
+                cpus_max,
+                memory: gib(2),
+                memory_max,
+                ..MachineSpec::default()
+            };
+            let error =
+                validate_machine_spec(&mut spec, &host.context()).expect_err("headroom below boot");
+            assert_invalid_key(&error, key);
+        }
+
+        for (cpus_max, memory_max) in [
+            (None, None),
+            (Some(2), Some(gib(2))),
+            (Some(8), Some(gib(16))),
+        ] {
+            let mut spec = MachineSpec {
+                cpus: 2,
+                cpus_max,
+                memory: gib(2),
+                memory_max,
+                ..MachineSpec::default()
+            };
+            validate_machine_spec(&mut spec, &host.context()).expect("headroom at or above boot");
+        }
     }
 
     #[test]

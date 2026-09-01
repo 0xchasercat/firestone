@@ -45,6 +45,10 @@ write_files:
       ExecStart={{ sshd_path }} -i
       StandardInput=socket
       StandardError=journal
+  - path: /etc/udev/rules.d/80-firestone-hotplug-cpu.rules
+    permissions: "0644"
+    content: |
+      ACTION=="add", SUBSYSTEM=="cpu", ATTR{online}="1"
   - path: /etc/systemd/system/serial-getty@hvc0.service.d/firestone-autologin.conf
     permissions: "0644"
     content: |
@@ -58,6 +62,7 @@ mounts:
 {%- endfor %}
 {%- endif %}
 runcmd:
+  - udevadm control --reload
   - systemctl daemon-reload
   - systemctl enable --now firestone-sshd.socket
   - systemctl is-active --quiet sshd-vsock.socket || systemctl is-active --quiet firestone-sshd.socket

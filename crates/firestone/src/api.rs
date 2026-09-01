@@ -19,8 +19,8 @@ use axum::{
     routing::{MethodRouter, delete, get, post},
 };
 use firestone_core::{
-    Action, Dispatcher, ErrorInfo, ErrorKind, Event, EventSink, FirestoneError, GlobalConfig,
-    ImageRef, LogSource, MachineSpec, MachineSpecPatch,
+    Action, ByteSize, Dispatcher, ErrorInfo, ErrorKind, Event, EventSink, FirestoneError,
+    GlobalConfig, ImageRef, LogSource, MachineSpec, MachineSpecPatch,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::sync::mpsc;
@@ -134,6 +134,7 @@ define_rest_routes! {
     "/v1/machines/{name}/start" => post(start_machine);
     "/v1/machines/{name}/stop" => post(stop_machine);
     "/v1/machines/{name}/restart" => post(restart_machine);
+    "/v1/machines/{name}/resize" => post(resize_machine);
     "/v1/machines/{name}/logs" => get(machine_logs);
     "/v1/machines/{name}/vmconfig" => get(machine_vmconfig);
     "/v1/machines/{name}/metrics" => get(machine_metrics);
@@ -203,6 +204,13 @@ struct StartBody {
 struct StopBody {
     timeout_s: Option<u64>,
     force: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ResizeBody {
+    cpus: Option<u8>,
+    memory: Option<ByteSize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -446,6 +454,29 @@ async fn clone_machine(
             fresh_disk: body.fresh_disk.unwrap_or(false),
         },
         "clone",
+        aggregate,
+    )
+    .await
+}
+
+async fn resize_machine(
+    State(state): State<ApiState>,
+    ApiPath(name): ApiPath,
+    request: Request<Body>,
+) -> Response {
+    let aggregate = accepts_json(request.headers());
+    let body = match parse_required_json::<ResizeBody>(request, "resize machine").await {
+        Ok(body) => body,
+        Err(error) => return error_response(error),
+    };
+    action_response(
+        &state,
+        Action::Resize {
+            name,
+            cpus: body.cpus,
+            memory: body.memory,
+        },
+        "resize",
         aggregate,
     )
     .await

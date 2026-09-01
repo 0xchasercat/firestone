@@ -4,6 +4,11 @@
 # `arch` defaults to the host and may be `x86_64` or `aarch64`.
 # CPU, memory, and disk values can also be set by `firestone create` flags.
 #
+# `cpus_max` and `memory_max` are optional headroom for `firestone resize`.
+# When set they must be at least `cpus` and `memory`, they are declared to the
+# VMM at boot, and only then can a running machine be resized live. Raising
+# `disk` grows the overlay on the next start; lowering it is refused.
+#
 # Network modes: `passt` (default), `tap`, or `none`. Repeat `forward`
 # entries for port mappings such as `8080:80` or `udp:5353:53`.
 #

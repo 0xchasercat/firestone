@@ -15,19 +15,20 @@ use std::{
 };
 
 use firestone_core::{
-    Action, Arch, Catalog, CatalogArchitectureSummary, CatalogEntrySummary, Cmd, CpResult,
-    DependencyManifest, DispatchFuture, Dispatcher, DoctorContext, DoctorOptions, ErrorKind, Event,
-    EventSink, ExtractedPasstHelper, FirestoneError, GlobalConfig, ImagePullRequest, ImageStore,
-    InternalHelper, Level, LiveMachineState, LogSource, LogsResult, MachineLock, MachineRecord,
-    MachineSpec, MachineSpecPatch, MachineState, MachineStatus, MachineSummary, MachineView,
-    MetricsCpu, MetricsMemory, MetricsResult, Paths, ReadinessOptions, RealValidationHost,
-    RemoveResult, ShimClient, ShimTimeouts, SpecResult, SpecWarningPayload, StartResult,
-    StateImage, StateStore, StateVersion, StopResult, Supervision, ValidationContext,
-    VersionDependency, VersionIdentity, VersionPaths, VersionResult, VmmApi, atomic,
-    cancel_prepared, classify_cp_operands, forwards_differ, launch_prepared_cancellable,
-    prepare_start, project_device_counters, read_reconciled_machine_state_live,
-    read_reconciled_machine_state_live_locked, run_doctor, sample_vmm_process, scp_command_plan,
-    stop_unsupervised, validate_machine_spec, wait_for_ssh_ready,
+    Action, Arch, ByteSize, Catalog, CatalogArchitectureSummary, CatalogEntrySummary, Cmd,
+    CpResult, DependencyManifest, DispatchFuture, Dispatcher, DoctorContext, DoctorOptions,
+    ErrorKind, Event, EventSink, ExtractedPasstHelper, FirestoneError, GlobalConfig,
+    ImagePullRequest, ImageStore, InternalHelper, Level, LiveMachineState, LogSource, LogsResult,
+    MachineLock, MachineRecord, MachineSpec, MachineSpecPatch, MachineState, MachineStatus,
+    MachineSummary, MachineView, MetricsCpu, MetricsMemory, MetricsResult, Paths, ReadinessOptions,
+    RealValidationHost, RemoveResult, ResizeResult, ShimClient, ShimTimeouts, SpecResult,
+    SpecWarningPayload, StartResult, StateImage, StateStore, StateVersion, StopResult, Supervision,
+    ValidationContext, VersionDependency, VersionIdentity, VersionPaths, VersionResult, VmmApi,
+    atomic, cancel_prepared, classify_cp_operands, disk_shrink_error, forwards_differ,
+    launch_prepared_cancellable, overlay_virtual_size, prepare_start, project_device_counters,
+    read_reconciled_machine_state_live, read_reconciled_machine_state_live_locked, run_doctor,
+    sample_vmm_process, scp_command_plan, stop_unsupervised, validate_machine_spec,
+    wait_for_ssh_ready,
 };
 use firestone_core::{CloneResult, StepId};
 
@@ -737,10 +738,13 @@ impl LocalDispatcher {
         let observed_state = self.read_live_state_locked(name, &lock)?;
         let pinned_image_ref = pinned_image_reference(&observed_state.state);
         let warnings = self.validate_action_spec(&mut spec, pinned_image_ref)?;
+        self.refuse_disk_shrink(name, &spec)?;
+        let previous = self.previous_spec_when_running(name, &observed_state.state)?;
         let document = render_spec(&spec)?;
         atomic::write(&self.paths.machine_spec(name)?, document.as_bytes())?;
         emit_running_spec_warning(&observed_state.state, events)?;
         emit_forward_restart_warning(&spec, &observed_state.state, events)?;
+        emit_credential_change_warning(previous.as_ref(), &spec, events)?;
         emit_spec_warnings(&warnings, events)?;
         emit_result(events, "edit", &SpecResult { spec, warnings })
     }
@@ -783,10 +787,13 @@ impl LocalDispatcher {
             .iter()
             .map(SpecWarningPayload::from)
             .collect::<Vec<_>>();
+        self.refuse_disk_shrink(name, &loaded.spec)?;
+        let previous = self.previous_spec_when_running(name, &observed_state.state)?;
         let document = render_spec(&loaded.spec)?;
         atomic::write(&self.paths.machine_spec(name)?, document.as_bytes())?;
         emit_running_spec_warning(&observed_state.state, events)?;
         emit_forward_restart_warning(&loaded.spec, &observed_state.state, events)?;
+        emit_credential_change_warning(previous.as_ref(), &loaded.spec, events)?;
         emit_spec_warnings(&warnings, events)?;
         emit_result(
             events,
@@ -796,6 +803,224 @@ impl LocalDispatcher {
                 warnings,
             },
         )
+    }
+
+    /// Refuses a `disk` value below the virtual size of an existing overlay.
+    ///
+    /// qcow2 shrink truncates the guest filesystem. A machine that has never
+    /// been started owns no overlay yet, so any `disk` remains free to change.
+    fn refuse_disk_shrink(&self, name: &str, spec: &MachineSpec) -> Result<(), FirestoneError> {
+        let overlay = self.paths.machine_disk(name)?;
+        let exists = overlay.try_exists().map_err(|source| {
+            filesystem_error(
+                ErrorKind::Generic,
+                format!("cannot inspect machine overlay {}", overlay.display()),
+                "check the machine directory permissions",
+                source,
+            )
+        })?;
+        if !exists {
+            return Ok(());
+        }
+        let Some(current) = overlay_virtual_size(&self.qemu_img_program()?, &overlay)? else {
+            return Ok(());
+        };
+        if spec.disk.as_bytes() < current {
+            return Err(disk_shrink_error(name, current, spec.disk.as_bytes()));
+        }
+        Ok(())
+    }
+
+    /// Loads the spec a running machine actually booted with, for change
+    /// comparison. Stopped machines need no comparison and pay no cost.
+    fn previous_spec_when_running(
+        &self,
+        name: &str,
+        state: &MachineState,
+    ) -> Result<Option<MachineSpec>, FirestoneError> {
+        if state.status != MachineStatus::Running {
+            return Ok(None);
+        }
+        self.load_machine_spec(name, state).map(Some)
+    }
+
+    /// Resizes one machine's CPU and memory, live when the VMM has headroom.
+    fn resize(
+        &self,
+        name: &str,
+        cpus: Option<u8>,
+        memory: Option<ByteSize>,
+        events: &mut dyn EventSink,
+    ) -> Result<(), FirestoneError> {
+        if cpus.is_none() && memory.is_none() {
+            return Err(FirestoneError::new(
+                ErrorKind::Usage,
+                format!("resize of machine `{name}` requested no change"),
+            )
+            .with_hint("pass --cpus N, --memory SIZE, or both"));
+        }
+        self.validate_machine_storage()?;
+        let machine_dir = self.paths.machine_dir(name)?;
+        ensure_machine_exists(&self.paths, name, &machine_dir)?;
+
+        // A running machine's shim owns the machine lock for its whole
+        // lifetime, so the live path deliberately takes no lock: it changes
+        // only the VMM's live sizing and the spec file, which the shim never
+        // writes. Every other status takes the lock like any spec change.
+        let preliminary = self.read_live_state(name)?;
+        let status = preliminary.state.status;
+        if matches!(status, MachineStatus::Starting | MachineStatus::Stopping) {
+            return Err(FirestoneError::new(
+                ErrorKind::Conflict,
+                format!("machine `{name}` is {status:?} and cannot be resized"),
+            )
+            .with_hint(format!(
+                "wait for machine {name:?} to settle and retry resize"
+            )));
+        }
+        let running = status == MachineStatus::Running;
+        let lock = if running {
+            None
+        } else {
+            let lock_path = self.paths.machine_lock(name)?;
+            let lock = MachineLock::acquire(name, &lock_path, events)?;
+            ensure_machine_exists(&self.paths, name, &machine_dir)?;
+            Some(lock)
+        };
+        let observed_state = match &lock {
+            Some(lock) => self.read_live_state_locked(name, lock)?,
+            None => preliminary,
+        };
+        if (observed_state.state.status == MachineStatus::Running) != running {
+            return Err(FirestoneError::new(
+                ErrorKind::Conflict,
+                format!("machine `{name}` changed lifecycle state during resize"),
+            )
+            .with_hint(format!("retry `firestone resize {name}`")));
+        }
+
+        let source = read_file(
+            &self.paths.machine_spec(name)?,
+            "machine spec",
+            ErrorKind::NotFound,
+        )?;
+        let text = std::str::from_utf8(&source).map_err(|source| {
+            FirestoneError::new(
+                ErrorKind::InvalidSpec,
+                format!("machine spec for {name:?} is not UTF-8"),
+            )
+            .with_hint("save firestone.toml as UTF-8 TOML")
+            .with_source(source)
+        })?;
+        let patch = MachineSpecPatch {
+            cpus,
+            memory,
+            ..MachineSpecPatch::default()
+        };
+        let loaded = self.load_spec_text_with_patch(
+            text,
+            &machine_dir,
+            &self.source_base,
+            pinned_image_reference(&observed_state.state),
+            &patch,
+        )?;
+        let warnings = loaded
+            .warnings
+            .iter()
+            .map(SpecWarningPayload::from)
+            .collect::<Vec<_>>();
+
+        self.refuse_disk_shrink(name, &loaded.spec)?;
+
+        let applied_live = if running {
+            let capacity = published_vmconfig_capacity(name, &self.read_published_vmconfig(name)?)?;
+            capacity.check(name, loaded.spec.cpus, loaded.spec.memory)?;
+            VmmApi::new(
+                &self.paths.machine_api_socket(name)?,
+                ShimTimeouts::default().api,
+            )
+            .vm_resize(cpus, memory.map(ByteSize::as_bytes))?;
+            true
+        } else {
+            false
+        };
+
+        let document = render_spec(&loaded.spec)?;
+        atomic::write(&self.paths.machine_spec(name)?, document.as_bytes())?;
+        drop(lock);
+        emit_spec_warnings(&warnings, events)?;
+        emit_result(
+            events,
+            "resize",
+            &ResizeResult {
+                name: name.to_owned(),
+                applied_live,
+                cpus: loaded.spec.cpus,
+                memory: loaded.spec.memory,
+            },
+        )
+    }
+
+    /// Reads and validates the canonical VmConfig published by the last start.
+    fn read_published_vmconfig(&self, name: &str) -> Result<serde_json::Value, FirestoneError> {
+        let path = self.paths.machine_vmconfig(name)?;
+        let mut file = open_owned_data_file(
+            &self.paths,
+            &path,
+            "machine VmConfig",
+            ErrorKind::NotFound,
+            Some(format!(
+                "start machine {name:?} before requesting --vmconfig"
+            )),
+        )?;
+        let mut bytes = Vec::new();
+        file.by_ref()
+            .take(MAX_VMCONFIG_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|source| {
+                filesystem_error(
+                    ErrorKind::Generic,
+                    format!("cannot read machine VmConfig {}", path.display()),
+                    "check the machine directory permissions",
+                    source,
+                )
+            })?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_VMCONFIG_BYTES {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "machine VmConfig {} exceeds the {MAX_VMCONFIG_BYTES} byte limit",
+                    path.display()
+                ),
+            )
+            .with_hint(format!(
+                "restart machine {name:?} to republish canonical VmConfig"
+            )));
+        }
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|source| {
+            FirestoneError::new(
+                ErrorKind::Dependency,
+                format!("persisted VmConfig {} is invalid JSON", path.display()),
+            )
+            .with_hint(format!(
+                "restart machine {name:?} to republish canonical VmConfig"
+            ))
+            .with_source(source)
+        })?;
+        let canonical = serde_json::to_vec(&value).map_err(|source| {
+            FirestoneError::new(ErrorKind::Generic, "cannot encode persisted VmConfig")
+                .with_source(source)
+        })?;
+        if canonical != bytes {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                format!("persisted VmConfig {} is not canonical", path.display()),
+            )
+            .with_hint(format!(
+                "restart machine {name:?} to republish canonical VmConfig"
+            )));
+        }
+        Ok(value)
     }
 
     fn validate_action_spec(
@@ -1050,13 +1275,25 @@ impl LocalDispatcher {
             && owned_file_ready(&self.paths.machine_state(name)?)?)
     }
     fn image_store(&self) -> Result<ImageStore, FirestoneError> {
-        let qemu_img = if self.qemu_img == Path::new("qemu-img") {
-            firestone_core::materialize_embedded_helper(&self.paths, InternalHelper::QemuImg)?
-                .unwrap_or_else(|| self.qemu_img.clone())
+        ImageStore::for_host(
+            self.paths.clone(),
+            self.catalog.clone(),
+            self.qemu_img_program()?,
+        )
+    }
+
+    /// Resolves the qemu-img this process runs, materializing the embedded
+    /// helper on a standalone build. No image store, and therefore no HTTP
+    /// client, is constructed.
+    fn qemu_img_program(&self) -> Result<PathBuf, FirestoneError> {
+        if self.qemu_img == Path::new("qemu-img") {
+            Ok(
+                firestone_core::materialize_embedded_helper(&self.paths, InternalHelper::QemuImg)?
+                    .unwrap_or_else(|| self.qemu_img.clone()),
+            )
         } else {
-            self.qemu_img.clone()
-        };
-        ImageStore::for_host(self.paths.clone(), self.catalog.clone(), qemu_img)
+            Ok(self.qemu_img.clone())
+        }
     }
 
     fn shim_program(&self) -> Result<PathBuf, FirestoneError> {
@@ -1561,63 +1798,7 @@ impl LocalDispatcher {
         self.validate_machine_storage()?;
         let machine_dir = self.paths.machine_dir(name)?;
         ensure_machine_exists(&self.paths, name, &machine_dir)?;
-        let path = self.paths.machine_vmconfig(name)?;
-        let mut file = open_owned_data_file(
-            &self.paths,
-            &path,
-            "machine VmConfig",
-            ErrorKind::NotFound,
-            Some(format!(
-                "start machine {name:?} before requesting --vmconfig"
-            )),
-        )?;
-        let mut bytes = Vec::new();
-        file.by_ref()
-            .take(MAX_VMCONFIG_BYTES.saturating_add(1))
-            .read_to_end(&mut bytes)
-            .map_err(|source| {
-                filesystem_error(
-                    ErrorKind::Generic,
-                    format!("cannot read machine VmConfig {}", path.display()),
-                    "check the machine directory permissions",
-                    source,
-                )
-            })?;
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_VMCONFIG_BYTES {
-            return Err(FirestoneError::new(
-                ErrorKind::Dependency,
-                format!(
-                    "machine VmConfig {} exceeds the {MAX_VMCONFIG_BYTES} byte limit",
-                    path.display()
-                ),
-            )
-            .with_hint(format!(
-                "restart machine {name:?} to republish canonical VmConfig"
-            )));
-        }
-        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|source| {
-            FirestoneError::new(
-                ErrorKind::Dependency,
-                format!("persisted VmConfig {} is invalid JSON", path.display()),
-            )
-            .with_hint(format!(
-                "restart machine {name:?} to republish canonical VmConfig"
-            ))
-            .with_source(source)
-        })?;
-        let canonical = serde_json::to_vec(&value).map_err(|source| {
-            FirestoneError::new(ErrorKind::Generic, "cannot encode persisted VmConfig")
-                .with_source(source)
-        })?;
-        if canonical != bytes {
-            return Err(FirestoneError::new(
-                ErrorKind::Dependency,
-                format!("persisted VmConfig {} is not canonical", path.display()),
-            )
-            .with_hint(format!(
-                "restart machine {name:?} to republish canonical VmConfig"
-            )));
-        }
+        let value = self.read_published_vmconfig(name)?;
         emit_result(events, "show-vmconfig", &value)
     }
 
@@ -1883,6 +2064,7 @@ impl Dispatcher for LocalDispatcher {
                     dest,
                     fresh_disk,
                 } => self.clone_machine(&source, &dest, fresh_disk, events),
+                Action::Resize { name, cpus, memory } => self.resize(&name, cpus, memory, events),
             }
         })
     }
@@ -2540,6 +2722,165 @@ fn emit_forward_restart_warning(
     Ok(())
 }
 
+/// Live-resize headroom read back from the VmConfig the running VM booted with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VmConfigCapacity {
+    boot_vcpus: u8,
+    max_vcpus: u8,
+    boot_memory: u64,
+    max_memory: u64,
+}
+
+impl VmConfigCapacity {
+    /// Refuses any request the booted machine provably cannot satisfy, so the
+    /// spec is never written for a resize Cloud Hypervisor would reject.
+    fn check(self, name: &str, cpus: u8, memory: ByteSize) -> Result<(), FirestoneError> {
+        if cpus > self.max_vcpus {
+            return Err(no_headroom_error(
+                name,
+                format!(
+                    "machine `{name}` booted with max_vcpus {} and cannot reach {cpus} vCPUs",
+                    self.max_vcpus
+                ),
+            ));
+        }
+        let requested = memory.as_bytes();
+        if requested > self.max_memory {
+            return Err(no_headroom_error(
+                name,
+                format!(
+                    "machine `{name}` booted with {} bytes of hotplug headroom and cannot reach {requested} bytes",
+                    self.max_memory
+                ),
+            ));
+        }
+        if requested < self.boot_memory {
+            return Err(no_headroom_error(
+                name,
+                format!(
+                    "machine `{name}` booted with {} bytes of memory and cannot shrink below it",
+                    self.boot_memory
+                ),
+            ));
+        }
+        if cpus < 1 {
+            return Err(FirestoneError::new(
+                ErrorKind::InvalidSpec,
+                format!("machine `{name}` must keep at least one vCPU"),
+            )
+            .with_hint("set cpus to 1 or more"));
+        }
+        let _ = self.boot_vcpus;
+        Ok(())
+    }
+}
+
+fn no_headroom_error(name: &str, message: String) -> FirestoneError {
+    FirestoneError::new(ErrorKind::Conflict, message).with_hint(format!(
+        "set cpus_max/memory_max and restart machine {name:?}"
+    ))
+}
+
+/// Reads boot and maximum CPU/memory out of one published canonical VmConfig.
+fn published_vmconfig_capacity(
+    name: &str,
+    value: &serde_json::Value,
+) -> Result<VmConfigCapacity, FirestoneError> {
+    let field = |path: &[&str]| -> Result<Option<u64>, FirestoneError> {
+        let mut cursor = value;
+        for key in path {
+            match cursor.get(key) {
+                Some(next) => cursor = next,
+                None => return Ok(None),
+            }
+        }
+        cursor.as_u64().map(Some).ok_or_else(|| {
+            FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "published VmConfig for machine `{name}` has a non-numeric `{}`",
+                    path.join(".")
+                ),
+            )
+            .with_hint(format!(
+                "restart machine {name:?} to republish canonical VmConfig"
+            ))
+        })
+    };
+    let required = |path: &[&str], found: Option<u64>| -> Result<u64, FirestoneError> {
+        found.ok_or_else(|| {
+            FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "published VmConfig for machine `{name}` is missing `{}`",
+                    path.join(".")
+                ),
+            )
+            .with_hint(format!(
+                "restart machine {name:?} to republish canonical VmConfig"
+            ))
+        })
+    };
+    let vcpu = |path: &[&str], value: u64| -> Result<u8, FirestoneError> {
+        u8::try_from(value).map_err(|source| {
+            FirestoneError::new(
+                ErrorKind::Dependency,
+                format!(
+                    "published VmConfig for machine `{name}` has an out-of-range `{}`",
+                    path.join(".")
+                ),
+            )
+            .with_hint(format!(
+                "restart machine {name:?} to republish canonical VmConfig"
+            ))
+            .with_source(source)
+        })
+    };
+
+    let boot_path = ["cpus", "boot_vcpus"];
+    let max_path = ["cpus", "max_vcpus"];
+    let size_path = ["memory", "size"];
+    let boot_vcpus = vcpu(&boot_path, required(&boot_path, field(&boot_path)?)?)?;
+    let max_vcpus = vcpu(&max_path, required(&max_path, field(&max_path)?)?)?;
+    let boot_memory = required(&size_path, field(&size_path)?)?;
+    let hotplug = field(&["memory", "hotplug_size"])?.unwrap_or(0);
+    Ok(VmConfigCapacity {
+        boot_vcpus,
+        max_vcpus,
+        boot_memory,
+        max_memory: boot_memory.saturating_add(hotplug),
+    })
+}
+
+/// Warns that a credential or provisioning change reaches the guest only at the
+/// next start, because cloud-init runs once per instance identity.
+fn emit_credential_change_warning(
+    previous: Option<&MachineSpec>,
+    next: &MachineSpec,
+    events: &mut dyn EventSink,
+) -> Result<(), FirestoneError> {
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    let mut changed = Vec::new();
+    if previous.user != next.user {
+        changed.push("user");
+    }
+    if previous.cloud_init != next.cloud_init {
+        changed.push("cloud_init");
+    }
+    if changed.is_empty() {
+        return Ok(());
+    }
+    events.emit(Event::Log {
+        level: Level::Warn,
+        message: format!(
+            "{} changed; cloud-init reprovisions the guest, so this applies on next start",
+            changed.join(" and ")
+        ),
+    })
+}
+
 fn emit_spec_warnings(
     warnings: &[SpecWarningPayload],
     events: &mut dyn EventSink,
@@ -2625,7 +2966,7 @@ mod tests {
     };
 
     use firestone_core::{
-        Action, Arch, Catalog, Dispatcher, ErrorKind, Event, EventSink, FirestoneError,
+        Action, Arch, ByteSize, Catalog, Dispatcher, ErrorKind, Event, EventSink, FirestoneError,
         GlobalConfig, ImageRef, Level, LogSource, MachineLock, MachineSpec, MachineSpecPatch,
         MachineStatus, NetworkSpecPatch, PathInputs, Paths, RealValidationHost, StateStore,
         Supervision, ValidationContext, VersionResult,
@@ -2634,7 +2975,7 @@ mod tests {
     use super::{
         LocalDispatcher, MAX_LOG_TAIL_BYTES, display_forward, display_status,
         emit_forward_restart_warning, format_uptime_seconds, forwards_pending,
-        parse_editor_command,
+        parse_editor_command, published_vmconfig_capacity,
     };
     struct WaitingSink(mpsc::Sender<()>);
 
@@ -2714,6 +3055,241 @@ esac
         )?;
         fs::set_permissions(&program, fs::Permissions::from_mode(0o700))?;
         Ok(program)
+    }
+
+    #[tokio::test]
+    async fn resize_stopped_machine_persists_spec_without_a_live_apply()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, _paths) = fixture()?;
+        create_machine(&dispatcher, "cold", MachineSpec::default()).await?;
+
+        let mut events = Vec::new();
+        dispatcher
+            .run(
+                Action::Resize {
+                    name: "cold".to_owned(),
+                    cpus: Some(4),
+                    memory: Some(ByteSize::from_gib(4)?),
+                },
+                &mut events,
+            )
+            .await?;
+
+        let payload = events
+            .iter()
+            .find_map(|event| match event {
+                Event::Result { action, payload } if action == "resize" => Some(payload),
+                _ => None,
+            })
+            .ok_or("missing resize result")?;
+        assert_eq!(payload["name"], "cold");
+        assert_eq!(payload["applied_live"], false);
+        assert_eq!(payload["cpus"], 4);
+        assert_eq!(payload["memory"], "4G");
+
+        let (persisted, _) = dispatcher.load_machine("cold")?;
+        assert_eq!(persisted.cpus, 4);
+        assert_eq!(persisted.memory, ByteSize::from_gib(4)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resize_without_cpus_or_memory_is_a_usage_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, _paths) = fixture()?;
+        create_machine(&dispatcher, "empty-resize", MachineSpec::default()).await?;
+
+        let mut events = Vec::new();
+        let error = dispatcher
+            .run(
+                Action::Resize {
+                    name: "empty-resize".to_owned(),
+                    cpus: None,
+                    memory: None,
+                },
+                &mut events,
+            )
+            .await
+            .err()
+            .ok_or("a no-op resize unexpectedly succeeded")?;
+
+        assert_eq!(error.kind(), ErrorKind::Usage);
+        assert!(
+            error
+                .hint()
+                .is_some_and(|hint| hint.contains("--cpus") && hint.contains("--memory"))
+        );
+        assert!(events.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn published_vmconfig_capacity_reads_boot_and_hotplug_headroom()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let with_headroom = published_vmconfig_capacity(
+            "demo",
+            &serde_json::json!({
+                "cpus": {"boot_vcpus": 2, "max_vcpus": 8},
+                "memory": {"size": 2_147_483_648_u64, "hotplug_size": 4_294_967_296_u64}
+            }),
+        )?;
+        assert_eq!(with_headroom.max_vcpus, 8);
+        assert_eq!(with_headroom.boot_memory, 2_147_483_648);
+        assert_eq!(with_headroom.max_memory, 6_442_450_944);
+
+        let without_headroom = published_vmconfig_capacity(
+            "demo",
+            &serde_json::json!({
+                "cpus": {"boot_vcpus": 2, "max_vcpus": 2},
+                "memory": {"size": 2_147_483_648_u64}
+            }),
+        )?;
+        assert_eq!(without_headroom.max_vcpus, 2);
+        assert_eq!(without_headroom.max_memory, 2_147_483_648);
+
+        let missing = published_vmconfig_capacity("demo", &serde_json::json!({"cpus": {}}))
+            .err()
+            .ok_or("a VmConfig without cpus.boot_vcpus unexpectedly parsed")?;
+        assert_eq!(missing.kind(), ErrorKind::Dependency);
+        Ok(())
+    }
+
+    #[test]
+    fn resize_beyond_booted_headroom_refuses_with_a_restart_hint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let capacity = published_vmconfig_capacity(
+            "demo",
+            &serde_json::json!({
+                "cpus": {"boot_vcpus": 2, "max_vcpus": 4},
+                "memory": {"size": 2_147_483_648_u64, "hotplug_size": 2_147_483_648_u64}
+            }),
+        )?;
+
+        capacity.check("demo", 4, ByteSize::from_gib(4)?)?;
+        capacity.check("demo", 1, ByteSize::from_gib(2)?)?;
+
+        for (cpus, memory) in [
+            (5_u8, ByteSize::from_gib(2)?),
+            (2, ByteSize::from_gib(5)?),
+            (2, ByteSize::from_gib(1)?),
+        ] {
+            let error = capacity
+                .check("demo", cpus, memory)
+                .err()
+                .ok_or("a request outside the booted headroom unexpectedly passed")?;
+            assert_eq!(error.kind(), ErrorKind::Conflict);
+            assert!(
+                error
+                    .hint()
+                    .is_some_and(|hint| hint.contains("set cpus_max/memory_max and restart")),
+                "{:?}",
+                error.hint()
+            );
+        }
+        Ok(())
+    }
+
+    /// A fake qemu-img whose `info` reports a fixed overlay virtual size.
+    fn fake_qemu_reporting(
+        root: &std::path::Path,
+        name: &str,
+        virtual_size: u64,
+    ) -> Result<std::path::PathBuf, std::io::Error> {
+        let program = root.join(name);
+        fs::write(
+            &program,
+            format!(
+                r#"#!/bin/sh
+case "$1" in
+  info)
+    printf '%s\n' '{{"format":"qcow2","virtual-size":{virtual_size},"dirty-flag":false,"format-specific":{{"type":"qcow2","data":{{"corrupt":false}}}}}}'
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+"#
+            )
+            .as_bytes(),
+        )?;
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700))?;
+        Ok(program)
+    }
+
+    #[tokio::test]
+    async fn patch_and_set_spec_disk_below_existing_overlay_refuse_the_shrink()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (directory, dispatcher, paths) = fixture()?;
+        let root = fs::canonicalize(directory.path())?;
+        let overlay_bytes = ByteSize::from_gib(20)?.as_bytes();
+        let dispatcher = dispatcher.with_programs(
+            fake_qemu_reporting(&root, "fake-qemu-20g", overlay_bytes)?,
+            root.join("shim"),
+        );
+        create_machine(&dispatcher, "shrink", MachineSpec::default()).await?;
+        write_owned(&paths.machine_disk("shrink")?, b"QFI\xfb")?;
+
+        for patch_disk in [ByteSize::from_gib(10)?, ByteSize::from_mib(128)?] {
+            let mut events = Vec::new();
+            let error = dispatcher
+                .run(
+                    Action::PatchSpec {
+                        name: "shrink".to_owned(),
+                        patch: MachineSpecPatch {
+                            disk: Some(patch_disk),
+                            ..MachineSpecPatch::default()
+                        },
+                    },
+                    &mut events,
+                )
+                .await
+                .err()
+                .ok_or("a disk shrink unexpectedly succeeded")?;
+            assert_eq!(error.kind(), ErrorKind::InvalidSpec);
+            assert!(
+                error.message().contains("disk shrink is not supported"),
+                "{}",
+                error.message()
+            );
+            assert!(error.hint().is_some());
+        }
+
+        let mut events = Vec::new();
+        let error = dispatcher
+            .run(
+                Action::SetSpec {
+                    name: "shrink".to_owned(),
+                    spec: MachineSpec {
+                        disk: ByteSize::from_gib(10)?,
+                        ..MachineSpec::default()
+                    },
+                },
+                &mut events,
+            )
+            .await
+            .err()
+            .ok_or("a PUT disk shrink unexpectedly succeeded")?;
+        assert!(error.message().contains("disk shrink is not supported"));
+
+        // The persisted spec is untouched, and a grow is accepted.
+        let (persisted, _) = dispatcher.load_machine("shrink")?;
+        assert_eq!(persisted.disk, ByteSize::from_gib(20)?);
+        events.clear();
+        dispatcher
+            .run(
+                Action::PatchSpec {
+                    name: "shrink".to_owned(),
+                    patch: MachineSpecPatch {
+                        disk: Some(ByteSize::from_gib(30)?),
+                        ..MachineSpecPatch::default()
+                    },
+                },
+                &mut events,
+            )
+            .await?;
+        let (grown, _) = dispatcher.load_machine("shrink")?;
+        assert_eq!(grown.disk, ByteSize::from_gib(30)?);
+        Ok(())
     }
 
     #[tokio::test]

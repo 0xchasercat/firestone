@@ -511,6 +511,26 @@ async fn streaming_routes_project_exact_actions_and_ndjson() -> TestResult {
             },
         },
         Case {
+            uri: "/v1/machines/delta/resize",
+            body: Some(json!({"cpus":4,"memory":"4G"})),
+            result_action: "resize",
+            expected_action: Action::Resize {
+                name: "delta".to_owned(),
+                cpus: Some(4),
+                memory: Some(firestone_core::ByteSize::from_gib(4)?),
+            },
+        },
+        Case {
+            uri: "/v1/machines/epsilon/resize",
+            body: Some(json!({"memory":"512M"})),
+            result_action: "resize",
+            expected_action: Action::Resize {
+                name: "epsilon".to_owned(),
+                cpus: None,
+                memory: Some(firestone_core::ByteSize::from_mib(512)?),
+            },
+        },
+        Case {
             uri: "/v1/images/pull",
             body: Some(json!({
                 "ref":"ubuntu:24.04",

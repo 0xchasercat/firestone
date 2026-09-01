@@ -36,6 +36,7 @@ set edit:completion:arg-completer[firestone] = {|@words|
             cand start 'Start a machine and wait for SSH readiness'
             cand stop 'Stop a machine'
             cand restart 'Stop and start a machine'
+            cand resize 'Change a machine''s CPU count or memory'
             cand rm 'Stop and remove one or more machines'
             cand ls 'List machines'
             cand list 'List machines'
@@ -62,7 +63,9 @@ set edit:completion:arg-completer[firestone] = {|@words|
             cand --name 'Name a machine created from an image reference'
             cand --arch 'Set the guest architecture; it must match the host'
             cand --cpus 'Set the number of virtual CPUs'
+            cand --cpus-max 'Reserve vCPU hotplug headroom for `resize`; must be at least --cpus'
             cand --memory 'Set guest memory, for example 2G or 2048M'
+            cand --memory-max 'Reserve memory hotplug headroom for `resize`; must be at least --memory'
             cand --disk 'Set writable disk capacity, for example 20G'
             cand --user 'Set the guest login user created by Firestone provisioning'
             cand --net 'Select passt, tap, or no network'
@@ -99,7 +102,9 @@ set edit:completion:arg-completer[firestone] = {|@words|
             cand --file 'Layer an existing machine specification below command-line flags'
             cand --arch 'Set the guest architecture; it must match the host'
             cand --cpus 'Set the number of virtual CPUs'
+            cand --cpus-max 'Reserve vCPU hotplug headroom for `resize`; must be at least --cpus'
             cand --memory 'Set guest memory, for example 2G or 2048M'
+            cand --memory-max 'Reserve memory hotplug headroom for `resize`; must be at least --memory'
             cand --disk 'Set writable disk capacity, for example 20G'
             cand --user 'Set the guest login user created by Firestone provisioning'
             cand --net 'Select passt, tap, or no network'
@@ -161,6 +166,21 @@ set edit:completion:arg-completer[firestone] = {|@words|
             cand --help 'Print help'
         }
         &'firestone;restart'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;resize'= {
+            cand --cpus 'Set the number of virtual CPUs'
+            cand --memory 'Set guest memory, for example 4G or 4096M'
             cand --home 'Override the Firestone home root (config, data, and runtime)'
             cand --json 'Print events as newline-delimited JSON and disable human output'
             cand -q 'Print only errors and command results'
@@ -549,6 +569,7 @@ set edit:completion:arg-completer[firestone] = {|@words|
             cand start 'Start a machine and wait for SSH readiness'
             cand stop 'Stop a machine'
             cand restart 'Stop and start a machine'
+            cand resize 'Change a machine''s CPU count or memory'
             cand rm 'Stop and remove one or more machines'
             cand ls 'List machines'
             cand show 'Show a machine''s specification and runtime state'
@@ -578,6 +599,8 @@ set edit:completion:arg-completer[firestone] = {|@words|
         &'firestone;help;stop'= {
         }
         &'firestone;help;restart'= {
+        }
+        &'firestone;help;resize'= {
         }
         &'firestone;help;rm'= {
         }

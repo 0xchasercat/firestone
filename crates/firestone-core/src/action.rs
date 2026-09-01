@@ -2,7 +2,7 @@ use std::{fmt, str::FromStr, time::Duration};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-use crate::{ImageRef, MachineSpec, MachineSpecPatch};
+use crate::{ByteSize, ImageRef, MachineSpec, MachineSpecPatch};
 
 /// An imperative operation accepted by the shared dispatcher.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +83,13 @@ pub enum Action {
         dest: String,
         #[serde(default)]
         fresh_disk: bool,
+    },
+    Resize {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cpus: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory: Option<ByteSize>,
     },
 }
 

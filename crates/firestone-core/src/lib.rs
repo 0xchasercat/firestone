@@ -60,7 +60,8 @@ pub use event::{Event, Level, StepId, Unit};
 pub use image::{
     ImageInspection, ImageMetadata, ImageMetadataVersion, ImagePruneResult, ImagePullRequest,
     ImageRemoveResult, ImageSourceLocation, ImageStore, ImageVerification, OverlayInfo,
-    PreparedMachineImage, PulledImage, ResolvedImageSource, StoredImage,
+    PreparedMachineImage, PulledImage, ResolvedImageSource, StoredImage, disk_shrink_error,
+    overlay_virtual_size,
 };
 pub use lock::MachineLock;
 pub use metrics::{
@@ -80,7 +81,7 @@ pub use readiness::{ReadinessOptions, wait_for_ssh_ready};
 pub use result::CloneResult;
 pub use result::{
     CatalogArchitectureSummary, CatalogEntrySummary, CpResult, LogsResult, MachineRecord,
-    MachineSummary, MachineView, RemoveResult, RunResult, ShellResult, SpecResult,
+    MachineSummary, MachineView, RemoveResult, ResizeResult, RunResult, ShellResult, SpecResult,
     SpecWarningPayload, SshConfigResult, StartResult, StopResult, VersionDependency,
     VersionIdentity, VersionPaths, VersionResult,
 };

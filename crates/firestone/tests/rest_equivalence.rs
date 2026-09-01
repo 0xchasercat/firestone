@@ -1243,7 +1243,7 @@ fn real_cli_and_unix_rest_project_one_metrics_sample_and_conflict() -> TestResul
     let payload = &metrics_cli.payload;
     assert_eq!(payload["cpu"]["vcpus"], 2);
     assert_eq!(payload["memory"]["allocated_bytes"], 2_147_483_648_u64);
-    assert_eq!(payload["memory"]["guest_actual_bytes"], 1);
+    assert_eq!(payload["memory"]["guest_actual_bytes"], 2_147_483_648_u64);
     assert_eq!(payload["net"], Value::Null);
     assert_eq!(
         payload["block"],

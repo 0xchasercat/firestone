@@ -889,7 +889,13 @@ pub fn prepare_start(
         lock,
         events,
     )?;
-    if disk_existed {
+    if prepared_image.overlay.grown {
+        events.emit(Event::StepDone {
+            id: StepId::from("disk"),
+            detail: Some(format!("grown to {} overlay", spec.disk)),
+            elapsed_ms: 0,
+        })?;
+    } else if disk_existed {
         events.emit(Event::StepSkip {
             id: StepId::from("disk"),
             reason: "exists".to_owned(),

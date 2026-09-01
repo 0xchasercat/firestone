@@ -58,6 +58,9 @@ _firestone() {
             firestone,metrics)
                 cmd="firestone__subcmd__metrics"
                 ;;
+            firestone,resize)
+                cmd="firestone__subcmd__resize"
+                ;;
             firestone,restart)
                 cmd="firestone__subcmd__restart"
                 ;;
@@ -132,6 +135,9 @@ _firestone() {
                 ;;
             firestone__subcmd__help,metrics)
                 cmd="firestone__subcmd__help__subcmd__metrics"
+                ;;
+            firestone__subcmd__help,resize)
+                cmd="firestone__subcmd__help__subcmd__resize"
                 ;;
             firestone__subcmd__help,restart)
                 cmd="firestone__subcmd__help__subcmd__restart"
@@ -224,7 +230,7 @@ _firestone() {
 
     case "${cmd}" in
         firestone)
-            opts="-q -v -y -h -V --json --quiet --verbose --no-color --yes --home --help --version run create start stop restart rm ls list show edit shell ssh cp ssh-config console logs metrics catalog images doctor completions version serve ui clone help"
+            opts="-q -v -y -h -V --json --quiet --verbose --no-color --yes --home --help --version run create start stop restart resize rm ls list show edit shell ssh cp ssh-config console logs metrics catalog images doctor completions version serve ui clone help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -332,7 +338,7 @@ _firestone() {
             return 0
             ;;
         firestone__subcmd__create)
-            opts="-f -p -q -v -y -h --image --file --edit --arch --cpus --memory --disk --user --net --forward --tap --network-mac --mount --user-data --cloud-init-network-config --ssh-key --no-provisioning --vmm-binary --vmm-firmware --vmm-arg --vmm-config --clear --json --quiet --verbose --no-color --yes --home --help"
+            opts="-f -p -q -v -y -h --image --file --edit --arch --cpus --cpus-max --memory --memory-max --disk --user --net --forward --tap --network-mac --mount --user-data --cloud-init-network-config --ssh-key --no-provisioning --vmm-binary --vmm-firmware --vmm-arg --vmm-config --clear --json --quiet --verbose --no-color --yes --home --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -358,7 +364,15 @@ _firestone() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
+                --cpus-max)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 --memory)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --memory-max)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -474,7 +488,7 @@ _firestone() {
             return 0
             ;;
         firestone__subcmd__help)
-            opts="run create start stop restart rm ls show edit shell cp ssh-config console logs metrics catalog images doctor completions version serve ui clone help"
+            opts="run create start stop restart resize rm ls show edit shell cp ssh-config console logs metrics catalog images doctor completions version serve ui clone help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -726,6 +740,20 @@ _firestone() {
             return 0
             ;;
         firestone__subcmd__help__subcmd__metrics)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        firestone__subcmd__help__subcmd__resize)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -1165,6 +1193,32 @@ _firestone() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        firestone__subcmd__resize)
+            opts="-q -v -y -h --cpus --memory --json --quiet --verbose --no-color --yes --home --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --cpus)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --memory)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         firestone__subcmd__restart)
             opts="-q -v -y -h --json --quiet --verbose --no-color --yes --home --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
@@ -1202,7 +1256,7 @@ _firestone() {
             return 0
             ;;
         firestone__subcmd__run)
-            opts="-p -q -v -y -h --name --rm --arch --cpus --memory --disk --user --net --forward --tap --network-mac --mount --user-data --cloud-init-network-config --ssh-key --no-provisioning --vmm-binary --vmm-firmware --vmm-arg --vmm-config --clear --json --quiet --verbose --no-color --yes --home --help"
+            opts="-p -q -v -y -h --name --rm --arch --cpus --cpus-max --memory --memory-max --disk --user --net --forward --tap --network-mac --mount --user-data --cloud-init-network-config --ssh-key --no-provisioning --vmm-binary --vmm-firmware --vmm-arg --vmm-config --clear --json --quiet --verbose --no-color --yes --home --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1220,7 +1274,15 @@ _firestone() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
+                --cpus-max)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 --memory)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --memory-max)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
