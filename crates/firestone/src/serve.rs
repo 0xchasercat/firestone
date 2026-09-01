@@ -1601,6 +1601,12 @@ mod tests {
             let directory = tempfile::tempdir()?;
             // The runtime-directory guard refuses a symlinked ancestor, and
             // macOS puts every temporary directory under a symlinked `/var`.
+            // It also refuses a group-writable ancestor, which a 002 umask
+            // would otherwise hand the temporary directory.
+            std::fs::set_permissions(
+                directory.path(),
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )?;
             let home = directory.path().canonicalize()?;
             let paths = firestone_core::Paths::from_inputs(&firestone_core::PathInputs {
                 firestone_home: Some(home),
