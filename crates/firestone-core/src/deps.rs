@@ -7,6 +7,12 @@ use crate::{ErrorKind, FirestoneError};
 const BUNDLED_MANIFEST: &str = include_str!("../../../deps.toml");
 const SUPPORTED_MANIFEST_VERSION: u32 = 1;
 
+/// Manifest name of the pinned kernel used for OCI direct kernel boot.
+pub const DIRECT_BOOT_KERNEL_DEPENDENCY: &str = "cloud-hypervisor-kernel";
+
+/// Pinned direct-boot kernel release recorded in `deps.toml`.
+pub const PINNED_DIRECT_BOOT_KERNEL_VERSION: &str = "ch-release-v6.16.9-20260508";
+
 /// One immutable, architecture-specific dependency artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyArtifact {
@@ -239,6 +245,37 @@ impl DependencyManifest {
         }
         Ok(artifact)
     }
+
+    /// Resolves the pinned direct-boot kernel used by OCI machines (SPEC §9.1).
+    ///
+    /// The kernel is a lazily installed data payload, never an executable, and
+    /// the firmware payload path is unaffected by this accessor.
+    pub fn direct_boot_kernel(
+        &self,
+        architecture: &str,
+    ) -> Result<DependencyArtifact, FirestoneError> {
+        let artifact = self
+            .artifact(DIRECT_BOOT_KERNEL_DEPENDENCY, architecture)
+            .map_err(|error| {
+                FirestoneError::new(
+                    ErrorKind::Dependency,
+                    format!("pinned direct-boot kernel metadata is unavailable for {architecture}"),
+                )
+                .with_hint(
+                    "regenerate deps.toml with scripts/pin-deps.sh refresh --arch all before booting an OCI machine",
+                )
+                .with_source(error)
+            })?;
+        if artifact.executable() {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                "pinned direct-boot kernel is classified as an executable payload",
+            )
+            .with_hint("publish the kernel image as a mode-0644 dependency artifact"));
+        }
+        Ok(artifact)
+    }
+
     fn entry(&self, dependency: &str) -> Result<&DependencyEntry, FirestoneError> {
         self.dependencies.get(dependency).ok_or_else(|| {
             FirestoneError::new(
@@ -503,6 +540,63 @@ sha256 = "{HASH}"
             .err()
             .ok_or("aarch64 embedded passt unexpectedly resolved")?;
         assert!(error.message().contains("runtime scope is x86_64"));
+        Ok(())
+    }
+
+    #[test]
+    fn direct_boot_kernel_bundled_manifest_resolves_both_architectures()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = DependencyManifest::bundled()?;
+
+        let x86_64 = manifest.direct_boot_kernel("x86_64")?;
+        assert_eq!(x86_64.dependency, super::DIRECT_BOOT_KERNEL_DEPENDENCY);
+        assert_eq!(x86_64.version, super::PINNED_DIRECT_BOOT_KERNEL_VERSION);
+        assert_eq!(x86_64.asset, "bzImage-x86_64");
+        assert_eq!(x86_64.install_name, "bzImage-ch-release-v6.16.9-20260508");
+        assert_eq!(
+            x86_64.sha256,
+            "58088758f601a04ef85b09cf23db5530d51edc039ed47afbf2264c5b762cb568"
+        );
+        assert!(!x86_64.executable());
+        assert_eq!(x86_64.expected_mode(), 0o644);
+
+        let aarch64 = manifest.direct_boot_kernel("aarch64")?;
+        assert_eq!(aarch64.asset, "Image-arm64");
+        assert_eq!(aarch64.install_name, "Image-ch-release-v6.16.9-20260508");
+        assert_eq!(
+            aarch64.sha256,
+            "69d1b1235381ec50f1b45cf771a7dff4a9013d452833ab34682d6283e2114010"
+        );
+        assert_eq!(aarch64.expected_mode(), 0o644);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_boot_kernel_missing_entry_reports_dependency_hint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = DependencyManifest::parse(
+            r#"
+manifest_version = 1
+[dependency.cloud-hypervisor]
+version = "v53.0"
+availability = "binary"
+"#,
+        )?;
+
+        let error = manifest
+            .direct_boot_kernel("x86_64")
+            .err()
+            .ok_or("the absent direct-boot kernel unexpectedly resolved")?;
+        assert!(
+            error
+                .message()
+                .contains("pinned direct-boot kernel metadata is unavailable for x86_64")
+        );
+        assert!(
+            error
+                .hint()
+                .is_some_and(|hint| hint.contains("scripts/pin-deps.sh refresh --arch all"))
+        );
         Ok(())
     }
 }

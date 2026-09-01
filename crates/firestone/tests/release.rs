@@ -51,6 +51,11 @@ fn dependency_pins() -> Vec<(&'static str, &'static str, &'static str)> {
                 "9fb511fc0dd423d90a79615a90a8ace9b9e078b4a115ea2c459e0ac2f4e60218",
             ),
             (
+                "cloud-hypervisor-kernel",
+                "ch-release-v6.16.9-20260508",
+                "58088758f601a04ef85b09cf23db5530d51edc039ed47afbf2264c5b762cb568",
+            ),
+            (
                 "passt",
                 "2025_02_17.a1e48a0",
                 "40e59201765c60a0a5bbd0f2caae1aae3fd8f9a9a0628a835159fb2f17ff7025",
@@ -81,6 +86,11 @@ fn dependency_pins() -> Vec<(&'static str, &'static str, &'static str)> {
                 "cloud-hypervisor-edk2",
                 "ch-1e1b96f126",
                 "460cefa75c72461745ac2f8e828ac8646475f93823101980dfc3f5967175c1ef",
+            ),
+            (
+                "cloud-hypervisor-kernel",
+                "ch-release-v6.16.9-20260508",
+                "69d1b1235381ec50f1b45cf771a7dff4a9013d452833ab34682d6283e2114010",
             ),
             (
                 "rust-hypervisor-firmware",

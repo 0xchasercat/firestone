@@ -53,6 +53,24 @@ install_name = "CLOUDHV_EFI-ch-1e1b96f126.fd"
 url = "https://github.com/cloud-hypervisor/edk2/releases/download/ch-1e1b96f126/CLOUDHV_EFI.fd"
 sha256 = "460cefa75c72461745ac2f8e828ac8646475f93823101980dfc3f5967175c1ef"
 
+# Direct-boot kernel for OCI machines; the firmware payload path is untouched.
+[dependency.cloud-hypervisor-kernel]
+version = "ch-release-v6.16.9-20260508"
+release_url = "https://github.com/cloud-hypervisor/linux/releases/tag/ch-release-v6.16.9-20260508"
+availability = "binary"
+
+[dependency.cloud-hypervisor-kernel.x86_64]
+asset = "bzImage-x86_64"
+install_name = "bzImage-ch-release-v6.16.9-20260508"
+url = "https://github.com/cloud-hypervisor/linux/releases/download/ch-release-v6.16.9-20260508/bzImage-x86_64"
+sha256 = "58088758f601a04ef85b09cf23db5530d51edc039ed47afbf2264c5b762cb568"
+
+[dependency.cloud-hypervisor-kernel.aarch64]
+asset = "Image-arm64"
+install_name = "Image-ch-release-v6.16.9-20260508"
+url = "https://github.com/cloud-hypervisor/linux/releases/download/ch-release-v6.16.9-20260508/Image-arm64"
+sha256 = "69d1b1235381ec50f1b45cf771a7dff4a9013d452833ab34682d6283e2114010"
+
 # Firestone-owned binaries reproduce upstream v1.14.0 for both release targets.
 [dependency.virtiofsd]
 version = "v1.14.0"

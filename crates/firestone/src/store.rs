@@ -2448,10 +2448,22 @@ esac
         );
         assert_eq!(result.architecture, architecture.as_str());
         let expected_dependencies = match architecture {
-            Arch::X86_64 => 6,
-            Arch::Aarch64 => 4,
+            Arch::X86_64 => 7,
+            Arch::Aarch64 => 5,
         };
         assert_eq!(result.dependencies.len(), expected_dependencies);
+        let kernel = result
+            .dependencies
+            .get("cloud-hypervisor-kernel")
+            .ok_or("direct-boot kernel version pin is missing")?;
+        assert_eq!(kernel.version, "ch-release-v6.16.9-20260508");
+        assert_eq!(
+            kernel.sha256,
+            match architecture {
+                Arch::X86_64 => "58088758f601a04ef85b09cf23db5530d51edc039ed47afbf2264c5b762cb568",
+                Arch::Aarch64 => "69d1b1235381ec50f1b45cf771a7dff4a9013d452833ab34682d6283e2114010",
+            }
+        );
         if architecture == Arch::X86_64 {
             assert_eq!(
                 result
