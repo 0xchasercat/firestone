@@ -36,6 +36,7 @@ Build it twice into separate target directories and require the two outputs to b
 - Unsafe is confined to `crates/firestone-init/src/ffi.rs`, which denies `unsafe_op_in_unsafe_fn` and documents every block. `firestone-initproto` forbids `unsafe` outright.
 - `crates/firestone-core/build.rs` already verifies and embeds a `firestone-init` asset when — and only when — `deps.toml` carries a `[dependency.firestone-init]` entry **and** `FIRESTONE_EMBEDDED_HELPERS_DIR` holds the named asset. Half a pin is a build failure; neither half is an ordinary development build.
 - Until then, `firestone_core::firestone_init_payload()` returns kind `dependency` with a hint naming the missing release, so the OCI pull pipeline cannot inject nothing by accident.
+- The OCI pull pipeline (M6-15) calls that feed **before** it contacts the registry, and re-reports its failure as `cannot pull OCI image '<ref>': the firestone-init guest payload is unavailable` with a hint naming both the standalone release and the `deps.toml` pin. So on a plain `cargo build`, `firestone images pull docker.io/library/alpine:3.20` fails in milliseconds with that message rather than after downloading layers; this is the exact limitation this runbook closes.
 
 ## Release runbook (orchestrator)
 
