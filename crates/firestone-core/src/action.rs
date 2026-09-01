@@ -49,6 +49,11 @@ pub enum Action {
         lines: u32,
         follow: bool,
     },
+    Cp {
+        source: String,
+        target: String,
+        recursive: bool,
+    },
     CatalogList,
     ImageList,
     ImagePull {
@@ -266,6 +271,27 @@ mod tests {
             serde_json::from_value::<Action>(serde_json::to_value(&remove)?)?,
             remove
         );
+        Ok(())
+    }
+
+    #[test]
+    fn action_cp_round_trips_operands_and_recursive_flag() -> Result<(), serde_json::Error> {
+        let action = Action::Cp {
+            source: "./notes.txt".to_owned(),
+            target: "dev:/tmp/notes.txt".to_owned(),
+            recursive: true,
+        };
+        let encoded = serde_json::to_value(&action)?;
+        assert_eq!(
+            encoded,
+            json!({
+                "type": "Cp",
+                "source": "./notes.txt",
+                "target": "dev:/tmp/notes.txt",
+                "recursive": true
+            })
+        );
+        assert_eq!(serde_json::from_value::<Action>(encoded)?, action);
         Ok(())
     }
 

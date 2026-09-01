@@ -107,6 +107,19 @@ pub struct ShellResult {
     pub signal: Option<i32>,
 }
 
+/// Exact scp invocation planned for one `firestone cp` operand pair.
+///
+/// The payload carries argv only. It never contains key material, and the CLI is the only surface
+/// that executes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CpResult {
+    pub name: String,
+    pub user: String,
+    pub recursive: bool,
+    pub program: String,
+    pub args: Vec<String>,
+}
+
 /// Create/start/shell/remove outcome for one run orchestration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunResult {

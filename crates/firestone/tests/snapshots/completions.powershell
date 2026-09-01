@@ -46,6 +46,7 @@ Register-ArgumentCompleter -Native -CommandName 'firestone' -ScriptBlock {
             [CompletionResult]::new('edit', 'edit', [CompletionResultType]::ParameterValue, 'Edit and validate a machine''s firestone.toml')
             [CompletionResult]::new('shell', 'shell', [CompletionResultType]::ParameterValue, 'Open SSH over the machine''s private vsock transport')
             [CompletionResult]::new('ssh', 'ssh', [CompletionResultType]::ParameterValue, 'Open SSH over the machine''s private vsock transport')
+            [CompletionResult]::new('cp', 'cp', [CompletionResultType]::ParameterValue, 'Copy files between the host and a machine over the vsock transport')
             [CompletionResult]::new('ssh-config', 'ssh-config', [CompletionResultType]::ParameterValue, 'Print an OpenSSH Host block for the machine')
             [CompletionResult]::new('console', 'console', [CompletionResultType]::ParameterValue, 'Attach to the machine''s hvc0 console')
             [CompletionResult]::new('logs', 'logs', [CompletionResultType]::ParameterValue, 'Print a bounded machine log')
@@ -269,6 +270,22 @@ Register-ArgumentCompleter -Native -CommandName 'firestone' -ScriptBlock {
         'firestone;ssh' {
             [CompletionResult]::new('--user', '--user', [CompletionResultType]::ParameterName, 'Select the guest login user')
             [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--verbose', '--verbose', [CompletionResultType]::ParameterName, 'Increase log detail. Pass twice for debug output')
+            [CompletionResult]::new('--no-color', '--no-color', [CompletionResultType]::ParameterName, 'Disable colored output')
+            [CompletionResult]::new('-y', '-y', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Assume yes when a command may prompt')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'firestone;cp' {
+            [CompletionResult]::new('--home', '--home', [CompletionResultType]::ParameterName, 'Override the Firestone home root (config, data, and runtime)')
+            [CompletionResult]::new('-r', '-r', [CompletionResultType]::ParameterName, 'Copy directories recursively')
+            [CompletionResult]::new('--recursive', '--recursive', [CompletionResultType]::ParameterName, 'Copy directories recursively')
             [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print events as newline-delimited JSON and disable human output')
             [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Print only errors and command results')
             [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Print only errors and command results')
@@ -547,6 +564,7 @@ Register-ArgumentCompleter -Native -CommandName 'firestone' -ScriptBlock {
             [CompletionResult]::new('show', 'show', [CompletionResultType]::ParameterValue, 'Show a machine''s specification and runtime state')
             [CompletionResult]::new('edit', 'edit', [CompletionResultType]::ParameterValue, 'Edit and validate a machine''s firestone.toml')
             [CompletionResult]::new('shell', 'shell', [CompletionResultType]::ParameterValue, 'Open SSH over the machine''s private vsock transport')
+            [CompletionResult]::new('cp', 'cp', [CompletionResultType]::ParameterValue, 'Copy files between the host and a machine over the vsock transport')
             [CompletionResult]::new('ssh-config', 'ssh-config', [CompletionResultType]::ParameterValue, 'Print an OpenSSH Host block for the machine')
             [CompletionResult]::new('console', 'console', [CompletionResultType]::ParameterValue, 'Attach to the machine''s hvc0 console')
             [CompletionResult]::new('logs', 'logs', [CompletionResultType]::ParameterValue, 'Print a bounded machine log')
@@ -588,6 +606,9 @@ Register-ArgumentCompleter -Native -CommandName 'firestone' -ScriptBlock {
             break
         }
         'firestone;help;shell' {
+            break
+        }
+        'firestone;help;cp' {
             break
         }
         'firestone;help;ssh-config' {

@@ -25,17 +25,17 @@ use std::{
 use clap::{CommandFactory as _, Parser, error::ErrorKind as ClapErrorKind};
 use dialoguer::Select;
 use firestone_core::{
-    Action, ByteSize, Catalog, Dispatcher, DoctorCheckId, DoctorReport, DoctorStatus, ErrorKind,
-    Event, EventSink, FirestoneError, GlobalConfig, ImageRef, MachineSpec, MachineSpecPatch,
-    MachineStatus, NetMode, NetworkSpecPatch, PathInputs, Paths, ProcessSignal, RawTerminal,
-    RealValidationHost, RunResult, ShellResult, SpecClear, SshConfigResult, ValidationContext,
-    block_on, console_plan, relay_console, shell_ssh_plan, ssh_config_plan,
+    Action, ByteSize, Catalog, Cmd, CpResult, Dispatcher, DoctorCheckId, DoctorReport,
+    DoctorStatus, ErrorKind, Event, EventSink, FirestoneError, GlobalConfig, ImageRef, MachineSpec,
+    MachineSpecPatch, MachineStatus, NetMode, NetworkSpecPatch, PathInputs, Paths, ProcessSignal,
+    RawTerminal, RealValidationHost, RunResult, ShellResult, SpecClear, SshConfigResult,
+    ValidationContext, block_on, console_plan, relay_console, shell_ssh_plan, ssh_config_plan,
 };
 
 use crate::{
     cli::{
-        Cli, Command, CreateDraft, CreateRequest, ImageCommand, ListenAddress, RunArgs, ShellArgs,
-        UiArgs, derive_machine_name, parse_hidden_vsock_proxy,
+        Cli, Command, CpArgs, CreateDraft, CreateRequest, ImageCommand, ListenAddress, RunArgs,
+        ShellArgs, UiArgs, derive_machine_name, parse_hidden_vsock_proxy,
     },
     render::{RenderOptions, Renderer, error_exit_code},
     serve::{BoundListener, ServeListener},
@@ -548,6 +548,7 @@ where
         Command::Shell(arguments) => {
             shell_command(arguments, paths, source_base, json, terminal, renderer).await
         }
+        Command::Cp(arguments) => cp_command(arguments, paths, source_base, json, renderer).await,
         Command::SshConfig(arguments) => {
             ssh_config_command(arguments.name, paths, source_base, renderer)
         }
@@ -1187,6 +1188,80 @@ where
 
 fn exec_ssh(plan: firestone_core::SshCommandPlan) -> Result<(), FirestoneError> {
     match plan.command().stdin_inherit().exec() {
+        Ok(never) => match never {},
+        Err(error) => Err(error),
+    }
+}
+
+/// Captures one action's terminal Result so the CLI can act on its payload.
+struct CapturedResult<'a> {
+    inner: &'a mut dyn EventSink,
+    action: &'static str,
+    payload: Option<serde_json::Value>,
+}
+
+impl EventSink for CapturedResult<'_> {
+    fn emit(&mut self, event: Event) -> Result<(), FirestoneError> {
+        match event {
+            Event::Result { action, payload } if action == self.action => {
+                self.payload = Some(payload);
+                Ok(())
+            }
+            other => self.inner.emit(other),
+        }
+    }
+}
+
+async fn cp_command<Stdout, Stderr>(
+    arguments: CpArgs,
+    paths: Paths,
+    source_base: std::path::PathBuf,
+    json: bool,
+    renderer: &mut Renderer<Stdout, Stderr>,
+) -> Result<(), FirestoneError>
+where
+    Stdout: io::Write + Send,
+    Stderr: io::Write + Send,
+{
+    if json {
+        return Err(FirestoneError::new(
+            ErrorKind::Usage,
+            "cp cannot mix an scp byte stream with NDJSON output",
+        )
+        .with_hint("remove --json and retry"));
+    }
+    let (global, catalog) = load_user_configuration(&paths)?;
+    let dispatcher = LocalDispatcher::new(paths, global, catalog).with_source_base(source_base);
+    let action = Action::Cp {
+        source: arguments.source,
+        target: arguments.target,
+        recursive: arguments.recursive,
+    };
+    let mut captured = CapturedResult {
+        inner: renderer,
+        action: "cp",
+        payload: None,
+    };
+    dispatcher.run(action, &mut captured).await?;
+    let payload = captured.payload.ok_or_else(|| {
+        FirestoneError::new(ErrorKind::Generic, "cp action produced no command plan")
+            .with_hint("report this Firestone dispatcher bug")
+    })?;
+    let plan: CpResult = serde_json::from_value(payload).map_err(|source| {
+        FirestoneError::new(ErrorKind::Generic, "cannot read the cp command plan")
+            .with_hint("report this Firestone serialization bug")
+            .with_source(source)
+    })?;
+    exec_cp(&plan)
+}
+
+fn exec_cp(plan: &CpResult) -> Result<(), FirestoneError> {
+    match Cmd::new(plan.program.as_str())
+        .args(plan.args.iter().map(String::as_str))
+        .stdin_inherit()
+        .error_kind(ErrorKind::Dependency)
+        .exec()
+    {
         Ok(never) => match never {},
         Err(error) => Err(error),
     }

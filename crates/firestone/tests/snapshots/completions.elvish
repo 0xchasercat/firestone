@@ -43,6 +43,7 @@ set edit:completion:arg-completer[firestone] = {|@words|
             cand edit 'Edit and validate a machine''s firestone.toml'
             cand shell 'Open SSH over the machine''s private vsock transport'
             cand ssh 'Open SSH over the machine''s private vsock transport'
+            cand cp 'Copy files between the host and a machine over the vsock transport'
             cand ssh-config 'Print an OpenSSH Host block for the machine'
             cand console 'Attach to the machine''s hvc0 console'
             cand logs 'Print a bounded machine log'
@@ -254,6 +255,21 @@ set edit:completion:arg-completer[firestone] = {|@words|
         &'firestone;ssh'= {
             cand --user 'Select the guest login user'
             cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand --json 'Print events as newline-delimited JSON and disable human output'
+            cand -q 'Print only errors and command results'
+            cand --quiet 'Print only errors and command results'
+            cand -v 'Increase log detail. Pass twice for debug output'
+            cand --verbose 'Increase log detail. Pass twice for debug output'
+            cand --no-color 'Disable colored output'
+            cand -y 'Assume yes when a command may prompt'
+            cand --yes 'Assume yes when a command may prompt'
+            cand -h 'Print help'
+            cand --help 'Print help'
+        }
+        &'firestone;cp'= {
+            cand --home 'Override the Firestone home root (config, data, and runtime)'
+            cand -r 'Copy directories recursively'
+            cand --recursive 'Copy directories recursively'
             cand --json 'Print events as newline-delimited JSON and disable human output'
             cand -q 'Print only errors and command results'
             cand --quiet 'Print only errors and command results'
@@ -509,6 +525,7 @@ set edit:completion:arg-completer[firestone] = {|@words|
             cand show 'Show a machine''s specification and runtime state'
             cand edit 'Edit and validate a machine''s firestone.toml'
             cand shell 'Open SSH over the machine''s private vsock transport'
+            cand cp 'Copy files between the host and a machine over the vsock transport'
             cand ssh-config 'Print an OpenSSH Host block for the machine'
             cand console 'Attach to the machine''s hvc0 console'
             cand logs 'Print a bounded machine log'
@@ -540,6 +557,8 @@ set edit:completion:arg-completer[firestone] = {|@words|
         &'firestone;help;edit'= {
         }
         &'firestone;help;shell'= {
+        }
+        &'firestone;help;cp'= {
         }
         &'firestone;help;ssh-config'= {
         }

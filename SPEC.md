@@ -252,6 +252,7 @@ pub enum Action {
     SetSpec { name: String, spec: MachineSpec },        // PUT
     PatchSpec { name: String, patch: MachineSpecPatch }, // PATCH
     Logs { name: String, source: LogSource, lines: u32, follow: bool },
+    Cp { source: String, target: String, recursive: bool },             // CLI-only (§11.9)
     CatalogList,
     ImageList, ImagePull { r#ref: ImageRef, sha256: Option<String> }, ImageInspect { id: String },
     ImageRemove { id: String, force: bool }, ImagePrune,
@@ -260,7 +261,7 @@ pub enum Action {
 }
 ```
 
-CLI subcommands and REST routes are thin adapters that construct an `Action` and hand it to `Dispatcher::run(action, &mut EventSink)`. Terminal attachment commands (`shell`, `console`, and `edit`) remain CLI-only. Bounded log reads, including follow, use the shared `Logs` action and `Output`/`Result` events; the CLI owns only terminal signal projection while REST maps the same operation to its documented stream.
+CLI subcommands and REST routes are thin adapters that construct an `Action` and hand it to `Dispatcher::run(action, &mut EventSink)`. Terminal attachment commands (`shell`, `console`, and `edit`) remain CLI-only. Bounded log reads, including follow, use the shared `Logs` action and `Output`/`Result` events; the CLI owns only terminal signal projection while REST maps the same operation to its documented stream. `cp` (§11.9) is the one action with a CLI-only transport: `Action::Cp` plans the exact `scp` argv and returns it as its `Result`, and only the CLI executes that plan, so it publishes no REST route.
 
 ### 5.3 `Event` — one stream, three renderers
 
@@ -1006,6 +1007,38 @@ An OCI guest (§8.5, §10.5) runs `firestone-init` and the image's entrypoint. I
 - `console` and `logs` work unchanged. The entrypoint's stdout and stderr reach `hvc0` and `console.log`, so the console is the interactive surface and `logs` is the durable one.
 - **Readiness.** Steps 7 and 8 of §9.3 do not apply. `start --wait` on an OCI machine is ready when the shim reports `running` after `vm.boot` — the shim is running and the VM was created and booted — not when SSH answers. `Result.status` is `running` and no `ssh` step is emitted. `[start].timeout` and `--timeout` still bound steps 2 through 6.
 
+### 11.9 `cp` (normative)
+
+`firestone cp [-r] SRC DST` copies files between the host and one machine by exec'ing the system `scp` over the same vsock `ProxyCommand` as §11.3.
+
+**Operand grammar.** Exactly one of `SRC` and `DST` is remote. An operand is remote if and only if it contains a colon and everything before its *first* colon is a non-empty machine name — lowercase ASCII letters, digits, and dashes (`[a-z0-9-]+`). Every other operand is local:
+
+| Operand | Classification |
+|---|---|
+| `dev:/etc/hostname` | remote, machine `dev`, path `/etc/hostname` |
+| `dev:` | remote, machine `dev`, empty path (the guest login directory) |
+| `./dev:/etc/hostname` | local (the `./` escape) |
+| `/srv/dev:/etc` | local (a colon after the first `/`) |
+| `notes.txt` | local (no colon) |
+| `Dev:/etc`, `dev_1:/etc`, `:/etc`, `::1:/etc` | local (not a machine name before the first colon) |
+| `fe80::1:/etc` | remote, machine `fe80` — an IPv6 literal is not operand syntax; use `./fe80::1:/etc` for the local file |
+
+Zero remote operands and two remote operands are both `usage` errors; each hint names the `./` escape. A remote operand whose machine does not exist is `not_found`; a machine that is not running is `not_running` with the same message and hint family as `shell` (`machine <name> is not running` / `start it with firestone start <name>`). `cp` never starts a machine.
+
+**Invocation.** The remote operand renders as `<user>@firestone.<machine>:<path>` with the machine's spec `user`; a local operand that `scp` would itself read as remote (a colon before any `/`) is passed with a `./` prefix so host and Firestone agree on the same file. The argv is:
+
+```
+scp [-r] -o ProxyCommand="firestone _vsock-proxy <name> 22"
+    -o IdentityFile=<data>/ssh/id_ed25519 -o IdentitiesOnly=yes
+    -o UserKnownHostsFile=<machine>/known_hosts -o StrictHostKeyChecking=accept-new
+    -o LogLevel=ERROR
+    <src> <dst>
+```
+
+The option block is the one shared by `shell` and the start readiness probe; `cp` never sets `BatchMode` and never allocates a TTY. Everything after the option block is `scp`'s own behavior: `-r` for directories, its progress meter and its exit status pass through unchanged, and firestone adds no other flag. Because OpenSSH 9 `scp` transfers over the SFTP protocol by default, a wildcard in a remote path is expanded by the guest's SFTP server rather than a remote shell, so brace expansion and shell-only globs do not apply; quote a remote glob so the host shell does not expand it first.
+
+`cp` is CLI-only. The process becomes `scp`, so there is nothing for an HTTP response to carry; `Action::Cp` returns the planned argv and the CLI execs it. `--json` is a `usage` error, exactly as for `shell`. Adding no route keeps `docs/openapi.json` and the §5.4 drift test unchanged, since that test compares the axum route table with the OpenAPI document and not the CLI command table.
+
 ---
 
 ## 12. Networking
@@ -1147,6 +1180,7 @@ Global flags on every command: `--json` (NDJSON events on stdout, human output o
 | `show NAME [--vmconfig]` | spec + state (+ generated VmConfig) |
 | `edit NAME` | open `firestone.toml` in the selected editor; validate on save, re-open on error |
 | `shell NAME [--user U] [-- CMD…]` (alias `ssh`) | ssh over vsock |
+| `cp [-r] SRC DST` | copy files over vsock with `scp`; exactly one operand is `<machine>:<path>` (§11.9) |
 | `ssh-config NAME` | print an OpenSSH Host block |
 | `console NAME` | attach to hvc0 |
 | `logs NAME [-f] [--source S] [-n N]` | view logs |
@@ -1524,6 +1558,7 @@ Do these in the first milestone, against the pinned versions, and record results
 | OCI stop semantics in v0.2 | `stop` sends `vm.power-button` as always, and, because `firestone-init` installs no ACPI handler, falls through §9.4's timeout to the force path; `stop --force` skips straight to it | claim graceful stop and hide the timeout; make `stop` force-only for OCI machines; block OCI boot until an ACPI handler exists | The existing stop sequence already degrades correctly and the guest syncs on its own entrypoint exit, so the force path is safe rather than merely tolerated. Recording it as verify 25 keeps the honest cost visible instead of advertising a graceful stop the guest cannot perform. |
 | Static `mkfs.ext4` helper | Extend the existing `build/helpers` recipe with e2fsprogs 1.47.3: configure `--with-libarchive=direct --disable-nls --disable-uuidd --disable-fuse2fs`, build only `libs` and `misc/mke2fs` with the full `pkg-config --static --libs libarchive` closure passed as a make-time `LIBARCHIVE` override, publish the stripped static binary as `mkfs.ext4` | a host `e2fsprogs` package; `make all` in the e2fsprogs tree; loop-mount plus `cp` as root; writing ext4 from Rust; libguestfs | The OCI pipeline needs an unprivileged, deterministic way to turn a layer tar into an ext4 image, and `mke2fs -d <tar>` with libarchive is the only pinned tool that preserves ownership, modes, symlinks, hard links and device nodes without root. `misc/Makefile` hardcodes `LIBARCHIVE=-larchive`, which cannot close a static link, and `make all` fails because `debugfs` cannot link statically, so the recipe must name the one target it needs. Reusing the passt/qemu-img container keeps one twice-built, byte-identity-checked, GPL-corresponding-source release instead of a second distribution channel. |
 | Port forward changes on a running machine | Apply on restart, surfaced: `forwards_pending` on the `ls` and `show` payloads compares the spec's forwards against the applied set in `state.json` as a canonical order-insensitive multiset, `ls` marks the row and prints one legend, `show` notes it on stderr, and a spec write on a running machine warns `port forwards apply on restart` | restart passt in place and reattach the VMM; add and remove mappings through a passt control interface; hide the divergence and let the next start apply it silently; report any spec edit as pending regardless of content | passt fixes `-t`/`-u` at spawn and exposes no runtime interface to change them, and the Cloud Hypervisor v53 vhost-user session cannot survive a passt restart — `--one-off` passt exits with the VMM and the VMM never reconnects to a replacement backend. There is no hot-apply to implement, so the honest contract is apply-on-restart made visible. Comparing canonical sets rather than text keeps a reorder or a respelling from raising a false pending flag. |
+| `cp` transport and operand grammar | Wrap the system `scp` through the existing vsock `ProxyCommand`, sharing one option block with `shell` and the readiness probe. Exactly one operand is remote, and an operand is remote only when the text before its first colon is a machine name (`[a-z0-9-]+`); `./` keeps an ambiguous local path local in both directions. `Action::Cp` returns the planned argv and the CLI alone execs it, so `cp` publishes no REST route. | implement a Firestone file-transfer protocol over vsock; require `firestone cp NAME SRC DST` with no `<machine>:<path>` grammar; accept any text before a colon as a host, as `scp` does; add `POST /v1/machines/{name}/files` | `scp` already speaks the guest's SFTP subsystem, and reusing the one option block means host-key trust, identity, and proxy policy cannot drift from `shell`. The colon grammar is what users already type for `scp` and `rsync`, while the machine-name charset makes classification decidable without asking the store, and `./` is OpenSSH's own escape. A REST route would have to stream a transfer the CLI performs by becoming `scp`, which is the same reason `shell` and `console` stay CLI-only; the §5.4 drift test compares routes to `docs/openapi.json` and is unaffected. |
 | M6 interface contracts frozen up front | Snapshot, clone, resize, metrics, prune, and terminal WS routes plus spec additions are fixed before implementation (route shapes recorded in the M6 milestone's feature sections as they land); UI work proceeds against the contracts in parallel | design each surface inside its implementation PR; a single serialized workstream | Parallel agents need a stable seam; freezing the action names, REST paths and payload shapes first lets core and UI land independently while the drift gate keeps `docs/openapi.json` honest. |
 | First-start pinned firmware | Before `vmconfig.json` publication, install only the effective built-in `auto`/`rhf`/`edk2` artifact through the shared locked, no-follow, exact hash/mode, fsynced, no-replace publisher; reverify it for VmConfig; never install or modify a custom firmware path | require a broad `doctor --fix` preflight; download every vendored artifact; trust an existing regular file; rewrite custom firmware | A direct first start from an empty home gets the one firmware it needs without unrelated host repair. The manifest identity and secure publisher keep VMM input inside Firestone's owned dependency boundary, while the custom path remains authoritative. |
 | Passt runtime isolation diagnosis | Probe the exact foreground, one-off vhost-user mode with repair disabled; classify both `Couldn't create user namespace` and `Failed to detach isolating namespaces` as fatal; offer the existing AppArmor repair when host facts support it; runtime selects only the verified literal root-owned pinned copy after repair | treat later detach failure as available because the first userns succeeded; use generic `unshare`; disable AppArmor or a sysctl; accept a user-writable profiled path | Passt cannot serve Cloud Hypervisor after either fatal exit. Matching runtime argv closes the false-ok gap, and verified literal-path selection proves the repair authorizes only the pinned binary. |
