@@ -466,9 +466,10 @@ fn observable_drift(view: &MachineView) -> Vec<&'static str> {
     }
     if let (Some(spec_mac), Some(state_mac)) =
         (view.spec.network.mac.as_ref(), view.state.mac.as_deref())
-        && !spec_mac.to_string().eq_ignore_ascii_case(state_mac)
     {
-        drift.push("mac");
+        if !spec_mac.to_string().eq_ignore_ascii_case(state_mac) {
+            drift.push("mac");
+        }
     }
     drift
 }
