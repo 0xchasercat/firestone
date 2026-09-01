@@ -27,6 +27,11 @@
             hx-get="/ui/machines/{{ machine.name | urlencode }}/edit"
             hx-target="#fs-dialog-slot"
             hx-swap="innerHTML">Edit</button>
+    {# Clone (§24). The source must be created or stopped, and the button says
+       so rather than spending a round trip to be told. #}
+    <button type="button" class="fs-btn"
+            data-fs-clone="{{ machine.name }}"
+            {% if not machine.clonable %}disabled title="clone needs a created or stopped source; stop {{ machine.name }} first"{% endif %}>Clone…</button>
     {% if machine.action %}
     <button type="button" class="fs-btn fs-btn--primary"
             data-fs-action="{{ machine.action }}"
@@ -48,4 +53,10 @@
     <div class="fs-meta__value" title="{{ kv.value }}">{{ kv.value }}</div>
   </div>
   {% endfor %}
+  {# The applied forwards, §12.5's set: what a client can reach right now, with
+     the pending marker beside them rather than in place of them. #}
+  <div class="fs-meta__forwards">
+    <div class="fs-meta__key">forwards</div>
+    <div class="fs-meta__value">{{ m.forwards(machine.forwards, machine.forwards_pending) }}</div>
+  </div>
 </div>

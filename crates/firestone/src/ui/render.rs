@@ -84,6 +84,14 @@ const TEMPLATES: &[(&str, &str)] = &[
         include_str!("../../templates/ui/_catalog_cards.html"),
     ),
     (
+        "ui/_catalog_images.html",
+        include_str!("../../templates/ui/_catalog_images.html"),
+    ),
+    (
+        "ui/tab_snapshots.html",
+        include_str!("../../templates/ui/tab_snapshots.html"),
+    ),
+    (
         "ui/create.html",
         include_str!("../../templates/ui/create.html"),
     ),

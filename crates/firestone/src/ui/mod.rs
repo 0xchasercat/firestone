@@ -129,6 +129,7 @@ pub fn router(dispatcher: Arc<dyn Dispatcher>, config: &GlobalConfig, paths: &Pa
         .route("/ui/machines/{name}/edit", get(routes::edit_form))
         .route("/ui/machines/{name}/tab/{tab}", get(routes::machine_tab))
         .route("/ui/catalog/cards", get(routes::catalog_cards))
+        .route("/ui/catalog/images", get(routes::catalog_images))
         .route("/ui/palette", get(routes::palette))
         .route("/ui/static/{*path}", get(static_asset))
         // `/v1` keeps its stable JSON ErrorEnvelope 404; a mistyped UI URL

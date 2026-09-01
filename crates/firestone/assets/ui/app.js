@@ -765,7 +765,13 @@
     if (!row || event.defaultPrevented) {
       return;
     }
-    if (event.target.closest("a, button, input, select, textarea, label")) {
+    /* `summary` and `details` are here for the row's overflow menu: opening a
+     * menu is not a request to open the machine. */
+    if (
+      event.target.closest(
+        "a, button, input, select, textarea, label, summary, details"
+      )
+    ) {
       return;
     }
     var selection = window.getSelection();
@@ -3193,5 +3199,733 @@
   window.firestoneEdit = {
     patchFromForm: patchFromForm,
     listChange: listChange
+  };
+
+  /* ================== snapshots, clone, images, prune (M6-26) ==============
+   *
+   * Six commands, one shape. Every one of them opens a dialog the shell
+   * already rendered, reads the operator's answer from the dialog's own
+   * returnValue, and then writes to a documented /v1 route — never to /ui.
+   * The UI stays the read surface it says it is (§16.5).
+   *
+   * Two honesty rules run through the whole section, and both cost something:
+   *
+   *   - A dialog states what the action actually does to the machine, in the
+   *     machine's current state: a snapshot of a running machine pauses the
+   *     guest (§23.4), and a restore of a running machine is refused unless it
+   *     is stopped first (§23.5). Neither is discovered from a 409.
+   *   - The system prune previews with dry_run before it removes, and the
+   *     confirm stays disabled until that preview has actually answered. The
+   *     operator approves a list, not a promise.
+   * ==================================================================== */
+
+  var SYSTEM_PRUNE_URL = "/v1/system/prune";
+
+  function setText(root, selector, value) {
+    var node = qs(selector, root);
+    if (node) {
+      node.textContent = value;
+    }
+    return node;
+  }
+
+  function show(node, visible) {
+    if (node) {
+      node.hidden = !visible;
+    }
+  }
+
+  /* One confirm flow for every dialog in this section. `prepare` fills the
+   * dialog in; `run` fires only for the confirm button's value, so Escape and
+   * Cancel are indistinguishable from never having opened it. A dialog that
+   * is somehow absent must not silently swallow the command, so the fallback
+   * runs it — the server is still the one that decides. */
+  function withDialog(id, prepare, run) {
+    var dialog = qs(id);
+    if (!dialog) {
+      run(null);
+      return;
+    }
+    prepare(dialog);
+    dialog.returnValue = "";
+    dialog.showModal();
+    dialog.addEventListener(
+      "close",
+      function () {
+        if (dialog.returnValue === "confirm") {
+          run(dialog);
+        }
+      },
+      { once: true }
+    );
+  }
+
+  /* Streams one machine-scoped action into that machine's own drawer, with
+   * the poll suppressed for its duration exactly as a lifecycle button does. */
+  async function streamForMachine(name, url, options) {
+    markStreaming(name, true);
+    var terminal = null;
+    try {
+      terminal = await streamAction(url, options, function (record) {
+        pushStreamLine(name, record);
+      });
+    } catch (error) {
+      terminal = { error: { kind: "generic", message: String(error) } };
+    } finally {
+      markStreaming(name, false);
+      closeDrawer(name);
+    }
+    return terminal;
+  }
+
+  function jsonBody(value) {
+    return {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/x-ndjson"
+      },
+      body: JSON.stringify(value)
+    };
+  }
+
+  /* The snapshots tab is not polled — a five-second swap under a table of
+   * destructive buttons would be its own hazard — so it is re-read explicitly
+   * after each command that changes it. */
+  function refreshSnapshots(name) {
+    var panel = qs("#fs-tabpanel");
+    var host = qs('[data-fs-snapshots="' + CSS.escape(name) + '"]');
+    if (!panel || !host || !window.htmx) {
+      refreshFromServer();
+      return;
+    }
+    window.htmx.ajax(
+      "GET",
+      "/ui/machines/" + encodeURIComponent(name) + "/tab/snapshots",
+      { target: panel, swap: "innerHTML" }
+    );
+    refreshFromServer();
+  }
+
+  /* ----------------------------------------------------------- snapshots -- */
+
+  function openSnapshotDialog(button, name, running) {
+    withDialog(
+      "#fs-snapshot-create",
+      function (dialog) {
+        var names = dialog.querySelectorAll("[data-fs-snapshot-name]");
+        Array.prototype.forEach.call(names, function (node) {
+          node.textContent = name;
+        });
+        show(qs('[data-fs-snapshot-tier="warm"]', dialog), running);
+        show(qs('[data-fs-snapshot-tier="cold"]', dialog), !running);
+        var field = qs("#fs-snapshot-name", dialog);
+        if (field) {
+          field.value = "";
+        }
+      },
+      function (dialog) {
+        var field = dialog && qs("#fs-snapshot-name", dialog);
+        runSnapshotCreate(button, name, field ? field.value.trim() : "");
+      }
+    );
+  }
+
+  async function runSnapshotCreate(button, name, snapshot) {
+    if (button) {
+      clearInlineNotice(button);
+    }
+    /* The identifier is optional: absent asks the server for
+     * snap-<yyyymmdd>-<hhmmss> from the UTC instant of the request (§23.1).
+     * An empty body would mean the same thing; "{}" is sent because that is
+     * what the route's optional-JSON parser reads either way. */
+    var body = snapshot ? { snapshot: snapshot } : {};
+    var terminal = await streamForMachine(
+      name,
+      "/v1/machines/" + encodeURIComponent(name) + "/snapshots",
+      jsonBody(body)
+    );
+
+    if (isErrorEnvelope(terminal)) {
+      if (button) {
+        inlineNotice(button, terminal, terminal.error.kind !== "conflict");
+      }
+      toast(name + " · snapshot failed", terminal.error.message, "fail");
+      return;
+    }
+    var payload = (terminal && terminal.payload) || {};
+    toast(
+      "snapshot " + (payload.snapshot || "taken"),
+      payload.kind ? payload.kind + " · " + compactJson(terminal) : compactJson(terminal),
+      "ok"
+    );
+    refreshSnapshots(name);
+  }
+
+  function openRestoreDialog(button, name, snapshot, warm, running) {
+    withDialog(
+      "#fs-snapshot-restore",
+      function (dialog) {
+        setText(dialog, "[data-fs-restore-name]", name);
+        setText(dialog, "[data-fs-restore-snapshot]", snapshot);
+        show(qs("[data-fs-restore-warm]", dialog), warm);
+        /* force exists for exactly one situation: the machine is running and
+         * a restore would otherwise be refused. Offering the checkbox on a
+         * stopped machine would suggest the restore needs permission it does
+         * not need. */
+        show(qs("[data-fs-restore-force-row]", dialog), running);
+        var force = qs("#fs-restore-force", dialog);
+        if (force) {
+          force.checked = false;
+        }
+      },
+      function (dialog) {
+        var force = dialog && qs("#fs-restore-force", dialog);
+        runSnapshotRestore(button, name, snapshot, !!(force && force.checked));
+      }
+    );
+  }
+
+  async function runSnapshotRestore(button, name, snapshot, force) {
+    if (button) {
+      clearInlineNotice(button);
+    }
+    var terminal = await streamForMachine(
+      name,
+      "/v1/machines/" +
+        encodeURIComponent(name) +
+        "/snapshots/" +
+        encodeURIComponent(snapshot) +
+        "/restore",
+      jsonBody({ force: force })
+    );
+
+    if (isErrorEnvelope(terminal)) {
+      if (button) {
+        inlineNotice(button, terminal, terminal.error.kind !== "conflict");
+      }
+      toast(name + " · restore failed", terminal.error.message, "fail");
+      return;
+    }
+    var payload = (terminal && terminal.payload) || {};
+    toast(
+      "restored " + name + " to " + snapshot,
+      payload.started ? "running again" : "stopped and startable",
+      "ok"
+    );
+    refreshSnapshots(name);
+  }
+
+  function openSnapshotDeleteDialog(button, name, snapshot) {
+    withDialog(
+      "#fs-snapshot-delete",
+      function (dialog) {
+        setText(dialog, "[data-fs-snapdelete-name]", name);
+        setText(dialog, "[data-fs-snapdelete-snapshot]", snapshot);
+      },
+      function () {
+        runSnapshotDelete(button, name, snapshot);
+      }
+    );
+  }
+
+  async function runSnapshotDelete(button, name, snapshot) {
+    if (button) {
+      clearInlineNotice(button);
+    }
+    var terminal = await streamForMachine(
+      name,
+      "/v1/machines/" +
+        encodeURIComponent(name) +
+        "/snapshots/" +
+        encodeURIComponent(snapshot),
+      { method: "DELETE", headers: { Accept: "application/json" } }
+    );
+
+    if (isErrorEnvelope(terminal)) {
+      if (button) {
+        inlineNotice(button, terminal, true);
+      }
+      toast(name + " · delete failed", terminal.error.message, "fail");
+      return;
+    }
+    toast("removed " + snapshot, "DELETE 204 · " + name, "ok");
+    refreshSnapshots(name);
+  }
+
+  /* --------------------------------------------------------------- clone -- */
+
+  function openCloneDialog(button, source) {
+    withDialog(
+      "#fs-clone",
+      function (dialog) {
+        setText(dialog, "[data-fs-clone-source]", source);
+        var field = qs("#fs-clone-name", dialog);
+        if (field) {
+          field.value = "";
+        }
+        var fresh = qs("#fs-clone-fresh", dialog);
+        if (fresh) {
+          fresh.checked = false;
+        }
+        var error = qs("[data-fs-clone-error]", dialog);
+        if (error) {
+          error.hidden = true;
+          error.textContent = "";
+        }
+      },
+      function (dialog) {
+        var field = dialog && qs("#fs-clone-name", dialog);
+        var fresh = dialog && qs("#fs-clone-fresh", dialog);
+        var dest = field ? field.value.trim() : "";
+        if (!dest) {
+          /* The one refusal the browser makes on its own: without a name there
+           * is no request body to build. Every other rule about the name is
+           * the server's. */
+          toast("clone needs a name", "give the new machine a name", "fail");
+          return;
+        }
+        runClone(button, source, dest, !!(fresh && fresh.checked));
+      }
+    );
+  }
+
+  async function runClone(button, source, dest, freshDisk) {
+    if (button) {
+      clearInlineNotice(button);
+    }
+    var terminal = await streamForMachine(
+      source,
+      "/v1/machines/" + encodeURIComponent(source) + "/clone",
+      jsonBody({ name: dest, fresh_disk: freshDisk })
+    );
+
+    if (isErrorEnvelope(terminal)) {
+      if (button) {
+        inlineNotice(button, terminal, terminal.error.kind !== "conflict");
+      }
+      toast(source + " · clone failed", terminal.error.message, "fail");
+      return;
+    }
+    toast("cloned " + source + " to " + dest, compactJson(terminal), "ok");
+    refreshFromServer();
+    goToMachine(dest);
+  }
+
+  /* The clone's whole point is the new machine, so the terminal Result lands
+   * on its page rather than leaving the operator to find it in the list. */
+  function goToMachine(name) {
+    var path = "/machines/" + encodeURIComponent(name);
+    if (!window.htmx || !qs("#fs-main-content")) {
+      window.location.assign(path);
+      return;
+    }
+    window.htmx.ajax("GET", path, {
+      target: "#fs-main-content",
+      swap: "innerHTML"
+    });
+    window.history.pushState({}, "", path);
+  }
+
+  /* -------------------------------------------------------------- images -- */
+
+  function openImageDeleteDialog(button, id, reference) {
+    withDialog(
+      "#fs-image-delete",
+      function (dialog) {
+        setText(dialog, "[data-fs-imagedelete-ref]", reference || id);
+      },
+      function () {
+        runImageDelete(button, id);
+      }
+    );
+  }
+
+  async function runImageDelete(button, id) {
+    if (button) {
+      clearInlineNotice(button);
+      button.disabled = true;
+    }
+    var terminal;
+    try {
+      terminal = await streamAction(
+        "/v1/images/" + encodeURIComponent(id),
+        { method: "DELETE", headers: { Accept: "application/json" } },
+        function () {}
+      );
+    } catch (error) {
+      terminal = { error: { kind: "generic", message: String(error) } };
+    }
+    if (button && button.isConnected) {
+      button.disabled = false;
+    }
+
+    if (isErrorEnvelope(terminal)) {
+      /* The refusal that matters here names what is holding the image — a
+       * machine, or a snapshot that pins it as its base (§8.4, §23.2). It is
+       * shown beside the row, in full, because "conflict" alone would leave
+       * the operator guessing at which machine to stop. */
+      if (button) {
+        inlineNotice(button, terminal, terminal.error.kind !== "conflict");
+      }
+      toast("image not removed", terminal.error.message, "fail");
+      return;
+    }
+    toast("removed image", "DELETE 204 · " + id, "ok");
+    refreshFromServer();
+  }
+
+  function openImagePruneDialog(button) {
+    withDialog(
+      "#fs-image-prune",
+      function () {},
+      function () {
+        runImagePrune(button);
+      }
+    );
+  }
+
+  async function runImagePrune(button) {
+    if (button) {
+      clearInlineNotice(button);
+      button.disabled = true;
+    }
+    var terminal;
+    try {
+      /* The route refuses a body outright, so none is sent and no
+       * Content-Type is declared either. */
+      terminal = await streamAction(
+        "/v1/images/prune",
+        { method: "POST", headers: { Accept: "application/json" } },
+        function () {}
+      );
+    } catch (error) {
+      terminal = { error: { kind: "generic", message: String(error) } };
+    }
+    if (button && button.isConnected) {
+      button.disabled = false;
+    }
+
+    if (isErrorEnvelope(terminal)) {
+      if (button) {
+        inlineNotice(button, terminal, true);
+      }
+      toast("prune failed", terminal.error.message, "fail");
+      return;
+    }
+    var payload = prunePayload(terminal) || {};
+    var removed = payload.removed ? payload.removed.length : 0;
+    toast(
+      removed === 1 ? "pruned 1 image" : "pruned " + removed + " images",
+      formatByteSize(payload.bytes_freed || 0) + " reclaimed",
+      "ok"
+    );
+    refreshFromServer();
+  }
+
+  /* --------------------------------------------------------- system prune -- */
+
+  /* The aggregate JSON body and the NDJSON terminal record carry the same
+   * payload in two shapes, and this section reads both rather than pinning
+   * the surface to one Accept header. */
+  function prunePayload(record) {
+    if (!record || typeof record !== "object") {
+      return null;
+    }
+    if (record.payload && typeof record.payload === "object") {
+      return record.payload;
+    }
+    if (record.removed || record.reclaimed_bytes !== undefined) {
+      return record;
+    }
+    return null;
+  }
+
+  function pruneRequest(dialog, dryRun) {
+    var machines = qs("#fs-prune-machines", dialog);
+    var images = qs("#fs-prune-images", dialog);
+    var wantsMachines = !!(machines && machines.checked);
+    return {
+      machines: wantsMachines,
+      images: !!(images && images.checked),
+      /* Removing a stopped machine is still removing a machine, so the tier is
+       * only ever requested with the flag that says so out loud. */
+      force: wantsMachines,
+      dry_run: !!dryRun
+    };
+  }
+
+  function openSystemPruneDialog() {
+    var dialog = qs("#fs-system-prune");
+    if (!dialog) {
+      return;
+    }
+    var machines = qs("#fs-prune-machines", dialog);
+    var images = qs("#fs-prune-images", dialog);
+    if (machines) {
+      machines.checked = false;
+    }
+    if (images) {
+      images.checked = false;
+    }
+    dialog.returnValue = "";
+    dialog.showModal();
+    previewSystemPrune(dialog);
+    dialog.addEventListener(
+      "close",
+      function () {
+        if (dialog.returnValue === "confirm") {
+          runSystemPrune(dialog);
+        }
+      },
+      { once: true }
+    );
+  }
+
+  /* The dry run. Until it answers there is nothing to approve, so the confirm
+   * button stays disabled: a "Remove" that fires against an unknown list is
+   * the exact failure this dialog exists to prevent. */
+  async function previewSystemPrune(dialog) {
+    var state = qs("[data-fs-prune-state]", dialog);
+    var rows = qs("[data-fs-prune-rows]", dialog);
+    var total = qs("[data-fs-prune-total]", dialog);
+    var submit = qs("[data-fs-prune-submit]", dialog);
+    if (submit) {
+      submit.disabled = true;
+    }
+    if (rows) {
+      rows.textContent = "";
+    }
+    if (total) {
+      total.textContent = "";
+    }
+    if (state) {
+      state.textContent = "counting…";
+    }
+
+    var record;
+    try {
+      record = await streamAction(
+        SYSTEM_PRUNE_URL,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json"
+          },
+          body: JSON.stringify(pruneRequest(dialog, true))
+        },
+        function () {}
+      );
+    } catch (error) {
+      record = { error: { kind: "generic", message: String(error) } };
+    }
+
+    if (isErrorEnvelope(record)) {
+      if (state) {
+        state.textContent = record.error.message;
+      }
+      return;
+    }
+    var payload = prunePayload(record);
+    if (!payload) {
+      if (state) {
+        state.textContent = "the preview did not answer with a removal list";
+      }
+      return;
+    }
+    renderPrunePreview(dialog, payload);
+    if (submit) {
+      submit.disabled = false;
+    }
+  }
+
+  function renderPrunePreview(dialog, payload) {
+    var state = qs("[data-fs-prune-state]", dialog);
+    var rows = qs("[data-fs-prune-rows]", dialog);
+    var total = qs("[data-fs-prune-total]", dialog);
+    var removed = payload.removed || [];
+
+    if (state) {
+      state.textContent =
+        removed.length === 1
+          ? "1 item would be removed"
+          : removed.length + " items would be removed";
+    }
+    if (rows) {
+      rows.textContent = "";
+      removed.forEach(function (item) {
+        var row = el("div", "fs-prune-row");
+        row.setAttribute("data-fs-prune-kind", item.kind || "");
+        row.appendChild(el("span", "fs-prune-row__kind", item.kind || "?"));
+        row.appendChild(el("span", "fs-prune-row__id", item.id || ""));
+        row.appendChild(
+          el("span", "fs-prune-row__bytes", formatByteSize(item.bytes || 0))
+        );
+        rows.appendChild(row);
+      });
+    }
+    if (total) {
+      total.textContent =
+        formatByteSize(payload.reclaimed_bytes || 0) + " would be reclaimed";
+    }
+  }
+
+  async function runSystemPrune(dialog) {
+    var record;
+    try {
+      record = await streamAction(
+        SYSTEM_PRUNE_URL,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/x-ndjson"
+          },
+          body: JSON.stringify(pruneRequest(dialog, false))
+        },
+        function () {}
+      );
+    } catch (error) {
+      record = { error: { kind: "generic", message: String(error) } };
+    }
+
+    if (isErrorEnvelope(record)) {
+      toast("prune failed", record.error.message, "fail");
+      return;
+    }
+    var payload = prunePayload(record) || {};
+    var removed = payload.removed ? payload.removed.length : 0;
+    toast(
+      removed === 1 ? "removed 1 item" : "removed " + removed + " items",
+      formatByteSize(payload.reclaimed_bytes || 0) + " reclaimed",
+      "ok"
+    );
+    refreshFromServer();
+  }
+
+  /* ----------------------------------------------------------- listeners -- */
+
+  /* Bubble phase, and after every handler above: a command button inside a
+   * row must not also navigate the row, and the capture-phase listener at the
+   * top of this file already stops the ones it owns. */
+  document.addEventListener("click", function (event) {
+    if (event.defaultPrevented) {
+      return;
+    }
+
+    var snapshotButton = event.target.closest("[data-fs-snapshot-action]");
+    if (snapshotButton) {
+      event.preventDefault();
+      event.stopPropagation();
+      var kind = snapshotButton.getAttribute("data-fs-snapshot-action");
+      var machine = snapshotButton.getAttribute("data-fs-machine");
+      var snapshot = snapshotButton.getAttribute("data-fs-snapshot");
+      if (kind === "create") {
+        openSnapshotDialog(
+          snapshotButton,
+          machine,
+          snapshotButton.getAttribute("data-fs-snapshot-kind") === "warm"
+        );
+      } else if (kind === "restore") {
+        openRestoreDialog(
+          snapshotButton,
+          machine,
+          snapshot,
+          snapshotButton.getAttribute("data-fs-snapshot-kind") === "warm",
+          snapshotButton.getAttribute("data-fs-running") === "true"
+        );
+      } else if (kind === "delete") {
+        openSnapshotDeleteDialog(snapshotButton, machine, snapshot);
+      }
+      return;
+    }
+
+    var cloneButton = event.target.closest("[data-fs-clone]");
+    if (cloneButton && !cloneButton.disabled) {
+      event.preventDefault();
+      event.stopPropagation();
+      closeRowMenus(null);
+      openCloneDialog(cloneButton, cloneButton.getAttribute("data-fs-clone"));
+      return;
+    }
+
+    var imageButton = event.target.closest("[data-fs-image-action]");
+    if (imageButton) {
+      event.preventDefault();
+      event.stopPropagation();
+      openImageDeleteDialog(
+        imageButton,
+        imageButton.getAttribute("data-fs-image"),
+        imageButton.getAttribute("data-fs-image-ref")
+      );
+      return;
+    }
+
+    var pruneButton = event.target.closest("[data-fs-prune]");
+    if (pruneButton) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (pruneButton.getAttribute("data-fs-prune") === "system") {
+        openSystemPruneDialog();
+      } else {
+        openImagePruneDialog(pruneButton);
+      }
+      return;
+    }
+
+    var paletteAction = event.target.closest("[data-fs-palette-action]");
+    if (paletteAction) {
+      event.preventDefault();
+      runPaletteAction(
+        paletteAction.getAttribute("data-fs-palette-action"),
+        paletteAction.getAttribute("data-fs-machine"),
+        paletteAction.getAttribute("data-fs-running") === "true"
+      );
+      return;
+    }
+
+    /* A menu left open over a table that repaints every five seconds is a
+     * click target that moves, so any click outside one closes it. */
+    closeRowMenus(event.target.closest("[data-fs-row-menu]"));
+  });
+
+  function closeRowMenus(keep) {
+    var menus = document.querySelectorAll("[data-fs-row-menu][open]");
+    Array.prototype.forEach.call(menus, function (menu) {
+      if (menu !== keep) {
+        menu.open = false;
+      }
+    });
+  }
+
+  function runPaletteAction(kind, machine, running) {
+    if (kind === "prune-images") {
+      openImagePruneDialog(null);
+    } else if (kind === "prune-system") {
+      openSystemPruneDialog();
+    } else if (kind === "snapshot" && machine) {
+      openSnapshotDialog(null, machine, running);
+    } else if (kind === "clone" && machine) {
+      openCloneDialog(null, machine);
+    }
+  }
+
+  /* Changing a tier re-runs the preview, because the list the operator is
+   * about to approve just changed. */
+  document.addEventListener("change", function (event) {
+    var option = event.target.closest("[data-fs-prune-option]");
+    if (!option) {
+      return;
+    }
+    var dialog = option.closest("dialog");
+    if (dialog) {
+      previewSystemPrune(dialog);
+    }
+  });
+
+  window.firestoneFeatures = {
+    prunePayload: prunePayload,
+    pruneRequest: pruneRequest
   };
 })();

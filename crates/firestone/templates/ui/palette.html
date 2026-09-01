@@ -28,7 +28,24 @@
 {% endfor %}
 {% endif %}
 
-{% if not machines and not images %}
+{# Commands (M6-26). The palette opens the dialog; every write still leaves
+   the browser for `/v1`, exactly as the buttons on the screens do. #}
+{% if actions %}
+<div class="fs-palette__group">Actions</div>
+{% for command in actions %}
+<button type="button" class="fs-palette__item" role="option" data-fs-palette-item
+        data-fs-palette-action="{{ command.kind }}"
+        data-fs-machine="{{ command.machine }}"
+        data-fs-running="{{ 'true' if command.running else 'false' }}"
+        data-fs-dialog-close>
+  <span class="fs-dot fs-dot--xs" data-status="idle"></span>
+  <span>{{ command.label }}</span>
+  <span class="fs-palette__item-meta">{{ command.note }}</span>
+</button>
+{% endfor %}
+{% endif %}
+
+{% if not machines and not images and not actions %}
 <div class="fs-palette__empty">
   {% if query %}Nothing matches “{{ query }}”{% else %}Type to search machines and images{% endif %}
 </div>

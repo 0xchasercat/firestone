@@ -27,6 +27,11 @@ struct FakeDispatcher {
     machines: Value,
     machine: Value,
     catalog: Value,
+    /// The `snapshot-list` payload the snapshots tab reads (M6-26).
+    snapshots: Value,
+    /// The `images-ls` payload, so the cached-images table can be driven with
+    /// more than the one entry the picker needs.
+    images: Value,
     /// Injected to prove failures render as pages and fragments rather than
     /// panicking or leaking a blank response.
     fail: Option<ErrorKind>,
@@ -70,9 +75,47 @@ impl Default for FakeDispatcher {
                 "aliases": ["noble"],
                 "architectures": [{ "architecture": "x86_64", "firmware": "edk2" }]
             }]),
+            snapshots: json!({ "snapshots": [] }),
+            images: json!([stored_image(
+                "sha256-abc",
+                "ubuntu:24.04",
+                642_000_000,
+                None
+            )]),
             fail: None,
         }
     }
+}
+
+/// One `images-ls` entry, shaped exactly like the stored sidecar the REST
+/// route serializes. `kind` is omitted for a disk image, which is what the
+/// real sidecar does (§8.5), so an absent field is exercised rather than
+/// assumed.
+fn stored_image(id: &str, reference: &str, size: u64, kind: Option<&str>) -> Value {
+    let mut image = json!({
+        "metadata": {
+            "version": 1,
+            "id": id,
+            "generation": 1,
+            "source_ref": reference,
+            "source_url": null,
+            "source_sha256": "a",
+            "stored_sha256": "b",
+            "architecture": "x86_64",
+            "firmware": "edk2",
+            "source_format": "qcow2",
+            "stored_format": "qcow2",
+            "verification_algorithm": null,
+            "verification_digest": null,
+            "size": size,
+            "pulled_at": "2026-09-01T05:00:00Z"
+        },
+        "path": format!("/data/images/{id}.qcow2")
+    });
+    if let Some(kind) = kind {
+        image["metadata"]["kind"] = json!(kind);
+    }
+    image
 }
 
 fn machine_view(name: &str, status: &str) -> Value {
@@ -143,29 +186,8 @@ impl Dispatcher for FakeDispatcher {
                     "show-vmconfig",
                     json!({ "cpus": { "boot_vcpus": 4, "max_vcpus": 4 } }),
                 ),
-                Action::ImageList => (
-                    "images-ls",
-                    json!([{
-                        "metadata": {
-                            "version": 1,
-                            "id": "sha256-abc",
-                            "generation": 1,
-                            "source_ref": "ubuntu:24.04",
-                            "source_url": null,
-                            "source_sha256": "a",
-                            "stored_sha256": "b",
-                            "architecture": "x86_64",
-                            "firmware": "edk2",
-                            "source_format": "qcow2",
-                            "stored_format": "qcow2",
-                            "verification_algorithm": null,
-                            "verification_digest": null,
-                            "size": 642_000_000u64,
-                            "pulled_at": "2026-09-01T05:00:00Z"
-                        },
-                        "path": "/data/images/sha256-abc.qcow2"
-                    }]),
-                ),
+                Action::ImageList => ("images-ls", self.images.clone()),
+                Action::SnapshotList { .. } => ("snapshot-list", self.snapshots.clone()),
                 Action::CatalogList => ("catalog", self.catalog.clone()),
                 Action::Doctor { .. } => (
                     "doctor",
@@ -1950,6 +1972,529 @@ async fn the_terminal_page_offers_no_mutation_surface_of_its_own() -> TestResult
         1,
         "term.js makes a request beyond the one machine read"
     );
+    Ok(())
+}
+
+// ================= snapshots, clone, images, prune surfaces (M6-26) =========
+
+/// Undoes minijinja's HTML escaping across a whole rendered body.
+///
+/// The escaper rewrites `/` as `&#x2f;`, so every URL in the markup — a chip's
+/// `http://…` href, a tab's fragment path — is escaped by the time it reaches
+/// a test. A browser reads those entities back; so does this, rather than
+/// asserting against a spelling no operator will ever see.
+fn decoded(body: &str) -> String {
+    body.replace("&#x2f;", "/")
+        .replace("&#x2F;", "/")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&amp;", "&")
+}
+
+/// A snapshot list with both tiers, so the tab can be held to §23's semantics
+/// rather than to one row.
+fn snapshot_list() -> Value {
+    json!({
+        "snapshots": [
+            {
+                "snapshot": "before-upgrade",
+                "kind": "cold",
+                "created_at": "2026-09-01T01:00:00Z",
+                "image_id": "sha256-abc",
+                "disk_bytes": 1_500_000_000u64
+            },
+            {
+                "snapshot": "snap-20260902-020000",
+                "kind": "warm",
+                "created_at": "2026-09-02T02:00:00Z",
+                "image_id": "sha256-abc",
+                "disk_bytes": 642_000_000u64,
+                "memory_bytes": 8_589_934_592u64
+            }
+        ]
+    })
+}
+
+/// A fleet whose forwards exercise every chip branch at once: a plain TCP
+/// forward, one with a bind address, a UDP forward, a port range, and a
+/// running machine whose spec has forwards it has not applied.
+fn forward_fleet() -> Value {
+    json!([
+        {
+            "name": "web",
+            "status": "running",
+            "image": "ubuntu:24.04",
+            "cpus": 4,
+            "memory": "8G",
+            "uptime": "2h 14m",
+            "forwards": [
+                "8080:80",
+                "192.168.1.5:9090:90",
+                "udp:5353:5353",
+                "8000-8010:80-90"
+            ],
+            "forwards_pending": true
+        },
+        {
+            "name": "staging-db",
+            "status": "stopped",
+            "image": "debian:12",
+            "cpus": 2,
+            "memory": "4G",
+            "uptime": null,
+            "forwards": ["5432:5432"],
+            "forwards_pending": false
+        }
+    ])
+}
+
+#[tokio::test]
+async fn the_snapshots_tab_lists_every_snapshot_with_its_tier_and_actions() -> TestResult {
+    let router = app(FakeDispatcher {
+        snapshots: snapshot_list(),
+        ..FakeDispatcher::default()
+    })?;
+    let (status, _, body) = get_fragment(&router, "/ui/machines/web/tab/snapshots").await?;
+    assert_eq!(status, StatusCode::OK);
+
+    // Both rows, both tiers, and the figures the list result carries.
+    assert!(body.contains(r#"data-fs-snapshot-row="before-upgrade""#));
+    assert!(body.contains(r#"data-fs-snapshot-row="snap-20260902-020000""#));
+    assert!(body.contains(r#"data-fs-tier="cold""#));
+    assert!(body.contains(r#"data-fs-tier="warm""#));
+    assert!(body.contains("1.5 GB"), "the disk size is missing");
+    assert!(body.contains("8.5 GB"), "the warm memory size is missing");
+    // A cold snapshot captured no memory; it did not capture zero bytes.
+    assert!(
+        body.contains("—"),
+        "a cold memory figure must be an em dash"
+    );
+
+    // Every row offers both writes, each behind a confirm.
+    assert!(body.contains(r#"data-fs-snapshot-action="restore""#));
+    assert!(body.contains(r#"data-fs-snapshot-action="delete""#));
+    assert!(body.contains(r#"data-fs-confirm="restore""#));
+    assert!(body.contains(r#"data-fs-confirm="delete""#));
+    assert!(body.contains(r#"data-fs-snapshot="before-upgrade""#));
+    // The restore button carries the machine's own state, because that is what
+    // decides whether force is even offered (§23.5).
+    assert!(body.contains(r#"data-fs-running="true""#));
+    // Colour is never emitted; the tier is a token resolved in CSS.
+    assert!(!body.contains(" style=\""), "the tab emitted a style");
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_snapshots_tab_explains_itself_when_a_machine_has_none() -> TestResult {
+    let router = app(FakeDispatcher::default())?;
+    let (status, _, body) = get_fragment(&router, "/ui/machines/web/tab/snapshots").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("data-fs-snapshot-empty"), "no empty state");
+    assert!(body.contains("No snapshots yet"));
+    // The empty state still states what a restore does, because that is the
+    // fact worth knowing before the first snapshot exists.
+    assert!(body.contains("Restoring one replaces all three"));
+    assert!(!body.contains("data-fs-snapshot-row"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_snapshot_button_names_the_pause_a_running_machine_will_take() -> TestResult {
+    // §23: a snapshot of a running machine is warm, and warm means the guest
+    // is paused. Discovering that from a stall is not acceptable.
+    let running = app(FakeDispatcher::default())?;
+    let (_, _, body) = get_fragment(&running, "/ui/machines/web/tab/snapshots").await?;
+    assert!(body.contains("Snapshot (brief pause)"));
+    assert!(body.contains(r#"data-fs-snapshot-kind="warm""#));
+    assert!(body.contains(r#"data-fs-snapshot-action="create""#));
+
+    let stopped = app(FakeDispatcher {
+        machine: machine_view("web", "stopped"),
+        ..FakeDispatcher::default()
+    })?;
+    let (_, _, cold) = get_fragment(&stopped, "/ui/machines/web/tab/snapshots").await?;
+    assert!(cold.contains("Take snapshot"));
+    assert!(cold.contains(r#"data-fs-snapshot-kind="cold""#));
+    assert!(!cold.contains("brief pause"));
+
+    // A machine mid-transition has no coherent disk to copy, so the button is
+    // withheld rather than offered as a request that can only be refused.
+    for status in ["starting", "stopping", "failed"] {
+        let router = app(FakeDispatcher {
+            machine: machine_view("web", status),
+            ..FakeDispatcher::default()
+        })?;
+        let (_, _, body) = get_fragment(&router, "/ui/machines/web/tab/snapshots").await?;
+        assert!(
+            body.contains("data-fs-snapshot-blocked"),
+            "a {status} machine was offered a snapshot"
+        );
+        assert!(!body.contains(r#"data-fs-snapshot-action="create""#));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_tab_strip_offers_snapshots_and_still_marks_exactly_one_tab() -> TestResult {
+    let router = app(FakeDispatcher {
+        snapshots: snapshot_list(),
+        ..FakeDispatcher::default()
+    })?;
+    let (status, _, raw) = get(&router, "/machines/web?tab=snapshots").await?;
+    let page = decoded(&raw);
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("/ui/machines/web/tab/snapshots"));
+    assert!(page.contains(">Snapshots</a>"));
+    assert!(
+        page.contains("data-fs-snapshot-row"),
+        "the tab did not open"
+    );
+    assert_eq!(
+        page.matches(r#"aria-selected="true""#).count(),
+        1,
+        "exactly one tab may be selected"
+    );
+
+    // An unknown tab is still the spec tab, and still exactly one selection.
+    let (_, _, unknown) = get(&router, "/machines/web?tab=nonsense").await?;
+    assert_eq!(unknown.matches(r#"aria-selected="true""#).count(), 1);
+    assert!(!unknown.contains("data-fs-snapshot-row"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn clone_is_offered_from_the_detail_head_and_the_row_menu() -> TestResult {
+    let stopped = app(FakeDispatcher {
+        machines: forward_fleet(),
+        machine: machine_view("staging-db", "stopped"),
+        ..FakeDispatcher::default()
+    })?;
+    let (_, _, head) = get_fragment(&stopped, "/ui/machines/staging-db/head").await?;
+    assert!(head.contains(r#"data-fs-clone="staging-db""#));
+    assert!(
+        !head.contains("stop staging-db first"),
+        "a stopped machine's clone button must not be refused in advance"
+    );
+
+    let (_, _, raw) = get_fragment(&stopped, "/ui/machines/rows").await?;
+    let rows = decoded(&raw);
+    assert!(rows.contains(r#"data-fs-row-menu="staging-db""#));
+    assert!(rows.contains(r#"data-fs-clone="staging-db""#));
+    // The menu also reaches the snapshots tab for that machine.
+    assert!(rows.contains("/machines/staging-db?tab=snapshots"));
+
+    // §24.2: a running source is refused before the lock is taken, so the
+    // control says so rather than spending a round trip to be told.
+    assert!(
+        rows.contains(r#"data-fs-clone="web""#) && rows.contains("stop web first"),
+        "a running machine must be offered a disabled clone with a reason"
+    );
+
+    // The clone control is never a lifecycle button: `data-fs-machine` means
+    // "this dispatches start/stop/restart/delete" and nothing else, so a
+    // transitioning machine still carries a clone entry and no lifecycle one.
+    let default = app(FakeDispatcher::default())?;
+    let (_, _, transitioning) = get_fragment(&default, "/ui/machines/rows").await?;
+    assert!(transitioning.contains(r#"data-fs-clone="mid-flight""#));
+    assert!(!transitioning.contains(r#"data-fs-machine="mid-flight""#));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_clone_dialog_takes_a_name_and_an_empty_disk_choice() -> TestResult {
+    let router = app(FakeDispatcher::default())?;
+    let (_, _, body) = get(&router, "/machines/web").await?;
+
+    assert!(body.contains(r#"id="fs-clone""#), "no clone dialog");
+    assert!(body.contains(r#"id="fs-clone-name""#));
+    assert!(body.contains(r#"id="fs-clone-fresh""#));
+    assert!(body.contains("Empty disk"));
+    assert!(body.contains("data-fs-clone-source"));
+    // The known limitation §24.4 names is stated where the choice is made.
+    assert!(decoded(&body).contains("/etc/machine-id"));
+    assert!(body.contains("The base image"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_catalog_lists_cached_images_with_an_oci_badge_and_a_delete() -> TestResult {
+    let router = app(FakeDispatcher {
+        images: json!([
+            stored_image("sha256-abc", "ubuntu:24.04", 642_000_000, None),
+            stored_image(
+                "sha256-0123456789abcdef",
+                "docker.io/library/alpine:3.20",
+                1_500_000_000,
+                Some("oci"),
+            ),
+        ]),
+        ..FakeDispatcher::default()
+    })?;
+
+    for uri in ["/catalog", "/ui/catalog/images"] {
+        let (status, _, body) = get_fragment(&router, uri).await?;
+        assert_eq!(status, StatusCode::OK, "{uri} did not render");
+        assert!(
+            body.contains(r#"data-fs-image-row="sha256-abc""#),
+            "{uri} lost a cached image"
+        );
+        assert!(body.contains("642 MB") && body.contains("1.5 GB"), "{uri}");
+        assert!(
+            body.contains("2026-09-01T05:00:00Z"),
+            "{uri} does not report when the image was pulled"
+        );
+        // An OCI-derived image is badged; a disk image carries no badge at all.
+        assert!(
+            body.contains(r#"data-fs-tier="oci""#),
+            "{uri} does not badge the OCI image"
+        );
+        assert_eq!(
+            body.matches(r#"data-fs-tier="oci""#).count(),
+            1,
+            "{uri} badged an image that is not OCI"
+        );
+        // Every row offers a delete that carries the id the route takes and
+        // the reference a human reads in the confirm.
+        assert!(body.contains(r#"data-fs-image-action="delete""#), "{uri}");
+        assert!(body.contains(r#"data-fs-image="sha256-abc""#), "{uri}");
+        assert!(
+            body.contains(r#"data-fs-image-ref="ubuntu:24.04""#),
+            "{uri}"
+        );
+        // The id is shortened for reading and kept whole in the title.
+        assert!(body.contains("sha256-0123456789ab…"), "{uri}");
+        assert!(body.contains(r#"title="sha256-0123456789abcdef""#), "{uri}");
+    }
+
+    // An empty store explains itself rather than rendering an empty table.
+    let bare = app(FakeDispatcher {
+        images: json!([]),
+        ..FakeDispatcher::default()
+    })?;
+    let (_, _, empty) = get_fragment(&bare, "/ui/catalog/images").await?;
+    assert!(empty.contains("data-fs-images-empty"));
+    assert!(empty.contains("No images cached"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_image_delete_confirm_states_what_would_refuse_it() -> TestResult {
+    let router = app(FakeDispatcher::default())?;
+    let (_, _, body) = get(&router, "/catalog").await?;
+
+    assert!(body.contains(r#"id="fs-image-delete""#));
+    assert!(body.contains("data-fs-imagedelete-ref"));
+    // The refusal an operator will actually hit is named up front: an image a
+    // machine or a snapshot pins is kept, and Firestone says what holds it.
+    assert!(body.contains("A machine or a snapshot that pins it keeps"));
+    assert!(body.contains("names what is holding it"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_catalog_offers_both_prune_surfaces_narrow_one_first() -> TestResult {
+    // Both live on /catalog because that is the screen that shows what is on
+    // disk, and the bounded command is read before the broad one.
+    let router = app(FakeDispatcher::default())?;
+    let (_, _, body) = get(&router, "/catalog").await?;
+
+    let images = body
+        .find(r#"data-fs-prune="images""#)
+        .ok_or("no image prune button")?;
+    let system = body
+        .find(r#"data-fs-prune="system""#)
+        .ok_or("no system prune button")?;
+    assert!(images < system, "the broad command must not come first");
+    assert!(body.contains("Prune unused images"));
+    assert!(body.contains("Free disk space"));
+
+    assert!(body.contains(r#"id="fs-image-prune""#));
+    assert!(body.contains("no machine and no snapshot references"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_system_prune_dialog_previews_before_it_removes() -> TestResult {
+    let router = app(FakeDispatcher::default())?;
+    let (_, _, body) = get(&router, "/catalog").await?;
+
+    assert!(body.contains(r#"id="fs-system-prune""#), "no prune dialog");
+    // The two tiers, each mapped to the flag it actually sets.
+    assert!(body.contains(r#"id="fs-prune-machines""#));
+    assert!(body.contains(r#"id="fs-prune-images""#));
+    assert!(body.contains("Also remove stopped machines"));
+    assert!(body.contains("Also remove unused images"));
+    assert!(body.matches("data-fs-prune-option").count() >= 2);
+
+    // The preview region, and a confirm that starts disabled: there is nothing
+    // to approve until the dry run has answered.
+    assert!(body.contains("data-fs-prune-preview"));
+    assert!(body.contains("data-fs-prune-rows"));
+    assert!(body.contains("data-fs-prune-total"));
+    assert!(body.contains("data-fs-prune-submit disabled"));
+    assert!(body.contains("dry_run: true"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn forward_chips_link_a_running_tcp_forward_and_nothing_else() -> TestResult {
+    let router = app(FakeDispatcher {
+        machines: forward_fleet(),
+        ..FakeDispatcher::default()
+    })?;
+    let (_, _, raw) = get_fragment(&router, "/ui/machines/rows").await?;
+    let rows = decoded(&raw);
+
+    // A single TCP forward on a running machine is a link, at loopback when
+    // nothing was bound and at the bind address when something was.
+    assert!(
+        rows.contains(r#"href="http://127.0.0.1:8080" target="_blank" rel="noopener""#),
+        "an unbound tcp forward did not become a chip link"
+    );
+    assert!(rows.contains(r#"href="http://192.168.1.5:9090""#));
+
+    // UDP is never linkified, and neither is a range: both render as chips
+    // with no href at all.
+    assert!(
+        !rows.contains("http://127.0.0.1:5353"),
+        "a udp forward was linkified"
+    );
+    assert!(rows.contains(r#"data-fs-forward="udp:5353:5353""#));
+    assert!(
+        !rows.contains("http://127.0.0.1:8000"),
+        "a port range was linkified"
+    );
+    assert!(rows.contains(r#"data-fs-forward="8000-8010:80-90""#));
+
+    // A stopped machine has applied nothing a browser can reach.
+    assert!(rows.contains(r#"data-fs-forward="5432:5432""#));
+    assert!(
+        !rows.contains("http://127.0.0.1:5432"),
+        "a stopped machine's forward was linkified"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pending_forward_set_is_marked_beside_the_chips_not_instead_of_them() -> TestResult {
+    let router = app(FakeDispatcher {
+        machines: forward_fleet(),
+        ..FakeDispatcher::default()
+    })?;
+    let (_, _, raw) = get_fragment(&router, "/ui/machines/rows").await?;
+    let rows = decoded(&raw);
+
+    assert!(rows.contains("data-fs-forwards-pending"), "no marker");
+    assert!(rows.contains("pending restart"));
+    // Exactly one row is marked: the running one whose spec moved on.
+    assert_eq!(rows.matches("data-fs-forwards-pending").count(), 1);
+    // The applied set is still shown, because it is what a client can reach.
+    assert!(rows.contains(r#"href="http://127.0.0.1:8080""#));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_detail_head_renders_the_applied_forwards_as_chips() -> TestResult {
+    let router = app(FakeDispatcher::default())?;
+    let (_, _, raw) = get_fragment(&router, "/ui/machines/web/head").await?;
+    let head = decoded(&raw);
+    assert!(head.contains(r#"data-fs-forward="127.0.0.1:8080:80""#));
+    assert!(head.contains(r#"href="http://127.0.0.1:8080""#));
+
+    // A stopped machine's head reports the same set, unlinked.
+    let stopped = app(FakeDispatcher {
+        machine: machine_view("web", "stopped"),
+        ..FakeDispatcher::default()
+    })?;
+    let (_, _, quiet_raw) = get_fragment(&stopped, "/ui/machines/web/head").await?;
+    let quiet = decoded(&quiet_raw);
+    assert!(quiet.contains(r#"data-fs-forward="127.0.0.1:8080:80""#));
+    assert!(!quiet.contains("http://127.0.0.1:8080"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_palette_offers_the_host_commands_and_verb_matched_machine_commands() -> TestResult {
+    let router = app(FakeDispatcher {
+        machines: forward_fleet(),
+        ..FakeDispatcher::default()
+    })?;
+
+    // The two host-wide commands are there for an empty query, because they
+    // are what the palette is opened for when nothing is named.
+    let (_, _, all) = get_fragment(&router, "/ui/palette").await?;
+    assert!(all.contains(r#"data-fs-palette-action="prune-images""#));
+    assert!(all.contains(r#"data-fs-palette-action="prune-system""#));
+    // Machine-scoped commands are verb-first, so an empty palette is a list of
+    // machines rather than two commands for every one of them.
+    assert!(!all.contains(r#"data-fs-palette-action="snapshot""#));
+    assert!(!all.contains(r#"data-fs-palette-action="clone""#));
+
+    let (_, _, snap) = get_fragment(&router, "/ui/palette?q=snap").await?;
+    assert!(snap.contains(r#"data-fs-palette-action="snapshot""#));
+    assert!(snap.contains("snapshot web"));
+    // The entry carries the machine's state, so the dialog can name the tier
+    // it is about to take without a second read.
+    assert!(snap.contains(r#"data-fs-running="true""#));
+
+    // A running machine cannot be cloned (§24.2), so it is not offered.
+    let (_, _, clone) = get_fragment(&router, "/ui/palette?q=clone").await?;
+    assert!(clone.contains("clone staging-db"));
+    assert!(
+        !clone.contains("clone web"),
+        "a running machine was offered a clone that can only be refused"
+    );
+
+    let (_, _, prune) = get_fragment(&router, "/ui/palette?q=prune").await?;
+    assert!(prune.contains(r#"data-fs-palette-action="prune-images""#));
+    assert!(prune.contains(r#"data-fs-palette-action="prune-system""#));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_new_surfaces_offer_no_mutation_surface_of_their_own() -> TestResult {
+    // Same rule as `the_ui_never_offers_a_second_mutation_surface`, applied to
+    // every template M6-26 added: snapshots, clone, image delete, both prunes
+    // and the palette commands all write to `/v1` from app.js, never to `/ui`.
+    let router = app(FakeDispatcher {
+        snapshots: snapshot_list(),
+        ..FakeDispatcher::default()
+    })?;
+
+    for uri in [
+        "/machines/web?tab=snapshots",
+        "/ui/machines/web/tab/snapshots",
+        "/ui/catalog/images",
+        "/ui/palette?q=prune",
+        "/ui/palette?q=snap",
+    ] {
+        let (_, _, body) = get_fragment(&router, uri).await?;
+        for forbidden in ["hx-post=", "hx-delete=", "hx-put=", "hx-patch=", "<form"] {
+            assert!(
+                !body.contains(forbidden),
+                "{uri} declares {forbidden}, forking the mutation contract"
+            );
+        }
+        assert!(!body.contains(" style=\""), "{uri} emitted an inline style");
+    }
+
+    // The shell's dialogs are markup only: they carry `method="dialog"` forms,
+    // which submit nowhere, and declare no htmx write at all.
+    let (_, _, page) = get(&router, "/catalog").await?;
+    for forbidden in [
+        "hx-post=\"/ui/",
+        "hx-delete=",
+        "hx-put=",
+        "hx-patch=",
+        // A dialog form that named an action would submit somewhere; these
+        // name none, so the dialog's only outcome is its returnValue.
+        " action=\"",
+    ] {
+        assert!(
+            !page.contains(forbidden),
+            "/catalog declares {forbidden}, forking the mutation contract"
+        );
+    }
     Ok(())
 }
 

@@ -6,10 +6,12 @@
 //! offers, how a byte count reads) live here so templates stay declarative,
 //! and status is always emitted as a stable token, never as a colour.
 
+use std::net::IpAddr;
+
 use firestone_core::{
     CloudInitSpec, DoctorCheck, DoctorReport, DoctorStatus, MachineSpec, MachineState,
-    MachineStatus, MachineSummary, MachineView, MountSpec, NetMode, NetworkSpec, VersionResult,
-    VmmSpec,
+    MachineStatus, MachineSummary, MachineView, MountSpec, NetMode, NetworkSpec, PortForward,
+    Protocol, SnapshotKind, SnapshotSummary, VersionResult, VmmSpec,
 };
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +31,12 @@ pub struct CachedImageMetadata {
     pub id: String,
     pub source_ref: String,
     pub size: u64,
+    /// `oci` or `disk`. The sidecar omits the field for a disk image (§8.5),
+    /// so an absent value is a disk image rather than an unknown one.
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub pulled_at: String,
 }
 
 /// Build identity shown in the sidebar.
@@ -277,6 +285,16 @@ pub struct MachineRow {
     pub image: String,
     pub resources: String,
     pub forwards_text: String,
+    /// The applied forwards as chips, linkified where a browser can follow
+    /// them (§16.5). Built from the same strings `forwards_text` reports.
+    pub forwards: Vec<ForwardChip>,
+    /// The spec configures forwards this running machine has not applied
+    /// (§12.5). Rendered beside the chips, never instead of them.
+    pub forwards_pending: bool,
+    /// Whether `clone` would be accepted right now (§24.2: the source must be
+    /// `created` or `stopped`). The menu item is offered disabled otherwise,
+    /// so the refusal is read before the round trip rather than after it.
+    pub clonable: bool,
     pub uptime: String,
     /// `None` while the machine is mid-transition: offering a lifecycle button
     /// against a state the server is still resolving is how a UI lies.
@@ -297,6 +315,11 @@ impl From<&MachineSummary> for MachineRow {
             } else {
                 summary.forwards.join("  ")
             },
+            // Only a running machine's forwards are reachable, so only those
+            // become links: a chip on a stopped machine would be a dead one.
+            forwards: forward_chips(&summary.forwards, summary.status == "running"),
+            forwards_pending: summary.forwards_pending,
+            clonable: is_clonable(&summary.status),
             uptime: summary.uptime.clone().unwrap_or_else(|| "—".to_owned()),
             action,
             action_label,
@@ -395,6 +418,10 @@ pub struct MachineDetail {
     pub spec_groups: Vec<SpecGroup>,
     /// Spec forwards this running machine has not applied yet (§12.4).
     pub forwards_pending: bool,
+    /// The applied forwards as chips, linkified while the machine runs.
+    pub forwards: Vec<ForwardChip>,
+    /// Whether `clone` would be accepted right now (§24.2).
+    pub clonable: bool,
     /// Editable spec fields that observably differ from what the running
     /// instance is using, named as an operator would name them.
     ///
@@ -431,6 +458,13 @@ impl MachineDetail {
             meta: meta_rows(&view.state, view.supervision.is_some()),
             spec_groups: spec_groups(&view.spec),
             forwards_pending: view.forwards_pending,
+            // The applied set, exactly as §12.5 defines it: what a client can
+            // reach right now, never the configured set the spec holds.
+            forwards: forward_chips(
+                &view.state.forwards,
+                view.state.status == MachineStatus::Running,
+            ),
+            clonable: is_clonable(status),
             drift_summary: drift.join(", "),
             drift,
         }
@@ -909,5 +943,342 @@ mod tests {
         assert_eq!(plural(1, "machine"), "machine");
         assert_eq!(plural(0, "machine"), "machines");
         assert_eq!(plural(3, "image"), "images");
+    }
+}
+
+// ================================== snapshots, clone, images, prune (M6-26) ==
+//
+// Everything below projects a landed shared result into the markup one of the
+// new surfaces renders. Nothing here talks to the host, and nothing here
+// parses a Firestone grammar of its own: a forward is read back through the
+// same §12.4 parser that wrote it, so the chip and the string it came from can
+// never disagree.
+
+/// One host-to-guest port forward as the UI draws it.
+///
+/// `href` is empty whenever a browser could not usefully follow the chip, and
+/// the template renders a plain span in that case. That is the whole
+/// linkability decision, made once, on the server, where the forward is
+/// already parsed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ForwardChip {
+    /// The canonical `[proto:][bind:]HOST:GUEST` text, verbatim.
+    pub text: String,
+    /// `http://…` for a followable forward, empty otherwise.
+    pub href: String,
+    /// `tcp` or `udp`; `?` when the recorded value no longer parses.
+    pub protocol: &'static str,
+}
+
+/// Builds the chips for one applied forward list.
+///
+/// `live` is the machine's own running state. A forward that is recorded but
+/// not currently applied — a stopped machine still carries the set its last
+/// start used — is rendered as text, because a link to a port nothing is
+/// listening on is worse than no link at all.
+///
+/// A value that no longer parses is kept verbatim and never linkified, the
+/// same discipline §12.5 applies when it compares the two sets.
+pub fn forward_chips(forwards: &[String], live: bool) -> Vec<ForwardChip> {
+    forwards
+        .iter()
+        .map(|forward| match forward.parse::<PortForward>() {
+            Ok(parsed) => ForwardChip {
+                text: parsed.to_string(),
+                href: if live {
+                    forward_href(&parsed).unwrap_or_default()
+                } else {
+                    String::new()
+                },
+                protocol: parsed.protocol().as_str(),
+            },
+            Err(_) => ForwardChip {
+                text: forward.clone(),
+                href: String::new(),
+                protocol: "?",
+            },
+        })
+        .collect()
+}
+
+/// The URL a single TCP forward answers on, or `None` when there is no single
+/// URL to name.
+///
+/// Three rules, each of them a claim the UI must be able to defend:
+///
+/// - **UDP is never linkified.** `http://` over UDP is not something a browser
+///   can open, and a chip that navigates nowhere teaches the reader that the
+///   chips lie.
+/// - **A range is never linkified.** `8000-8010:80-90` is eleven forwards; the
+///   first of them is not the forward, and picking one silently would be a
+///   guess dressed as a fact.
+/// - **The bind address is honoured, and an unspecified one becomes
+///   loopback.** passt binds `0.0.0.0` on every host address, but the browser
+///   is on this host, so `127.0.0.1` is both reachable and the narrower claim.
+pub fn forward_href(forward: &PortForward) -> Option<String> {
+    if forward.protocol() != Protocol::Tcp {
+        return None;
+    }
+    let host = forward.host();
+    if host.start() != host.end() {
+        return None;
+    }
+    let port = host.start();
+    Some(match forward.bind() {
+        None => format!("http://127.0.0.1:{port}"),
+        Some(IpAddr::V4(address)) if address.is_unspecified() => {
+            format!("http://127.0.0.1:{port}")
+        }
+        Some(IpAddr::V6(address)) if address.is_unspecified() => {
+            format!("http://[::1]:{port}")
+        }
+        Some(IpAddr::V4(address)) => format!("http://{address}:{port}"),
+        // A literal IPv6 authority is bracketed, or the port reads as another
+        // hextet and the URL names a different address entirely.
+        Some(IpAddr::V6(address)) => format!("http://[{address}]:{port}"),
+    })
+}
+
+/// Whether `clone` would accept this machine as a source right now.
+///
+/// §24.2: the source must be `created` or `stopped`, and the check runs before
+/// the source lock is taken so a running machine is refused rather than
+/// queued. The UI reads the same rule so the refusal is visible before the
+/// request, and `ls` display statuses such as `running (unsupervised)` are
+/// compared by their leading word rather than by an exact match.
+pub fn is_clonable(status: &str) -> bool {
+    matches!(
+        status.split_whitespace().next().unwrap_or_default(),
+        "created" | "stopped"
+    )
+}
+
+/// One row of the machine detail snapshots tab.
+#[derive(Debug, Clone, Serialize)]
+pub struct SnapshotRow {
+    pub snapshot: String,
+    /// `cold` or `warm` — the word §23 defines, never a colour.
+    pub kind: &'static str,
+    pub created: String,
+    pub size: String,
+    /// Guest memory a warm snapshot captured; an em dash for a cold one,
+    /// because a cold snapshot captured no memory rather than zero bytes.
+    pub memory: String,
+    pub image_id: String,
+    /// Warm restores always start the machine again (§23.5), and the row says
+    /// so rather than letting the confirm dialog surprise the operator.
+    pub warm: bool,
+}
+
+/// Projects the snapshot list result into rows, newest identifier first.
+///
+/// The dispatcher orders by identifier and the default names are
+/// `snap-<yyyymmdd>-<hhmmss>`, so reversing that order puts the most recent
+/// snapshot — the one an operator reaches for under pressure — at the top.
+pub fn snapshot_rows(snapshots: &[SnapshotSummary]) -> Vec<SnapshotRow> {
+    let mut rows: Vec<SnapshotRow> = snapshots
+        .iter()
+        .map(|summary| SnapshotRow {
+            snapshot: summary.snapshot.clone(),
+            kind: summary.kind.as_str(),
+            created: summary.created_at.clone(),
+            size: format_bytes(summary.disk_bytes),
+            memory: summary.memory_bytes.map_or_else(dash, format_bytes),
+            image_id: summary.image_id.clone().unwrap_or_else(dash),
+            warm: summary.kind == SnapshotKind::Warm,
+        })
+        .collect();
+    rows.reverse();
+    rows
+}
+
+/// One row of the cached-images table on the catalog screen.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageRow {
+    pub reference: String,
+    pub id: String,
+    /// The leading identity of the id, which is what an operator reads; the
+    /// full value stays in the row's title attribute.
+    pub short_id: String,
+    pub size: String,
+    pub bytes: u64,
+    pub pulled: String,
+    /// True for an image built from an OCI reference (§8.5).
+    pub oci: bool,
+}
+
+/// Projects the image store listing into table rows, largest first.
+///
+/// Size order is the order that matters on a screen whose only destructive
+/// affordance is "reclaim disk": the row worth deleting is at the top.
+pub fn image_rows(images: &[CachedImage]) -> Vec<ImageRow> {
+    let mut rows: Vec<ImageRow> = images
+        .iter()
+        .map(|image| ImageRow {
+            reference: image.metadata.source_ref.clone(),
+            id: image.metadata.id.clone(),
+            short_id: short_id(&image.metadata.id),
+            size: format_bytes(image.metadata.size),
+            bytes: image.metadata.size,
+            pulled: if image.metadata.pulled_at.is_empty() {
+                dash()
+            } else {
+                image.metadata.pulled_at.clone()
+            },
+            oci: image.metadata.kind.as_deref() == Some("oci"),
+        })
+        .collect();
+    rows.sort_by(|left, right| {
+        right
+            .bytes
+            .cmp(&left.bytes)
+            .then_with(|| left.reference.cmp(&right.reference))
+    });
+    rows
+}
+
+/// The first nineteen characters of an image id, which keeps the `sha256-`
+/// prefix and twelve hex digits — enough to name one image on this host.
+fn short_id(id: &str) -> String {
+    if id.chars().count() <= 19 {
+        return id.to_owned();
+    }
+    id.chars().take(19).collect::<String>() + "…"
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod feature_tests {
+    use firestone_core::{PortForward, SnapshotKind, SnapshotSummary};
+
+    use super::{
+        CachedImage, CachedImageMetadata, ForwardChip, forward_chips, forward_href, image_rows,
+        short_id, snapshot_rows,
+    };
+
+    fn chip(text: &str, href: &str, protocol: &'static str) -> ForwardChip {
+        ForwardChip {
+            text: text.to_owned(),
+            href: href.to_owned(),
+            protocol,
+        }
+    }
+
+    #[test]
+    fn forward_href_links_a_single_tcp_port_at_the_address_it_bound() {
+        let cases: [(&str, Option<&str>); 8] = [
+            // No bind: loopback is what this browser can reach.
+            ("8080:80", Some("http://127.0.0.1:8080")),
+            ("tcp:8080:80", Some("http://127.0.0.1:8080")),
+            // A bind address is honoured verbatim.
+            ("192.168.1.5:8080:80", Some("http://192.168.1.5:8080")),
+            // Unspecified means "every address", and this browser is on this
+            // host, so loopback is the reachable and narrower claim.
+            ("0.0.0.0:8080:80", Some("http://127.0.0.1:8080")),
+            ("[::]:8080:80", Some("http://[::1]:8080")),
+            // An IPv6 authority must be bracketed or the port reads as a hextet.
+            ("[::1]:9090:90", Some("http://[::1]:9090")),
+            // UDP has no http URL, and a range is many forwards rather than one.
+            ("udp:5353:5353", None),
+            ("8000-8010:80-90", None),
+        ];
+        for (raw, expected) in cases {
+            let forward: PortForward = raw.parse().expect("a valid forward");
+            assert_eq!(
+                forward_href(&forward).as_deref(),
+                expected,
+                "{raw} produced the wrong href"
+            );
+        }
+    }
+
+    #[test]
+    fn forward_chips_linkify_only_a_running_machine() {
+        let forwards = vec!["8080:80".to_owned(), "udp:5353:5353".to_owned()];
+
+        assert_eq!(
+            forward_chips(&forwards, true),
+            vec![
+                chip("8080:80", "http://127.0.0.1:8080", "tcp"),
+                chip("udp:5353:5353", "", "udp"),
+            ]
+        );
+        // A stopped machine has applied nothing a browser can reach.
+        assert_eq!(
+            forward_chips(&forwards, false),
+            vec![chip("8080:80", "", "tcp"), chip("udp:5353:5353", "", "udp")]
+        );
+    }
+
+    #[test]
+    fn forward_chips_keep_an_unparseable_recorded_value_verbatim() {
+        let chips = forward_chips(&["not-a-forward".to_owned()], true);
+        assert_eq!(chips, vec![chip("not-a-forward", "", "?")]);
+    }
+
+    #[test]
+    fn snapshot_rows_report_the_tier_and_leave_a_cold_memory_figure_absent() {
+        let summaries = vec![
+            SnapshotSummary {
+                snapshot: "snap-20260901-010000".to_owned(),
+                kind: SnapshotKind::Cold,
+                created_at: "2026-09-01T01:00:00Z".to_owned(),
+                image_id: Some("sha256-abc".to_owned()),
+                disk_bytes: 1_500_000_000,
+                memory_bytes: None,
+            },
+            SnapshotSummary {
+                snapshot: "snap-20260902-020000".to_owned(),
+                kind: SnapshotKind::Warm,
+                created_at: "2026-09-02T02:00:00Z".to_owned(),
+                image_id: None,
+                disk_bytes: 0,
+                memory_bytes: Some(8_589_934_592),
+            },
+        ];
+
+        let rows = snapshot_rows(&summaries);
+        // Newest first: the snapshot reached for under pressure is on top.
+        assert_eq!(rows[0].snapshot, "snap-20260902-020000");
+        assert_eq!(rows[0].kind, "warm");
+        assert!(rows[0].warm);
+        assert_eq!(rows[0].memory, "8.5 GB");
+        assert_eq!(rows[0].image_id, "—");
+
+        assert_eq!(rows[1].kind, "cold");
+        assert!(!rows[1].warm);
+        // A cold snapshot captured no memory; it did not capture zero bytes.
+        assert_eq!(rows[1].memory, "—");
+        assert_eq!(rows[1].size, "1.5 GB");
+    }
+
+    #[test]
+    fn image_rows_badge_an_oci_image_and_shorten_its_id() {
+        let image = |id: &str, kind: Option<&str>, size: u64| CachedImage {
+            metadata: CachedImageMetadata {
+                id: id.to_owned(),
+                source_ref: "ubuntu:24.04".to_owned(),
+                size,
+                kind: kind.map(ToOwned::to_owned),
+                pulled_at: "2026-09-01T05:00:00Z".to_owned(),
+            },
+        };
+
+        let rows = image_rows(&[
+            image("sha256-0123456789abcdef0123", None, 642_000_000),
+            image("sha256-fedcba9876543210", Some("oci"), 1_500_000_000),
+        ]);
+
+        // Largest first: the row worth reclaiming is the one on top.
+        assert_eq!(rows[0].size, "1.5 GB");
+        assert!(rows[0].oci, "an oci image must be badged");
+        assert!(!rows[1].oci, "an absent kind is a disk image, not unknown");
+        assert_eq!(rows[1].short_id, "sha256-0123456789ab…");
+    }
+
+    #[test]
+    fn short_id_keeps_a_shorter_identity_whole() {
+        assert_eq!(short_id("sha256-abc"), "sha256-abc");
+        assert_eq!(short_id(""), "");
     }
 }

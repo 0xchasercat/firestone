@@ -11,6 +11,43 @@
 </span>
 {%- endmacro %}
 
+{#
+  Forward chips (M6-26, SPEC §12.5 and §16.5).
+
+  A TCP forward the machine has actually applied becomes a link the reader can
+  follow; a UDP forward, a port range, and every forward of a machine that is
+  not running stay plain text, because a chip that navigates nowhere teaches
+  the reader that the chips lie. The href is decided on the server, where the
+  forward is already parsed — see `view::forward_href`.
+
+  `pending` is §12.5's condition: the spec configures forwards this running
+  machine has not applied. It is a marker *beside* the chips, never instead of
+  them, because the applied set is what a client can reach right now.
+
+  Defined before `machine_row`, which calls it: a macro captures the scope it
+  was defined in, so one defined later would not be in it.
+#}
+{% macro forwards(chips, pending) -%}
+<span class="fs-chips">
+  {% for chip in chips %}
+    {% if chip.href %}
+    <a class="fs-chip fs-chip--link" href="{{ chip.href }}" target="_blank" rel="noopener"
+       data-fs-forward="{{ chip.text }}"
+       title="{{ chip.text }} · opens {{ chip.href }}">{{ chip.text }}</a>
+    {% else %}
+    <span class="fs-chip" data-fs-forward="{{ chip.text }}"
+          title="{{ chip.text }}">{{ chip.text }}</span>
+    {% endif %}
+  {% else %}
+  <span class="fs-chip fs-chip--empty">—</span>
+  {% endfor %}
+  {% if pending %}
+  <span class="fs-chip fs-chip--pending" data-fs-forwards-pending
+        title="the spec configures forwards this machine has not applied; passt fixes its mappings at spawn, so a restart is what applies them">pending restart</span>
+  {% endif %}
+</span>
+{%- endmacro %}
+
 {% macro machine_row(m) -%}
 <div class="fs-row" data-fs-row="{{ m.name }}" data-fs-notice-slot>
   <span class="fs-cell fs-cell--name">
@@ -25,16 +62,36 @@
   <span class="fs-cell fs-cell--mono fs-cell--muted" title="{{ m.image }}">{{ m.image }}</span>
   <span class="fs-cell fs-cell--mono">{{ m.resources }}</span>
   <span class="fs-cell fs-cell--mono fs-cell--muted fs-cell--small fs-cell--forwards"
-        title="{{ m.forwards_text }}">{{ m.forwards_text }}</span>
+        title="{{ m.forwards_text }}">{{ forwards(m.forwards, m.forwards_pending) }}</span>
   <span class="fs-cell fs-cell--mono fs-cell--muted fs-cell--uptime">{{ m.uptime }}</span>
-  {% if m.action %}
-  <button type="button"
-          class="fs-btn fs-btn--sm fs-btn--row"
-          data-fs-action="{{ m.action }}"
-          data-fs-machine="{{ m.name }}">{{ m.action_label }}</button>
-  {% else %}
-  <span class="fs-cell fs-cell--mono fs-cell--muted">···</span>
-  {% endif %}
+  <span class="fs-cell fs-row__actions">
+    {% if m.action %}
+    <button type="button"
+            class="fs-btn fs-btn--sm fs-btn--row"
+            data-fs-action="{{ m.action }}"
+            data-fs-machine="{{ m.name }}">{{ m.action_label }}</button>
+    {% else %}
+    <span class="fs-cell fs-cell--mono fs-cell--muted">···</span>
+    {% endif %}
+    {# The row's overflow menu. A <details> rather than a scripted popover:
+       the platform already owns open, close and Escape, and the CSP forbids
+       the inline handlers a hand-rolled menu would want. #}
+    <details class="fs-menu" data-fs-row-menu="{{ m.name }}">
+      <summary class="fs-btn fs-btn--sm fs-btn--icon" aria-label="More actions for {{ m.name }}">⋯</summary>
+      <div class="fs-menu__list" role="menu">
+        {# `data-fs-clone` carries the name itself rather than reusing
+           `data-fs-machine`: that attribute means "this button dispatches a
+           lifecycle action", and a transitioning machine must not carry one. #}
+        <button type="button" class="fs-menu__item" role="menuitem"
+                data-fs-clone="{{ m.name }}"
+                {% if not m.clonable %}disabled title="clone needs a created or stopped source; stop {{ m.name }} first"{% endif %}>Clone…</button>
+        <a class="fs-menu__item" role="menuitem"
+           href="/machines/{{ m.name | urlencode }}?tab=snapshots"
+           hx-get="/machines/{{ m.name | urlencode }}?tab=snapshots"
+           hx-target="#fs-main-content" hx-push-url="true">Snapshots</a>
+      </div>
+    </details>
+  </span>
 </div>
 {%- endmacro %}
 

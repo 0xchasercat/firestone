@@ -71,5 +71,209 @@
     </div>
   </form>
 </dialog>
+
+{# ============================ snapshots, clone, images, prune (M6-26) ====
+
+   Every dialog below is markup only. It is filled and read by app.js, and the
+   write it authorises goes from the browser to the documented `/v1` route —
+   the shell declares no hx-post, hx-delete or hx-patch of its own, so the
+   single-mutation-surface rule (§16.5) is unchanged.
+
+   `method="dialog"` throughout: the platform owns focus trapping, Escape and
+   the returnValue, and the CSP forbids the inline handlers a hand-rolled
+   modal would need. #}
+
+<dialog class="fs-dialog" id="fs-snapshot-create" aria-labelledby="fs-snapshot-create-title">
+  <form method="dialog">
+    <div class="fs-dialog__head">
+      <div class="fs-dialog__title" id="fs-snapshot-create-title">Take a snapshot</div>
+    </div>
+    <div class="fs-dialog__body">
+      <p data-fs-snapshot-tier="cold" hidden>
+        <strong data-fs-snapshot-name></strong> is not running, so this is a
+        <strong>cold</strong> snapshot: a file copy of its disk and spec, and
+        guaranteed as such.
+      </p>
+      <p data-fs-snapshot-tier="warm" hidden>
+        <strong data-fs-snapshot-name></strong> is running, so this is a
+        <strong>warm</strong> snapshot. Firestone pauses the guest, writes its
+        memory and its disk, then resumes it. The pause is brief but it is real,
+        and the guest observes it.
+      </p>
+      <label class="fs-field">
+        <span class="fs-field__label">Snapshot name <span class="fs-field__opt">optional</span></span>
+        <input class="fs-input fs-input--mono" type="text" id="fs-snapshot-name"
+               autocomplete="off" spellcheck="false" placeholder="before-upgrade">
+        <span class="fs-field__hint">
+          Leave it empty and Firestone names it <span class="fs-mono">snap-yyyymmdd-hhmmss</span>
+          from the UTC instant of the request. 1–64 characters of A–Z a–z 0–9 . _ -
+          that do not start with a dot or a dash.
+        </span>
+      </label>
+    </div>
+    <div class="fs-dialog__foot">
+      <button class="fs-btn" value="cancel">Cancel</button>
+      <button class="fs-btn fs-btn--primary" value="confirm" data-fs-snapshot-submit>Take snapshot</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog class="fs-dialog" id="fs-snapshot-restore" aria-labelledby="fs-snapshot-restore-title">
+  <form method="dialog">
+    <div class="fs-dialog__head">
+      <div class="fs-dialog__title" id="fs-snapshot-restore-title">Restore a snapshot</div>
+    </div>
+    <div class="fs-dialog__body">
+      <p>
+        Restoring <strong data-fs-restore-snapshot></strong> is a whole-machine
+        rollback of <strong data-fs-restore-name></strong>: its disk, its
+        <span class="fs-mono">firestone.toml</span> and its published VM config
+        are all replaced from the snapshot. Anything written since it was taken
+        is gone, and the machine comes back to the configuration its disk was
+        captured under.
+      </p>
+      <p data-fs-restore-warm hidden>
+        This is a warm snapshot, so the machine always starts again afterwards:
+        a memory image only means something resumed.
+      </p>
+      <label class="fs-checkbox" data-fs-restore-force-row hidden>
+        <input type="checkbox" id="fs-restore-force">
+        <span>Stop it first — this machine is running, and a restore is refused otherwise</span>
+      </label>
+    </div>
+    <div class="fs-dialog__foot">
+      <button class="fs-btn" value="cancel">Cancel</button>
+      <button class="fs-btn fs-btn--danger" value="confirm">Restore</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog class="fs-dialog" id="fs-snapshot-delete" aria-labelledby="fs-snapshot-delete-title">
+  <form method="dialog">
+    <div class="fs-dialog__head">
+      <div class="fs-dialog__title" id="fs-snapshot-delete-title">Delete snapshot</div>
+    </div>
+    <div class="fs-dialog__body">
+      <p>
+        This permanently removes <strong data-fs-snapdelete-snapshot></strong>
+        from <strong data-fs-snapdelete-name></strong>, including its copied
+        disk and any captured memory. It cannot be undone.
+      </p>
+    </div>
+    <div class="fs-dialog__foot">
+      <button class="fs-btn" value="cancel">Cancel</button>
+      <button class="fs-btn fs-btn--danger" value="confirm">Delete</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog class="fs-dialog" id="fs-clone" aria-labelledby="fs-clone-title">
+  <form method="dialog">
+    <div class="fs-dialog__head">
+      <div class="fs-dialog__title" id="fs-clone-title">Clone machine</div>
+    </div>
+    <div class="fs-dialog__body">
+      <p>
+        Copies <strong data-fs-clone-source></strong>'s spec byte for byte, and
+        by default its disk, into a machine that has never run. The base image
+        is shared, never duplicated.
+      </p>
+      <label class="fs-field">
+        <span class="fs-field__label">New machine name</span>
+        <input class="fs-input fs-input--mono" type="text" id="fs-clone-name"
+               autocomplete="off" spellcheck="false" placeholder="web-2" required>
+        <span class="fs-field__error" data-fs-clone-error hidden></span>
+      </label>
+      <label class="fs-checkbox">
+        <input type="checkbox" id="fs-clone-fresh">
+        <span>Empty disk — start from the base image instead of copying the source's disk</span>
+      </label>
+      <p class="fs-field__hint">
+        A copied disk carries the guest's own <span class="fs-mono">/etc/machine-id</span>
+        and hostname. An empty disk re-provisions from the base image and avoids that.
+      </p>
+    </div>
+    <div class="fs-dialog__foot">
+      <button class="fs-btn" value="cancel">Cancel</button>
+      <button class="fs-btn fs-btn--primary" value="confirm">Clone</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog class="fs-dialog" id="fs-image-delete" aria-labelledby="fs-image-delete-title">
+  <form method="dialog">
+    <div class="fs-dialog__head">
+      <div class="fs-dialog__title" id="fs-image-delete-title">Delete cached image</div>
+    </div>
+    <div class="fs-dialog__body">
+      <p>
+        This removes <strong class="fs-mono" data-fs-imagedelete-ref></strong>
+        from this host's image store. A machine or a snapshot that pins it keeps
+        it: Firestone refuses and names what is holding it.
+      </p>
+    </div>
+    <div class="fs-dialog__foot">
+      <button class="fs-btn" value="cancel">Cancel</button>
+      <button class="fs-btn fs-btn--danger" value="confirm">Delete</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog class="fs-dialog" id="fs-image-prune" aria-labelledby="fs-image-prune-title">
+  <form method="dialog">
+    <div class="fs-dialog__head">
+      <div class="fs-dialog__title" id="fs-image-prune-title">Prune unused images</div>
+    </div>
+    <div class="fs-dialog__body">
+      <p>
+        Removes every cached image no machine and no snapshot references. Anything
+        still pinned is kept, so this cannot break a machine you can still start.
+      </p>
+    </div>
+    <div class="fs-dialog__foot">
+      <button class="fs-btn" value="cancel">Cancel</button>
+      <button class="fs-btn fs-btn--danger" value="confirm">Prune</button>
+    </div>
+  </form>
+</dialog>
+
+{# The one dialog that reads before it writes: it runs the dry run first and
+   renders exactly what the real call would remove, so the operator confirms a
+   list rather than a promise. #}
+<dialog class="fs-dialog fs-dialog--wide" id="fs-system-prune" aria-labelledby="fs-system-prune-title">
+  <form method="dialog">
+    <div class="fs-dialog__head">
+      <div class="fs-dialog__title" id="fs-system-prune-title">Free disk space</div>
+    </div>
+    <div class="fs-dialog__body">
+      <p>
+        Inert artifacts — finished runtime directories, orphaned partials, stale
+        logs — are always included. The two tiers below are not, because each one
+        removes something you could still have wanted.
+      </p>
+      <label class="fs-checkbox">
+        <input type="checkbox" id="fs-prune-machines" data-fs-prune-option>
+        <span>Also remove stopped machines — their specs and disks, permanently</span>
+      </label>
+      <label class="fs-checkbox">
+        <input type="checkbox" id="fs-prune-images" data-fs-prune-option>
+        <span>Also remove unused images — the ones nothing references</span>
+      </label>
+      <div class="fs-prune-preview" data-fs-prune-preview aria-live="polite">
+        <div class="fs-prune-preview__state" data-fs-prune-state>counting…</div>
+        <div class="fs-prune-preview__rows" data-fs-prune-rows></div>
+        <div class="fs-prune-preview__total" data-fs-prune-total></div>
+      </div>
+      <span class="fs-note">
+        The preview is <span class="fs-mono">dry_run: true</span> against the same
+        route the confirm runs, so the list you approve is the list that is removed.
+      </span>
+    </div>
+    <div class="fs-dialog__foot">
+      <button class="fs-btn" value="cancel">Cancel</button>
+      <button class="fs-btn fs-btn--danger" value="confirm" data-fs-prune-submit disabled>Remove</button>
+    </div>
+  </form>
+</dialog>
 </body>
 </html>

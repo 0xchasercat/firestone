@@ -1,0 +1,37 @@
+{# The image store, as opposed to the catalog above it: what is actually on
+   this host's disk. A read of `Action::ImageList`; the deletions go from the
+   browser to DELETE /v1/images/{id} and POST /v1/images/prune. #}
+{% if images %}
+<div class="fs-panel fs-panel--clip fs-table fs-table--images">
+  <div class="fs-table__head" role="row">
+    <span>Reference</span><span>Id</span><span>Size</span>
+    <span class="fs-cell--pulled">Pulled</span>
+    <span><span class="fs-visually-hidden">Actions</span></span>
+  </div>
+  {% for image in images %}
+  <div class="fs-row fs-row--static" data-fs-image-row="{{ image.id }}" data-fs-notice-slot>
+    <span class="fs-cell fs-cell--mono fs-cell--name" title="{{ image.reference }}">
+      {{ image.reference }}
+      {% if image.oci %}<span class="fs-tier" data-fs-tier="oci" title="built from an OCI reference">OCI</span>{% endif %}
+    </span>
+    <span class="fs-cell fs-cell--mono fs-cell--muted fs-cell--small" title="{{ image.id }}">{{ image.short_id }}</span>
+    <span class="fs-cell fs-cell--mono">{{ image.size }}</span>
+    <span class="fs-cell fs-cell--mono fs-cell--muted fs-cell--small fs-cell--pulled">{{ image.pulled }}</span>
+    <span class="fs-cell fs-row__actions">
+      <button type="button" class="fs-btn fs-btn--sm fs-btn--danger"
+              data-fs-image-action="delete"
+              data-fs-image="{{ image.id }}"
+              data-fs-image-ref="{{ image.reference }}">Delete</button>
+    </span>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="fs-empty" data-fs-images-empty>
+  <div class="fs-empty__title">No images cached</div>
+  <div class="fs-empty__body">
+    Pull a catalog reference above, or create a machine and Firestone resolves
+    and stores the image it needs.
+  </div>
+</div>
+{% endif %}
