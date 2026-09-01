@@ -1709,7 +1709,9 @@ async fn a_stopped_edit_dialog_promises_nothing_live() -> TestResult {
         "a stopped machine must not badge a field as live or deferred"
     );
     assert!(body.contains("data-fs-edit-note"));
-    assert!(body.contains("the next time it starts"));
+    // One phrasing across the whole dialog: the note and the group badges say
+    // "applies at next start", never a third wording for the same fact.
+    assert!(body.contains("applies at next start"));
     Ok(())
 }
 
@@ -2420,15 +2422,18 @@ async fn the_palette_offers_the_host_commands_and_verb_matched_machine_commands(
         ..FakeDispatcher::default()
     })?;
 
-    // The two host-wide commands are there for an empty query, because they
-    // are what the palette is opened for when nothing is named.
+    // The host-wide commands are there for an empty query, because they are
+    // what the palette is opened for when nothing is named.
     let (_, _, all) = get_fragment(&router, "/ui/palette").await?;
+    assert!(all.contains(r#"data-fs-palette-action="new-machine""#));
     assert!(all.contains(r#"data-fs-palette-action="prune-images""#));
     assert!(all.contains(r#"data-fs-palette-action="prune-system""#));
     // Machine-scoped commands are verb-first, so an empty palette is a list of
-    // machines rather than two commands for every one of them.
+    // machines rather than four commands for every one of them.
     assert!(!all.contains(r#"data-fs-palette-action="snapshot""#));
     assert!(!all.contains(r#"data-fs-palette-action="clone""#));
+    assert!(!all.contains(r#"data-fs-palette-action="edit""#));
+    assert!(!all.contains(r#"data-fs-palette-action="terminal""#));
 
     let (_, _, snap) = get_fragment(&router, "/ui/palette?q=snap").await?;
     assert!(snap.contains(r#"data-fs-palette-action="snapshot""#));
@@ -2448,7 +2453,261 @@ async fn the_palette_offers_the_host_commands_and_verb_matched_machine_commands(
     let (_, _, prune) = get_fragment(&router, "/ui/palette?q=prune").await?;
     assert!(prune.contains(r#"data-fs-palette-action="prune-images""#));
     assert!(prune.contains(r#"data-fs-palette-action="prune-system""#));
+
+    // Edit is offered for a machine in any state, because the dialog is; the
+    // terminal is offered only while a machine is running, because both
+    // transports need a live machine and the detail head says the same.
+    let (_, _, edit) = get_fragment(&router, "/ui/palette?q=edit").await?;
+    assert!(edit.contains("edit web"));
+    assert!(edit.contains("edit staging-db"));
+
+    let (_, _, terminal) = get_fragment(&router, "/ui/palette?q=term").await?;
+    assert!(terminal.contains("terminal web"));
+    assert!(
+        !terminal.contains("terminal staging-db"),
+        "a stopped machine was offered a terminal that cannot attach"
+    );
     Ok(())
+}
+
+/// The palette offers exactly the commands the screens offer, and no
+/// lifecycle command at all.
+///
+/// Start, stop, restart and delete render a transition on the button that
+/// dispatched them and read the server's answer back onto it; a palette entry
+/// has no button, so offering one there would be a second, weaker
+/// implementation of what those four commands mean (SPEC §16.5).
+#[tokio::test]
+async fn the_palette_offers_no_lifecycle_command() -> TestResult {
+    let router = app(FakeDispatcher {
+        machines: forward_fleet(),
+        ..FakeDispatcher::default()
+    })?;
+
+    for verb in ["start", "stop", "restart", "delete", "remove"] {
+        let (_, _, body) = get_fragment(&router, &format!("/ui/palette?q={verb}")).await?;
+        assert!(
+            !body.contains(&format!(r#"data-fs-palette-action="{verb}""#)),
+            "the palette offered a {verb} command"
+        );
+        assert!(
+            !body.contains("data-fs-machine=\"web\" data-fs-action"),
+            "the palette offered a lifecycle button"
+        );
+    }
+    Ok(())
+}
+
+/// Every list that can be empty renders the one shared empty state.
+///
+/// Three waves each invented their own markup for "there is nothing here";
+/// `_macros.html::empty` is the single one, and its icon is the marker that
+/// says a surface went through it rather than around it.
+#[tokio::test]
+async fn every_empty_list_renders_the_shared_empty_state() -> TestResult {
+    let router = app(FakeDispatcher {
+        machines: json!([]),
+        catalog: json!([]),
+        images: json!([]),
+        snapshots: json!({ "snapshots": [] }),
+        ..FakeDispatcher::default()
+    })?;
+
+    for uri in [
+        "/ui/machines/rows",
+        "/ui/machines/rows?q=zzz",
+        "/ui/overview/machines",
+        "/ui/catalog/cards",
+        "/ui/catalog/images",
+        "/ui/machines/web/tab/snapshots",
+    ] {
+        let (_, _, body) = get_fragment(&router, uri).await?;
+        assert!(
+            body.contains("fs-empty__icon"),
+            "{uri} rendered an empty state that did not come from the macro"
+        );
+        assert!(
+            body.contains("fs-empty__title") && body.contains("fs-empty__body"),
+            "{uri} is missing the shared empty-state parts"
+        );
+    }
+
+    // The overview's image-cache panel is on the whole screen, not a fragment.
+    let (_, _, overview) = get(&router, "/").await?;
+    assert!(overview.contains("fs-empty__icon"));
+    Ok(())
+}
+
+/// Every live region answers `fs:refresh`.
+///
+/// A mutation ends by dispatching that event on `<body>`; a polled region
+/// that does not listen for it makes the reader wait a poll interval to see
+/// what they just did.
+#[tokio::test]
+async fn every_live_region_answers_the_refresh_event() -> TestResult {
+    let router = app(FakeDispatcher::default())?;
+
+    for uri in ["/", "/machines", "/machines/web", "/catalog"] {
+        let (_, _, body) = get(&router, uri).await?;
+        for (index, _) in body.match_indices("hx-trigger=\"every ") {
+            let tail = &body[index..];
+            let end = tail.find('>').unwrap_or(tail.len());
+            assert!(
+                tail[..end].contains("fs:refresh from:body"),
+                "{uri} polls a region that does not answer fs:refresh"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// One badge system: nothing renders the classes the three waves each
+/// invented for the same pill.
+#[tokio::test]
+async fn every_badge_renders_through_the_shared_badge_class() -> TestResult {
+    let router = app(FakeDispatcher {
+        machine: machine_view_with_drift("web", "running"),
+        snapshots: snapshot_list(),
+        images: json!([stored_image("sha256-abc", "ubuntu:24.04", 1, Some("oci"))]),
+        ..FakeDispatcher::default()
+    })?;
+
+    let mut bodies = Vec::new();
+    for uri in ["/machines/web", "/catalog"] {
+        let (_, _, body) = get(&router, uri).await?;
+        bodies.push(body);
+    }
+    for uri in [
+        "/ui/machines/web/tab/snapshots",
+        "/ui/machines/web/edit",
+        "/ui/catalog/images",
+    ] {
+        let (_, _, body) = get_fragment(&router, uri).await?;
+        bodies.push(body);
+    }
+
+    for body in &bodies {
+        for retired in [
+            r#"class="fs-tier""#,
+            r#"class="fs-applies"#,
+            r#"class="fs-drift""#,
+            r#"class="fs-tag""#,
+            r#"fs-chip fs-chip--pending"#,
+        ] {
+            assert!(
+                !body.contains(retired),
+                "a superseded badge class is still rendered: {retired}"
+            );
+        }
+    }
+    // And the shared one is what replaced them, on every surface that has a
+    // badge at all.
+    assert!(
+        bodies[0].contains("fs-badge"),
+        "the detail head lost its badges"
+    );
+    assert!(
+        bodies[2].contains("fs-badge"),
+        "the snapshot tier lost its badge"
+    );
+    assert!(
+        bodies[3].contains("fs-badge"),
+        "the edit dialog lost its badges"
+    );
+    assert!(bodies[4].contains("fs-badge"), "the OCI badge is gone");
+    Ok(())
+}
+
+/// The stylesheet defines every colour once, as a token.
+///
+/// Three appended sections each reached for a literal, which is how a dark
+/// theme quietly loses a component. A colour may appear only inside a `:root`
+/// block, where both palettes are declared together.
+#[test]
+fn the_stylesheet_declares_every_colour_inside_a_token_block() {
+    const APP_CSS: &str = include_str!("../../assets/ui/app.css");
+
+    let mut root_depth: Option<usize> = None;
+    let mut depth = 0_usize;
+    let mut in_comment = false;
+
+    for raw in APP_CSS.lines() {
+        let mut line = raw;
+        if in_comment {
+            match line.find("*/") {
+                Some(at) => {
+                    line = &line[at + 2..];
+                    in_comment = false;
+                }
+                None => continue,
+            }
+        }
+        let code = match line.find("/*") {
+            Some(at) => {
+                in_comment = !line[at..].contains("*/");
+                if in_comment { &line[..at] } else { line }
+            }
+            None => line,
+        };
+
+        let trimmed = code.trim();
+        if trimmed.ends_with('{') {
+            let selector = trimmed.trim_end_matches('{').trim();
+            depth += 1;
+            if root_depth.is_none() && selector.starts_with(":root") {
+                root_depth = Some(depth);
+            }
+            continue;
+        }
+        if trimmed == "}" {
+            if root_depth == Some(depth) {
+                root_depth = None;
+            }
+            depth = depth.saturating_sub(1);
+            continue;
+        }
+        if root_depth.is_some() {
+            continue;
+        }
+        let has_literal = trimmed.contains('#')
+            || trimmed.contains("rgb(")
+            || trimmed.contains("rgba(")
+            || trimmed.contains("hsl(");
+        assert!(
+            !has_literal,
+            "app.css declares a colour outside a :root token block: {trimmed}"
+        );
+    }
+    assert!(depth == 0, "app.css does not close every rule it opens");
+}
+
+/// No file the UI ships carries an unresolved merge conflict.
+///
+/// `the_embedded_runtime_script_closes_every_block` counts braces, which a
+/// conflict marker leaves balanced: app.js shipped a literal `=======` for a
+/// whole milestone, and a marker anywhere in this bundle is a syntax error
+/// that takes the entire runtime with it.
+#[test]
+fn no_shipped_ui_source_carries_a_merge_conflict_marker() {
+    const SOURCES: &[(&str, &str)] = &[
+        ("app.js", include_str!("../../assets/ui/app.js")),
+        ("app.css", include_str!("../../assets/ui/app.css")),
+        ("term.js", include_str!("../../assets/ui/term.js")),
+        ("theme.js", include_str!("../../assets/ui/theme.js")),
+    ];
+
+    for (name, source) in SOURCES {
+        for (number, line) in source.lines().enumerate() {
+            let marker = line.starts_with("<<<<<<<")
+                || line.starts_with(">>>>>>>")
+                || line.trim_end() == "=======";
+            assert!(
+                !marker,
+                "{name}:{} carries a merge conflict marker",
+                number + 1
+            );
+        }
+    }
 }
 
 #[tokio::test]

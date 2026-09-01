@@ -82,15 +82,12 @@
         <span class="fs-minirow__note">{{ image.size }}</span>
       </div>
       {% else %}
-      <div class="fs-empty">
-        <div class="fs-empty__title">No images cached</div>
-        <div class="fs-empty__body">
-          Pull one from the catalog, or create a machine and Firestone will fetch
-          its image on first start.
-        </div>
-        <a class="fs-btn" href="/catalog" hx-get="/catalog"
-           hx-target="#fs-main-content" hx-push-url="true">Open catalog</a>
-      </div>
+      {{ m.empty(
+          "image",
+          "No images cached",
+          "Pull one from the catalog, or create a machine and Firestone resolves and stores the image it needs on first start.",
+          "Open catalog", "/catalog"
+      ) }}
       {% endfor %}
     </div>
   </div>

@@ -11,8 +11,13 @@
      served from one short-lived cache rather than re-probed per request. #}
   <a class="fs-hostpill" id="fs-hostpill"
      href="/" hx-get="/" hx-target="#fs-main-content" hx-push-url="true">
+    {# A live region like every other one, so it also answers `fs:refresh`:
+       a machine that just started changes the counts this pill carries, and
+       the reader should not wait up to thirty seconds to see it. The doctor
+       report behind it is cached, so the extra read is cheap. #}
     <span class="fs-hostpill__inner"
-          hx-get="/ui/host" hx-trigger="every 30s" hx-swap="innerHTML" hx-target="this">
+          hx-get="/ui/host" hx-trigger="every 30s, fs:refresh from:body"
+          hx-swap="innerHTML" hx-target="this">
       {% include "ui/_hostpill.html" %}
     </span>
   </a>

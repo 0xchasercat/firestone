@@ -4,6 +4,53 @@
   which is what lets the served Content-Security-Policy forbid inline styles.
 #}
 
+{#
+  The empty state (M6-28, SPEC §16.5).
+
+  Nine feature surfaces grew across three waves and each invented its own way
+  of saying "there is nothing here yet". This is the one way: an icon, a title
+  that names what is absent, one line that says what would put something here,
+  and at most one primary action.
+
+  `icon` is a name, not markup, so no caller can hand this macro a path it
+  drew itself. Exactly one of `action_href` (a screen this UI navigates to)
+  and `action_dialog` (a `/ui` read fragment loaded into the dialog slot) may
+  be set, and neither carries an inline handler — the CSP forbids one.
+#}
+{% macro empty(icon, title, body, action_label, action_href, action_dialog) -%}
+<div class="fs-empty">
+  <span class="fs-empty__icon" aria-hidden="true">
+    <svg width="22" height="22" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+         stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+      {%- if icon == "machine" %}
+      <rect x="1.5" y="3" width="13" height="10" rx="1.5"></rect><path d="M1.5 7.5h13"></path>
+      {%- elif icon == "image" %}
+      <path d="M8 1.8 14 5 8 8.2 2 5Z"></path><path d="M2 8l6 3.2L14 8"></path>
+      {%- elif icon == "snapshot" %}
+      <circle cx="8" cy="8" r="5.2"></circle><path d="M8 5.2V8l1.9 1.2"></path>
+      {%- elif icon == "search" %}
+      <circle cx="7" cy="7" r="4.6"></circle><path d="m10.6 10.6 3 3"></path>
+      {%- elif icon == "folder" %}
+      <path d="M1.8 12.4V4.2h4.1l1.3 1.6h7v6.6z"></path>
+      {%- else %}
+      <path d="M2.6 3.4h10.8v9.2H2.6z"></path><path d="M5.4 7.2h5.2M5.4 9.6h3.2"></path>
+      {%- endif %}
+    </svg>
+  </span>
+  <div class="fs-empty__title">{{ title }}</div>
+  <div class="fs-empty__body">{{ body }}</div>
+  {%- if action_label and action_href %}
+  <a class="fs-btn fs-btn--primary" href="{{ action_href }}"
+     hx-get="{{ action_href }}" hx-target="#fs-main-content"
+     hx-push-url="true">{{ action_label }}</a>
+  {%- elif action_label and action_dialog %}
+  <button type="button" class="fs-btn fs-btn--primary"
+          hx-get="{{ action_dialog }}" hx-target="#fs-dialog-slot"
+          hx-swap="innerHTML">{{ action_label }}</button>
+  {%- endif %}
+</div>
+{%- endmacro %}
+
 {% macro status(value, pill) -%}
 <span class="fs-status{% if pill %} fs-status--pill{% endif %}" data-status="{{ value }}">
   <span class="fs-dot"></span>
@@ -42,7 +89,7 @@
   <span class="fs-chip fs-chip--empty">—</span>
   {% endfor %}
   {% if pending %}
-  <span class="fs-chip fs-chip--pending" data-fs-forwards-pending
+  <span class="fs-badge fs-badge--pending fs-badge--sentence" data-fs-forwards-pending
         title="the spec configures forwards this machine has not applied; passt fixes its mappings at spawn, so a restart is what applies them">pending restart</span>
   {% endif %}
 </span>

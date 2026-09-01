@@ -3,16 +3,16 @@
   <div class="fs-detail-head__ident">
     <h1 class="fs-detail-head__title">{{ machine.name }}</h1>
     {{ m.status(machine.status, true) }}
-    <span class="fs-tag">{{ machine.image }}</span>
+    <span class="fs-badge fs-badge--plain">{{ machine.image }}</span>
     {% if machine.degraded %}
-    <span class="fs-tag" title="{{ machine.degraded }}">degraded</span>
+    <span class="fs-badge fs-badge--plain" title="{{ machine.degraded }}">degraded</span>
     {% endif %}
     {# Drift the server can prove: state.json records the image, the MAC and
        the forwards the running instance applied, so those three can be
        compared. Everything else the edit dialog marks client-side when it
        saves it against a running machine. #}
     {% if machine.drift %}
-    <span class="fs-drift" data-fs-drift="server"
+    <span class="fs-badge fs-badge--pending fs-badge--sentence" data-fs-drift="server"
           title="the running instance is using different values for: {{ machine.drift_summary }} · restart {{ machine.name }} to apply the spec">spec drift · {{ machine.drift_summary }}</span>
     {% endif %}
   </div>

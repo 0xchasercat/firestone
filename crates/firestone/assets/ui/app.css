@@ -78,6 +78,17 @@
   --terminal-dim: #8f867b;
   --terminal-fg: #cfc8bd;
   --terminal-ok: #63c98a;
+  --terminal-fail: #ef6547;
+  /* The scrim behind a modal, and the darker one behind a terminal overlay.
+   * Both stay dark in either theme: a modal dims what is behind it, and what
+   * is behind the terminal overlay is already a dark pane. */
+  --backdrop: rgba(15, 13, 11, 0.42);
+  --scrim: rgba(12, 10, 9, 0.72);
+  --menu-shadow: 0 12px 28px rgba(0, 0, 0, 0.18);
+  /* The pull progress bar's two stops. Its ember end is --ember; this is the
+   * deeper one it runs into. */
+  --ember-deep: #e33d1d;
+  --ember-bright: #ff7a2f;
 
   --sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system,
     "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -118,6 +129,9 @@
     --btn-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
     --pulse: rgba(63, 182, 115, 0.35);
     --pulse-0: rgba(63, 182, 115, 0);
+    --menu-shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
+    --ember-deep: #e8471f;
+    --ember-bright: #ff8b4a;
 
     color-scheme: dark;
   }
@@ -150,6 +164,9 @@
   --btn-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
   --pulse: rgba(63, 182, 115, 0.35);
   --pulse-0: rgba(63, 182, 115, 0);
+  --menu-shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
+  --ember-deep: #e8471f;
+  --ember-bright: #ff8b4a;
 
   color-scheme: dark;
 }
@@ -661,6 +678,77 @@ textarea {
   font-weight: 600;
 }
 
+/* --------------------------------------------------------------- badges -- */
+
+/* One badge system (M6-28). Five things in this UI are a short, stable word
+ * in a pill: the image a machine booted, a snapshot's §23 tier, an image's
+ * OCI origin, when an edited field takes effect, and the two "not applied
+ * yet" markers. Three waves gave each of them its own class and its own
+ * geometry; this is the shared shape, and a modifier only ever changes the
+ * colour role, never the size.
+ *
+ * The status pill above is deliberately *not* one of these: it carries a dot
+ * and a live state, and it is driven by `data-status` rather than by a word. */
+.fs-badge {
+  display: inline-flex;
+  align-items: center;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  padding: 3px 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text2);
+  white-space: nowrap;
+}
+
+/* A plain reference or label — the image a machine booted, "degraded". Reads
+ * as data, so it keeps the reference's own case and its own type size. */
+.fs-badge--plain {
+  font-size: 12px;
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 400;
+  padding: 4px 12px;
+}
+
+/* Already true by the time the dialog closes. */
+.fs-badge--live {
+  color: var(--ok);
+  border-color: var(--ok);
+  background: var(--ok-bg);
+}
+
+/* A promise about the next start, not a success: muted, and quieter than the
+ * fields it labels. */
+.fs-badge--later {
+  color: var(--text3);
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 500;
+}
+
+/* Something the running machine has not applied yet: the drift pill, the
+ * pending-forwards marker, a warm snapshot's tier. */
+.fs-badge--pending {
+  color: var(--warn);
+  background: var(--warn-bg);
+  border-color: transparent;
+}
+
+.fs-badge--pending.fs-badge--sentence {
+  font-family: var(--sans);
+  font-size: 11.5px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.fs-badge--gap {
+  margin-left: 6px;
+}
+
 /* -------------------------------------------------------------- buttons -- */
 
 .fs-btn {
@@ -1050,9 +1138,13 @@ textarea {
 
 /* Every track is minmax(min, fr): no column can collapse to zero width, and
  * every cell clips with an ellipsis rather than pushing the grid wider. */
+/* The machines table. The last track carries two controls — the lifecycle
+ * button and the row's overflow menu — which is why it is wider than a
+ * button. One declaration: a second one appended later would have to be kept
+ * in step with this rule's narrow-viewport override, and was not. */
 .fs-table {
   --fs-cols: minmax(74px, 1.1fr) minmax(70px, 0.9fr) minmax(80px, 1.1fr)
-    minmax(96px, 1.2fr) minmax(70px, 1.4fr) minmax(46px, 0.7fr) 64px;
+    minmax(96px, 1.2fr) minmax(70px, 1.4fr) minmax(46px, 0.7fr) 96px;
 }
 
 .fs-table__head,
@@ -1139,9 +1231,29 @@ textarea {
   text-decoration: none;
 }
 
+/* The one empty state (M6-28). Every list that can be empty renders this
+ * shape through `_macros.html::empty`: an icon, a title naming what is
+ * absent, one line saying what would put something there, and at most one
+ * primary action. */
 .fs-empty {
-  padding: 44px 20px 48px;
+  padding: 40px 20px 44px;
   text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.fs-empty__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  margin-bottom: 12px;
+  color: var(--text3);
+  background: var(--panel2);
+  border: 1px solid var(--line);
 }
 
 .fs-empty__title {
@@ -1154,6 +1266,14 @@ textarea {
   font-size: 13px;
   margin: 6px auto 16px;
   max-width: 44ch;
+}
+
+/* The same idea inside a form field group, where there is room for one line
+ * and no room for an icon. */
+.fs-rows__empty {
+  color: var(--text3);
+  font-size: 12px;
+  padding: 2px 0 4px;
 }
 
 /* ------------------------------------------------------------- skeleton -- */
@@ -1216,16 +1336,6 @@ textarea {
 
 .fs-detail-head__title {
   font-size: 24px;
-}
-
-.fs-tag {
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--text2);
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  padding: 4px 12px;
-  white-space: nowrap;
 }
 
 .fs-meta {
@@ -1377,7 +1487,7 @@ textarea {
 }
 
 .fs-stream__line--fail {
-  color: #ef6547;
+  color: var(--terminal-fail);
 }
 
 /* ----------------------------------------------------------------- logs -- */
@@ -1391,7 +1501,11 @@ textarea {
   flex-wrap: wrap;
 }
 
-.fs-chip {
+/* The log bar's source selector. It was `.fs-chip` until M6-28, which
+ * collided with the forward chips a later wave gave the same class: two
+ * unrelated components, one name, and the later rule silently reshaped this
+ * one. A selector is not a chip — it is clicked — so it has its own name. */
+.fs-logbar__source {
   font-family: var(--mono);
   font-size: 11.5px;
   padding: 5px 11px;
@@ -1404,12 +1518,12 @@ textarea {
   transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
 }
 
-.fs-chip:hover {
+.fs-logbar__source:hover {
   border-color: var(--line2);
   text-decoration: none;
 }
 
-.fs-chip.is-active {
+.fs-logbar__source.is-active {
   color: var(--text);
   border-color: var(--line2);
   background: var(--panel2);
@@ -1563,7 +1677,9 @@ textarea {
   animation: none;
 }
 
-.fs-chips {
+/* The catalog card's alias chips. Same story as the log bar's selector: this
+ * was `.fs-chips`, which a later wave reused for the forward chips. */
+.fs-tagchips {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
@@ -1607,7 +1723,7 @@ textarea {
 .fs-progress__bar {
   height: 100%;
   width: 0;
-  background: linear-gradient(90deg, #ff7a2f, #e33d1d);
+  background: linear-gradient(90deg, var(--ember-bright), var(--ember-deep));
   border-radius: 999px;
   transition: width 0.18s ease;
 }
@@ -1727,7 +1843,7 @@ textarea {
 }
 
 .fs-dialog::backdrop {
-  background: rgba(15, 13, 11, 0.42);
+  background: var(--backdrop);
 }
 
 .fs-dialog[open] {
@@ -1787,7 +1903,7 @@ textarea {
 }
 
 .fs-palette::backdrop {
-  background: rgba(15, 13, 11, 0.42);
+  background: var(--backdrop);
 }
 
 .fs-palette[open] {
@@ -1989,7 +2105,7 @@ textarea {
    * collapse. */
   .fs-table {
     --fs-cols: minmax(74px, 1.2fr) minmax(70px, 1fr) minmax(80px, 1.1fr)
-      minmax(96px, 1.2fr) 64px;
+      minmax(96px, 1.2fr) 96px;
   }
 
   .fs-cell--forwards,
@@ -2220,12 +2336,16 @@ textarea {
 /* A coloured background reads as a block, not as text with a tinted halo. */
 .fs-logview [class*="fs-ansi-bg-"] {
   padding: 1px 0;
+}
+
 /* ==========================================================================
  * SECTION: create-dialog spec fields                               (M6-23)
  * ========================================================================== */
 
+/* One wide dialog width, shared by create, edit and the prune preview. */
 .fs-dialog--wide {
   width: min(680px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px);
 }
 
 .fs-field {
@@ -2443,8 +2563,12 @@ textarea {
 .fs-inline-notice[data-fs-password-cleared],
 .fs-inline-notice[data-fs-userdata-over] {
   margin-top: 8px;
-/* =================================================================== * SECTION: live utilization                                         (M6-25)
- * =================================================================== *
+}
+
+/* ==========================================================================
+ * SECTION: live utilization                                         (M6-25)
+ * ==========================================================================
+ *
  * Sparklines are hand-drawn <polyline> elements, not a chart library. Their
  * geometry arrives as a `points` attribute written by app.js; everything
  * visual — stroke, fill, width — is here, because the served CSP has no
@@ -2532,7 +2656,8 @@ textarea {
   font-size: 11px;
   color: var(--text3);
   margin-top: 3px;
-=======
+}
+
 /* --------------------------------------------------------------- terminal -- */
 
 /* The terminal page (SPEC §16.5) is its own document, not the sidebar shell:
@@ -2661,6 +2786,9 @@ textarea {
 
   .fs-tile:first-child {
     border-top: 0;
+  }
+}
+
 .fs-term__tabs {
   display: flex;
   gap: 4px;
@@ -2774,7 +2902,7 @@ textarea {
   align-items: center;
   justify-content: center;
   padding: 20px;
-  background: rgba(12, 10, 9, 0.72);
+  background: var(--scrim);
 }
 
 .fs-term__overlay-card {
@@ -2829,7 +2957,7 @@ textarea {
     display: none;
   }
 }
-=======
+
 /* ======================================================== machine edit ==
  *
  * The edit dialog reuses the create dialog's field markup wholesale, so the
@@ -2857,55 +2985,8 @@ textarea {
   color: var(--text2);
 }
 
-/* When a field takes effect. "live" is the only one that is already true by
- * the time the dialog closes; the others are a promise about the next start,
- * so they read as muted rather than as a success. */
-.fs-applies {
-  font-family: var(--mono);
-  font-size: 10.5px;
-  color: var(--text3);
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  padding: 2px 8px;
-  white-space: nowrap;
-}
-
-.fs-applies--live {
-  color: var(--ok);
-  border-color: var(--ok);
-  background: var(--ok-bg);
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  font-weight: 600;
-}
-
-.fs-drift {
-  font-size: 11.5px;
-  font-weight: 600;
-  color: var(--warn);
-  background: var(--warn-bg);
-  border: 1px solid transparent;
-  border-radius: 999px;
-  padding: 3px 10px;
-  white-space: nowrap;
-}
 
 /* ==================== snapshots, clone, images, prune (M6-26) ============= */
-
-/* The machines table grew a per-row overflow menu, so the last track carries
- * two controls instead of one. Declared here, after the original rule and
- * after its narrow-viewport override, so both are replaced together. */
-.fs-table {
-  --fs-cols: minmax(74px, 1.1fr) minmax(70px, 0.9fr) minmax(80px, 1.1fr)
-    minmax(96px, 1.2fr) minmax(70px, 1.4fr) minmax(46px, 0.7fr) 96px;
-}
-
-@media (max-width: 860px) {
-  .fs-table {
-    --fs-cols: minmax(74px, 1.2fr) minmax(70px, 1fr) minmax(80px, 1.1fr)
-      minmax(96px, 1.2fr) 96px;
-  }
-}
 
 .fs-row__actions {
   display: flex;
@@ -2952,7 +3033,7 @@ textarea {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 8px;
-  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.18);
+  box-shadow: var(--menu-shadow);
 }
 
 .fs-menu__item {
@@ -3006,8 +3087,8 @@ textarea {
 }
 
 .fs-chip--link {
-  color: var(--accent, var(--text));
-  border-color: var(--accent, var(--line));
+  color: var(--ember);
+  border-color: var(--ember);
   text-decoration: none;
 }
 
@@ -3016,42 +3097,11 @@ textarea {
   text-decoration: underline;
 }
 
-.fs-chip--pending {
-  color: var(--warn);
-  background: var(--warn-bg);
-  border-color: transparent;
-  font-family: var(--sans, inherit);
-  font-weight: 600;
-}
 
 .fs-meta__forwards {
   grid-column: 1 / -1;
 }
 
-/* Snapshot tier and OCI badge: a stable word in a stable box, never a colour
- * on its own. */
-.fs-tier {
-  font-family: var(--mono);
-  font-size: 10.5px;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  font-weight: 600;
-  padding: 2px 7px;
-  border-radius: 999px;
-  border: 1px solid var(--line);
-  color: var(--text2);
-  white-space: nowrap;
-}
-
-.fs-tier[data-fs-tier="warm"] {
-  color: var(--warn);
-  background: var(--warn-bg);
-  border-color: transparent;
-}
-
-.fs-tier[data-fs-tier="oci"] {
-  margin-left: 6px;
-}
 
 .fs-table--snapshots {
   --fs-cols: minmax(120px, 1.6fr) minmax(56px, 0.5fr) minmax(120px, 1.2fr)
@@ -3166,10 +3216,6 @@ textarea {
   font-family: var(--mono);
   font-size: 12px;
   font-weight: 600;
-}
-
-.fs-dialog--wide {
-  max-width: 640px;
 }
 
 .fs-field__opt {

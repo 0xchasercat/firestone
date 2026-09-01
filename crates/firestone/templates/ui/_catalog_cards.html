@@ -1,3 +1,4 @@
+{% import "ui/_macros.html" as m %}
 {% for e in entries %}
 <div class="fs-card" data-fs-card data-fs-notice-slot>
   <div class="fs-card__head">
@@ -13,7 +14,7 @@
             data-fs-pull="{{ e.reference }}">Pull</button>
     {% endif %}
   </div>
-  <div class="fs-chips">
+  <div class="fs-tagchips">
     {% for chip in e.chips %}<span class="fs-tagchip">{{ chip }}</span>{% endfor %}
   </div>
   {% if e.cached %}
@@ -21,11 +22,9 @@
   {% endif %}
 </div>
 {% else %}
-<div class="fs-empty">
-  <div class="fs-empty__title">The catalog is empty</div>
-  <div class="fs-empty__body">
-    Firestone ships a built-in catalog. If this is empty, a user catalog at
-    <span class="fs-mono">~/.config/firestone/images.toml</span> may be overriding it.
-  </div>
-</div>
+{{ m.empty(
+    "image",
+    "The catalog is empty",
+    "Firestone ships a built-in catalog. If this is empty, a user catalog at ~/.config/firestone/images.toml may be overriding it."
+) }}
 {% endfor %}

@@ -2,7 +2,7 @@
   <div class="fs-panel fs-panel--clip">
     <div class="fs-logbar">
       {% for s in sources %}
-      <a class="fs-chip{% if s.active %} is-active{% endif %}"
+      <a class="fs-logbar__source{% if s.active %} is-active{% endif %}"
          href="{{ s.href }}"
          hx-get="{{ s.fragment }}"
          hx-target="#fs-tabpanel"

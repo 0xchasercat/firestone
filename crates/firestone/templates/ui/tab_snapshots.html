@@ -5,6 +5,7 @@
    below is a data attribute app.js turns into a request against the
    documented `/v1` routes, so this template declares no hx-post, hx-delete or
    form of its own — see `the_ui_never_offers_a_second_mutation_surface`. #}
+{% import "ui/_macros.html" as m %}
 <div class="fs-tabbody" data-fs-snapshots="{{ machine.name }}" data-fs-notice-slot>
   <div class="fs-subhead">
     <div>
@@ -45,7 +46,8 @@
     <div class="fs-row fs-row--static" data-fs-snapshot-row="{{ snap.snapshot }}">
       <span class="fs-cell fs-cell--mono fs-cell--name" title="{{ snap.snapshot }}">{{ snap.snapshot }}</span>
       <span class="fs-cell">
-        <span class="fs-tier" data-fs-tier="{{ snap.kind }}">{{ snap.kind }}</span>
+        <span class="fs-badge{% if snap.kind == 'warm' %} fs-badge--pending{% endif %}"
+              data-fs-tier="{{ snap.kind }}">{{ snap.kind }}</span>
       </span>
       <span class="fs-cell fs-cell--mono fs-cell--muted fs-cell--small">{{ snap.created }}</span>
       <span class="fs-cell fs-cell--mono">{{ snap.size }}</span>
@@ -68,13 +70,12 @@
     {% endfor %}
   </div>
   {% else %}
-  <div class="fs-empty" data-fs-snapshot-empty>
-    <div class="fs-empty__title">No snapshots yet</div>
-    <div class="fs-empty__body">
-      A snapshot copies this machine's disk, its spec and — while it runs — its
-      guest memory. Restoring one replaces all three, so a machine comes back to
-      the configuration its disk was captured under.
-    </div>
+  <div data-fs-snapshot-empty>
+    {{ m.empty(
+        "snapshot",
+        "No snapshots yet",
+        "A snapshot copies this machine's disk, its spec and — while it runs — its guest memory. Restoring one replaces all three, so the machine comes back to the configuration its disk was captured under."
+    ) }}
   </div>
   {% endif %}
 
