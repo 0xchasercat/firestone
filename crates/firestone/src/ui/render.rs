@@ -84,6 +84,14 @@ const TEMPLATES: &[(&str, &str)] = &[
         include_str!("../../templates/ui/create.html"),
     ),
     (
+        "ui/_spec_fields.html",
+        include_str!("../../templates/ui/_spec_fields.html"),
+    ),
+    (
+        "ui/_image_picker.html",
+        include_str!("../../templates/ui/_image_picker.html"),
+    ),
+    (
         "ui/palette.html",
         include_str!("../../templates/ui/palette.html"),
     ),

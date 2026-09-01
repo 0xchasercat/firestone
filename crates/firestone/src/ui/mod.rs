@@ -120,6 +120,7 @@ pub fn router(dispatcher: Arc<dyn Dispatcher>, config: &GlobalConfig, paths: &Pa
         .route("/ui/overview/machines", get(routes::overview_machines))
         .route("/ui/machines/rows", get(routes::machine_rows))
         .route("/ui/machines/new", get(routes::create_form))
+        .route("/ui/machines/new/images", get(routes::create_form_images))
         .route("/ui/machines", post(routes::create_machine))
         .route("/ui/machines/{name}/head", get(routes::machine_head))
         .route("/ui/machines/{name}/tab/{tab}", get(routes::machine_tab))

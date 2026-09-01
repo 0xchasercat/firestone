@@ -2220,4 +2220,193 @@ textarea {
 /* A coloured background reads as a block, not as text with a tinted halo. */
 .fs-logview [class*="fs-ansi-bg-"] {
   padding: 1px 0;
+/* ==========================================================================
+ * SECTION: create-dialog spec fields                               (M6-23)
+ * ========================================================================== */
+
+.fs-dialog--wide {
+  width: min(680px, calc(100vw - 32px));
+}
+
+.fs-field {
+  min-width: 0;
+}
+
+.fs-field__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 5px;
+}
+
+.fs-field__head .fs-field__label {
+  margin-bottom: 0;
+}
+
+/* ------------------------------------------------------------ image picker -- */
+
+.fs-picker {
+  display: grid;
+  gap: 10px;
+}
+
+.fs-picker__list {
+  display: grid;
+  gap: 6px;
+  max-height: 200px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 6px;
+  background: var(--panel2);
+}
+
+.fs-picker__option {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.fs-picker__option:hover {
+  border-color: var(--line2);
+}
+
+.fs-picker__option:has(.fs-picker__radio:checked) {
+  border-color: var(--ember);
+  background: var(--panel);
+}
+
+.fs-picker__option:has(.fs-picker__radio:focus-visible) {
+  border-color: var(--ember);
+}
+
+.fs-picker__radio {
+  accent-color: var(--ember);
+  margin: 0;
+  flex: 0 0 auto;
+}
+
+.fs-picker__ref {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fs-picker__aliases {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fs-picker__pullslot {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+
+.fs-picker__empty {
+  font-size: 12.5px;
+  color: var(--text3);
+  padding: 10px 12px;
+}
+
+.fs-picker__custom {
+  display: block;
+}
+
+/* ------------------------------------------------------------- unit sizes -- */
+
+.fs-unitrow {
+  display: flex;
+  gap: 6px;
+}
+
+.fs-unitrow .fs-input {
+  min-width: 0;
+}
+
+.fs-unitrow__unit {
+  width: 84px;
+  flex: 0 0 auto;
+}
+
+/* ---------------------------------------------------------- repeated rows -- */
+
+.fs-rows {
+  display: grid;
+  gap: 6px;
+}
+
+.fs-rows:empty {
+  display: none;
+}
+
+.fs-rows__foot {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.fs-rowfields {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1.4fr) minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: center;
+}
+
+.fs-rowfields--mount {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto auto;
+}
+
+@media (max-width: 640px) {
+  .fs-rowfields,
+  .fs-rowfields--mount {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+}
+
+/* ---------------------------------------------------------------- advanced -- */
+
+.fs-advanced {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0 12px;
+}
+
+.fs-advanced__summary {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text2);
+  cursor: pointer;
+  padding: 9px 0;
+  list-style: none;
+}
+
+.fs-advanced__summary::-webkit-details-marker {
+  display: none;
+}
+
+.fs-advanced__summary::before {
+  content: "▸ ";
+  color: var(--text3);
+}
+
+.fs-advanced[open] .fs-advanced__summary::before {
+  content: "▾ ";
+}
+
+.fs-advanced__body {
+  padding-bottom: 12px;
 }

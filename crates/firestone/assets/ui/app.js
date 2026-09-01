@@ -1126,6 +1126,129 @@
         state.fg = code - 90 + 8;
       } else if (code >= 100 && code <= 107) {
         state.bg = code - 100 + 8;
+  /* ==========================================================================
+   * SECTION: create-dialog field composition                        (M6-23)
+   * ==========================================================================
+   *
+   * The create dialog offers friendly controls — an image listbox, a number
+   * plus a unit, repeatable forward and mount rows — over the exact fields the
+   * server already parses. Nothing here invents a second grammar: every
+   * control composes into `image`, `memory`, `disk`, `forward` or `mounts`,
+   * and those strings are the ones POST /ui/machines reads, character for
+   * character, the same way `firestone create` reads its flags.
+   *
+   * Two consequences follow, and both are deliberate:
+   *
+   *   - A raw value the composer cannot round-trip is never rewritten. The
+   *     group marks itself raw-only, reveals the text field, and lets the
+   *     server answer, rather than quietly dropping a forward it could not
+   *     parse.
+   *   - Visibility is the `hidden` attribute, never a style. The CSP has no
+   *     'unsafe-inline'.
+   */
+
+  var CREATE_FORM = "[data-fs-create-form]";
+
+  function fieldsOf(root, selector) {
+    return Array.prototype.slice.call(root.querySelectorAll(selector));
+  }
+
+  function valueOf(root, selector) {
+    var node = qs(selector, root);
+    return node ? node.value.trim() : "";
+  }
+
+  function formOf(node) {
+    return node && node.closest ? node.closest(CREATE_FORM) : null;
+  }
+
+  /* ------------------------------------------------------- image picker -- */
+
+  function pickImage(form, reference, fromCustom) {
+    var hidden = qs("[data-fs-picker-value]", form);
+    if (hidden) {
+      hidden.value = reference;
+    }
+    if (fromCustom) {
+      fieldsOf(form, "[data-fs-picker-option]").forEach(function (radio) {
+        radio.checked = false;
+      });
+      return;
+    }
+    var custom = qs("[data-fs-picker-custom]", form);
+    if (custom) {
+      custom.value = "";
+    }
+  }
+
+  /* Re-reads the picker after a pull so the entry that was just fetched shows
+   * its cached badge and size. The fragment is a read and knows nothing about
+   * this form, so whatever the user had chosen or typed is stashed across the
+   * swap and put back. */
+  function refreshImagePicker(form) {
+    var list = qs("[data-fs-picker-list]", form);
+    if (!list || !window.htmx) {
+      return Promise.resolve();
+    }
+    var hidden = qs("[data-fs-picker-value]", form);
+    var chosen = hidden ? hidden.value : "";
+    var typed = valueOf(form, "[data-fs-picker-custom]");
+
+    return Promise.resolve(
+      window.htmx.ajax("GET", "/ui/machines/new/images", {
+        target: list,
+        swap: "innerHTML"
+      })
+    ).then(function () {
+      var custom = qs("[data-fs-picker-custom]", form);
+      if (custom) {
+        custom.value = typed;
+      }
+      fieldsOf(form, "[data-fs-picker-option]").forEach(function (radio) {
+        radio.checked = !typed && radio.value === chosen;
+      });
+      if (hidden) {
+        hidden.value = chosen;
+      }
+    });
+  }
+
+  /* ---------------------------------------------------------- unit sizes -- */
+
+  /* `G` is GiB and `M` is MiB in the ByteSize grammar, which is why the select
+   * says GiB and MiB. Composing 8 + G gives "8G": 8192 MiB, not 8000 MB. */
+  function syncSize(field) {
+    var amount = qs("[data-fs-size-amount]", field);
+    var unit = qs("[data-fs-size-unit]", field);
+    var value = qs("[data-fs-size-value]", field);
+    if (!amount || !unit || !value) {
+      return;
+    }
+    var text = amount.value.trim();
+    value.value = text ? text + unit.value : "";
+  }
+
+  /* ------------------------------------------------------- repeated rows -- */
+
+  function addRow(group, templateSelector, hostSelector) {
+    var template = qs(templateSelector, group);
+    var host = qs(hostSelector, group);
+    if (!template || !host) {
+      return null;
+    }
+    var row = template.content.firstElementChild.cloneNode(true);
+    host.appendChild(row);
+    return row;
+  }
+
+  function setRawOnly(group, rawOnly, rawSelector) {
+    var raw = qs(rawSelector, group);
+    group.toggleAttribute("data-fs-raw-only", rawOnly);
+    if (rawOnly && raw) {
+      raw.hidden = false;
+      var toggle = qs("[data-fs-raw-toggle]", group);
+      if (toggle) {
+        toggle.setAttribute("aria-pressed", "true");
       }
     }
   }
@@ -1413,4 +1536,374 @@
     parseSgr: parseSgr,
     foldCarriageReturns: foldCarriageReturns
   };
+  /* Splits `[proto:][bind:]HOST:GUEST` the way the server does: the guest is
+   * the last colon-separated field and the host the one before it, so an IPv6
+   * literal in brackets survives untouched. */
+  function splitForward(token) {
+    var guestAt = token.lastIndexOf(":");
+    if (guestAt < 0) {
+      return null;
+    }
+    var guest = token.slice(guestAt + 1);
+    var head = token.slice(0, guestAt);
+    var hostAt = head.lastIndexOf(":");
+    var host = hostAt < 0 ? head : head.slice(hostAt + 1);
+    var bind = hostAt < 0 ? "" : head.slice(0, hostAt);
+    var proto = "tcp";
+    if (bind === "tcp" || bind === "udp") {
+      proto = bind;
+      bind = "";
+    } else if (bind.indexOf("tcp:") === 0 || bind.indexOf("udp:") === 0) {
+      proto = bind.slice(0, 3);
+      bind = bind.slice(4);
+    }
+    if (!host || !guest) {
+      return null;
+    }
+    return { proto: proto, bind: bind, host: host, guest: guest };
+  }
+
+  function hydrateForwards(group) {
+    var raw = qs("[data-fs-forward-value]", group);
+    var host = qs("[data-fs-forward-rows]", group);
+    if (!raw || !host) {
+      return;
+    }
+    host.textContent = "";
+    var complete = true;
+    raw.value
+      .split(",")
+      .map(function (token) {
+        return token.trim();
+      })
+      .filter(function (token) {
+        return token.length > 0;
+      })
+      .forEach(function (token) {
+        var parsed = splitForward(token);
+        if (!parsed) {
+          complete = false;
+          return;
+        }
+        var row = addRow(
+          group,
+          "[data-fs-forward-template]",
+          "[data-fs-forward-rows]"
+        );
+        if (!row) {
+          return;
+        }
+        qs("[data-fs-forward-proto]", row).value = parsed.proto;
+        qs("[data-fs-forward-bind]", row).value = parsed.bind;
+        qs("[data-fs-forward-host]", row).value = parsed.host;
+        qs("[data-fs-forward-guest]", row).value = parsed.guest;
+      });
+    if (!complete) {
+      host.textContent = "";
+    }
+    setRawOnly(group, !complete, "[data-fs-forward-value]");
+  }
+
+  function composeForwards(group) {
+    if (group.hasAttribute("data-fs-raw-only")) {
+      return;
+    }
+    var raw = qs("[data-fs-forward-value]", group);
+    if (!raw) {
+      return;
+    }
+    var parts = [];
+    fieldsOf(group, "[data-fs-forward-row]").forEach(function (row) {
+      var host = valueOf(row, "[data-fs-forward-host]");
+      var guest = valueOf(row, "[data-fs-forward-guest]");
+      if (!host && !guest) {
+        return;
+      }
+      var prefix = "";
+      if (valueOf(row, "[data-fs-forward-proto]") === "udp") {
+        prefix += "udp:";
+      }
+      var bind = valueOf(row, "[data-fs-forward-bind]");
+      if (bind) {
+        prefix += bind + ":";
+      }
+      parts.push(prefix + host + ":" + guest);
+    });
+    raw.value = parts.join(", ");
+  }
+
+  function splitMount(line) {
+    var parts = line.split(":");
+    if (parts.length === 2 && parts[0] && parts[1]) {
+      return { host: parts[0], guest: parts[1], readonly: false };
+    }
+    if (parts.length === 3 && parts[0] && parts[1] && parts[2] === "ro") {
+      return { host: parts[0], guest: parts[1], readonly: true };
+    }
+    return null;
+  }
+
+  function hydrateMounts(group) {
+    var raw = qs("[data-fs-mount-value]", group);
+    var host = qs("[data-fs-mount-rows]", group);
+    if (!raw || !host) {
+      return;
+    }
+    host.textContent = "";
+    var complete = true;
+    raw.value
+      .split("\n")
+      .map(function (line) {
+        return line.trim();
+      })
+      .filter(function (line) {
+        return line.length > 0;
+      })
+      .forEach(function (line) {
+        var parsed = splitMount(line);
+        if (!parsed) {
+          complete = false;
+          return;
+        }
+        var row = addRow(
+          group,
+          "[data-fs-mount-template]",
+          "[data-fs-mount-rows]"
+        );
+        if (!row) {
+          return;
+        }
+        qs("[data-fs-mount-host]", row).value = parsed.host;
+        qs("[data-fs-mount-guest]", row).value = parsed.guest;
+        qs("[data-fs-mount-ro]", row).checked = parsed.readonly;
+      });
+    if (!complete) {
+      host.textContent = "";
+    }
+    setRawOnly(group, !complete, "[data-fs-mount-value]");
+  }
+
+  function composeMounts(group) {
+    if (group.hasAttribute("data-fs-raw-only")) {
+      return;
+    }
+    var raw = qs("[data-fs-mount-value]", group);
+    if (!raw) {
+      return;
+    }
+    var lines = [];
+    fieldsOf(group, "[data-fs-mount-row]").forEach(function (row) {
+      var host = valueOf(row, "[data-fs-mount-host]");
+      var guest = valueOf(row, "[data-fs-mount-guest]");
+      if (!host && !guest) {
+        return;
+      }
+      var readonly = qs("[data-fs-mount-ro]", row);
+      lines.push(host + ":" + guest + (readonly && readonly.checked ? ":ro" : ""));
+    });
+    raw.value = lines.join("\n");
+  }
+
+  /* ------------------------------------------------------------- network -- */
+
+  function syncNetMode(form) {
+    var select = qs("[data-fs-net-mode]", form);
+    var field = qs("[data-fs-tap-field]", form);
+    if (select && field) {
+      field.hidden = select.value !== "tap";
+    }
+  }
+
+  /* --------------------------------------------------------- dialog init -- */
+
+  function initCreateForm(form) {
+    if (form.hasAttribute("data-fs-ready")) {
+      return;
+    }
+    form.setAttribute("data-fs-ready", "");
+    var forwards = qs("[data-fs-forwards]", form);
+    if (forwards) {
+      hydrateForwards(forwards);
+    }
+    var mounts = qs("[data-fs-mounts]", form);
+    if (mounts) {
+      hydrateMounts(mounts);
+    }
+    syncNetMode(form);
+  }
+
+  /* Composed once more on the way out, so a value edited without firing a
+   * change event — an autofilled row, a programmatic edit — still reaches the
+   * server in canonical form. */
+  function composeCreateForm(form) {
+    var forwards = qs("[data-fs-forwards]", form);
+    if (forwards) {
+      composeForwards(forwards);
+    }
+    var mounts = qs("[data-fs-mounts]", form);
+    if (mounts) {
+      composeMounts(mounts);
+    }
+    fieldsOf(form, "[data-fs-size][data-fs-touched]").forEach(syncSize);
+  }
+
+  document.body.addEventListener("htmx:afterSwap", function () {
+    var form = qs(CREATE_FORM);
+    if (form) {
+      initCreateForm(form);
+    }
+  });
+
+  /* Capture at the document, so the composition runs before htmx's own submit
+   * listener on the form gathers the parameters. */
+  document.addEventListener(
+    "submit",
+    function (event) {
+      var form = formOf(event.target);
+      if (form) {
+        composeCreateForm(form);
+      }
+    },
+    true
+  );
+
+  document.addEventListener("click", function (event) {
+    var form = formOf(event.target);
+    if (!form) {
+      return;
+    }
+
+    var raw = event.target.closest("[data-fs-raw-toggle]");
+    if (raw) {
+      event.preventDefault();
+      var group = raw.closest("[data-fs-forwards], [data-fs-mounts]");
+      var field = group && qs("[data-fs-forward-value], [data-fs-mount-value]", group);
+      if (field) {
+        field.hidden = !field.hidden;
+        raw.setAttribute("aria-pressed", field.hidden ? "false" : "true");
+      }
+      return;
+    }
+
+    if (event.target.closest("[data-fs-forward-add]")) {
+      event.preventDefault();
+      var forwards = qs("[data-fs-forwards]", form);
+      if (forwards) {
+        setRawOnly(forwards, false, "[data-fs-forward-value]");
+        addRow(forwards, "[data-fs-forward-template]", "[data-fs-forward-rows]");
+        composeForwards(forwards);
+      }
+      return;
+    }
+
+    if (event.target.closest("[data-fs-mount-add]")) {
+      event.preventDefault();
+      var mounts = qs("[data-fs-mounts]", form);
+      if (mounts) {
+        setRawOnly(mounts, false, "[data-fs-mount-value]");
+        addRow(mounts, "[data-fs-mount-template]", "[data-fs-mount-rows]");
+        composeMounts(mounts);
+      }
+      return;
+    }
+
+    var remove = event.target.closest("[data-fs-row-remove]");
+    if (remove) {
+      event.preventDefault();
+      var owner = remove.closest("[data-fs-forwards], [data-fs-mounts]");
+      var row = remove.closest("[data-fs-forward-row], [data-fs-mount-row]");
+      if (row) {
+        row.remove();
+      }
+      if (owner) {
+        composeForwards(owner);
+        composeMounts(owner);
+      }
+    }
+  });
+
+  /* The in-dialog pull reuses the same NDJSON machinery the catalog uses, then
+   * re-reads the picker so the entry it just fetched reports its real size
+   * instead of still offering a pull. */
+  document.addEventListener(
+    "click",
+    function (event) {
+      var button = event.target.closest("[data-fs-pull-picker]");
+      if (!button) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      var form = formOf(button);
+      runPull(button, button.getAttribute("data-fs-pull-picker")).then(
+        function () {
+          if (form) {
+            refreshImagePicker(form);
+          }
+        }
+      );
+    },
+    true
+  );
+
+  document.addEventListener("change", function (event) {
+    var form = formOf(event.target);
+    if (!form) {
+      return;
+    }
+    if (event.target.closest("[data-fs-net-mode]")) {
+      syncNetMode(form);
+      return;
+    }
+    if (event.target.closest("[data-fs-picker-option]")) {
+      pickImage(form, event.target.value, false);
+      return;
+    }
+    var rawField = event.target.closest(
+      "[data-fs-forward-value], [data-fs-mount-value]"
+    );
+    if (rawField) {
+      var group = rawField.closest("[data-fs-forwards], [data-fs-mounts]");
+      if (group) {
+        setRawOnly(group, false, "[data-fs-forward-value], [data-fs-mount-value]");
+        hydrateForwards(group);
+        hydrateMounts(group);
+      }
+      return;
+    }
+    var mountGroup = event.target.closest("[data-fs-mounts]");
+    if (mountGroup) {
+      composeMounts(mountGroup);
+    }
+    var forwardGroup = event.target.closest("[data-fs-forwards]");
+    if (forwardGroup) {
+      composeForwards(forwardGroup);
+    }
+  });
+
+  document.addEventListener("input", function (event) {
+    var form = formOf(event.target);
+    if (!form) {
+      return;
+    }
+    var custom = event.target.closest("[data-fs-picker-custom]");
+    if (custom) {
+      pickImage(form, custom.value.trim(), true);
+      return;
+    }
+    var size = event.target.closest("[data-fs-size]");
+    if (size) {
+      size.setAttribute("data-fs-touched", "");
+      syncSize(size);
+      return;
+    }
+    var forwardGroup = event.target.closest("[data-fs-forwards]");
+    if (forwardGroup && !event.target.closest("[data-fs-forward-value]")) {
+      composeForwards(forwardGroup);
+    }
+    var mountGroup = event.target.closest("[data-fs-mounts]");
+    if (mountGroup && !event.target.closest("[data-fs-mount-value]")) {
+      composeMounts(mountGroup);
+    }
+  });
 })();

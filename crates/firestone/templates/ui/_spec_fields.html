@@ -1,0 +1,247 @@
+{#
+  Spec field markup, factored out of the create dialog so a later edit surface
+  renders exactly the same controls against the same names.
+
+  Two rules run through every macro here:
+
+    - The Content-Security-Policy has no 'unsafe-inline', so nothing carries a
+      style attribute or an inline handler. Visibility is the `hidden`
+      attribute, toggled from app.js.
+    - The field a handler parses is always a plain named input. The friendly
+      controls beside it (unit selects, repeatable rows, the image listbox)
+      are unnamed and compose into that field, so the server contract is the
+      same one the CLI and REST already speak.
+#}
+
+{% macro text_field(id, name, label, value, error, hint, placeholder, mono, required) -%}
+<div class="fs-field">
+  <label class="fs-field__label" for="{{ id }}">{{ label }}</label>
+  <input class="fs-input{% if mono %} fs-input--mono{% endif %}" id="{{ id }}" name="{{ name }}"
+         autocomplete="off" spellcheck="false" value="{{ value }}"
+         {% if placeholder %}placeholder="{{ placeholder }}"{% endif %}
+         {% if required %}required{% endif %}
+         {% if error %}aria-invalid="true" aria-describedby="{{ id }}-error"{% endif %}>
+  {% if error %}
+  <div class="fs-field__error" id="{{ id }}-error">{{ error }}</div>
+  {% elif hint %}
+  <div class="fs-field__hint">{{ hint }}</div>
+  {% endif %}
+</div>
+{%- endmacro %}
+
+{#
+  A size is entered as a number plus a unit, and composed into the canonical
+  ByteSize string in the hidden field the handler reads. The units are labelled
+  GiB and MiB because that is what `G` and `M` mean here: 1G is 1024 MiB, not
+  1000 MB, and a form that printed "GB" would be lying about the machine it is
+  about to build.
+#}
+{% macro size_field(id, name, label, size, error, hint) -%}
+<div class="fs-field" data-fs-size>
+  <label class="fs-field__label" for="{{ id }}-amount">{{ label }}</label>
+  <div class="fs-unitrow">
+    <input class="fs-input fs-input--mono" id="{{ id }}-amount" type="number" min="1" step="1"
+           inputmode="numeric" autocomplete="off" value="{{ size.amount }}"
+           data-fs-size-amount
+           {% if error %}aria-invalid="true"{% endif %}>
+    <select class="fs-input fs-input--mono fs-unitrow__unit" id="{{ id }}-unit"
+            aria-label="{{ label }} unit" data-fs-size-unit>
+      <option value="G"{% if size.unit == "G" %} selected{% endif %}>GiB</option>
+      <option value="M"{% if size.unit == "M" %} selected{% endif %}>MiB</option>
+    </select>
+  </div>
+  <input type="hidden" id="{{ id }}" name="{{ name }}" value="{{ size.raw }}" data-fs-size-value>
+  {% if error %}
+  <div class="fs-field__error" id="{{ id }}-error">{{ error }}</div>
+  {% elif hint %}
+  <div class="fs-field__hint">{{ hint }}</div>
+  {% endif %}
+</div>
+{%- endmacro %}
+
+{#
+  The catalog listbox plus the free-text row, rendered both inside the dialog
+  and on its own by GET /ui/machines/new/images after a pull. A catalog entry
+  is a radio so the browser supplies selection, roving focus and arrow keys;
+  app.js copies the chosen value into the hidden `image` field that is actually
+  submitted.
+#}
+{% macro image_list(images, selected, custom) -%}
+<div class="fs-picker__list" role="radiogroup" aria-labelledby="fs-create-image-label">
+  {% for image in images %}
+  <label class="fs-picker__option" data-fs-card data-fs-notice-slot>
+    <input type="radio" class="fs-picker__radio" name="image_choice" value="{{ image.reference }}"
+           data-fs-picker-option{% if image.reference == selected %} checked{% endif %}>
+    <span class="fs-picker__ref">{{ image.reference }}</span>
+    {% if image.aliases %}<span class="fs-picker__aliases">{{ image.aliases }}</span>{% endif %}
+    <span class="fs-card__spacer"></span>
+    {% if image.cached %}
+    <span class="fs-cached" title="{{ image.cached_id }}">
+      <span class="fs-dot fs-dot--sm"></span>
+      <span>{{ image.size }}</span>
+    </span>
+    {% else %}
+    <span class="fs-picker__pullslot">
+      <button type="button" class="fs-btn fs-btn--sm"
+              data-fs-pull-picker="{{ image.reference }}">Pull now</button>
+    </span>
+    {% endif %}
+  </label>
+  {% else %}
+  <div class="fs-picker__empty">
+    the catalog is empty; name an image below
+  </div>
+  {% endfor %}
+</div>
+<div class="fs-picker__custom">
+  <label class="fs-field__label" for="fs-create-image-custom">URL, path, or any other reference</label>
+  <input class="fs-input fs-input--mono" id="fs-create-image-custom" list="fs-image-options"
+         autocomplete="off" spellcheck="false" value="{{ custom }}"
+         placeholder="https://cloud-images.example/noble.img"
+         data-fs-picker-custom>
+  <datalist id="fs-image-options">
+    {% for image in images %}<option value="{{ image.reference }}"></option>{% endfor %}
+  </datalist>
+</div>
+{%- endmacro %}
+
+{% macro image_picker(form, errors, images, custom) -%}
+<div class="fs-field" data-fs-picker>
+  <span class="fs-field__label" id="fs-create-image-label">Image</span>
+  <input type="hidden" id="fs-create-image" name="image" value="{{ form.image }}" data-fs-picker-value>
+  <div class="fs-picker" id="fs-create-image-list" data-fs-picker-list>
+    {{ image_list(images, form.image, custom) }}
+  </div>
+  {% if errors.image %}
+  <div class="fs-field__error" id="fs-create-image-error">{{ errors.image }}</div>
+  {% else %}
+  <div class="fs-field__hint">a catalog reference, an https:// URL, or a local path</div>
+  {% endif %}
+</div>
+{%- endmacro %}
+
+{#
+  Network mode, plus the fields only some modes use. The tap device is revealed
+  when the mode is tap; the MAC lives behind Advanced because leaving it unset
+  is the right answer almost always — Firestone generates one and stores it.
+#}
+{% macro network_fields(form, errors, net_modes) -%}
+<div class="fs-form__grid">
+  <div class="fs-field">
+    <label class="fs-field__label" for="fs-create-net">Network</label>
+    <select class="fs-input fs-input--mono" id="fs-create-net" name="net_mode" data-fs-net-mode>
+      {% for mode in net_modes %}
+      <option value="{{ mode }}"{% if mode == form.net_mode %} selected{% endif %}>{{ mode }}</option>
+      {% endfor %}
+    </select>
+    {% if errors.net_mode %}<div class="fs-field__error">{{ errors.net_mode }}</div>{% endif %}
+  </div>
+  <div class="fs-field" data-fs-tap-field{% if form.net_mode != "tap" %} hidden{% endif %}>
+    <label class="fs-field__label" for="fs-create-tap">tap device</label>
+    <input class="fs-input fs-input--mono" id="fs-create-tap" name="tap"
+           autocomplete="off" spellcheck="false" value="{{ form.tap }}" placeholder="tap0"
+           {% if errors.tap %}aria-invalid="true" aria-describedby="fs-create-tap-error"{% endif %}>
+    {% if errors.tap %}
+    <div class="fs-field__error" id="fs-create-tap-error">{{ errors.tap }}</div>
+    {% else %}
+    <div class="fs-field__hint">a tap device you already own</div>
+    {% endif %}
+  </div>
+</div>
+<details class="fs-advanced"{% if errors.mac %} open{% endif %}>
+  <summary class="fs-advanced__summary">Advanced</summary>
+  <div class="fs-advanced__body">
+    {{ text_field(
+        "fs-create-mac", "mac", "MAC address", form.mac, errors.mac,
+        "left unset, Firestone generates one and stores it in state.json",
+        "52:54:00:9a:1f:c3", true, false
+    ) }}
+  </div>
+</details>
+{%- endmacro %}
+
+{#
+  Port forwards: one row per forward, composed into the canonical comma-joined
+  `[proto:][bind:]HOST:GUEST` list. The raw field is the one that is submitted,
+  so the toggle shows exactly what the server will parse rather than a
+  reconstruction of it.
+#}
+{% macro forward_rows(form, errors) -%}
+<div class="fs-field" data-fs-forwards>
+  <div class="fs-field__head">
+    <span class="fs-field__label">Port forwards</span>
+    <button type="button" class="fs-btn fs-btn--sm" data-fs-raw-toggle="forward"
+            aria-pressed="false" aria-controls="fs-create-forward">raw</button>
+  </div>
+  <div class="fs-rows" data-fs-forward-rows></div>
+  <div class="fs-rows__foot">
+    <button type="button" class="fs-btn fs-btn--sm" data-fs-forward-add>Add forward</button>
+  </div>
+  <input class="fs-input fs-input--mono" id="fs-create-forward" name="forward"
+         autocomplete="off" spellcheck="false" value="{{ form.forward }}"
+         aria-label="port forwards, raw" data-fs-forward-value hidden
+         {% if errors.forward %}aria-invalid="true" aria-describedby="fs-create-forward-error"{% endif %}>
+  {% if errors.forward %}
+  <div class="fs-field__error" id="fs-create-forward-error">{{ errors.forward }}</div>
+  {% else %}
+  <div class="fs-field__hint">comma separated · [proto:][bind:]HOST:GUEST</div>
+  {% endif %}
+  <template data-fs-forward-template>
+    <div class="fs-rowfields" data-fs-forward-row>
+      <select class="fs-input fs-input--mono" aria-label="protocol" data-fs-forward-proto>
+        <option value="tcp">tcp</option>
+        <option value="udp">udp</option>
+      </select>
+      <input class="fs-input fs-input--mono" aria-label="bind address" placeholder="bind (optional)"
+             autocomplete="off" spellcheck="false" data-fs-forward-bind>
+      <input class="fs-input fs-input--mono" aria-label="host port" placeholder="host"
+             autocomplete="off" spellcheck="false" data-fs-forward-host>
+      <input class="fs-input fs-input--mono" aria-label="guest port" placeholder="guest"
+             autocomplete="off" spellcheck="false" data-fs-forward-guest>
+      <button type="button" class="fs-btn fs-btn--sm fs-btn--row" data-fs-row-remove
+              aria-label="remove this forward">Remove</button>
+    </div>
+  </template>
+</div>
+{%- endmacro %}
+
+{#
+  Shared folders, composed into the newline-joined `host:guest[:ro]` grammar the
+  CLI's --mount already uses.
+#}
+{% macro mount_rows(form, errors) -%}
+<div class="fs-field" data-fs-mounts>
+  <div class="fs-field__head">
+    <span class="fs-field__label">Shared folders</span>
+    <button type="button" class="fs-btn fs-btn--sm" data-fs-raw-toggle="mounts"
+            aria-pressed="false" aria-controls="fs-create-mounts">raw</button>
+  </div>
+  <div class="fs-rows" data-fs-mount-rows></div>
+  <div class="fs-rows__foot">
+    <button type="button" class="fs-btn fs-btn--sm" data-fs-mount-add>Add folder</button>
+  </div>
+  <textarea class="fs-input fs-input--mono" id="fs-create-mounts" name="mounts" rows="3"
+            autocomplete="off" spellcheck="false"
+            aria-label="shared folders, raw" data-fs-mount-value hidden
+            {% if errors.mounts %}aria-invalid="true" aria-describedby="fs-create-mounts-error"{% endif %}>{{ form.mounts }}</textarea>
+  {% if errors.mounts %}
+  <div class="fs-field__error" id="fs-create-mounts-error">{{ errors.mounts }}</div>
+  {% else %}
+  <div class="fs-field__hint">one per line · HOST:GUEST[:ro]</div>
+  {% endif %}
+  <template data-fs-mount-template>
+    <div class="fs-rowfields fs-rowfields--mount" data-fs-mount-row>
+      <input class="fs-input fs-input--mono" aria-label="host path" placeholder="~/code"
+             autocomplete="off" spellcheck="false" data-fs-mount-host>
+      <input class="fs-input fs-input--mono" aria-label="guest path" placeholder="/code"
+             autocomplete="off" spellcheck="false" data-fs-mount-guest>
+      <label class="fs-checkbox">
+        <input type="checkbox" data-fs-mount-ro>
+        <span>read-only</span>
+      </label>
+      <button type="button" class="fs-btn fs-btn--sm fs-btn--row" data-fs-row-remove
+              aria-label="remove this folder">Remove</button>
+    </div>
+  </template>
+</div>
+{%- endmacro %}
