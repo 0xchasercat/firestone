@@ -643,6 +643,33 @@ pub fn passt_forward_argument(forward: PortForward) -> Result<String, FirestoneE
     })
 }
 
+/// True when a configured forward set differs from the forwards a running
+/// machine actually applied at spawn (§12.4).
+///
+/// passt fixes `-t`/`-u` at spawn, so the recorded `state.json` forwards are the
+/// applied set. Comparison is canonical: every side is normalized through
+/// [`PortForward`]'s parser and display form and then sorted, so configuration
+/// order never signals a pending change. A recorded value that no longer parses
+/// is compared verbatim rather than discarded.
+#[must_use]
+pub fn forwards_differ(configured: &[PortForward], applied: &[String]) -> bool {
+    let mut configured = configured
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let mut applied = applied
+        .iter()
+        .map(|forward| {
+            forward
+                .parse::<PortForward>()
+                .map_or_else(|_| forward.clone(), |parsed| parsed.to_string())
+        })
+        .collect::<Vec<_>>();
+    configured.sort_unstable();
+    applied.sort_unstable();
+    configured != applied
+}
+
 fn prepare_passt(options: NetworkPlanOptions<'_>) -> Result<PasstPlan, FirestoneError> {
     if options.passt_program.as_bytes().is_empty() {
         return Err(
@@ -892,7 +919,7 @@ mod tests {
         ErrorKind, MacAddr, NetMode, NetworkSpec, PathInputs, Paths, PortForward,
         network::{
             NetworkPlan, NetworkPlanOptions, ReadinessCancellation, SocketReadiness, TapHost,
-            TapOwnership, passt_forward_argument, prepare_network,
+            TapOwnership, forwards_differ, passt_forward_argument, prepare_network,
         },
     };
 
@@ -1036,6 +1063,55 @@ mod tests {
         assert_eq!(plan.socket().uid(), fixture.paths.uid());
         assert_eq!(plan.socket().mode(), 0o700);
         assert_eq!(plan.log().mode(), 0o600);
+        Ok(())
+    }
+
+    #[test]
+    fn forwards_differ_compares_canonical_sets_and_ignores_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cases: [(&[&str], &[&str], bool); 8] = [
+            // Identical sets, and both sides empty.
+            (&["8080:80"], &["8080:80"], false),
+            (&[], &[], false),
+            // Reordering configuration is not a change.
+            (
+                &["8080:80", "udp:5353:53"],
+                &["udp:5353:53", "8080:80"],
+                false,
+            ),
+            // A forward added to, or removed from, the configured set.
+            (&["8080:80", "8443:443"], &["8080:80"], true),
+            (&["8080:80"], &["8080:80", "8443:443"], true),
+            // Non-canonical recorded spellings normalize before comparison.
+            (&["8080:80"], &["tcp:8080:80"], false),
+            (&["[::1]:2222:22"], &["[0:0:0:0:0:0:0:1]:2222:22"], false),
+            // Multiplicity still counts.
+            (&["8080:80"], &["8080:80", "8080:80"], true),
+        ];
+        for (configured, applied, expected) in cases {
+            let parsed = configured
+                .iter()
+                .map(|value| PortForward::from_str(value))
+                .collect::<Result<Vec<_>, _>>()?;
+            let applied = applied
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                forwards_differ(&parsed, &applied),
+                expected,
+                "{configured:?} vs {applied:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn forwards_differ_unparsable_recorded_value_compares_verbatim()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let configured = vec![PortForward::from_str("8080:80")?];
+        assert!(forwards_differ(&configured, &["not a forward".to_owned()]));
+        assert!(forwards_differ(&[], &["not a forward".to_owned()]));
         Ok(())
     }
 

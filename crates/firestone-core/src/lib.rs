@@ -66,7 +66,7 @@ pub use network::{
     DEFAULT_NETWORK_READINESS_POLL_INTERVAL, DEFAULT_NETWORK_READINESS_TIMEOUT, NetworkPlan,
     NetworkPlanOptions, OwnedPathExpectation, PINNED_PASST_VERSION, PasstPlan,
     ReadinessCancellation, SocketReadiness, SocketReadinessPlan, TapHost, TapOwnership, TapPlan,
-    passt_forward_argument, prepare_network, validate_tap,
+    forwards_differ, passt_forward_argument, prepare_network, validate_tap,
 };
 pub use paths::{PathInputs, Paths};
 pub use readiness::{ReadinessOptions, wait_for_ssh_ready};

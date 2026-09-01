@@ -1028,7 +1028,7 @@ passt --foreground --one-off --vhost-user
 - `--one-off` makes passt exit when the VMM disconnects, so teardown is automatic.
 - The VMM connects as a vhost‑user client (`vhost_mode: "Client"`) **[verify 14]**.
 - The guest reaches host loopback services through its gateway address (passt default). Documented for users; not configurable in v0.1.
-- Forwards are fixed for the life of the process; changing `network.forward` takes effect on the next start. `ssh -L` over vsock covers ad‑hoc needs (§11.5).
+- Forwards are fixed for the life of the process; changing `network.forward` takes effect on the next start, and the divergence is surfaced as `forwards_pending` until then (§12.5). `ssh -L` over vsock covers ad‑hoc needs (§11.5).
 - Limitation to document plainly: two passt machines on one host reach each other only through forwarded host ports. Multi‑VM clusters need tap mode.
 
 ### 12.2 `tap`
@@ -1052,6 +1052,24 @@ No `net` device. Shell, console, mounts still work.
 `[proto:][bind:]HOST:GUEST` where `proto ∈ {tcp,udp}` (default tcp), `bind` is an IPv4/IPv6 literal (default all addresses), and `HOST`/`GUEST` are ports or equal‑length ranges `a-b`. Examples: `8080:80`, `udp:5353:53`, `127.0.0.1:2222:22`, `8000-8010:8000-8010`. Parsing is a pure function with exhaustive unit tests; the mapping to passt's `-t`/`-u` grammar is a second pure function tested against the pinned passt man page **[verify 15]**. `ls` displays forwards as `8080→80`.
 
 Firestone emits one repeated `-t` or `-u` option per forward. The passt value is `[bind/]HOST:GUEST`: IPv4 is emitted directly, IPv6 is bracketed, and omitted bind means all addresses. TCP mappings precede UDP mappings while preserving configuration order within each protocol. Overlapping host ranges for one protocol are rejected even when bind literals differ because the pinned passt mapping table has one translation slot per protocol and host port. `--repair-path none` is emitted last because the pinned parser ends its second option pass at that option.
+
+### 12.5 Pending forwards (normative)
+
+passt fixes its `-t`/`-u` mappings at spawn and offers no runtime interface to change them, and the Cloud Hypervisor v53 vhost-user session does not survive a passt restart: `--one-off` passt exits when the VMM disconnects, and the VMM does not reconnect to a replacement backend. There is therefore no hot-apply for port forwards, and Firestone never pretends otherwise. The honest contract is apply-on-restart, made visible rather than silent.
+
+`state.json` `forwards` is the applied set: the shim writes the forwards it actually passed to passt at spawn, in canonical `[proto:][bind:]HOST:GUEST` form. `network.forward` in `firestone.toml` is the configured set. The two diverge whenever the spec is edited while the machine runs.
+
+`forwards_pending` is a boolean on `MachineSummary` (`ls`, `GET /v1/machines`) and on the show payload (`show`, `GET /v1/machines/{name}`). It is true exactly when the machine's status is `running` and the configured set differs from the applied set. It is false for every other status, because a machine that is not running has applied nothing.
+
+The comparison is canonical, not textual. Both sides are normalized through the §12.4 parser and its display form and compared as multisets, so configuration order is irrelevant and an equivalent respelling (`tcp:8080:80` for `8080:80`, a contracted IPv6 literal) is not a pending change. A recorded value that no longer parses is compared verbatim rather than discarded.
+
+Surfaces:
+
+- `ls` marks a pending row with a trailing `*` in the `FORWARDS` column and, when at least one row is marked, prints the single legend line `* forwards pending restart` after the table. The column still shows the applied forwards, since those are the ones a client can reach right now.
+- `show` prints `forwards pending restart` to stderr, keeping stdout a single valid JSON document (§15.3).
+- `PUT`/`PATCH` on the spec of a running machine, and `firestone edit`, emit the warning `Event::Log` `port forwards apply on restart` whenever the write leaves forwards pending. It is additional to, not a replacement for, the general `machine is running; spec changes take effect on next start` warning.
+
+`restart` clears the condition because the shim rewrites `state.json` `forwards` from the new spec at spawn. Nothing else does.
 
 ---
 
@@ -1176,7 +1194,7 @@ $ firestone run ubuntu
 - All feedback goes to stderr; stdout carries only data (`create` summary, `ls` table, `show`, `ssh-config`, `--json` streams), so pipes work.
 - Non‑TTY: no control characters or spinner frames; each step prints `[image] ubuntu:24.04 · x86_64 · cached` on start/done; NO_COLOR respected.
 - `--json`: NDJSON `Event`s on stdout, one per line, and nothing else on stdout.
-- `ls` table: `NAME  STATUS  IMAGE  CPUS  MEM  UPTIME  FORWARDS`; statuses `running`, `running!` (degraded), `stopped`, `failed`, `starting`, `stopping`, `created`. Never truncates names.
+- `ls` table: `NAME  STATUS  IMAGE  CPUS  MEM  UPTIME  FORWARDS`; statuses `running`, `running!` (degraded), `stopped`, `failed`, `starting`, `stopping`, `created`. Never truncates names. A `FORWARDS` cell ends in `*` when the machine's configured forwards are not the applied ones, and the table is then followed by the legend `* forwards pending restart` (§12.5).
 - Time, sizes, rates use short human units (`1.3s`, `613 MB`, `48 MB/s`).
 - Success ends with a single result line where useful (`start`: `ubuntu is running · shell: firestone shell ubuntu`). No decorative banners.
 - Human `create` prints a labeled effective-spec block containing name, canonical image, CPUs, memory, disk, network, forwards, mounts, the resolved `firestone.toml` path, and exact `edit` and `start` commands. Quiet mode still prints this terminal result. JSON and REST retain the canonical `MachineRecord` payload without CLI-only path or command fields.
@@ -1255,9 +1273,9 @@ The server holds no state and takes the same machine locks as the CLI. `curl --u
 |---|---|---|---|
 | GET | `/v1/version` | | `{version, identity, architecture, dependencies, paths}` |
 | GET | `/v1/doctor` | | doctor report |
-| GET | `/v1/machines` | | `[MachineSummary]` (same rows as `ls`) |
+| GET | `/v1/machines` | | `[MachineSummary]` (same rows as `ls`, including `forwards_pending`) |
 | POST | `/v1/machines` | `{name, spec}` (spec = `MachineSpecPatch` layered on defaults) | 201 `{name, spec, state}` |
-| GET | `/v1/machines/{name}` | | `{spec, state, supervision}` |
+| GET | `/v1/machines/{name}` | | `{spec, state, supervision, forwards_pending}` |
 | PUT | `/v1/machines/{name}` | `MachineSpec` (omitted fields take built-in defaults) | 200 `{spec, warnings}` |
 | PATCH | `/v1/machines/{name}` | `MachineSpecPatch` | 200 `{spec, warnings}` |
 | DELETE | `/v1/machines/{name}?force=` | | 204 (stream if a stop is needed) |
@@ -1422,6 +1440,7 @@ firestone/
 - Drift test (§5.4).
 - Catalog: resolution rules (§8.2), arch selection, merge/override.
 - Port forward parser and passt argument mapper (§12.4).
+- Pending forwards (§12.5): canonical diff matrix (equal, added, removed, reordered-equal, respelled, unparsable), the not-running gate, the `port forwards apply on restart` warning, the marked `ls` row with its legend, and `forwards_pending` in the `ls`/`show` REST payloads and their OpenAPI schemas.
 - Cloud‑init: golden renders for {no user‑data, cloud‑config user‑data, shellscript user‑data, keys, mounts, provisioning=false}; instance id stability.
 - VmConfig mapping: golden JSON for {default, tap, none, mounts, edk2, config_overlay}.
 - State: reconcile matrix (status × socket alive × shim pid alive × runtime dir exists) → expected status/rewrite.
@@ -1504,6 +1523,7 @@ Do these in the first milestone, against the pinned versions, and record results
 | Plain-HTTP registries | Opt-in only, through an `images.insecure_registries` list of exact `host:port` entries that can never include Docker Hub | allow plain HTTP whenever HTTPS fails; a global `--insecure` flag; refuse plain HTTP entirely | A silent HTTPS-to-HTTP fallback is a downgrade attack, and a per-invocation flag gets pasted into scripts. An exact host-and-port allowlist in the global config makes the exposure explicit, reviewable, and narrow, while still supporting the local development registries that need it. |
 | OCI stop semantics in v0.2 | `stop` sends `vm.power-button` as always, and, because `firestone-init` installs no ACPI handler, falls through §9.4's timeout to the force path; `stop --force` skips straight to it | claim graceful stop and hide the timeout; make `stop` force-only for OCI machines; block OCI boot until an ACPI handler exists | The existing stop sequence already degrades correctly and the guest syncs on its own entrypoint exit, so the force path is safe rather than merely tolerated. Recording it as verify 25 keeps the honest cost visible instead of advertising a graceful stop the guest cannot perform. |
 | Static `mkfs.ext4` helper | Extend the existing `build/helpers` recipe with e2fsprogs 1.47.3: configure `--with-libarchive=direct --disable-nls --disable-uuidd --disable-fuse2fs`, build only `libs` and `misc/mke2fs` with the full `pkg-config --static --libs libarchive` closure passed as a make-time `LIBARCHIVE` override, publish the stripped static binary as `mkfs.ext4` | a host `e2fsprogs` package; `make all` in the e2fsprogs tree; loop-mount plus `cp` as root; writing ext4 from Rust; libguestfs | The OCI pipeline needs an unprivileged, deterministic way to turn a layer tar into an ext4 image, and `mke2fs -d <tar>` with libarchive is the only pinned tool that preserves ownership, modes, symlinks, hard links and device nodes without root. `misc/Makefile` hardcodes `LIBARCHIVE=-larchive`, which cannot close a static link, and `make all` fails because `debugfs` cannot link statically, so the recipe must name the one target it needs. Reusing the passt/qemu-img container keeps one twice-built, byte-identity-checked, GPL-corresponding-source release instead of a second distribution channel. |
+| Port forward changes on a running machine | Apply on restart, surfaced: `forwards_pending` on the `ls` and `show` payloads compares the spec's forwards against the applied set in `state.json` as a canonical order-insensitive multiset, `ls` marks the row and prints one legend, `show` notes it on stderr, and a spec write on a running machine warns `port forwards apply on restart` | restart passt in place and reattach the VMM; add and remove mappings through a passt control interface; hide the divergence and let the next start apply it silently; report any spec edit as pending regardless of content | passt fixes `-t`/`-u` at spawn and exposes no runtime interface to change them, and the Cloud Hypervisor v53 vhost-user session cannot survive a passt restart — `--one-off` passt exits with the VMM and the VMM never reconnects to a replacement backend. There is no hot-apply to implement, so the honest contract is apply-on-restart made visible. Comparing canonical sets rather than text keeps a reorder or a respelling from raising a false pending flag. |
 | M6 interface contracts frozen up front | Snapshot, clone, resize, metrics, prune, and terminal WS routes plus spec additions are fixed before implementation (route shapes recorded in the M6 milestone's feature sections as they land); UI work proceeds against the contracts in parallel | design each surface inside its implementation PR; a single serialized workstream | Parallel agents need a stable seam; freezing the action names, REST paths and payload shapes first lets core and UI land independently while the drift gate keeps `docs/openapi.json` honest. |
 | First-start pinned firmware | Before `vmconfig.json` publication, install only the effective built-in `auto`/`rhf`/`edk2` artifact through the shared locked, no-follow, exact hash/mode, fsynced, no-replace publisher; reverify it for VmConfig; never install or modify a custom firmware path | require a broad `doctor --fix` preflight; download every vendored artifact; trust an existing regular file; rewrite custom firmware | A direct first start from an empty home gets the one firmware it needs without unrelated host repair. The manifest identity and secure publisher keep VMM input inside Firestone's owned dependency boundary, while the custom path remains authoritative. |
 | Passt runtime isolation diagnosis | Probe the exact foreground, one-off vhost-user mode with repair disabled; classify both `Couldn't create user namespace` and `Failed to detach isolating namespaces` as fatal; offer the existing AppArmor repair when host facts support it; runtime selects only the verified literal root-owned pinned copy after repair | treat later detach failure as available because the first userns succeeded; use generic `unshare`; disable AppArmor or a sysctl; accept a user-writable profiled path | Passt cannot serve Cloud Hypervisor after either fatal exit. Matching runtime argv closes the false-ok gap, and verified literal-path selection proves the repair authorizes only the pinned binary. |

@@ -2749,6 +2749,10 @@
             "items": {
               "type": "string"
             }
+          },
+          "forwards_pending": {
+            "type": "boolean",
+            "description": "Spec forwards differ from the forwards this running machine applied at spawn. Always false unless the machine is running; passt applies the new set on the next start."
           }
         },
         "additionalProperties": false,
@@ -2759,7 +2763,8 @@
           "cpus",
           "memory",
           "uptime",
-          "forwards"
+          "forwards",
+          "forwards_pending"
         ]
       },
       "MachineView": {
@@ -2780,13 +2785,18 @@
                 "type": "null"
               }
             ]
+          },
+          "forwards_pending": {
+            "type": "boolean",
+            "description": "Spec forwards differ from the forwards this running machine applied at spawn. Always false unless the machine is running; passt applies the new set on the next start."
           }
         },
         "additionalProperties": false,
         "required": [
           "spec",
           "state",
-          "supervision"
+          "supervision",
+          "forwards_pending"
         ]
       },
       "MachineRecord": {
@@ -4874,7 +4884,8 @@
             "cpus": 2,
             "memory": "2G",
             "uptime": null,
-            "forwards": []
+            "forwards": [],
+            "forwards_pending": false
           }
         ]
       },
@@ -4988,7 +4999,8 @@
             "degraded": [],
             "last_exit": null
           },
-          "supervision": null
+          "supervision": null,
+          "forwards_pending": false
         }
       },
       "MachineSpecInput": {

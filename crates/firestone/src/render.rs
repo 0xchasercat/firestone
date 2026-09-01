@@ -879,7 +879,11 @@ where
                     .map_err(|error| invalid_result_payload("show", error))?;
                 serde_json::to_writer_pretty(&mut self.stdout, &view)
                     .map_err(json_output_failure)?;
-                finish_record(&mut self.stdout)
+                finish_record(&mut self.stdout)?;
+                if view.forwards_pending {
+                    write_line(&mut self.stderr, format_args!("forwards pending restart"))?;
+                }
+                Ok(())
             }
             "show-vmconfig" => {
                 serde_json::to_writer(&mut self.stdout, &payload).map_err(json_output_failure)?;
@@ -1354,7 +1358,14 @@ fn write_machine_table<W: Write>(writer: &mut W, machines: &[MachineSummary]) ->
                 write_safe_text(writer, forward)?;
             }
         }
+        if machine.forwards_pending {
+            writer.write_all(b" *")?;
+        }
         writer.write_all(b"\n")?;
+    }
+
+    if machines.iter().any(|machine| machine.forwards_pending) {
+        writer.write_all(b"* forwards pending restart\n")?;
     }
 
     writer.flush()
@@ -2051,6 +2062,7 @@ mod tests {
                 memory: "8G".to_owned(),
                 uptime: None,
                 forwards: Vec::new(),
+                forwards_pending: false,
             },
             MachineSummary {
                 name: "development-machine".to_owned(),
@@ -2060,6 +2072,7 @@ mod tests {
                 memory: "2G".to_owned(),
                 uptime: Some("41s".to_owned()),
                 forwards: vec!["8080→80".to_owned(), "8443→443".to_owned()],
+                forwards_pending: false,
             },
         ];
         let mut renderer =
@@ -2085,6 +2098,90 @@ mod tests {
     }
 
     #[test]
+    fn list_table_marks_pending_forwards_and_prints_one_legend() -> TestResult {
+        let machines = vec![
+            MachineSummary {
+                name: "cleared".to_owned(),
+                status: "running".to_owned(),
+                image: "ubuntu:24.04".to_owned(),
+                cpus: 2,
+                memory: "2G".to_owned(),
+                uptime: Some("41s".to_owned()),
+                forwards: Vec::new(),
+                forwards_pending: true,
+            },
+            MachineSummary {
+                name: "settled".to_owned(),
+                status: "running".to_owned(),
+                image: "ubuntu:24.04".to_owned(),
+                cpus: 2,
+                memory: "2G".to_owned(),
+                uptime: Some("41s".to_owned()),
+                forwards: vec!["8443→443".to_owned()],
+                forwards_pending: false,
+            },
+            MachineSummary {
+                name: "widened".to_owned(),
+                status: "running".to_owned(),
+                image: "ubuntu:24.04".to_owned(),
+                cpus: 2,
+                memory: "2G".to_owned(),
+                uptime: Some("41s".to_owned()),
+                forwards: vec!["8080→80".to_owned()],
+                forwards_pending: true,
+            },
+        ];
+        let mut renderer =
+            Renderer::new(Vec::new(), Vec::new(), RenderOptions::human(false, false));
+
+        renderer.emit(Event::Result {
+            action: "list".to_owned(),
+            payload: serde_json::to_value(machines)?,
+        })?;
+
+        let (stdout, stderr) = renderer.into_writers();
+        assert_eq!(
+            stdout,
+            concat!(
+                "NAME     STATUS   IMAGE         CPUS  MEM  UPTIME  FORWARDS\n",
+                "cleared  running  ubuntu:24.04  2     2G   41s     - *\n",
+                "settled  running  ubuntu:24.04  2     2G   41s     8443→443\n",
+                "widened  running  ubuntu:24.04  2     2G   41s     8080→80 *\n",
+                "* forwards pending restart\n",
+            )
+            .as_bytes()
+        );
+        assert!(stderr.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn list_table_without_pending_forwards_omits_the_legend() -> TestResult {
+        let machines = vec![MachineSummary {
+            name: "settled".to_owned(),
+            status: "running".to_owned(),
+            image: "ubuntu:24.04".to_owned(),
+            cpus: 2,
+            memory: "2G".to_owned(),
+            uptime: Some("41s".to_owned()),
+            forwards: vec!["8443→443".to_owned()],
+            forwards_pending: false,
+        }];
+        let mut renderer =
+            Renderer::new(Vec::new(), Vec::new(), RenderOptions::human(false, false));
+
+        renderer.emit(Event::Result {
+            action: "list".to_owned(),
+            payload: serde_json::to_value(machines)?,
+        })?;
+
+        let (stdout, _) = renderer.into_writers();
+        let output = String::from_utf8(stdout)?;
+        assert!(!output.contains('*'), "{output}");
+        Ok(())
+    }
+
+    #[test]
     fn list_table_sanitizes_controls_and_measures_terminal_width() -> TestResult {
         let machines = vec![MachineSummary {
             name: "开发".to_owned(),
@@ -2094,6 +2191,7 @@ mod tests {
             memory: "2G".to_owned(),
             uptime: None,
             forwards: vec!["1\n2".to_owned()],
+            forwards_pending: false,
         }];
         let mut renderer =
             Renderer::new(Vec::new(), Vec::new(), RenderOptions::human(false, false));
@@ -2200,6 +2298,7 @@ mod tests {
                 last_exit: None,
             },
             supervision: None,
+            forwards_pending: false,
         };
         let mut expected = serde_json::to_vec_pretty(&view)?;
         expected.push(b'\n');
@@ -2216,6 +2315,53 @@ mod tests {
         assert!(stdout.starts_with(b"{\n  \"spec\": {\n"));
         assert!(stderr.is_empty());
         assert!(String::from_utf8_lossy(&stdout).contains("\"supervision\": null"));
+        assert!(String::from_utf8_lossy(&stdout).contains("\"forwards_pending\": false"));
+        Ok(())
+    }
+
+    #[test]
+    fn show_result_pending_forwards_notes_the_restart_on_stderr() -> TestResult {
+        let spec = MachineSpec {
+            image: ImageRef::new("ubuntu:24.04"),
+            ..MachineSpec::default()
+        };
+        let view = MachineView {
+            spec,
+            state: MachineState {
+                version: StateVersion,
+                status: MachineStatus::Running,
+                image: StateImage {
+                    r#ref: "ubuntu:24.04".to_owned(),
+                    id: Some("ubuntu-24.04-amd64".to_owned()),
+                    sha256: Some("abc123".to_owned()),
+                },
+                mac: None,
+                cid: 3,
+                instance_id: None,
+                shim_pid: Some(4_200),
+                vmm_pid: Some(4_201),
+                sidecar_pids: BTreeMap::new(),
+                runtime_dir: PathBuf::from("/run/user/1000/firestone/dev"),
+                started_at: Some("2026-08-28T09:12:44Z".to_owned()),
+                forwards: vec!["8080:80".to_owned()],
+                degraded: Vec::new(),
+                last_exit: None,
+            },
+            supervision: None,
+            forwards_pending: true,
+        };
+        let mut renderer =
+            Renderer::new(Vec::new(), Vec::new(), RenderOptions::human(false, false));
+
+        renderer.emit(Event::Result {
+            action: "show".to_owned(),
+            payload: serde_json::to_value(view)?,
+        })?;
+
+        let (stdout, stderr) = renderer.into_writers();
+        assert!(String::from_utf8_lossy(&stdout).contains("\"forwards_pending\": true"));
+        assert!(serde_json::from_slice::<serde_json::Value>(&stdout).is_ok());
+        assert_eq!(stderr, b"forwards pending restart\n");
         Ok(())
     }
 
