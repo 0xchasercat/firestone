@@ -1,6 +1,9 @@
 # Firestone machine specification.
 #
-# `image` accepts a catalog reference, HTTPS URL, or local qcow2/raw path.
+# `image` accepts a catalog reference, HTTPS URL, local qcow2/raw path, or an
+# OCI reference such as `docker://nginx` or `ghcr.io/owner/app:v1`. Registries
+# reachable only over plain HTTP go in `[images].insecure_registries` in
+# `~/.config/firestone/config.toml`, as bare `host` or `host:port` entries.
 # `arch` defaults to the host and may be `x86_64` or `aarch64`.
 # CPU, memory, and disk values can also be set by `firestone create` flags.
 #

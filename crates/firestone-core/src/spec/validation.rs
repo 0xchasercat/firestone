@@ -371,6 +371,28 @@ fn validate_image(
         return Ok(());
     }
 
+    // §8.5. This precedes the `looks_like_url` shape check because that check
+    // claims every `scheme://…` string, `docker://` included. The order is
+    // still equivalent to §8.2 for URLs: no `scheme://…` reference parses as an
+    // OCI reference, so `https://…` and `http://…` fall through unchanged.
+    if let Some(classification) = crate::oci::classify(&reference) {
+        match crate::oci::OciReference::parse(&reference) {
+            Ok(parsed) => {
+                spec.image = super::ImageRef::new(parsed.to_string());
+                return Ok(());
+            }
+            Err(error) if classification.is_explicit() => {
+                let message = error.message().to_owned();
+                let hint = error.hint().map_or_else(
+                    || "write an OCI reference such as 'docker://nginx:latest'".to_owned(),
+                    str::to_owned,
+                );
+                return Err(invalid_with_source("image", message, hint, error));
+            }
+            Err(_) => {}
+        }
+    }
+
     if looks_like_url(&reference) {
         return validate_https_url(&reference);
     }
@@ -1734,7 +1756,61 @@ checksum_alg = "sha256"
             validate_machine_spec(&mut spec, &host.context()).expect_err("unknown catalog image");
         assert_invalid_key(&error, "image");
         assert!(error.message().contains("closest catalog images"));
-        assert!(error.hint().is_some_and(|hint| hint.contains("images ls")));
+        assert!(
+            error
+                .hint()
+                .is_some_and(|hint| hint.contains("firestone catalog"))
+        );
+        assert!(
+            error
+                .hint()
+                .is_some_and(|hint| hint.contains("docker://nginx"))
+        );
+    }
+
+    #[test]
+    fn image_oci_reference_is_normalized_in_place() {
+        let host = FakeHost::default();
+        for (input, expected) in [
+            ("docker://nginx", "docker.io/library/nginx:latest"),
+            ("oci://ghcr.io/owner/app:v1", "ghcr.io/owner/app:v1"),
+            ("localhost:5000/app", "localhost:5000/app:latest"),
+        ] {
+            let mut spec = MachineSpec {
+                image: input.into(),
+                ..MachineSpec::default()
+            };
+            validate_machine_spec(&mut spec, &host.context())
+                .unwrap_or_else(|error| panic!("{input}: {}", error.message()));
+            assert_eq!(spec.image.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn image_explicit_oci_scheme_malformed_returns_keyed_error() {
+        let host = FakeHost::default();
+        let mut spec = MachineSpec {
+            image: "docker://NGINX".into(),
+            ..MachineSpec::default()
+        };
+        let error =
+            validate_machine_spec(&mut spec, &host.context()).expect_err("malformed OCI reference");
+        assert_invalid_key(&error, "image");
+        assert!(error.message().contains("invalid OCI image reference"));
+        assert!(error.hint().is_some());
+    }
+
+    #[test]
+    fn image_registry_less_namespaced_reference_stays_a_path_error() {
+        let host = FakeHost::default();
+        let mut spec = MachineSpec {
+            image: "owner/app".into(),
+            ..MachineSpec::default()
+        };
+        let error =
+            validate_machine_spec(&mut spec, &host.context()).expect_err("missing local image");
+        assert_invalid_key(&error, "image");
+        assert!(error.message().contains("local image"));
     }
 
     #[test]
