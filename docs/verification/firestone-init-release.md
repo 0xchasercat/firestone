@@ -74,3 +74,18 @@ Neither the injection nor the boot can be exercised without KVM and a real regis
 3. On a `network.mode = "passt"` machine, `firestone-init: eth0 configured with <address>` appears within the 5 s budget, and `/etc/resolv.conf` exists.
 4. On a `network.mode = "none"` machine, no DHCP warning appears at all and boot reaches the entrypoint measurably sooner.
 5. `firestone stop` reaches the entrypoint as `SIGTERM` on its own process group, and the machine's `last_exit` records a clean exit rather than a timeout — that is the `reboot(RB_POWER_OFF)` path working.
+
+## Published release (orchestrator record)
+
+`firestone-init-v0.1.0-firestone.1` was built at commit `4dc0af6` inside the pinned `build/firestone` container with the two-pass command above, and the two passes were byte-identical:
+
+| Asset | SHA-256 | Bytes |
+|---|---|---|
+| `firestone-init-v0.1.0-x86_64-unknown-linux-musl` | `1018c2dceecbf8d761d20ac40a07f28baada0e3cf2c3322af24fe7bb96b67d11` | 681,240 |
+
+The release tag deviates from step 3 above, which suggested uploading the asset to the Firestone version release. That ordering is circular — the version release is the one that would embed the payload, and the payload has to be pinned before it can be embedded — so the asset follows the `virtiofsd` pattern instead and carries its own lifecycle tag. SPEC §21 records the decision.
+
+`deps.toml` now carries `[dependency.firestone-init]` for x86_64, regenerated with `scripts/pin-deps.sh refresh --arch all` and checked with `scripts/pin-deps.sh verify --arch all`. Two consequences of the pin are load-bearing:
+
+- The x86_64 standalone release build must stage the asset into `FIRESTONE_EMBEDDED_HELPERS_DIR`; `scripts/build-release.sh` downloads it from the manifest alongside `cloud-hypervisor`, `passt` and `qemu-img`, and `build.rs` fails the build if it is absent or mismatched. That is step 5 above, now done.
+- A build that embeds nothing resolves the payload from the pin at run time, downloading it once on first OCI use through the same publisher as the direct-boot kernel (SPEC §17.2). A plain `cargo build` can therefore pull an OCI image; only the guest-side checks of the previous section still need KVM.
