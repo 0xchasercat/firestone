@@ -48,7 +48,8 @@ pub use console::{
 };
 pub use deps::{
     DIRECT_BOOT_KERNEL_DEPENDENCY, DependencyArtifact, DependencyManifest,
-    FIRESTONE_INIT_DEPENDENCY, PINNED_DIRECT_BOOT_KERNEL_VERSION, PINNED_FIRESTONE_INIT_VERSION,
+    FIRESTONE_INIT_DEPENDENCY, MKFS_EXT4_DEPENDENCY, PINNED_DIRECT_BOOT_KERNEL_VERSION,
+    PINNED_FIRESTONE_INIT_VERSION, PINNED_MKFS_EXT4_VERSION,
 };
 pub use dispatcher::{DispatchFuture, Dispatcher, EventSink, block_on};
 pub use doctor::{

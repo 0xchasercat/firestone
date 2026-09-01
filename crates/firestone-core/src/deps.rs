@@ -13,6 +13,12 @@ pub const DIRECT_BOOT_KERNEL_DEPENDENCY: &str = "cloud-hypervisor-kernel";
 /// Pinned direct-boot kernel release recorded in `deps.toml`.
 pub const PINNED_DIRECT_BOOT_KERNEL_VERSION: &str = "ch-release-v6.16.9-20260508";
 
+/// Manifest name of the static `mkfs.ext4` that packs an OCI rootfs (§8.5).
+pub const MKFS_EXT4_DEPENDENCY: &str = "mkfs-ext4";
+
+/// Pinned e2fsprogs release recorded in `deps.toml`.
+pub const PINNED_MKFS_EXT4_VERSION: &str = "1.47.3";
+
 /// Manifest name of Firestone's own guest PID 1 payload (SPEC §10.5, §17.2).
 pub const FIRESTONE_INIT_DEPENDENCY: &str = "firestone-init";
 
@@ -35,7 +41,7 @@ impl DependencyArtifact {
     pub fn executable(&self) -> bool {
         matches!(
             self.dependency.as_str(),
-            "cloud-hypervisor" | "virtiofsd" | "passt" | "qemu-img"
+            "cloud-hypervisor" | "virtiofsd" | "passt" | "qemu-img" | MKFS_EXT4_DEPENDENCY
         )
     }
 
@@ -278,6 +284,33 @@ impl DependencyManifest {
                 "pinned direct-boot kernel is classified as an executable payload",
             )
             .with_hint("publish the kernel image as a mode-0644 dependency artifact"));
+        }
+        Ok(artifact)
+    }
+
+    /// Resolves the pinned static `mkfs.ext4` used to pack an OCI rootfs (§8.5).
+    ///
+    /// The helper is an executable published into `<data>/bin` with mode 0755
+    /// by the same locked publisher that installs the firmware and the kernel.
+    pub fn mkfs_ext4(&self, architecture: &str) -> Result<DependencyArtifact, FirestoneError> {
+        let artifact = self
+            .artifact(MKFS_EXT4_DEPENDENCY, architecture)
+            .map_err(|error| {
+                FirestoneError::new(
+                    ErrorKind::Dependency,
+                    format!("pinned mkfs.ext4 metadata is unavailable for {architecture}"),
+                )
+                .with_hint(
+                    "regenerate deps.toml with scripts/pin-deps.sh refresh --arch all before pulling an OCI image",
+                )
+                .with_source(error)
+            })?;
+        if !artifact.executable() {
+            return Err(FirestoneError::new(
+                ErrorKind::Dependency,
+                "pinned mkfs.ext4 is not classified as an executable payload",
+            )
+            .with_hint("publish mkfs.ext4 as a mode-0755 dependency artifact"));
         }
         Ok(artifact)
     }
@@ -631,6 +664,33 @@ availability = "binary"
                 .hint()
                 .is_some_and(|hint| hint.contains("scripts/pin-deps.sh refresh --arch all"))
         );
+        Ok(())
+    }
+
+    /// SPEC §8.5, §17.2: the OCI packing helper is an executable published
+    /// mode 0755, and its x86_64-only runtime scope is reported, not guessed.
+    #[test]
+    fn mkfs_ext4_bundled_manifest_resolves_x86_64_only() -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = DependencyManifest::bundled()?;
+
+        let x86_64 = manifest.mkfs_ext4("x86_64")?;
+        assert_eq!(x86_64.dependency, super::MKFS_EXT4_DEPENDENCY);
+        assert_eq!(x86_64.version, super::PINNED_MKFS_EXT4_VERSION);
+        assert_eq!(x86_64.install_name, "mkfs.ext4-1.47.3");
+        assert!(x86_64.executable());
+        assert_eq!(x86_64.expected_mode(), 0o755);
+
+        let aarch64 = manifest
+            .mkfs_ext4("aarch64")
+            .err()
+            .ok_or("aarch64 mkfs.ext4 unexpectedly resolved")?;
+        assert_eq!(aarch64.kind(), crate::ErrorKind::Dependency);
+        assert!(
+            aarch64
+                .message()
+                .contains("pinned mkfs.ext4 metadata is unavailable for aarch64")
+        );
+        assert!(aarch64.hint().is_some());
         Ok(())
     }
 }

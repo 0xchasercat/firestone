@@ -36,6 +36,7 @@ Build it twice into separate target directories and require the two outputs to b
 - Unsafe is confined to `crates/firestone-init/src/ffi.rs`, which denies `unsafe_op_in_unsafe_fn` and documents every block. `firestone-initproto` forbids `unsafe` outright.
 - `crates/firestone-core/build.rs` already verifies and embeds a `firestone-init` asset when — and only when — `deps.toml` carries a `[dependency.firestone-init]` entry **and** `FIRESTONE_EMBEDDED_HELPERS_DIR` holds the named asset. Half a pin is a build failure; neither half is an ordinary development build.
 - `firestone_core::firestone_init_payload()` prefers that embedded payload and, since the release below was pinned, falls back to downloading the pinned artifact. With neither available it returns kind `dependency` naming both ways out, so the OCI pull pipeline cannot inject nothing by accident.
+- The OCI pull pipeline (M6-15) calls that feed **before** it contacts the registry, through the store's own pinned-artifact publisher, and re-reports a failure as `cannot pull OCI image '<ref>': the firestone-init guest payload is unavailable`, carrying the feed's own hint. So a plain `cargo build` pulls an OCI image by downloading the pinned payload once on first use, and an offline build with no embed fails in milliseconds rather than after downloading layers.
 
 ## Release runbook (orchestrator)
 

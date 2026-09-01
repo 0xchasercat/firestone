@@ -42,6 +42,9 @@ pub const DEFAULT_MAX_ENTRIES: u64 = 1_000_000;
 pub const FIRESTONE_INIT_PATH: &str = "sbin/firestone-init";
 /// Path of the injected marker file inside the merged tar.
 pub const FIRESTONE_OCI_MARKER_PATH: &str = "etc/firestone-oci";
+/// Bytes the SPEC §8.5 sizing rule charges for one directory, symlink, or hard
+/// link in the merged tree.
+pub const METADATA_ENTRY_BYTES: u64 = 4096;
 
 /// Whiteout prefix defined by the OCI image layer specification.
 const WHITEOUT_PREFIX: &[u8] = b".wh.";
@@ -261,6 +264,10 @@ pub struct MergeSummary {
     pub entries_written: u64,
     /// Uncompressed bytes read while planning the merge.
     pub uncompressed_bytes_read: u64,
+    /// The merged tree's size for the SPEC §8.5 ext4 sizing rule: every
+    /// emitted regular file's size plus [`METADATA_ENTRY_BYTES`] for each
+    /// emitted directory, symlink, and hard link.
+    pub unpacked_bytes: u64,
     /// The image configuration the caller supplied, carried through so one
     /// value describes the merged rootfs.
     pub config: OciImageConfig,
@@ -279,13 +286,14 @@ pub fn merge_layers<W: Write>(
 ) -> Result<MergeSummary, FirestoneError> {
     let plan = build_plan(request)?;
     let mut writer = BufWriter::new(output);
-    let entries_written = write_merged(request, &plan, &mut writer)?;
+    let (entries_written, unpacked_bytes) = write_merged(request, &plan, &mut writer)?;
     writer.write_all(&[0u8; BLOCK * 2]).map_err(write_error)?;
     writer.flush().map_err(write_error)?;
 
     Ok(MergeSummary {
         entries_written,
         uncompressed_bytes_read: plan.bytes_read,
+        unpacked_bytes,
         config: request.config.clone(),
     })
 }
@@ -488,11 +496,14 @@ fn plan_hardlinks(
 }
 
 /// Pass two: streams the surviving members out in sorted order.
+///
+/// Returns the number of members written and the merged tree's unpacked size
+/// for the §8.5 sizing rule.
 fn write_merged<W: Write>(
     request: &MergeRequest<'_>,
     plan: &MergePlan,
     output: &mut W,
-) -> Result<u64, FirestoneError> {
+) -> Result<(u64, u64), FirestoneError> {
     let mut cursors: Vec<LayerCursor<'_>> = request
         .layers
         .iter()
@@ -507,31 +518,49 @@ fn write_merged<W: Write>(
     let init_binary = request.injected_init.unwrap_or_default();
     let mut injected_index = 0usize;
     let mut written = 0u64;
+    let mut unpacked = 0u64;
 
     for (path, entry) in &plan.entries {
         let mut shadowed = false;
         while injected_index < injected.len() && injected[injected_index] <= path.as_slice() {
             shadowed |= injected[injected_index] == path.as_slice();
-            write_injected(output, injected[injected_index], init_binary)?;
+            unpacked = unpacked.saturating_add(write_injected(
+                output,
+                injected[injected_index],
+                init_binary,
+            )?);
             injected_index += 1;
             written += 1;
         }
         if shadowed {
             continue;
         }
-        write_entry(request, plan, &mut cursors, path, entry, output)?;
+        unpacked = unpacked.saturating_add(write_entry(
+            request,
+            plan,
+            &mut cursors,
+            path,
+            entry,
+            output,
+        )?);
         written += 1;
     }
     while injected_index < injected.len() {
-        write_injected(output, injected[injected_index], init_binary)?;
+        unpacked = unpacked.saturating_add(write_injected(
+            output,
+            injected[injected_index],
+            init_binary,
+        )?);
         injected_index += 1;
         written += 1;
     }
 
-    Ok(written)
+    Ok((written, unpacked))
 }
 
 /// Streams one surviving member, repairing its header when the plan says so.
+///
+/// Returns the member's contribution to the §8.5 unpacked size.
 fn write_entry<W: Write>(
     request: &MergeRequest<'_>,
     plan: &MergePlan,
@@ -539,7 +568,7 @@ fn write_entry<W: Write>(
     path: &[u8],
     entry: &MergedEntry,
     output: &mut W,
-) -> Result<(), FirestoneError> {
+) -> Result<u64, FirestoneError> {
     let cursor = cursors.get_mut(entry.layer).ok_or_else(|| {
         layer_error(
             format!("layer index {} is out of range", entry.layer),
@@ -555,6 +584,21 @@ fn write_entry<W: Write>(
             "re-pull the image and merge it again",
         ));
     }
+
+    // §8.5 sizing: an emitted regular file counts its data, and every emitted
+    // directory, symlink, and hard link counts one metadata block. A promoted
+    // hard link is emitted as a regular file, so it counts its content.
+    let unpacked = match plan.overrides.get(path) {
+        Some(EmitMode::Promote { size, .. }) => *size,
+        Some(EmitMode::Relink(_)) => METADATA_ENTRY_BYTES,
+        None => match entry.kind {
+            MergedKind::Regular => member.data_size,
+            MergedKind::Directory | MergedKind::Symlink | MergedKind::HardLink => {
+                METADATA_ENTRY_BYTES
+            }
+            MergedKind::Other => 0,
+        },
+    };
 
     match plan.overrides.get(path) {
         None => {
@@ -625,19 +669,21 @@ fn write_entry<W: Write>(
         }
     }
 
-    Ok(())
+    Ok(unpacked)
 }
 
-/// Writes one injected member.
+/// Writes one injected member and returns its §8.5 unpacked contribution.
 fn write_injected<W: Write>(
     output: &mut W,
     path: &[u8],
     init_binary: &[u8],
-) -> Result<(), FirestoneError> {
+) -> Result<u64, FirestoneError> {
     if path == FIRESTONE_INIT_PATH.as_bytes() {
-        write_injected_init(output, init_binary)
+        write_injected_init(output, init_binary)?;
+        Ok(init_binary.len() as u64)
     } else {
-        write_injected_marker(output)
+        write_injected_marker(output)?;
+        Ok(0)
     }
 }
 
@@ -1834,7 +1880,52 @@ mod tests {
 
         assert_eq!(summary.entries_written, 2);
         assert!(summary.uncompressed_bytes_read > 0);
+        // One directory plus a one-byte file (SPEC §8.5 sizing input).
+        assert_eq!(summary.unpacked_bytes, METADATA_ENTRY_BYTES + 1);
         assert_eq!(summary.config, config);
+        Ok(())
+    }
+
+    /// SPEC §8.5 sizing counts the members the canonical tar emits: file data
+    /// for regular files and one metadata block for every directory, symlink,
+    /// and hard link, with a promoted hard link counting as the file it became.
+    #[test]
+    fn merge_layers_unpacked_bytes_counts_emitted_members_by_kind() -> TestResult {
+        let lower = build_layer(&[
+            dir_entry("bin"),
+            file_entry("bin/real", "0123456789"),
+            hardlink_entry("bin/link", "bin/real"),
+            hardlink_entry("bin/link2", "bin/real"),
+            symlink_entry("bin/alias", "real"),
+            file_entry("bin/dropped", "gone"),
+        ])?;
+        let upper = build_layer(&[
+            file_entry("bin/real", "upper"),
+            file_entry("bin/.wh.dropped", ""),
+        ])?;
+        let sources = [
+            BytesLayer::new("layer-0", lower),
+            BytesLayer::new("layer-1", upper),
+        ];
+        let layers: Vec<&dyn LayerSource> = sources
+            .iter()
+            .map(|source| source as &dyn LayerSource)
+            .collect();
+        let config = OciImageConfig::default();
+        let init = b"init-bytes";
+        let request = MergeRequest::new(&layers, &config).with_injected_init(init);
+        let mut merged = Vec::new();
+
+        let summary = merge_layers(&request, &mut merged)?;
+
+        // The `bin` directory, the `bin/alias` symlink and the `bin/link2`
+        // relinked hard link cost one metadata block each; the promoted
+        // `bin/link` carries the shadowed ten-byte content, `bin/real` carries
+        // the five upper bytes, the injected init carries its own, and the
+        // empty `/etc/firestone-oci` marker carries none. `bin/dropped` was
+        // whiteouted, so it is not emitted and not counted.
+        let expected = 3 * METADATA_ENTRY_BYTES + 10 + 5 + init.len() as u64;
+        assert_eq!(summary.unpacked_bytes, expected);
         Ok(())
     }
 
