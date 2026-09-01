@@ -4160,6 +4160,9 @@ fn signal_verified_tree_preserving(
         ProcessSignal::Quit => rustix::process::Signal::QUIT,
         ProcessSignal::Terminate => rustix::process::Signal::TERM,
         ProcessSignal::Kill => rustix::process::Signal::KILL,
+        // `SIGWINCH` belongs to terminal transports, not to the VMM
+        // supervision tree; the mapping keeps the translation total.
+        ProcessSignal::WindowChange => rustix::process::Signal::WINCH,
     };
     match rustix::process::pidfd_send_signal(&leader, rustix_signal) {
         Ok(()) | Err(rustix::io::Errno::SRCH) => {}
@@ -6301,6 +6304,9 @@ fn signal_descendants(
             ProcessSignal::Quit => rustix::process::Signal::QUIT,
             ProcessSignal::Terminate => rustix::process::Signal::TERM,
             ProcessSignal::Kill => rustix::process::Signal::KILL,
+            // `SIGWINCH` belongs to terminal transports, not to the VMM
+            // supervision tree; the mapping keeps the translation total.
+            ProcessSignal::WindowChange => rustix::process::Signal::WINCH,
         };
         for identity in descendants.values() {
             // The pidfd was opened before identity inspection and remains the
