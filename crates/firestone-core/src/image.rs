@@ -30,7 +30,7 @@ use crate::{
     MachineLock, MachineState, Paths, StateImage, StateStore, StepId, Unit, atomic,
     bounded::{self, BoundedReadError},
     catalog::{SshdPath, parse_https_url},
-    embedded_helpers::install_pinned_artifact_with,
+    embedded_helpers::{PinnedArtifactInstaller, install_pinned_artifact_with},
     oci::{OciClassification, OciReference, layers::OciImageConfig},
 };
 const IMAGE_METADATA_VERSION: u32 = 1;
@@ -748,6 +748,17 @@ impl HttpSource for ReqwestHttpSource {
             body: Box::new(response),
             content_length,
         })
+    }
+}
+
+/// The pinned-artifact publisher used by the `firestone-init` payload fallback
+/// (SPEC §10.5, §17.2): one strict HTTPS transport, one locked publisher.
+impl PinnedArtifactInstaller for ImageStore {
+    fn install_pinned_artifact(
+        &self,
+        artifact: &DependencyArtifact,
+    ) -> Result<PathBuf, FirestoneError> {
+        self.ensure_pinned_artifact(artifact)
     }
 }
 

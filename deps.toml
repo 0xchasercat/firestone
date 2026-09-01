@@ -137,6 +137,20 @@ install_name = "mkfs.ext4-1.47.3"
 url = "https://github.com/0xchasercat/firestone/releases/download/helpers-v0.2.0-firestone.1/mkfs.ext4-1.47.3-x86_64-unknown-linux-musl"
 sha256 = "f1ed0b2b8b14a29e4edccf2bb44e2fb81e63a9bf74286746057915655795b987"
 
+# Firestone's own guest PID 1, published under its own release tag and embedded
+# in the x86_64 standalone release; a source build downloads it on first OCI use.
+[dependency.firestone-init]
+version = "v0.1.0"
+release_url = "https://github.com/0xchasercat/firestone/releases/tag/firestone-init-v0.1.0-firestone.1"
+availability = "binary"
+architectures = ["x86_64"]
+
+[dependency.firestone-init.x86_64]
+asset = "firestone-init-v0.1.0-x86_64-unknown-linux-musl"
+install_name = "firestone-init-v0.1.0"
+url = "https://github.com/0xchasercat/firestone/releases/download/firestone-init-v0.1.0-firestone.1/firestone-init-v0.1.0-x86_64-unknown-linux-musl"
+sha256 = "1018c2dceecbf8d761d20ac40a07f28baada0e3cf2c3322af24fe7bb96b67d11"
+
 [helper.release]
 tag = "helpers-v0.2.0-firestone.1"
 
