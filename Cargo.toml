@@ -11,7 +11,7 @@ edition = "2024"
 rust-version = "1.85"
 
 [workspace.dependencies]
-axum = { version = "=0.8.4", default-features = false, features = ["form", "http1", "json", "query", "tokio"] }
+axum = { version = "=0.8.4", default-features = false, features = ["form", "http1", "json", "query", "tokio", "ws"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "=4.6.9"
 console = "=0.16.4"
@@ -30,7 +30,7 @@ minijinja = { version = "=2.24.0", features = ["serde"] }
 nix = { version = "0.30", features = ["fs", "hostname", "poll", "process", "signal", "socket", "term", "user"] }
 owo-colors = "=4.4.0"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
-rustix = { version = "1", features = ["param", "process"] }
+rustix = { version = "1", features = ["param", "process", "pty", "termios"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -44,6 +44,7 @@ signal-hook = "0.3"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-stream = { version = "=0.1.17", default-features = false, features = ["sync"] }
+tokio-tungstenite = { version = "=0.26.2", default-features = false, features = ["handshake"] }
 toml = "0.8"
 tower = { version = "=0.5.2", features = ["util"] }
 tracing = "0.1"

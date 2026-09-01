@@ -20,13 +20,15 @@ use axum::{
 };
 use firestone_core::{
     Action, ByteSize, Dispatcher, ErrorInfo, ErrorKind, Event, EventSink, FirestoneError,
-    GlobalConfig, ImageRef, LogSource, MachineSpec, MachineSpecPatch,
+    GlobalConfig, ImageRef, LogSource, MachineSpec, MachineSpecPatch, Paths,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::sync::mpsc;
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
 use crate::render::{TerminalSanitizer, sanitize_terminal_output};
+
+mod ws;
 
 const MAX_JSON_BODY_BYTES: usize = 1024 * 1024;
 const MAX_TIMEOUT_SECONDS: u64 = 60 * 60;
@@ -61,6 +63,10 @@ impl From<&GlobalConfig> for RestConfig {
 struct ApiState {
     dispatcher: Arc<dyn Dispatcher>,
     config: RestConfig,
+    /// Resolved for the WebSocket terminal transports, which reach the
+    /// machine's console socket and SSH identity directly rather than
+    /// through an action.
+    paths: Paths,
 }
 
 struct RestRoute {
@@ -138,6 +144,8 @@ define_rest_routes! {
     "/v1/machines/{name}/logs" => get(machine_logs);
     "/v1/machines/{name}/vmconfig" => get(machine_vmconfig);
     "/v1/machines/{name}/metrics" => get(machine_metrics);
+    "/v1/machines/{name}/console/ws" => get(ws::console);
+    "/v1/machines/{name}/shell/ws" => get(ws::shell);
     "/v1/images" => get(images);
     "/v1/images/pull" => post(pull_image);
     "/v1/images/prune" => post(prune_images);
@@ -146,10 +154,11 @@ define_rest_routes! {
 }
 
 /// Builds the complete v1 REST router over the shared action dispatcher.
-pub fn router(dispatcher: Arc<dyn Dispatcher>, config: &GlobalConfig) -> Router {
+pub fn router(dispatcher: Arc<dyn Dispatcher>, config: &GlobalConfig, paths: &Paths) -> Router {
     let state = ApiState {
         dispatcher,
         config: RestConfig::from(config),
+        paths: paths.clone(),
     };
 
     REST_ROUTES

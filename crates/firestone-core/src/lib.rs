@@ -19,6 +19,7 @@ pub mod metrics;
 pub mod network;
 pub mod oci;
 pub mod paths;
+pub mod pty;
 pub mod readiness;
 pub mod result;
 pub mod shim;
@@ -38,9 +39,10 @@ pub use cloudinit::{
     RenderedCloudInit, SEED_IMAGE_SIZE, publish_seed, publish_seed_with_sshd_path,
     render_cloud_init, render_cloud_init_with_guest_ssh,
 };
-pub use cmd::{Cmd, CmdOutput, ManagedProcess, ProcessSignal};
+pub use cmd::{Cmd, CmdOutput, ManagedProcess, ProcessSignal, signal_process_group};
 pub use console::{
-    ConsoleBroker, ConsolePlan, ConsoleResult, RawTerminal, console_plan, relay_console,
+    CONSOLE_ACK_MAX_BYTES, ConsoleAck, ConsoleBroker, ConsolePlan, ConsoleResult, RawTerminal,
+    console_plan, relay_console,
 };
 pub use deps::{
     DIRECT_BOOT_KERNEL_DEPENDENCY, DependencyArtifact, DependencyManifest,
@@ -79,6 +81,7 @@ pub use network::{
 };
 pub use oci::{OciClassification, OciReference, OciTagOrDigest};
 pub use paths::{PathInputs, Paths};
+pub use pty::{PtyPair, set_window_size};
 pub use readiness::{ReadinessOptions, wait_for_ssh_ready};
 pub use result::CloneResult;
 pub use result::{

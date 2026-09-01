@@ -17,7 +17,7 @@ use axum::{
 use firestone_core::{
     Action, DispatchFuture, Dispatcher, ErrorKind, Event, EventSink, FirestoneError, GlobalConfig,
     ImageRef, LogSource, MachineSpec, MachineSpecPatch, MachineState, MachineStatus,
-    MachineSummary, MachineView, StateImage, StateVersion, StepId,
+    MachineSummary, MachineView, PathInputs, Paths, StateImage, StateVersion, StepId,
 };
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -98,11 +98,37 @@ impl Dispatcher for RecordingDispatcher {
     }
 }
 
+/// A `Paths` rooted at a directory these tests never touch.
+///
+/// Only the WebSocket terminal transports read `ApiState::paths`; every test
+/// that reaches the filesystem builds its own rooted `Paths` instead.
+#[allow(clippy::expect_used)]
+fn unused_paths() -> Paths {
+    Paths::from_inputs(&path_inputs("/nonexistent/firestone-api-tests"))
+        .expect("an absolute FIRESTONE_HOME override always resolves")
+}
+
+/// Builds fully explicit path inputs rooted at `home`.
+fn path_inputs(home: &str) -> PathInputs {
+    PathInputs {
+        current_dir: std::path::PathBuf::from("/"),
+        home_dir: None,
+        firestone_home: Some(std::path::PathBuf::from(home)),
+        firestone_config_dir: None,
+        firestone_data_dir: None,
+        firestone_runtime_dir: None,
+        xdg_config_home: None,
+        xdg_data_home: None,
+        xdg_runtime_dir: None,
+        uid: nix::unistd::getuid().as_raw(),
+    }
+}
+
 fn app<D>(dispatcher: Arc<D>) -> Router
 where
     D: Dispatcher + 'static,
 {
-    router(dispatcher, &GlobalConfig::default())
+    router(dispatcher, &GlobalConfig::default(), &unused_paths())
 }
 
 fn request(method: Method, uri: &str, body: Body) -> Result<Request<Body>, axum::http::Error> {
