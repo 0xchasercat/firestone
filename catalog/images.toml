@@ -69,13 +69,13 @@ format = "qcow2"
 sshd_path = "/usr/sbin/sshd"
 
 [image.arch.x86_64]
-url = "https://cloud.debian.org/images/cloud/trixie/20260826-2582/debian-13-genericcloud-amd64-20260826-2582.qcow2"
-checksum_url = "https://cloud.debian.org/images/cloud/trixie/20260826-2582/SHA512SUMS"
+url = "https://cloud.debian.org/images/cloud/trixie/20260831-2587/debian-13-genericcloud-amd64-20260831-2587.qcow2"
+checksum_url = "https://cloud.debian.org/images/cloud/trixie/20260831-2587/SHA512SUMS"
 checksum_alg = "sha512"
 
 [image.arch.aarch64]
-url = "https://cloud.debian.org/images/cloud/trixie/20260826-2582/debian-13-genericcloud-arm64-20260826-2582.qcow2"
-checksum_url = "https://cloud.debian.org/images/cloud/trixie/20260826-2582/SHA512SUMS"
+url = "https://cloud.debian.org/images/cloud/trixie/20260831-2587/debian-13-genericcloud-arm64-20260831-2587.qcow2"
+checksum_url = "https://cloud.debian.org/images/cloud/trixie/20260831-2587/SHA512SUMS"
 checksum_alg = "sha512"
 
 [[image]]

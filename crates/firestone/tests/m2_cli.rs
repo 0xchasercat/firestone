@@ -224,7 +224,14 @@ fn interactive_shell(
     record: &Path,
 ) -> Result<ExitStatus, Box<dyn Error>> {
     let opened = openpty(None, None)?;
-    let _master = fs::File::from(opened.master);
+    let master = fs::File::from(opened.master);
+    // The child's progress output exceeds the PTY buffer; without a reader on
+    // the master side the child blocks mid-write and never reaches its exit.
+    let _drain = std::thread::spawn(move || {
+        let mut master = master;
+        let mut sink = Vec::new();
+        let _ = std::io::copy(&mut master, &mut sink);
+    });
     let terminal = fs::File::from(opened.slave);
     let mut command = firestone(home, path);
     command
