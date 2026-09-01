@@ -10,7 +10,10 @@ use super::{Arch, ByteSize, MachineSpec, NetMode};
 use crate::{
     Catalog, ErrorKind, FirestoneError, Paths,
     bounded::{self, BoundedReadError},
-    cloudinit::{MAX_NETWORK_CONFIG_BYTES, MAX_SSH_KEY_FILE_BYTES, MAX_USER_DATA_BYTES},
+    cloudinit::{
+        MAX_INLINE_USER_DATA_BYTES, MAX_NETWORK_CONFIG_BYTES, MAX_PASSWORD_BYTES,
+        MAX_SSH_KEY_FILE_BYTES, MAX_USER_DATA_BYTES,
+    },
 };
 
 /// A non-fatal spec issue surfaced consistently by each interface.
@@ -627,6 +630,26 @@ fn validate_cloud_init(
     spec: &MachineSpec,
     context: &ValidationContext<'_>,
 ) -> Result<(), FirestoneError> {
+    if spec.cloud_init.user_data.is_some() && spec.cloud_init.user_data_inline.is_some() {
+        return Err(invalid(
+            "cloud_init.user_data_inline",
+            "'cloud_init.user_data' and 'cloud_init.user_data_inline' are both set",
+            "keep one user part: clear 'cloud_init.user_data' or 'cloud_init.user_data_inline'",
+        ));
+    }
+
+    if let Some(inline) = &spec.cloud_init.user_data_inline {
+        validate_inline_user_data(inline)?;
+    }
+
+    for (index, key) in spec.cloud_init.ssh_authorized_keys.iter().enumerate() {
+        validate_inline_authorized_key(index, key)?;
+    }
+
+    if let Some(password) = &spec.cloud_init.password {
+        validate_password(password)?;
+    }
+
     if let Some(path) = &spec.cloud_init.user_data {
         let contents = read_required_file(
             context.host,
@@ -724,6 +747,91 @@ fn validate_cloud_init(
                 "add at least one OpenSSH public key",
             ));
         }
+    }
+    Ok(())
+}
+
+/// Applies the §7.2 rules for inline user-data supplied in the spec itself.
+fn validate_inline_user_data(inline: &str) -> Result<(), FirestoneError> {
+    const KEY: &str = "cloud_init.user_data_inline";
+    if inline.len() as u64 > MAX_INLINE_USER_DATA_BYTES {
+        return Err(invalid(
+            KEY,
+            format!("inline user-data is {} bytes", inline.len()),
+            "reduce inline user-data to 32 KiB or move it to a 'cloud_init.user_data' file",
+        ));
+    }
+    let first_line = inline.split('\n').next().unwrap_or_default();
+    let first_line = first_line.strip_suffix('\r').unwrap_or(first_line);
+    if first_line != "#cloud-config" && !first_line.starts_with("#!") {
+        return Err(invalid(
+            KEY,
+            "inline user-data has an unsupported first line",
+            "start inline user-data with '#cloud-config' or '#!'; set provisioning = false when using a raw shell script",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates one inline OpenSSH public key exactly like a file-loaded key.
+fn validate_inline_authorized_key(index: usize, key: &str) -> Result<(), FirestoneError> {
+    let field = format!("cloud_init.ssh_authorized_keys[{index}]");
+    let line = key.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return Err(invalid(
+            &field,
+            "inline authorized key is empty or a comment",
+            "supply one OpenSSH public key such as 'ssh-ed25519 AAAA… user@host'",
+        ));
+    }
+    if line.lines().count() != 1 {
+        return Err(invalid(
+            &field,
+            "inline authorized key contains more than one line",
+            "supply exactly one OpenSSH public key per entry",
+        ));
+    }
+    if line.len() as u64 > MAX_SSH_KEY_FILE_BYTES {
+        return Err(invalid(
+            &field,
+            format!("inline authorized key is {} bytes", line.len()),
+            "supply an OpenSSH public key of 64 KiB or less",
+        ));
+    }
+    PublicKey::from_openssh(line).map_err(|error| {
+        invalid_with_source(
+            &field,
+            "inline authorized key is not a valid OpenSSH public key",
+            "replace the entry with an OpenSSH public key",
+            error,
+        )
+    })?;
+    Ok(())
+}
+
+/// Validates the guest password without ever repeating its value.
+fn validate_password(password: &str) -> Result<(), FirestoneError> {
+    const KEY: &str = "cloud_init.password";
+    if password.is_empty() {
+        return Err(invalid(
+            KEY,
+            "password is empty",
+            "set a non-empty password or clear 'cloud_init.password'",
+        ));
+    }
+    if password.len() as u64 > MAX_PASSWORD_BYTES {
+        return Err(invalid(
+            KEY,
+            format!("password is {} bytes", password.len()),
+            "use a password of 256 bytes or less",
+        ));
+    }
+    if password.chars().any(char::is_control) {
+        return Err(invalid(
+            KEY,
+            "password contains a control character",
+            "use a password without newlines, tabs, or other control characters",
+        ));
     }
     Ok(())
 }
@@ -910,12 +1018,17 @@ fn read_required_file(
         )),
     }
 }
+/// Builds one keyed spec error carrying the dotted path as a structured field.
+///
+/// Every §7.2 validation failure flows through here, so field-addressed
+/// surfaces can answer beside the offending input without parsing messages.
 fn invalid(key: &str, message: impl Into<String>, hint: impl Into<String>) -> FirestoneError {
     FirestoneError::new(
         ErrorKind::InvalidSpec,
         format!("invalid '{key}': {}", message.into()),
     )
     .with_hint(hint)
+    .with_field(key.to_owned())
 }
 
 fn invalid_with_source(
@@ -937,8 +1050,8 @@ mod tests {
     };
 
     use super::{
-        MAX_USER_DATA_BYTES, RealValidationHost, SpecWarning, ValidationContext, ValidationHost,
-        read_required_file, validate_machine_spec,
+        MAX_INLINE_USER_DATA_BYTES, MAX_USER_DATA_BYTES, RealValidationHost, SpecWarning,
+        ValidationContext, ValidationHost, read_required_file, validate_machine_spec,
     };
     use crate::{
         Arch, ByteSize, Catalog, CloudInitSpecPatch, ErrorKind, Firmware, MachineSpec,
@@ -1803,6 +1916,127 @@ checksum_alg = "sha256"
             .push(PathBuf::from("~/.ssh/id.pub"));
         validate_machine_spec(&mut spec, &host.context())?;
         Ok(())
+    }
+
+    #[test]
+    fn cloud_init_both_user_parts_returns_error_naming_both_keys() {
+        let mut host = FakeHost::default();
+        host.add_file("/machines/dev/user-data", b"#cloud-config\n".to_vec());
+        let mut spec = MachineSpec::default();
+        spec.cloud_init.user_data = Some(PathBuf::from("user-data"));
+        spec.cloud_init.user_data_inline = Some("#cloud-config\ntoken: shh\n".to_owned());
+
+        let error = validate_machine_spec(&mut spec, &host.context()).expect_err("both user parts");
+
+        assert_invalid_key(&error, "cloud_init.user_data_inline");
+        assert!(error.message().contains("cloud_init.user_data'"));
+        assert!(!error.message().contains("token: shh"));
+        assert_eq!(error.field(), Some("cloud_init.user_data_inline"));
+    }
+
+    #[test]
+    fn cloud_init_inline_user_data_matrix_matches_file_rules() {
+        let host = FakeHost::default();
+        let cases: [(&str, bool); 5] = [
+            ("#cloud-config\nruncmd: []\n", true),
+            ("#cloud-config\r\nruncmd: []\n", true),
+            ("#!/bin/sh\necho ok\n", true),
+            ("hostname: dev\n", false),
+            ("", false),
+        ];
+
+        for (inline, accepted) in cases {
+            let mut spec = MachineSpec::default();
+            spec.cloud_init.user_data_inline = Some(inline.to_owned());
+            let result = validate_machine_spec(&mut spec, &host.context());
+            assert_eq!(result.is_ok(), accepted, "inline case {inline:?}");
+            if let Err(error) = result {
+                assert_invalid_key(&error, "cloud_init.user_data_inline");
+            }
+        }
+
+        let mut oversized = MachineSpec::default();
+        oversized.cloud_init.user_data_inline = Some(format!(
+            "#cloud-config\n# {}",
+            "p".repeat(MAX_INLINE_USER_DATA_BYTES as usize)
+        ));
+        let error =
+            validate_machine_spec(&mut oversized, &host.context()).expect_err("oversized inline");
+        assert_invalid_key(&error, "cloud_init.user_data_inline");
+        assert!(error.message().contains("bytes"));
+    }
+
+    #[test]
+    fn cloud_init_inline_authorized_keys_matrix_returns_indexed_fields() {
+        let host = FakeHost::default();
+        const VALID: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKg0J8YPh7wARkZSlBzFAoJez6gssTQUuPu4Qy3z8T1P test@example";
+        let rejected = [
+            "",
+            "   ",
+            "# ssh-ed25519 AAAA comment",
+            "ssh-ed25519 not-base64 user@test",
+            "not-a-key",
+        ];
+
+        let mut accepted = MachineSpec::default();
+        accepted.cloud_init.ssh_authorized_keys = vec![VALID.to_owned(), format!("  {VALID}  ")];
+        validate_machine_spec(&mut accepted, &host.context()).expect("valid inline keys");
+
+        for entry in rejected {
+            let mut spec = MachineSpec::default();
+            spec.cloud_init.ssh_authorized_keys = vec![VALID.to_owned(), (*entry).to_owned()];
+            let error =
+                validate_machine_spec(&mut spec, &host.context()).expect_err("invalid inline key");
+            assert_invalid_key(&error, "cloud_init.ssh_authorized_keys[1]");
+            assert_eq!(error.field(), Some("cloud_init.ssh_authorized_keys[1]"));
+        }
+    }
+
+    #[test]
+    fn cloud_init_password_matrix_never_repeats_the_value() {
+        let host = FakeHost::default();
+        let mut accepted = MachineSpec::default();
+        accepted.cloud_init.password = Some("correct horse: battery".to_owned());
+        validate_machine_spec(&mut accepted, &host.context()).expect("valid password");
+
+        for password in ["", "line\nbreak", "tab\there", &"x".repeat(257)] {
+            let mut spec = MachineSpec::default();
+            spec.cloud_init.password = Some(password.to_owned());
+            let error =
+                validate_machine_spec(&mut spec, &host.context()).expect_err("invalid password");
+            assert_invalid_key(&error, "cloud_init.password");
+            assert_eq!(error.field(), Some("cloud_init.password"));
+            if !password.is_empty() {
+                assert!(
+                    !error.message().contains(password),
+                    "password value leaked into {}",
+                    error.message()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn spec_validation_errors_carry_their_dotted_field_path() {
+        let host = FakeHost::default();
+        let mut cpus = MachineSpec {
+            cpus: 0,
+            ..MachineSpec::default()
+        };
+        let cpus_error = validate_machine_spec(&mut cpus, &host.context()).expect_err("cpus");
+        assert_eq!(cpus_error.field(), Some("cpus"));
+
+        let mut mount = MachineSpec {
+            mounts: vec![MountSpec {
+                host: PathBuf::from("/missing"),
+                guest: PathBuf::from("/guest"),
+                readonly: false,
+                tag: None,
+            }],
+            ..MachineSpec::default()
+        };
+        let mount_error = validate_machine_spec(&mut mount, &host.context()).expect_err("mount");
+        assert_eq!(mount_error.field(), Some("mount[0].host"));
     }
 
     #[test]

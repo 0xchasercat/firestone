@@ -308,6 +308,7 @@ impl Rejection {
                 kind: ErrorKind::Usage,
                 message: self.message.to_owned(),
                 hint: Some(self.hint.to_owned()),
+                field: None,
             },
         };
         let body = serde_json::to_vec(&envelope).unwrap_or_else(|_| INTERNAL_ERROR_JSON.to_vec());

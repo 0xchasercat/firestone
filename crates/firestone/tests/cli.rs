@@ -693,6 +693,54 @@ fn create_non_tty_renders_effective_summary_without_prompting() -> TestResult {
 }
 
 #[test]
+fn create_with_password_publishes_mode_0600_spec_and_keeps_it_out_of_output() -> TestResult {
+    const PASSWORD: &str = "pl41nt3xt-guest-pw";
+
+    let directory = tempfile::tempdir()?;
+    let root = fs::canonicalize(directory.path())?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    let home = root.join("home");
+    let password_file = root.join("password");
+    fs::write(&password_file, format!("{PASSWORD}\n"))?;
+
+    let output = Command::new("sh")
+        .args(["-c", "umask 002; exec \"$@\"", "firestone-test"])
+        .arg(env!("CARGO_BIN_EXE_firestone"))
+        .arg("--home")
+        .arg(&home)
+        .args([
+            "create",
+            "secret-dev",
+            "ubuntu",
+            "--user-data-inline",
+            "#cloud-config\nruncmd: []\n",
+            "--ssh-pwauth",
+            "--password-file",
+        ])
+        .arg(&password_file)
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stdout.contains("Created machine"));
+    assert!(!stdout.contains(PASSWORD), "password reached stdout");
+    assert!(!stderr.contains(PASSWORD), "password reached stderr");
+
+    let spec_path = home.join("data/machines/secret-dev/firestone.toml");
+    let mode = fs::metadata(&spec_path)?.permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "machine spec mode {mode:04o}");
+    let document = fs::read_to_string(&spec_path)?;
+    assert!(document.contains("ssh_pwauth = true"));
+    assert!(document.contains(PASSWORD), "spec stores the password");
+    Ok(())
+}
+
+#[test]
 fn create_non_tty_without_image_preserves_usage_error() -> TestResult {
     let directory = tempfile::tempdir()?;
     let home = directory.path().join("home");

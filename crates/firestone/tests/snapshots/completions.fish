@@ -73,8 +73,11 @@ complete -c firestone -n "__fish_firestone_using_subcommand run" -l tap -d 'Use 
 complete -c firestone -n "__fish_firestone_using_subcommand run" -l network-mac -d 'Set a fixed guest network MAC address' -r
 complete -c firestone -n "__fish_firestone_using_subcommand run" -l mount -d 'Share a host directory with the guest; repeat as needed' -r
 complete -c firestone -n "__fish_firestone_using_subcommand run" -l user-data -d 'Add a cloud-init user-data file' -r -F
+complete -c firestone -n "__fish_firestone_using_subcommand run" -l user-data-inline -d 'Set cloud-init user-data inline instead of from a file' -r
 complete -c firestone -n "__fish_firestone_using_subcommand run" -l cloud-init-network-config -d 'Add a cloud-init network-config file' -r -F
 complete -c firestone -n "__fish_firestone_using_subcommand run" -l ssh-key -d 'Add an OpenSSH public-key file; repeat as needed' -r -F
+complete -c firestone -n "__fish_firestone_using_subcommand run" -l ssh-authorized-key -d 'Add an inline OpenSSH public key; repeat as needed' -r
+complete -c firestone -n "__fish_firestone_using_subcommand run" -l password-file -d 'Read the guest password for --user from a file' -r
 complete -c firestone -n "__fish_firestone_using_subcommand run" -l vmm-binary -d 'Use a custom cloud-hypervisor executable' -r -F
 complete -c firestone -n "__fish_firestone_using_subcommand run" -l vmm-firmware -d 'Select auto, rhf, edk2, or a firmware file' -r
 complete -c firestone -n "__fish_firestone_using_subcommand run" -l vmm-arg -d 'Append one cloud-hypervisor argument; repeat as needed' -r
@@ -82,6 +85,7 @@ complete -c firestone -n "__fish_firestone_using_subcommand run" -l vmm-config -
 complete -c firestone -n "__fish_firestone_using_subcommand run" -l clear -d 'Clear an inherited optional field; repeat as needed' -r
 complete -c firestone -n "__fish_firestone_using_subcommand run" -l home -d 'Override the Firestone home root (config, data, and runtime)' -r -F
 complete -c firestone -n "__fish_firestone_using_subcommand run" -l rm -d 'Remove a machine created by this invocation after SSH exits'
+complete -c firestone -n "__fish_firestone_using_subcommand run" -l ssh-pwauth -d 'Allow SSH password authentication in the guest'
 complete -c firestone -n "__fish_firestone_using_subcommand run" -l no-provisioning -d 'Disable Firestone\'s built-in guest provisioning'
 complete -c firestone -n "__fish_firestone_using_subcommand run" -l json -d 'Print events as newline-delimited JSON and disable human output'
 complete -c firestone -n "__fish_firestone_using_subcommand run" -s q -l quiet -d 'Print only errors and command results'
@@ -104,8 +108,11 @@ complete -c firestone -n "__fish_firestone_using_subcommand create" -l tap -d 'U
 complete -c firestone -n "__fish_firestone_using_subcommand create" -l network-mac -d 'Set a fixed guest network MAC address' -r
 complete -c firestone -n "__fish_firestone_using_subcommand create" -l mount -d 'Share a host directory with the guest; repeat as needed' -r
 complete -c firestone -n "__fish_firestone_using_subcommand create" -l user-data -d 'Add a cloud-init user-data file' -r -F
+complete -c firestone -n "__fish_firestone_using_subcommand create" -l user-data-inline -d 'Set cloud-init user-data inline instead of from a file' -r
 complete -c firestone -n "__fish_firestone_using_subcommand create" -l cloud-init-network-config -d 'Add a cloud-init network-config file' -r -F
 complete -c firestone -n "__fish_firestone_using_subcommand create" -l ssh-key -d 'Add an OpenSSH public-key file; repeat as needed' -r -F
+complete -c firestone -n "__fish_firestone_using_subcommand create" -l ssh-authorized-key -d 'Add an inline OpenSSH public key; repeat as needed' -r
+complete -c firestone -n "__fish_firestone_using_subcommand create" -l password-file -d 'Read the guest password for --user from a file' -r
 complete -c firestone -n "__fish_firestone_using_subcommand create" -l vmm-binary -d 'Use a custom cloud-hypervisor executable' -r -F
 complete -c firestone -n "__fish_firestone_using_subcommand create" -l vmm-firmware -d 'Select auto, rhf, edk2, or a firmware file' -r
 complete -c firestone -n "__fish_firestone_using_subcommand create" -l vmm-arg -d 'Append one cloud-hypervisor argument; repeat as needed' -r
@@ -113,6 +120,7 @@ complete -c firestone -n "__fish_firestone_using_subcommand create" -l vmm-confi
 complete -c firestone -n "__fish_firestone_using_subcommand create" -l clear -d 'Clear an inherited optional field; repeat as needed' -r
 complete -c firestone -n "__fish_firestone_using_subcommand create" -l home -d 'Override the Firestone home root (config, data, and runtime)' -r -F
 complete -c firestone -n "__fish_firestone_using_subcommand create" -l edit -d 'Open the generated specification in the configured editor'
+complete -c firestone -n "__fish_firestone_using_subcommand create" -l ssh-pwauth -d 'Allow SSH password authentication in the guest'
 complete -c firestone -n "__fish_firestone_using_subcommand create" -l no-provisioning -d 'Disable Firestone\'s built-in guest provisioning'
 complete -c firestone -n "__fish_firestone_using_subcommand create" -l json -d 'Print events as newline-delimited JSON and disable human output'
 complete -c firestone -n "__fish_firestone_using_subcommand create" -s q -l quiet -d 'Print only errors and command results'

@@ -178,12 +178,16 @@ impl MountSpec {
 }
 
 /// Cloud-init inputs and Firestone provisioning policy.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct CloudInitSpec {
     pub user_data: Option<PathBuf>,
+    pub user_data_inline: Option<String>,
     pub network_config: Option<PathBuf>,
     pub ssh_keys: Vec<PathBuf>,
+    pub ssh_authorized_keys: Vec<String>,
+    pub password: Option<String>,
+    pub ssh_pwauth: bool,
     pub provisioning: bool,
 }
 
@@ -191,10 +195,44 @@ impl Default for CloudInitSpec {
     fn default() -> Self {
         Self {
             user_data: None,
+            user_data_inline: None,
             network_config: None,
             ssh_keys: Vec::new(),
+            ssh_authorized_keys: Vec::new(),
+            password: None,
+            ssh_pwauth: false,
             provisioning: true,
         }
+    }
+}
+
+/// Placeholder printed instead of guest-secret or cloud-init contents.
+pub(crate) const REDACTED: &str = "<redacted>";
+
+fn redacted(value: Option<&impl AsRef<str>>) -> Option<&'static str> {
+    value.map(|_| REDACTED)
+}
+
+/// Redacts inline user-data and the guest password in every debug rendering.
+///
+/// `MachineSpec` derives `Debug`, so anything that formats a spec — a panic
+/// message, a trace line, a test assertion — reaches this implementation.
+impl std::fmt::Debug for CloudInitSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CloudInitSpec")
+            .field("user_data", &self.user_data)
+            .field(
+                "user_data_inline",
+                &redacted(self.user_data_inline.as_ref()),
+            )
+            .field("network_config", &self.network_config)
+            .field("ssh_keys", &self.ssh_keys)
+            .field("ssh_authorized_keys", &self.ssh_authorized_keys)
+            .field("password", &redacted(self.password.as_ref()))
+            .field("ssh_pwauth", &self.ssh_pwauth)
+            .field("provisioning", &self.provisioning)
+            .finish()
     }
 }
 
@@ -229,10 +267,16 @@ pub enum SpecClear {
     Mount,
     #[serde(rename = "cloud_init.user_data")]
     CloudInitUserData,
+    #[serde(rename = "cloud_init.user_data_inline")]
+    CloudInitUserDataInline,
     #[serde(rename = "cloud_init.network_config")]
     CloudInitNetworkConfig,
     #[serde(rename = "cloud_init.ssh_keys")]
     CloudInitSshKeys,
+    #[serde(rename = "cloud_init.ssh_authorized_keys")]
+    CloudInitSshAuthorizedKeys,
+    #[serde(rename = "cloud_init.password")]
+    CloudInitPassword,
     #[serde(rename = "vmm.binary")]
     VmmBinary,
     #[serde(rename = "vmm.extra_args")]
@@ -253,8 +297,11 @@ impl SpecClear {
         Self::NetworkMac,
         Self::Mount,
         Self::CloudInitUserData,
+        Self::CloudInitUserDataInline,
         Self::CloudInitNetworkConfig,
         Self::CloudInitSshKeys,
+        Self::CloudInitSshAuthorizedKeys,
+        Self::CloudInitPassword,
         Self::VmmBinary,
         Self::VmmExtraArgs,
         Self::VmmConfigOverlay,
@@ -271,8 +318,11 @@ impl SpecClear {
             Self::NetworkMac => "network.mac",
             Self::Mount => "mount",
             Self::CloudInitUserData => "cloud_init.user_data",
+            Self::CloudInitUserDataInline => "cloud_init.user_data_inline",
             Self::CloudInitNetworkConfig => "cloud_init.network_config",
             Self::CloudInitSshKeys => "cloud_init.ssh_keys",
+            Self::CloudInitSshAuthorizedKeys => "cloud_init.ssh_authorized_keys",
+            Self::CloudInitPassword => "cloud_init.password",
             Self::VmmBinary => "vmm.binary",
             Self::VmmExtraArgs => "vmm.extra_args",
             Self::VmmConfigOverlay => "vmm.config_overlay",
@@ -513,6 +563,18 @@ impl MachineSpecPatch {
                 .cloud_init
                 .as_ref()
                 .is_some_and(|cloud_init| cloud_init.user_data.is_some()),
+            SpecClear::CloudInitUserDataInline => self
+                .cloud_init
+                .as_ref()
+                .is_some_and(|cloud_init| cloud_init.user_data_inline.is_some()),
+            SpecClear::CloudInitSshAuthorizedKeys => self
+                .cloud_init
+                .as_ref()
+                .is_some_and(|cloud_init| cloud_init.ssh_authorized_keys.is_some()),
+            SpecClear::CloudInitPassword => self
+                .cloud_init
+                .as_ref()
+                .is_some_and(|cloud_init| cloud_init.password.is_some()),
             SpecClear::CloudInitNetworkConfig => self
                 .cloud_init
                 .as_ref()
@@ -544,8 +606,13 @@ impl MachineSpecPatch {
                 SpecClear::NetworkMac => spec.network.mac = None,
                 SpecClear::Mount => spec.mounts.clear(),
                 SpecClear::CloudInitUserData => spec.cloud_init.user_data = None,
+                SpecClear::CloudInitUserDataInline => spec.cloud_init.user_data_inline = None,
                 SpecClear::CloudInitNetworkConfig => spec.cloud_init.network_config = None,
                 SpecClear::CloudInitSshKeys => spec.cloud_init.ssh_keys.clear(),
+                SpecClear::CloudInitSshAuthorizedKeys => {
+                    spec.cloud_init.ssh_authorized_keys.clear();
+                }
+                SpecClear::CloudInitPassword => spec.cloud_init.password = None,
                 SpecClear::VmmBinary => spec.vmm.binary = None,
                 SpecClear::VmmExtraArgs => spec.vmm.extra_args.clear(),
                 SpecClear::VmmConfigOverlay => spec.vmm.config_overlay = None,
@@ -582,8 +649,14 @@ impl From<&MachineSpec> for MachineSpecPatch {
         if spec.cloud_init.user_data.is_none() {
             clear.push(SpecClear::CloudInitUserData);
         }
+        if spec.cloud_init.user_data_inline.is_none() {
+            clear.push(SpecClear::CloudInitUserDataInline);
+        }
         if spec.cloud_init.network_config.is_none() {
             clear.push(SpecClear::CloudInitNetworkConfig);
+        }
+        if spec.cloud_init.password.is_none() {
+            clear.push(SpecClear::CloudInitPassword);
         }
         if spec.vmm.binary.is_none() {
             clear.push(SpecClear::VmmBinary);
@@ -617,8 +690,12 @@ impl From<&MachineSpec> for MachineSpecPatch {
             mounts: Some(spec.mounts.clone()),
             cloud_init: Some(CloudInitSpecPatch {
                 user_data: spec.cloud_init.user_data.clone(),
+                user_data_inline: spec.cloud_init.user_data_inline.clone(),
                 network_config: spec.cloud_init.network_config.clone(),
                 ssh_keys: Some(spec.cloud_init.ssh_keys.clone()),
+                ssh_authorized_keys: Some(spec.cloud_init.ssh_authorized_keys.clone()),
+                password: spec.cloud_init.password.clone(),
+                ssh_pwauth: Some(spec.cloud_init.ssh_pwauth),
                 provisioning: Some(spec.cloud_init.provisioning),
             }),
             vmm: Some(VmmSpecPatch {
@@ -674,17 +751,45 @@ impl NetworkSpecPatch {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct CloudInitSpecPatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_data: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_data_inline: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub network_config: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh_keys: Option<Vec<PathBuf>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_authorized_keys: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_pwauth: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub provisioning: Option<bool>,
+}
+
+/// Redacts the same leaves [`CloudInitSpec`]'s implementation redacts.
+impl std::fmt::Debug for CloudInitSpecPatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CloudInitSpecPatch")
+            .field("user_data", &self.user_data)
+            .field(
+                "user_data_inline",
+                &redacted(self.user_data_inline.as_ref()),
+            )
+            .field("network_config", &self.network_config)
+            .field("ssh_keys", &self.ssh_keys)
+            .field("ssh_authorized_keys", &self.ssh_authorized_keys)
+            .field("password", &redacted(self.password.as_ref()))
+            .field("ssh_pwauth", &self.ssh_pwauth)
+            .field("provisioning", &self.provisioning)
+            .finish()
+    }
 }
 
 impl CloudInitSpecPatch {
@@ -692,11 +797,27 @@ impl CloudInitSpecPatch {
         if let Some(user_data) = &self.user_data {
             spec.user_data = Some(user_data.clone());
         }
+        if let Some(user_data_inline) = &self.user_data_inline {
+            spec.user_data_inline = Some(user_data_inline.clone());
+        }
         if let Some(network_config) = &self.network_config {
             spec.network_config = Some(network_config.clone());
         }
         if let Some(ssh_keys) = &self.ssh_keys {
             merge_vector(&mut spec.ssh_keys, ssh_keys, vector_merge);
+        }
+        if let Some(ssh_authorized_keys) = &self.ssh_authorized_keys {
+            merge_vector(
+                &mut spec.ssh_authorized_keys,
+                ssh_authorized_keys,
+                vector_merge,
+            );
+        }
+        if let Some(password) = &self.password {
+            spec.password = Some(password.clone());
+        }
+        if let Some(ssh_pwauth) = self.ssh_pwauth {
+            spec.ssh_pwauth = ssh_pwauth;
         }
         if let Some(provisioning) = self.provisioning {
             spec.provisioning = provisioning;
@@ -877,6 +998,13 @@ pub const SPEC_FIELD_METADATA: &[SpecFieldMetadata] = &[
         false,
     ),
     field(
+        "cloud_init.user_data_inline",
+        "user-data-inline",
+        None,
+        PatchMerge::Replace,
+        false,
+    ),
+    field(
         "cloud_init.network_config",
         "cloud-init-network-config",
         None,
@@ -888,6 +1016,27 @@ pub const SPEC_FIELD_METADATA: &[SpecFieldMetadata] = &[
         "ssh-key",
         None,
         PatchMerge::Append,
+        false,
+    ),
+    field(
+        "cloud_init.ssh_authorized_keys",
+        "ssh-authorized-key",
+        None,
+        PatchMerge::Append,
+        false,
+    ),
+    field(
+        "cloud_init.password",
+        "password-file",
+        None,
+        PatchMerge::Replace,
+        false,
+    ),
+    field(
+        "cloud_init.ssh_pwauth",
+        "ssh-pwauth",
+        None,
+        PatchMerge::Replace,
         false,
     ),
     field(
@@ -1168,7 +1317,16 @@ impl TableSchema {
             ],
             Self::Network => &["mode", "forward", "tap", "mac"],
             Self::Mount => &["host", "guest", "readonly", "tag"],
-            Self::CloudInit => &["user_data", "network_config", "ssh_keys", "provisioning"],
+            Self::CloudInit => &[
+                "user_data",
+                "user_data_inline",
+                "network_config",
+                "ssh_keys",
+                "ssh_authorized_keys",
+                "password",
+                "ssh_pwauth",
+                "provisioning",
+            ],
             Self::Vmm => &["binary", "firmware", "extra_args", "config_overlay"],
             Self::Global => &["defaults", "start", "stop", "ui", "images"],
             Self::Start => &["timeout_first_boot", "timeout"],
@@ -1946,8 +2104,14 @@ config_overlay = "[]"
             }],
             cloud_init: CloudInitSpec {
                 user_data: Some(PathBuf::from("/tmp/user-data")),
+                // Serialization fixture only: §7.2 rejects both user parts
+                // together, while the drift checks need every leaf present.
+                user_data_inline: Some("#cloud-config\n".to_owned()),
                 network_config: Some(PathBuf::from("/tmp/network-config")),
                 ssh_keys: vec![PathBuf::from("/tmp/id.pub")],
+                ssh_authorized_keys: vec!["ssh-ed25519 AAAA inline@test".to_owned()],
+                password: Some("hunter2".to_owned()),
+                ssh_pwauth: true,
                 provisioning: false,
             },
             vmm: VmmSpec {
@@ -2020,8 +2184,12 @@ config_overlay = "[]"
             mounts: Some(spec.mounts),
             cloud_init: Some(CloudInitSpecPatch {
                 user_data: spec.cloud_init.user_data,
+                user_data_inline: spec.cloud_init.user_data_inline,
                 network_config: spec.cloud_init.network_config,
                 ssh_keys: Some(spec.cloud_init.ssh_keys),
+                ssh_authorized_keys: Some(spec.cloud_init.ssh_authorized_keys),
+                password: spec.cloud_init.password,
+                ssh_pwauth: Some(spec.cloud_init.ssh_pwauth),
                 provisioning: Some(spec.cloud_init.provisioning),
             }),
             vmm: Some(VmmSpecPatch {
@@ -2077,7 +2245,11 @@ config_overlay = "[]"
             "network.tap" => "tap".to_owned(),
             "mount" => "mount".to_owned(),
             "cloud_init.user_data" => "user-data".to_owned(),
+            "cloud_init.user_data_inline" => "user-data-inline".to_owned(),
             "cloud_init.ssh_keys" => "ssh-key".to_owned(),
+            "cloud_init.ssh_authorized_keys" => "ssh-authorized-key".to_owned(),
+            "cloud_init.password" => "password-file".to_owned(),
+            "cloud_init.ssh_pwauth" => "ssh-pwauth".to_owned(),
             "cloud_init.provisioning" => "no-provisioning".to_owned(),
             "vmm.extra_args" => "vmm-arg".to_owned(),
             "vmm.config_overlay" => "vmm-config".to_owned(),

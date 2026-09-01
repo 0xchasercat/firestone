@@ -1,5 +1,7 @@
 use std::{
     ffi::OsString,
+    fs::File,
+    io::Read as _,
     net::SocketAddr,
     path::{Path, PathBuf},
 };
@@ -650,6 +652,10 @@ pub struct SpecArgs {
     #[arg(long = "user-data", value_name = "FILE")]
     pub user_data: Option<PathBuf>,
 
+    /// Set cloud-init user-data inline instead of from a file.
+    #[arg(long = "user-data-inline", value_name = "TEXT")]
+    pub user_data_inline: Option<String>,
+
     /// Add a cloud-init network-config file.
     #[arg(long = "cloud-init-network-config", value_name = "FILE")]
     pub cloud_init_network_config: Option<PathBuf>,
@@ -657,6 +663,18 @@ pub struct SpecArgs {
     /// Add an OpenSSH public-key file; repeat as needed.
     #[arg(long = "ssh-key", value_name = "FILE")]
     pub ssh_key: Vec<PathBuf>,
+
+    /// Add an inline OpenSSH public key; repeat as needed.
+    #[arg(long = "ssh-authorized-key", value_name = "KEY")]
+    pub ssh_authorized_key: Vec<String>,
+
+    /// Read the guest password for --user from a file.
+    #[arg(long = "password-file", value_name = "FILE", value_parser = parse_password_file)]
+    pub password_file: Option<String>,
+
+    /// Allow SSH password authentication in the guest.
+    #[arg(long = "ssh-pwauth")]
+    pub ssh_pwauth: bool,
 
     /// Disable Firestone's built-in guest provisioning.
     #[arg(long = "no-provisioning")]
@@ -701,8 +719,12 @@ impl SpecArgs {
             network_mac,
             mount,
             user_data,
+            user_data_inline,
             cloud_init_network_config,
             ssh_key,
+            ssh_authorized_key,
+            password_file,
+            ssh_pwauth,
             no_provisioning,
             vmm_binary,
             vmm_firmware,
@@ -726,18 +748,28 @@ impl SpecArgs {
 
         let mounts = non_empty(mount);
         let ssh_keys = non_empty(ssh_key);
+        let ssh_authorized_keys = non_empty(ssh_authorized_key);
         let provisioning = no_provisioning.then_some(false);
+        let ssh_pwauth = ssh_pwauth.then_some(true);
         let cloud_init = if user_data.is_none()
+            && user_data_inline.is_none()
             && cloud_init_network_config.is_none()
             && ssh_keys.is_none()
+            && ssh_authorized_keys.is_none()
+            && password_file.is_none()
+            && ssh_pwauth.is_none()
             && provisioning.is_none()
         {
             None
         } else {
             Some(CloudInitSpecPatch {
                 user_data,
+                user_data_inline,
                 network_config: cloud_init_network_config,
                 ssh_keys,
+                ssh_authorized_keys,
+                password: password_file,
+                ssh_pwauth,
                 provisioning,
             })
         };
@@ -891,6 +923,36 @@ fn parse_mount(value: &str) -> Result<MountSpec, String> {
         readonly,
         tag: None,
     })
+}
+
+/// Reads the guest password from a file so it never appears in the argv.
+///
+/// One trailing newline is removed. No failure message repeats file contents.
+fn parse_password_file(value: &str) -> Result<String, String> {
+    const MAX_PASSWORD_FILE_BYTES: u64 = 4096;
+
+    let mut file = File::open(value)
+        .map_err(|error| format!("cannot open --password-file '{value}': {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect --password-file '{value}': {error}"))?;
+    if !metadata.is_file() {
+        return Err(format!("--password-file '{value}' is not a regular file"));
+    }
+    let mut contents = String::new();
+    file.by_ref()
+        .take(MAX_PASSWORD_FILE_BYTES + 1)
+        .read_to_string(&mut contents)
+        .map_err(|error| format!("cannot read --password-file '{value}': {error}"))?;
+    if contents.len() as u64 > MAX_PASSWORD_FILE_BYTES {
+        return Err(format!("--password-file '{value}' exceeds 4 KiB"));
+    }
+    let password = contents.strip_suffix('\n').unwrap_or(&contents);
+    let password = password.strip_suffix('\r').unwrap_or(password);
+    if password.is_empty() {
+        return Err(format!("--password-file '{value}' is empty"));
+    }
+    Ok(password.to_owned())
 }
 
 fn parse_vmm_config(value: &str) -> Result<serde_json::Value, String> {
@@ -1595,6 +1657,84 @@ mod tests {
             vmm.config_overlay,
             Some(json!({"cpus": {"boot_vcpus": 4}, "payload": null}))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn cloud_init_credential_flags_project_into_the_patch() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let password_file = directory.path().join("password");
+        std::fs::write(&password_file, "s3cret: value\n")?;
+        let password_argument = password_file.to_str().ok_or("UTF-8 password path")?;
+
+        let request = create_request(&[
+            "firestone",
+            "create",
+            "dev",
+            "ubuntu:24.04",
+            "--user-data-inline",
+            "#cloud-config\nruncmd: []\n",
+            "--ssh-authorized-key",
+            "ssh-ed25519 AAAA one@host",
+            "--ssh-authorized-key",
+            "ssh-ed25519 BBBB two@host",
+            "--password-file",
+            password_argument,
+            "--ssh-pwauth",
+        ])?;
+
+        let cloud_init = request.patch.cloud_init.ok_or("cloud-init patch")?;
+        assert_eq!(
+            cloud_init.user_data_inline.as_deref(),
+            Some("#cloud-config\nruncmd: []\n")
+        );
+        assert_eq!(
+            cloud_init.ssh_authorized_keys,
+            Some(vec![
+                "ssh-ed25519 AAAA one@host".to_owned(),
+                "ssh-ed25519 BBBB two@host".to_owned()
+            ])
+        );
+        assert_eq!(cloud_init.password.as_deref(), Some("s3cret: value"));
+        assert_eq!(cloud_init.ssh_pwauth, Some(true));
+        assert_eq!(cloud_init.provisioning, None);
+        Ok(())
+    }
+
+    #[test]
+    fn password_file_failures_report_the_path_without_contents()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let empty = directory.path().join("empty");
+        std::fs::write(&empty, "\n")?;
+        let empty_argument = empty.to_str().ok_or("UTF-8 password path")?;
+
+        let error = create_request(&[
+            "firestone",
+            "create",
+            "dev",
+            "ubuntu:24.04",
+            "--password-file",
+            empty_argument,
+        ])
+        .err()
+        .ok_or("empty password file should fail")?;
+        assert!(error.to_string().contains("is empty"));
+
+        let missing = directory.path().join("missing");
+        let missing_argument = missing.to_str().ok_or("UTF-8 password path")?;
+        let error = create_request(&[
+            "firestone",
+            "create",
+            "dev",
+            "ubuntu:24.04",
+            "--password-file",
+            missing_argument,
+        ])
+        .err()
+        .ok_or("missing password file should fail")?;
+        assert!(error.to_string().contains("cannot open --password-file"));
         Ok(())
     }
 

@@ -1546,8 +1546,11 @@
           "network.mac",
           "mount",
           "cloud_init.user_data",
+          "cloud_init.user_data_inline",
           "cloud_init.network_config",
           "cloud_init.ssh_keys",
+          "cloud_init.ssh_authorized_keys",
+          "cloud_init.password",
           "vmm.binary",
           "vmm.extra_args",
           "vmm.config_overlay",
@@ -1776,6 +1779,13 @@
               }
             ]
           },
+          "user_data_inline": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Inline user part, at most 32 KiB. Mutually exclusive with user_data."
+          },
           "network_config": {
             "anyOf": [
               {
@@ -1792,12 +1802,29 @@
               "$ref": "#/components/schemas/Path"
             }
           },
+          "ssh_authorized_keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Inline OpenSSH public keys, deduplicated together with ssh_keys."
+          },
+          "password": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Plaintext guest password for user, 1 to 256 bytes without control characters."
+          },
+          "ssh_pwauth": {
+            "type": "boolean"
+          },
           "provisioning": {
             "type": "boolean"
           }
         },
         "additionalProperties": false,
-        "description": "All properties may be omitted and inherit CloudInitSpec defaults. Only user_data and network_config accept JSON null."
+        "description": "All properties may be omitted and inherit CloudInitSpec defaults. Only user_data, user_data_inline, network_config and password accept JSON null."
       },
       "CloudInitSpec": {
         "type": "object",
@@ -1812,6 +1839,13 @@
               }
             ]
           },
+          "user_data_inline": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Inline user part, at most 32 KiB. Mutually exclusive with user_data."
+          },
           "network_config": {
             "anyOf": [
               {
@@ -1828,6 +1862,23 @@
               "$ref": "#/components/schemas/Path"
             }
           },
+          "ssh_authorized_keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Inline OpenSSH public keys, deduplicated together with ssh_keys."
+          },
+          "password": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Plaintext guest password for user, 1 to 256 bytes without control characters."
+          },
+          "ssh_pwauth": {
+            "type": "boolean"
+          },
           "provisioning": {
             "type": "boolean"
           }
@@ -1835,8 +1886,12 @@
         "additionalProperties": false,
         "required": [
           "user_data",
+          "user_data_inline",
           "network_config",
           "ssh_keys",
+          "ssh_authorized_keys",
+          "password",
+          "ssh_pwauth",
           "provisioning"
         ]
       },
@@ -2133,6 +2188,12 @@
               }
             ]
           },
+          "user_data_inline": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "network_config": {
             "anyOf": [
               {
@@ -2154,6 +2215,31 @@
               {
                 "type": "null"
               }
+            ]
+          },
+          "ssh_authorized_keys": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "password": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ssh_pwauth": {
+            "type": [
+              "boolean",
+              "null"
             ]
           },
           "provisioning": {
@@ -2506,6 +2592,34 @@
               "properties": {
                 "clear": {
                   "contains": {
+                    "const": "cloud_init.user_data_inline"
+                  }
+                },
+                "cloud_init": {
+                  "type": "object",
+                  "properties": {
+                    "user_data_inline": {
+                      "not": {
+                        "type": "null"
+                      }
+                    }
+                  },
+                  "required": [
+                    "user_data_inline"
+                  ]
+                }
+              },
+              "required": [
+                "clear",
+                "cloud_init"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "clear": {
+                  "contains": {
                     "const": "cloud_init.network_config"
                   }
                 },
@@ -2548,6 +2662,62 @@
                   },
                   "required": [
                     "ssh_keys"
+                  ]
+                }
+              },
+              "required": [
+                "clear",
+                "cloud_init"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "clear": {
+                  "contains": {
+                    "const": "cloud_init.password"
+                  }
+                },
+                "cloud_init": {
+                  "type": "object",
+                  "properties": {
+                    "password": {
+                      "not": {
+                        "type": "null"
+                      }
+                    }
+                  },
+                  "required": [
+                    "password"
+                  ]
+                }
+              },
+              "required": [
+                "clear",
+                "cloud_init"
+              ]
+            }
+          },
+          {
+            "not": {
+              "properties": {
+                "clear": {
+                  "contains": {
+                    "const": "cloud_init.ssh_authorized_keys"
+                  }
+                },
+                "cloud_init": {
+                  "type": "object",
+                  "properties": {
+                    "ssh_authorized_keys": {
+                      "not": {
+                        "type": "null"
+                      }
+                    }
+                  },
+                  "required": [
+                    "ssh_authorized_keys"
                   ]
                 }
               },
@@ -3713,6 +3883,9 @@
           },
           "hint": {
             "type": "string"
+          },
+          "field": {
+            "type": "string"
           }
         },
         "additionalProperties": false,
@@ -3720,7 +3893,7 @@
           "kind",
           "message"
         ],
-        "description": "hint is omitted when the error has no public remediation hint."
+        "description": "hint is omitted when the error has no public remediation hint. field is omitted unless the error belongs to one machine-spec leaf; when present it is that leaf's dotted path, such as memory, network.forward, mount[0].host or cloud_init.password."
       },
       "ErrorEnvelope": {
         "type": "object",
@@ -5596,8 +5769,12 @@
             "mount": [],
             "cloud_init": {
               "user_data": null,
+              "user_data_inline": null,
               "network_config": null,
               "ssh_keys": [],
+              "ssh_authorized_keys": [],
+              "password": null,
+              "ssh_pwauth": false,
               "provisioning": true
             },
             "vmm": {
@@ -5647,8 +5824,12 @@
             "mount": [],
             "cloud_init": {
               "user_data": null,
+              "user_data_inline": null,
               "network_config": null,
               "ssh_keys": [],
+              "ssh_authorized_keys": [],
+              "password": null,
+              "ssh_pwauth": false,
               "provisioning": true
             },
             "vmm": {
@@ -5718,8 +5899,12 @@
             "mount": [],
             "cloud_init": {
               "user_data": null,
+              "user_data_inline": null,
               "network_config": null,
               "ssh_keys": [],
+              "ssh_authorized_keys": [],
+              "password": null,
+              "ssh_pwauth": false,
               "provisioning": true
             },
             "vmm": {

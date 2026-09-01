@@ -262,6 +262,29 @@ firestone create keyed ubuntu --ssh-key "$HOME/.ssh/id_ed25519.pub"
 
 Firestone reads its own public key and the supplied public key files. It never puts a private key in the seed or logs. The final multipart user-data and network-config are stored in the protected machine directory for inspection, so do not treat that directory as a place to hide plaintext secrets.
 
+Paste a key instead of pointing at a file when the key text is what you have:
+
+```sh
+firestone create pasted ubuntu --ssh-authorized-key "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKg0J8YPh7wARkZSlBzFAoJez6gssTQUuPu4Qy3z8T1P me@laptop"
+```
+
+Inline keys are validated exactly like key files, and a key supplied both ways is written once.
+
+Small user-data can live in the machine specification instead of a separate file. `--user-data` and `--user-data-inline` are mutually exclusive, and identical bytes produce an identical guest configuration either way:
+
+```sh
+user_data=$(printf '#cloud-config\npackages: [htop]\n')
+firestone create inline ubuntu --user-data-inline "$user_data"
+```
+
+Set a console login password for `--user` when key-only access is not enough. The password is read from a file so it never appears in the process list:
+
+```sh
+firestone create console-login ubuntu --password-file ./password.txt
+```
+
+The password reaches the guest through cloud-init `chpasswd`, so `firestone console` and local login accept it immediately. Guest SSH still refuses passwords until you also pass `--ssh-pwauth`. Firestone stores the password as plaintext in `machines/<name>/firestone.toml` and in the seed it renders; both are written mode 0600 inside the machine directory. Changing or removing the password changes the instance id, so the guest re-provisions on the next start.
+
 Provide NoCloud network-config for a tap guest or another environment that needs static guest addressing:
 
 ```sh
