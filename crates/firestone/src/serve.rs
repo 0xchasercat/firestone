@@ -1601,6 +1601,12 @@ mod tests {
             let directory = tempfile::tempdir()?;
             // The runtime-directory guard refuses a symlinked ancestor, and
             // macOS puts every temporary directory under a symlinked `/var`.
+            // It also refuses a group-writable ancestor, which a 002 umask
+            // would otherwise hand the temporary directory.
+            std::fs::set_permissions(
+                directory.path(),
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )?;
             let home = directory.path().canonicalize()?;
             let paths = firestone_core::Paths::from_inputs(&firestone_core::PathInputs {
                 firestone_home: Some(home),
@@ -1922,8 +1928,16 @@ mod tests {
         let dispatcher = ShowDispatcher::arc(firestone_core::MachineStatus::Running)?;
         let server = UpgradeServer::start(dispatcher).await?;
         // `shell_ssh_plan` writes the Firestone SSH identity and resolves the
-        // machine's known_hosts file, so both directories must exist.
-        std::fs::create_dir_all(server.paths.machine_dir("dev")?)?;
+        // machine's known_hosts file, so both directories must exist — with
+        // owner-only modes, or the ancestry guard rejects them under a group
+        // umask.
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(server.paths.machine_dir("dev")?)?;
+        }
 
         // The handshake must reach 101: the PTY and the OpenSSH child are
         // allocated only after the upgrade. The session then ends on its own,
