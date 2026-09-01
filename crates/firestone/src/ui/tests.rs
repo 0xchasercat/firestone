@@ -1061,3 +1061,293 @@ async fn the_ui_never_offers_a_second_mutation_surface() -> TestResult {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------- terminal --
+
+/// The strict policy, spelled out rather than imported.
+///
+/// A test that reads the constant it is checking can only prove the constant
+/// equals itself. These two literals are the contract SPEC §16.5 states, so a
+/// policy edit has to be made here as well, deliberately, in a diff a reviewer
+/// reads as a security change.
+const STRICT_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+img-src 'self' data:; font-src 'self'; connect-src 'self'; \
+base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
+/// The terminal page's policy: the same, plus `'wasm-unsafe-eval'`.
+const TERMINAL_CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; \
+style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; \
+base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
+/// The router as it is actually served: wrapped in the shared security
+/// headers, with no loopback gate (the Unix-socket transport).
+fn secured_app(dispatcher: FakeDispatcher) -> Result<Router, FirestoneError> {
+    Ok(super::auth::secured(app(dispatcher)?, None))
+}
+
+async fn csp_of(router: &Router, uri: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let response = router
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty())?)
+        .await?;
+    Ok(response
+        .headers()
+        .get("content-security-policy")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned))
+}
+
+#[tokio::test]
+async fn the_terminal_page_renders_its_own_full_window_document() -> TestResult {
+    let router = app(FakeDispatcher::default())?;
+    let (status, content_type, body) = get(&router, "/machines/web/terminal").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type, "text/html; charset=utf-8");
+    assert!(body.starts_with("<!DOCTYPE html>"));
+    assert!(body.trim_end().ends_with("</html>"));
+
+    // Its own layout: none of the sidebar shell's chrome is on this page.
+    for absent in ["fs-sidebar", "id=\"fs-main-content\"", "hx-ext=\"morph\""] {
+        assert!(!body.contains(absent), "the terminal page carries {absent}");
+    }
+    // And none of the shell's scripts: htmx is not on a page with no swaps.
+    assert!(!body.contains("htmx.min.js"));
+    assert!(body.contains("/ui/static/term.js?v="));
+    assert!(body.contains("/ui/static/theme.js?v="));
+
+    // Both transports, the machine's own state read, and the emulator, are
+    // resolved by the server and handed to the page as data.
+    for expected in [
+        "data-fs-console-url=\"/v1/machines/web/console/ws\"",
+        "data-fs-shell-url=\"/v1/machines/web/shell/ws\"",
+        "data-fs-state-url=\"/v1/machines/web\"",
+        "data-fs-module-url=\"/ui/static/ghostty-web.js?v=",
+        "data-fs-wasm-url=\"/ui/static/ghostty-vt.wasm?v=",
+        "data-fs-term-tab=\"console\"",
+        "data-fs-term-tab=\"shell\"",
+        "id=\"fs-term-overlay\"",
+        "id=\"fs-term-reconnect\"",
+        "href=\"/machines/web\"",
+    ] {
+        assert!(
+            body.contains(expected),
+            "the terminal page lacks {expected}"
+        );
+    }
+
+    // The CSP forbids an inline script and an inline style on this page too.
+    assert!(!body.contains("<script>"));
+    assert!(!body.contains(" style=\""));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_terminal_page_opens_the_tab_the_url_asks_for() -> TestResult {
+    let router = app(FakeDispatcher::default())?;
+
+    let (_, _, console) = get(&router, "/machines/web/terminal").await?;
+    assert!(console.contains("data-fs-tab=\"console\""));
+
+    let (_, _, shell) = get(&router, "/machines/web/terminal?tab=shell").await?;
+    assert!(shell.contains("data-fs-tab=\"shell\""));
+
+    // An unknown tab is the console rather than an error: the console is the
+    // transport that works before a machine has a network or an sshd.
+    let (status, _, unknown) = get(&router, "/machines/web/terminal?tab=nonsense").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(unknown.contains("data-fs-tab=\"console\""));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_stopped_machine_still_renders_a_terminal_page_that_can_explain_itself() -> TestResult {
+    let router = app(FakeDispatcher {
+        machine: machine_view("staging-db", "stopped"),
+        ..FakeDispatcher::default()
+    })?;
+    let (status, _, body) = get(&router, "/machines/staging-db/terminal").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("data-status=\"stopped\""));
+    assert!(body.contains("id=\"fs-term-overlay\""));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_missing_machine_has_no_terminal_page() -> TestResult {
+    let router = app(FakeDispatcher {
+        fail: Some(ErrorKind::NotFound),
+        ..FakeDispatcher::default()
+    })?;
+    let (status, _, body) = get(&router, "/machines/ghost/terminal").await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // The failure renders in the navigable shell, not in the terminal layout.
+    assert!(body.contains("id=\"fs-main-content\""));
+    Ok(())
+}
+
+#[tokio::test]
+async fn only_the_terminal_page_relaxes_the_content_security_policy() -> TestResult {
+    let router = secured_app(FakeDispatcher::default())?;
+
+    assert_eq!(
+        csp_of(&router, "/machines/web/terminal").await?.as_deref(),
+        Some(TERMINAL_CSP),
+        "the terminal page must carry exactly the wasm-capable policy"
+    );
+    assert_eq!(
+        csp_of(&router, "/machines/web/terminal?tab=shell")
+            .await?
+            .as_deref(),
+        Some(TERMINAL_CSP)
+    );
+
+    // Every other surface keeps the strict policy byte for byte: the screens,
+    // a fragment, the assets the terminal itself loads, and the 404 for a
+    // path that merely looks like the terminal's.
+    for uri in [
+        "/",
+        "/machines",
+        "/machines/web",
+        "/catalog",
+        "/ui/machines/rows",
+        "/ui/machines/web/head",
+        "/ui/static/app.css",
+        "/ui/static/term.js",
+        "/ui/static/ghostty-web.js",
+        "/ui/static/ghostty-vt.wasm",
+        "/machines/web/terminals",
+        "/machines/web/terminal/extra",
+    ] {
+        assert_eq!(
+            csp_of(&router, uri).await?.as_deref(),
+            Some(STRICT_CSP),
+            "{uri} does not carry the strict policy"
+        );
+    }
+
+    // The relaxation is one token, and it is not 'unsafe-eval'.
+    assert!(!TERMINAL_CSP.contains("'unsafe-eval';"));
+    assert!(!TERMINAL_CSP.contains("unsafe-inline"));
+    assert_eq!(
+        TERMINAL_CSP.replace(" 'wasm-unsafe-eval'", ""),
+        STRICT_CSP,
+        "the two policies differ by more than the wasm token"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_terminal_page_falls_back_to_the_strict_policy() -> TestResult {
+    // The marker is attached to the rendered page, never to the error path,
+    // so a machine that cannot be read cannot hand out the weaker policy.
+    let router = secured_app(FakeDispatcher {
+        fail: Some(ErrorKind::NotFound),
+        ..FakeDispatcher::default()
+    })?;
+    assert_eq!(
+        csp_of(&router, "/machines/ghost/terminal")
+            .await?
+            .as_deref(),
+        Some(STRICT_CSP)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_terminal_link_is_offered_only_while_a_machine_is_running() -> TestResult {
+    let running = app(FakeDispatcher::default())?;
+    let (_, _, body) = get(&running, "/machines/web").await?;
+    assert!(
+        body.contains("href=\"/machines/web/terminal\""),
+        "a running machine offers no terminal link"
+    );
+    // The same head rendered as a fragment must agree with the page.
+    let (_, _, head) = get_fragment(&running, "/ui/machines/web/head").await?;
+    assert!(head.contains("href=\"/machines/web/terminal\""));
+
+    let stopped = app(FakeDispatcher {
+        machine: machine_view("staging-db", "stopped"),
+        ..FakeDispatcher::default()
+    })?;
+    let (_, _, body) = get(&stopped, "/machines/staging-db").await?;
+    assert!(
+        !body.contains("/terminal\""),
+        "a stopped machine offers a terminal that cannot connect"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_terminal_assets_are_served_with_their_own_media_types() -> TestResult {
+    let router = app(FakeDispatcher::default())?;
+
+    let wasm = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/ui/static/ghostty-vt.wasm")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(wasm.status(), StatusCode::OK);
+    assert_eq!(
+        wasm.headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/wasm"),
+        "a wasm module served as anything else is refused by the browser"
+    );
+    let bytes = to_bytes(wasm.into_body(), 8 * 1024 * 1024).await?;
+    assert_eq!(
+        &bytes[..4],
+        b"\0asm",
+        "the wasm body was not served verbatim"
+    );
+
+    for name in [
+        "term.js",
+        "ghostty-web.js",
+        "__vite-browser-external-2447137e.js",
+    ] {
+        let (status, content_type, _) = get(&router, &format!("/ui/static/{name}")).await?;
+        assert_eq!(status, StatusCode::OK, "{name} is not served");
+        assert_eq!(content_type, "text/javascript; charset=utf-8", "{name}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_terminal_page_offers_no_mutation_surface_of_its_own() -> TestResult {
+    // The page is a read. Its only outbound traffic is the two documented /v1
+    // WebSocket transports and one GET of the machine it is attached to.
+    let router = app(FakeDispatcher::default())?;
+    for uri in ["/machines/web/terminal", "/machines/web/terminal?tab=shell"] {
+        let (_, _, body) = get(&router, uri).await?;
+        for forbidden in [
+            "hx-post=",
+            "hx-delete=",
+            "hx-put=",
+            "hx-patch=",
+            "<form",
+            "/v1/machines/web/start",
+            "/v1/machines/web/stop",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "{uri} declares {forbidden}, forking the mutation contract"
+            );
+        }
+    }
+
+    // term.js reaches for the same three URLs and nothing else under /v1.
+    let source = include_str!("../../assets/ui/term.js");
+    for forbidden in ["method: \"POST\"", "method: \"DELETE\"", "method: \"PUT\""] {
+        assert!(!source.contains(forbidden), "term.js issues a {forbidden}");
+    }
+    assert_eq!(
+        source.matches("fetch(").count(),
+        1,
+        "term.js makes a request beyond the one machine read"
+    );
+    Ok(())
+}

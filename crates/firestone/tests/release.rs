@@ -20,7 +20,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const UI_ASSET_DIRECTORY: &str = "crates/firestone/assets/ui";
 
 /// Sources Firestone authors itself, so `web-assets.toml` does not pin them.
-const FIRST_PARTY_UI_FILES: [&str; 3] = ["app.css", "app.js", "theme.js"];
+const FIRST_PARTY_UI_FILES: [&str; 4] = ["app.css", "app.js", "theme.js", "term.js"];
 
 fn command() -> Command {
     Command::new(env!("CARGO_BIN_EXE_firestone"))
@@ -511,6 +511,50 @@ fn web_assets_manifest_entries_match_vendored_third_party_files() -> TestResult 
         pinned,
         vendored_ui_files(&root)?,
         "web-assets.toml does not match {UI_ASSET_DIRECTORY}: pin every vendored third-party file and drop pins whose file was removed"
+    );
+    Ok(())
+}
+
+/// The terminal page ships three vendored files the browser fetches at
+/// runtime, and every one of them has to be pinned by name.
+///
+/// The generic manifest tests above prove the pins agree with the directory.
+/// This one names the assets, because a terminal that silently loses its
+/// emulator falls back to a plain transcript rather than failing loudly, and
+/// a pin dropped in a refactor would not otherwise be noticed.
+#[test]
+fn web_assets_manifest_pins_every_vendored_terminal_asset() -> TestResult {
+    let root = workspace_root()?;
+    let pins = web_asset_pins()?;
+    let by_path: BTreeMap<&str, &WebAssetPin> =
+        pins.iter().map(|pin| (pin.path.as_str(), pin)).collect();
+
+    for relative in [
+        "crates/firestone/assets/ui/ghostty-web.js",
+        "crates/firestone/assets/ui/ghostty-vt.wasm",
+        "crates/firestone/assets/ui/__vite-browser-external-2447137e.js",
+    ] {
+        let pin = by_path
+            .get(relative)
+            .ok_or_else(|| format!("{relative} is vendored but not pinned in web-assets.toml"))?;
+        assert_eq!(
+            file_sha256(&root.join(relative))?,
+            pin.sha256,
+            "[asset.{}] no longer matches {relative}",
+            pin.name
+        );
+    }
+
+    // term.js is Firestone's own source, so it is exempt from the manifest and
+    // must stay exempt: pinning a file the repository edits would fail on the
+    // next change to it.
+    assert!(
+        FIRST_PARTY_UI_FILES.contains(&"term.js"),
+        "term.js is not on the first-party exemption list"
+    );
+    assert!(
+        !by_path.contains_key("crates/firestone/assets/ui/term.js"),
+        "term.js is authored here and must not be pinned as a vendored file"
     );
     Ok(())
 }

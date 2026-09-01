@@ -114,6 +114,9 @@ pub fn router(dispatcher: Arc<dyn Dispatcher>, config: &GlobalConfig, paths: &Pa
         .route("/machines", get(routes::machines))
         .route("/machines/{name}", get(routes::detail))
         .route("/catalog", get(routes::catalog))
+        // A read like every other screen: the page renders, and the byte
+        // stream it then opens goes to the documented `/v1` WebSocket routes.
+        .route("/machines/{name}/terminal", get(routes::terminal))
         // Live regions and partial swaps.
         .route("/ui/host", get(routes::host_pill))
         .route("/ui/overview/stats", get(routes::overview_stats))

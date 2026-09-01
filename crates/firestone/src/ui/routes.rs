@@ -165,6 +165,90 @@ async fn catalog_body(state: &UiState) -> Result<String, FirestoneError> {
     )
 }
 
+/// `GET /machines/{name}/terminal` — the full-window browser terminal.
+///
+/// Rendering it is a read like every other screen; the terminal itself is the
+/// `/v1` WebSocket transports of §16.3, opened by `term.js` after the document
+/// loads. The page is served whatever the machine's state is, because a
+/// stopped machine's terminal must explain itself rather than 404: the
+/// overlay names the reason and the Reconnect button is the retry.
+///
+/// This is the one response in the application that carries the wasm-capable
+/// Content-Security-Policy, and it asks for it by marking itself — see
+/// [`crate::ui::auth::WasmPolicy`].
+pub async fn terminal(
+    State(state): State<UiState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Query(query): Query<TabQuery>,
+) -> Response {
+    match terminal_body(&state, &name, query.tab.as_deref()).await {
+        Ok(body) => {
+            let mut response = html(StatusCode::OK, body);
+            response
+                .extensions_mut()
+                .insert(crate::ui::auth::WasmPolicy);
+            response
+        }
+        Err(error) => failure(&state, headers, error).await,
+    }
+}
+
+async fn terminal_body(
+    state: &UiState,
+    name: &str,
+    tab: Option<&str>,
+) -> Result<String, FirestoneError> {
+    let view = show_machine(state, name).await?;
+    let detail = MachineDetail::new(name, &view);
+    render(
+        "ui/terminal.html",
+        context! {
+            build => state.build.as_str(),
+            terminal => TerminalPage::new(&detail, tab),
+        },
+    )
+}
+
+/// Everything the terminal page needs beyond the machine itself.
+///
+/// `slug` is the percent-encoded machine name the template composes every URL
+/// from — the same encoding the routes themselves use, so a name with a slash
+/// or a space links to exactly the route that will match it. The template
+/// joins the fixed path segments, as every other template here does, which
+/// keeps the interpolated value free of characters HTML escaping would
+/// rewrite.
+#[derive(Debug, serde::Serialize)]
+struct TerminalPage {
+    name: String,
+    slug: String,
+    status: String,
+    tab: &'static str,
+    note: &'static str,
+}
+
+impl TerminalPage {
+    fn new(machine: &MachineDetail, tab: Option<&str>) -> Self {
+        // The console is the default because it is the one transport that
+        // works before a machine has a network, a user, or an sshd.
+        let tab = if tab == Some("shell") {
+            "shell"
+        } else {
+            "console"
+        };
+        Self {
+            name: machine.name.clone(),
+            slug: urlencode(&machine.name),
+            status: machine.status.clone(),
+            tab,
+            note: match tab {
+                "shell" => "SSH over vsock on a host pseudo-terminal · resize is honoured",
+                _ => "serial console · single client · resize is the guest's to decide",
+            },
+        }
+    }
+}
+
 // -------------------------------------------------------------- fragments --
 
 pub async fn host_pill(State(state): State<UiState>) -> Response {

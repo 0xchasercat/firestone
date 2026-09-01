@@ -77,6 +77,31 @@ const ASSETS: &[Asset] = &[
         content_type: "font/woff2",
         bytes: include_bytes!("../../assets/ui/fonts/ibm-plex-mono-latin-500.woff2"),
     },
+    // The terminal page (SPEC §16.5). Only that page loads these, and only
+    // that page carries the relaxed policy the WebAssembly module needs.
+    Asset {
+        name: "term.js",
+        content_type: "text/javascript; charset=utf-8",
+        bytes: include_bytes!("../../assets/ui/term.js"),
+    },
+    Asset {
+        name: "ghostty-web.js",
+        content_type: "text/javascript; charset=utf-8",
+        bytes: include_bytes!("../../assets/ui/ghostty-web.js"),
+    },
+    // ghostty-web's `loadFromPath` dynamically imports this Vite-generated
+    // Node shim before falling back to `fetch`. Serving the vendored stub
+    // keeps that import from 404ing on a page whose whole job is a console.
+    Asset {
+        name: "__vite-browser-external-2447137e.js",
+        content_type: "text/javascript; charset=utf-8",
+        bytes: include_bytes!("../../assets/ui/__vite-browser-external-2447137e.js"),
+    },
+    Asset {
+        name: "ghostty-vt.wasm",
+        content_type: "application/wasm",
+        bytes: include_bytes!("../../assets/ui/ghostty-vt.wasm"),
+    },
 ];
 
 /// Every asset URL carries `?v=<build>`, so a cached copy can never outlive
@@ -204,6 +229,72 @@ mod tests {
             !source.contains("new Function"),
             "app.js must not construct functions from strings"
         );
+    }
+
+    #[test]
+    fn the_vendored_terminal_emulator_is_a_wasm_module_and_its_loader_finds_it() {
+        let wasm = ASSETS
+            .iter()
+            .find(|asset| asset.name == "ghostty-vt.wasm")
+            .expect("ghostty wasm asset");
+        assert_eq!(wasm.content_type, "application/wasm");
+        // A wasm module served as anything else is refused by the browser's
+        // streaming compiler, and the failure is silent in the page.
+        assert_eq!(&wasm.bytes[..4], b"\0asm", "not a WebAssembly module");
+
+        // The bundle falls back to a path when it cannot use its own inlined
+        // copy, and term.js hands it this exact URL. If either half stops
+        // agreeing the emulator silently never loads.
+        let bundle = ASSETS
+            .iter()
+            .find(|asset| asset.name == "ghostty-web.js")
+            .expect("ghostty bundle asset");
+        let source = String::from_utf8_lossy(bundle.bytes);
+        assert!(
+            source.contains("loadFromPath"),
+            "the vendored bundle no longer loads wasm from a path"
+        );
+        assert!(
+            source.contains("__vite-browser-external-2447137e.js"),
+            "the vendored bundle imports a different Node shim than the one pinned"
+        );
+        assert!(
+            ASSETS
+                .iter()
+                .any(|asset| asset.name == "__vite-browser-external-2447137e.js"),
+            "the shim the bundle imports is not served, so every load logs a 404"
+        );
+
+        let term = ASSETS
+            .iter()
+            .find(|asset| asset.name == "term.js")
+            .expect("term.js asset");
+        let term_source = String::from_utf8_lossy(term.bytes);
+        assert!(
+            term_source.contains("Ghostty.load(config.wasm)"),
+            "term.js no longer passes the same-origin wasm URL, so the bundle \
+             would fetch its inlined data: copy and connect-src 'self' would block it"
+        );
+    }
+
+    #[test]
+    fn the_terminal_scripts_avoid_the_constructs_the_relaxed_policy_still_forbids() {
+        // The terminal page is served 'wasm-unsafe-eval', not 'unsafe-eval'.
+        // Neither the first-party client nor the vendored emulator may reach
+        // for eval or new Function, or that page would break in the one place
+        // its policy is weakest.
+        for name in ["term.js", "ghostty-web.js"] {
+            let asset = ASSETS
+                .iter()
+                .find(|asset| asset.name == name)
+                .expect("terminal script asset");
+            let source = strip_comments(&String::from_utf8_lossy(asset.bytes));
+            assert!(!source.contains("eval("), "{name} must not call eval");
+            assert!(
+                !source.contains("new Function"),
+                "{name} must not construct functions from strings"
+            );
+        }
     }
 
     /// Removes block and line comments so prose about a forbidden construct

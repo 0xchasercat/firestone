@@ -9,6 +9,12 @@
     {% endif %}
   </div>
   <div class="fs-page-head__actions">
+    {# Only while running: both transports require a live machine, so a link
+       offered on a stopped one would open a page that can only apologise. A
+       plain anchor, not an htmx swap — the terminal is its own document. #}
+    {% if machine.is_running %}
+    <a class="fs-btn" href="/machines/{{ machine.name | urlencode }}/terminal">Terminal</a>
+    {% endif %}
     {% if machine.action %}
     <button type="button" class="fs-btn fs-btn--primary"
             data-fs-action="{{ machine.action }}"
