@@ -1385,13 +1385,13 @@ def http_get_forward(port: int, timeout: float) -> bytes:
 
 def scenario_warm_snapshot(harness: Harness, name: str, forward_port: int) -> dict[str, Any]:
     write_marker(harness, name, "base")
+    # `systemd-run` detaches the server from this SSH channel completely; a
+    # backgrounded shell job keeps the channel open and `shell` never returns.
     harness.guest(
         name,
-        "mkdir -p /root/www && printf '"
-        + WARM_PAGE
-        + "' > /root/www/index.html && cd /root/www && "
-        "setsid python3 -m http.server "
-        f"{GUEST_HTTP_PORT} > /root/www/http.log 2>&1 < /dev/null & sleep 2; exit 0",
+        f"mkdir -p /root/www && printf {WARM_PAGE} > /root/www/index.html && "
+        "systemd-run --unit=m6-http --working-directory=/root/www "
+        f"/usr/bin/python3 -m http.server {GUEST_HTTP_PORT}",
     )
     page = http_get_forward(forward_port, 60)
     require(page.decode().strip() == WARM_PAGE, f"the forward served {page!r}")
