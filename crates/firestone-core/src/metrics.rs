@@ -80,6 +80,157 @@ pub struct MetricsNetDevice {
     pub counters: BTreeMap<String, u64>,
 }
 
+/// One on-demand sample of the host Firestone runs on.
+///
+/// The host sample follows the same rules as the machine sample: it is read
+/// only, it stores nothing, and an unavailable figure is `null` rather than a
+/// zero. Unlike the machine sample it is levels, not counters, so one reading
+/// stands on its own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostMetricsResult {
+    pub sampled_at: String,
+    pub cpu: HostMetricsCpu,
+    pub memory: HostMetricsMemory,
+    pub disk: HostMetricsDisk,
+}
+
+/// Host processor count and kernel load averages.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HostMetricsCpu {
+    pub cores: Option<u32>,
+    pub load_average_1m: Option<f64>,
+    pub load_average_5m: Option<f64>,
+    pub load_average_15m: Option<f64>,
+}
+
+/// Host memory levels, as the kernel reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostMetricsMemory {
+    pub total_bytes: Option<u64>,
+    pub available_bytes: Option<u64>,
+}
+
+/// Capacity of the filesystem holding the Firestone data directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostMetricsDisk {
+    pub path: String,
+    pub total_bytes: Option<u64>,
+    pub available_bytes: Option<u64>,
+}
+
+/// Reads `MemTotal` and `MemAvailable` from one `/proc/meminfo` document.
+///
+/// Both are reported in kibibytes and returned as bytes. A missing or
+/// malformed line is absent, never zero.
+#[must_use]
+pub fn parse_proc_meminfo_bytes(contents: &str) -> (Option<u64>, Option<u64>) {
+    (
+        meminfo_field(contents, "MemTotal:"),
+        meminfo_field(contents, "MemAvailable:"),
+    )
+}
+
+fn meminfo_field(contents: &str, name: &str) -> Option<u64> {
+    let value = contents
+        .lines()
+        .find_map(|line| line.strip_prefix(name))?
+        .trim();
+    let kibibytes = value.strip_suffix("kB")?.trim_end().parse::<u64>().ok()?;
+    kibibytes.checked_mul(BYTES_PER_KIB)
+}
+
+/// Reads the 1, 5, and 15 minute load averages from one `/proc/loadavg` line.
+#[must_use]
+pub fn parse_proc_loadavg(contents: &str) -> Option<[f64; 3]> {
+    let mut fields = contents.split_ascii_whitespace();
+    let mut next = || {
+        fields
+            .next()
+            .and_then(|field| field.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+    };
+    Some([next()?, next()?, next()?])
+}
+
+/// Total and available bytes on the filesystem holding `path`.
+///
+/// Available counts the blocks this user may still use, which is what a
+/// reader deciding whether another image fits actually needs. A path that
+/// does not exist yet is measured through its nearest existing ancestor: that
+/// is the filesystem it will be created on.
+#[must_use]
+pub fn filesystem_capacity(path: &std::path::Path) -> Option<(u64, u64)> {
+    let mut candidate = Some(path);
+    while let Some(current) = candidate {
+        if let Ok(stats) = nix::sys::statvfs::statvfs(current) {
+            // statvfs field widths differ between the supported targets, so
+            // every count is widened through one generic conversion rather
+            // than a per-target cast.
+            let fragment = widen(stats.fragment_size());
+            return Some((
+                fragment.saturating_mul(widen(stats.blocks())),
+                fragment.saturating_mul(widen(stats.blocks_available())),
+            ));
+        }
+        candidate = current.parent();
+    }
+    None
+}
+
+fn widen<T: Into<u64>>(value: T) -> u64 {
+    value.into()
+}
+
+/// Samples host processor and memory levels.
+///
+/// `/proc` is Linux only, so a host without it reports absent memory and load
+/// figures rather than failing. The core count comes from the standard library
+/// and is available everywhere.
+#[must_use]
+pub fn sample_host(
+    data_dir: &std::path::Path,
+) -> (HostMetricsCpu, HostMetricsMemory, HostMetricsDisk) {
+    let cores = std::thread::available_parallelism()
+        .ok()
+        .and_then(|count| u32::try_from(count.get()).ok());
+    let load = read_proc("/proc/loadavg")
+        .as_deref()
+        .and_then(parse_proc_loadavg);
+    let (total_bytes, available_bytes) = read_proc("/proc/meminfo")
+        .as_deref()
+        .map_or((None, None), parse_proc_meminfo_bytes);
+    let capacity = filesystem_capacity(data_dir);
+    (
+        HostMetricsCpu {
+            cores,
+            load_average_1m: load.map(|load| load[0]),
+            load_average_5m: load.map(|load| load[1]),
+            load_average_15m: load.map(|load| load[2]),
+        },
+        HostMetricsMemory {
+            total_bytes,
+            available_bytes,
+        },
+        HostMetricsDisk {
+            path: data_dir.display().to_string(),
+            total_bytes: capacity.map(|capacity| capacity.0),
+            available_bytes: capacity.map(|capacity| capacity.1),
+        },
+    )
+}
+
+fn read_proc(path: &str) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string(path).ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// Host process figures sampled from `/proc` for the machine's VMM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VmmProcessSample {
@@ -353,6 +504,83 @@ mod tests {
         let (block, net) = project_device_counters(&BTreeMap::new());
         assert!(block.is_empty());
         assert_eq!(net, None);
+    }
+
+    #[test]
+    fn proc_meminfo_reports_total_and_available_in_bytes() {
+        let document = "MemTotal:       16316196 kB\nMemFree:          204584 kB\nMemAvailable:    9218044 kB\nBuffers:           12345 kB\n";
+        assert_eq!(
+            super::parse_proc_meminfo_bytes(document),
+            (Some(16_707_784_704), Some(9_439_277_056))
+        );
+    }
+
+    #[test]
+    fn proc_meminfo_missing_or_malformed_fields_are_absent() {
+        for document in [
+            "",
+            "MemTotal:\n",
+            "MemTotal:       16316196\n",
+            "MemTotal:       many kB\n",
+            "MemFree:          204584 kB\n",
+        ] {
+            assert_eq!(
+                super::parse_proc_meminfo_bytes(document),
+                (None, None),
+                "accepted {document:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn proc_loadavg_reads_three_averages_and_rejects_malformed_lines() {
+        assert_eq!(
+            super::parse_proc_loadavg("0.45 0.30 0.25 1/234 5678\n"),
+            Some([0.45, 0.30, 0.25])
+        );
+        for line in ["", "0.45 0.30", "x 0.30 0.25 1/2 3", "-1 0.30 0.25 1/2 3"] {
+            assert_eq!(super::parse_proc_loadavg(line), None, "accepted {line:?}");
+        }
+    }
+
+    #[test]
+    fn filesystem_capacity_measures_a_directory_and_falls_back_to_its_parent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let measured =
+            super::filesystem_capacity(directory.path()).ok_or("no capacity for a temp dir")?;
+        assert!(measured.0 > 0, "total {}", measured.0);
+        assert!(
+            measured.1 <= measured.0,
+            "available {} of {}",
+            measured.1,
+            measured.0
+        );
+        // A data directory doctor has not created yet lives on the filesystem
+        // its parent is on, which is the figure worth reporting.
+        assert_eq!(
+            super::filesystem_capacity(&directory.path().join("not/created/yet")),
+            Some(measured)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn host_sample_reports_the_measured_data_directory_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let (cpu, memory, disk) = super::sample_host(directory.path());
+        assert_eq!(disk.path, directory.path().display().to_string());
+        assert!(disk.total_bytes.is_some());
+        assert!(cpu.cores.is_some_and(|cores| cores >= 1));
+        if cfg!(target_os = "linux") {
+            assert!(memory.total_bytes.is_some());
+            assert!(cpu.load_average_1m.is_some());
+        } else {
+            assert_eq!(memory.total_bytes, None);
+            assert_eq!(cpu.load_average_1m, None);
+        }
+        Ok(())
     }
 
     #[test]

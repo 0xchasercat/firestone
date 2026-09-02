@@ -44,4 +44,24 @@ For the standalone release build, which embeds the pinned helpers and refuses a 
 scripts/build-release.sh --target x86_64-unknown-linux-musl
 ```
 
+## Uninstall
+
+`firestone uninstall` removes the executable you ran it with and keeps everything else:
+
+```sh
+firestone uninstall
+```
+
+It lists what it will remove, asks once, and then prints where your machines and images still live. Pass `--yes` to skip the question.
+
+To delete the data too, add `--purge`:
+
+```sh
+firestone uninstall --purge
+```
+
+That removes the config, data and runtime directories, which deletes every machine, image and snapshot on this host. It is confirmed twice, and refused while a machine is running: stop them first.
+
+Uninstall removes only files this installation owns. If you installed Firestone with a package manager, the executable lives under `/usr` or `/opt` and uninstall refuses it, because that copy belongs to the package manager; remove it with the same tool that installed it.
+
 Next: [check the host and boot your first machine](quickstart.md). The full page list is in the [documentation index](README.md).

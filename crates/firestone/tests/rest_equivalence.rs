@@ -580,16 +580,67 @@ fn normalize_doctor_free_bytes(payload: &mut Value) -> TestResult<u64> {
     Ok(free)
 }
 
+/// Drops the `fixed` marker from one doctor payload.
+///
+/// The CLI's `doctor` applies every repair that needs no administrator, so a
+/// check it repaired is marked `fixed` (SPEC §17.3). The REST read repairs
+/// nothing and never carries the field. That one marker is the whole
+/// difference; every other field still has to match byte for byte.
+fn take_doctor_fixed(payload: &mut Value) -> TestResult<usize> {
+    let checks = payload["checks"]
+        .as_array_mut()
+        .ok_or("doctor Result checks is not an array")?;
+    let mut fixed = 0;
+    for check in checks {
+        let object = check
+            .as_object_mut()
+            .ok_or("doctor Result check is not an object")?;
+        if object.remove("fixed") == Some(Value::Bool(true)) {
+            fixed += 1;
+        }
+    }
+    Ok(fixed)
+}
+
+/// Removes the same marker from the raw payload bytes.
+///
+/// The payload's keys are sorted, so `fixed` leads the check object and takes
+/// the comma after it. The trailing form is stripped too, so the helper does
+/// not depend on that ordering.
+fn redact_doctor_fixed(payload: &[u8]) -> Vec<u8> {
+    let markers: [&[u8]; 2] = [br#""fixed":true,"#, br#","fixed":true"#];
+    let mut redacted = Vec::with_capacity(payload.len());
+    let mut index = 0;
+    while index < payload.len() {
+        if let Some(marker) = markers
+            .into_iter()
+            .find(|marker| payload[index..].starts_with(marker))
+        {
+            index += marker.len();
+            continue;
+        }
+        redacted.push(payload[index]);
+        index += 1;
+    }
+    redacted
+}
+
 fn assert_doctor_payload(cli: &TerminalResult, rest: &[u8]) -> TestResult {
     let mut cli_value = cli.payload.clone();
     let mut rest_value: Value = serde_json::from_slice(rest)?;
     let cli_free = normalize_doctor_free_bytes(&mut cli_value)?;
     let rest_free = normalize_doctor_free_bytes(&mut rest_value)?;
     assert!(cli_free > 0 && rest_free > 0);
+    take_doctor_fixed(&mut cli_value)?;
+    assert_eq!(
+        take_doctor_fixed(&mut rest_value)?,
+        0,
+        "the REST doctor read must repair nothing"
+    );
     assert_eq!(rest_value, cli_value, "doctor stable fields changed");
     assert_eq!(
         redact_doctor_free_bytes(rest)?,
-        redact_doctor_free_bytes(&cli.payload_bytes)?,
+        redact_doctor_fixed(&redact_doctor_free_bytes(&cli.payload_bytes)?),
         "doctor stable payload bytes or field order changed"
     );
     Ok(())

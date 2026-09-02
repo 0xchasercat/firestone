@@ -2,7 +2,7 @@
 
 Symptom-to-repair table for the thirteen error kinds, and how Firestone decides what is recoverable.
 
-Run `firestone doctor` first. It answers most host problems and prints the exact command for the ones it will not run itself. Then use the narrowest log: `firestone logs NAME --source vmm` for a VMM failure, `--source shim` for a supervision failure, `--source console` for a guest failure.
+Run `firestone doctor` first. It repairs the host problems it owns and prints the exact command for the ones it will not run itself; the AppArmor repair on Ubuntu is the only one that waits, behind `firestone doctor --fix`. Then use the narrowest log: `firestone logs NAME --source vmm` for a VMM failure, `--source shim` for a supervision failure, `--source console` for a guest failure.
 
 Every Firestone error carries a stable kind, concrete context and, where there is something to do, a hint. The kinds are `usage`, `invalid_spec`, `not_found`, `not_running`, `conflict`, `already_exists`, `already_running`, `busy`, `dependency`, `timeout`, `checksum`, `interrupted` and `generic`. REST returns the same kind in the JSON envelope, so the repair for a 409 from `curl` is the repair for exit code 4 from the CLI.
 
@@ -12,6 +12,8 @@ Every Firestone error carries a stable kind, concrete context and, where there i
 | `/dev/kvm does not exist` | Enable hardware virtualization, load the matching KVM module, or enable nested KVM in the outer hypervisor. A normal container has no KVM. |
 | `/dev/kvm does not open read/write` | Run doctor's detected `usermod` command and log in again. Do not make `/dev/kvm` world-writable. |
 | `passt not found` or a version rejection | Run doctor; it names the exact helper and probes every option it needs. On a standalone release this means the embedded payload failed to materialize. |
+| A helper `has length X; expected Y` | An older release installed different bytes under that name. Any command that needs the helper now replaces it with this build's payload; nothing to do by hand. |
+| `image store is busy with another mutation` | Another image operation holds the store lock. A pull of the same reference waits for it and then uses the published image, so this names a different operation: wait for it and retry. |
 | `qemu-img`, `ssh` or `ssh-keygen` missing | Run the package command doctor prints. |
 | An unsafe config, data, runtime, lock, log or socket path | Move the unexpected node aside and let Firestone recreate its own. Do not chmod or follow an unknown-owner or symlinked node to silence the check. |
 | Less than 5 GB free | Free space on the data filesystem, or move the data directory with `FIRESTONE_DATA_DIR`. |
@@ -24,6 +26,7 @@ Every Firestone error carries a stable kind, concrete context and, where there i
 | SSH host key changed | Do not disable host-key checking. Confirm that a seed change you made regenerated the guest. Firestone removes `known_hosts` on a seed rewrite and on `rm`; an unexplained change is a hard failure. |
 | `shell` says not running | Start the machine. Vsock SSH works even with `--net none`, but not on an OCI machine, which has no sshd. |
 | Console requires a terminal | Run `firestone console NAME` in an interactive terminal. Use `logs --source console` in a script. |
+| A log is empty on a machine that never started | Expected. A machine that has not run has written no log, so the read succeeds with no output. |
 | A forward cannot bind or overlaps | Stop the conflicting process or pick another host port. Same-protocol host ranges cannot overlap. Bind to loopback when external access is not needed. |
 | Forwards look wrong on a running machine | Check for the `*` and the `forwards pending restart` legend in `ls`. Restart the machine to apply them. |
 | Tap validation fails | Create and own the tap and bridge outside Firestone, then check `/dev/net/tun` access. |

@@ -57,6 +57,8 @@ pub enum Action {
     Metrics {
         name: String,
     },
+    /// One on-demand sample of the host itself (§25).
+    HostMetrics,
     CatalogList,
     ImageList,
     ImagePull {
@@ -358,6 +360,17 @@ mod tests {
         let encoded = serde_json::to_value(&action)?;
         assert_eq!(encoded, json!({"type": "Metrics", "name": "ubuntu"}));
         assert_eq!(serde_json::from_value::<Action>(encoded)?, action);
+        Ok(())
+    }
+
+    #[test]
+    fn action_host_metrics_round_trips_without_operands() -> Result<(), serde_json::Error> {
+        let encoded = serde_json::to_value(Action::HostMetrics)?;
+        assert_eq!(encoded, json!({"type": "HostMetrics"}));
+        assert_eq!(
+            serde_json::from_value::<Action>(encoded)?,
+            Action::HostMetrics
+        );
         Ok(())
     }
 

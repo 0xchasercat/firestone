@@ -14,12 +14,15 @@ use firestone_core::CloneResult;
 use firestone_core::PruneResult;
 use firestone_core::{
     CatalogEntrySummary, CatalogFirmware, DoctorCheckId, DoctorReport, DoctorStatus, ErrorInfo,
-    ErrorKind, Event, EventSink, FirestoneError, Level, LogsResult, MachineRecord, MachineStatus,
-    MachineSummary, MachineView, MetricsResult, NetMode, RemoveResult, ResizeResult,
-    SnapshotListResult, SnapshotRemoveResult, SnapshotRestoreResult, SnapshotResult,
-    SnapshotSummary, SshConfigResult, StartResult, StepId, StopResult, Unit, VersionResult,
+    ErrorKind, Event, EventSink, FirestoneError, HostMetricsResult, Level, LogsResult,
+    MachineRecord, MachineStatus, MachineSummary, MachineView, MetricsResult, NetMode,
+    RemoveResult, ResizeResult, SnapshotListResult, SnapshotRemoveResult, SnapshotRestoreResult,
+    SnapshotResult, SnapshotSummary, SshConfigResult, StartResult, StepId, StopResult, Unit,
+    VersionResult,
 };
 use owo_colors::OwoColorize as _;
+
+use crate::uninstall::UninstallResult;
 use unicode_width::UnicodeWidthChar;
 
 /// Selects structured output or the human CLI renderer.
@@ -986,6 +989,16 @@ where
                     .map_err(|error| invalid_result_payload("metrics", error))?;
                 write_metrics_report(&mut self.stdout, &result).map_err(write_output_failure)
             }
+            "host-metrics" => {
+                let result: HostMetricsResult = serde_json::from_value(payload)
+                    .map_err(|error| invalid_result_payload("host-metrics", error))?;
+                write_host_metrics_report(&mut self.stdout, &result).map_err(write_output_failure)
+            }
+            "uninstall" => {
+                let result: UninstallResult = serde_json::from_value(payload)
+                    .map_err(|error| invalid_result_payload("uninstall", error))?;
+                write_uninstall_report(&mut self.stdout, &result).map_err(write_output_failure)
+            }
             _ if payload.is_null() => Ok(()),
             _ => self.render_other_result(payload),
         }
@@ -1273,7 +1286,14 @@ pub const fn error_exit_code(error: &FirestoneError) -> u8 {
 
 fn write_doctor_report<W: Write>(writer: &mut W, report: &DoctorReport) -> io::Result<()> {
     for check in &report.checks {
-        write_safe_text(writer, doctor_status_label(check.status))?;
+        // A check this run repaired reads `fixed`, not `ok`: the reader wants
+        // to know what changed on their host, not only that it is well now.
+        let label = if check.fixed {
+            "fixed"
+        } else {
+            doctor_status_label(check.status)
+        };
+        write_safe_text(writer, label)?;
         writer.write_all(b" ")?;
         write_safe_text(writer, doctor_check_id_label(check.id))?;
         writer.write_all(b": ")?;
@@ -1406,6 +1426,67 @@ fn write_metrics_report<W: Write>(writer: &mut W, result: &MetricsResult) -> io:
 
 fn optional_count(value: Option<u64>) -> String {
     value.map_or_else(|| "-".to_owned(), |value| value.to_string())
+}
+
+fn optional_load(value: Option<f64>) -> String {
+    value.map_or_else(|| "-".to_owned(), |value| format!("{value:.2}"))
+}
+
+/// Renders one host sample as three plain lines.
+///
+/// Like the machine table it states levels and never a rate, and an absent
+/// figure prints `-`.
+fn write_host_metrics_report<W: Write>(
+    writer: &mut W,
+    result: &HostMetricsResult,
+) -> io::Result<()> {
+    write!(writer, "sampled at ")?;
+    write_safe_text(writer, &result.sampled_at)?;
+    writer.write_all(b"\n")?;
+    writeln!(
+        writer,
+        "cpu       {} cores, load {} {} {}",
+        optional_count(result.cpu.cores.map(u64::from)),
+        optional_load(result.cpu.load_average_1m),
+        optional_load(result.cpu.load_average_5m),
+        optional_load(result.cpu.load_average_15m),
+    )?;
+    writeln!(
+        writer,
+        "memory    {} bytes available of {} bytes",
+        optional_count(result.memory.available_bytes),
+        optional_count(result.memory.total_bytes),
+    )?;
+    write!(
+        writer,
+        "disk      {} bytes available of {} bytes at ",
+        optional_count(result.disk.available_bytes),
+        optional_count(result.disk.total_bytes),
+    )?;
+    write_safe_text(writer, &result.disk.path)?;
+    writer.write_all(b"\n")?;
+    writer.flush()
+}
+
+/// Renders what an uninstall removed and what it left behind.
+fn write_uninstall_report<W: Write>(writer: &mut W, result: &UninstallResult) -> io::Result<()> {
+    writeln!(writer, "Removed:")?;
+    for path in &result.removed {
+        writer.write_all(b"  ")?;
+        write_safe_text(writer, path)?;
+        writer.write_all(b"\n")?;
+    }
+    if !result.kept.is_empty() {
+        writeln!(writer, "Kept:")?;
+        for kept in &result.kept {
+            writer.write_all(b"  ")?;
+            write_safe_text(writer, &kept.path)?;
+            writer.write_all(b" (")?;
+            write_safe_text(writer, &kept.holds)?;
+            writer.write_all(b")\n")?;
+        }
+    }
+    writer.flush()
 }
 
 fn write_catalog_table<W: Write>(
@@ -2407,6 +2488,7 @@ mod tests {
             Renderer::new(Vec::new(), Vec::new(), RenderOptions::human(false, false));
         let report = DoctorReport {
             checks: vec![DoctorCheck {
+                fixed: false,
                 id: DoctorCheckId::Kvm,
                 status: DoctorStatus::Fail,
                 reason: "cannot open /dev/kvm".to_owned(),
@@ -2430,12 +2512,112 @@ mod tests {
         Ok(())
     }
 
+    /// SPEC §17.3. A check this run repaired reads `fixed`, so the reader can
+    /// see what changed instead of a row that was always `ok`.
+    #[test]
+    fn human_doctor_result_labels_a_repaired_check_fixed() -> TestResult {
+        let mut renderer =
+            Renderer::new(Vec::new(), Vec::new(), RenderOptions::human(false, false));
+        let report = DoctorReport {
+            checks: vec![
+                DoctorCheck {
+                    fixed: true,
+                    id: DoctorCheckId::SshKey,
+                    status: DoctorStatus::Ok,
+                    reason: "Firestone SSH key is present".to_owned(),
+                    fix: None,
+                    hint: None,
+                },
+                DoctorCheck {
+                    fixed: false,
+                    id: DoctorCheckId::Ssh,
+                    status: DoctorStatus::Ok,
+                    reason: "ssh and ssh-keygen are available".to_owned(),
+                    fix: None,
+                    hint: None,
+                },
+            ],
+        };
+
+        renderer.emit(Event::Result {
+            action: "doctor".to_owned(),
+            payload: serde_json::to_value(report)?,
+        })?;
+
+        let (stdout, _) = renderer.into_writers();
+        assert_eq!(
+            stdout,
+            b"fixed ssh_key: Firestone SSH key is present\nok ssh: ssh and ssh-keygen are available\n"
+        );
+        Ok(())
+    }
+
+    /// Uninstall says what it removed and, by default, where the machines it
+    /// kept still live.
+    #[test]
+    fn human_uninstall_result_lists_removed_and_kept_paths() -> TestResult {
+        let mut renderer =
+            Renderer::new(Vec::new(), Vec::new(), RenderOptions::human(false, false));
+
+        renderer.emit(Event::Result {
+            action: "uninstall".to_owned(),
+            payload: serde_json::json!({
+                "removed": ["/home/reader/.local/bin/firestone"],
+                "kept": [{
+                    "path": "/home/reader/.local/share/firestone",
+                    "holds": "machines, images, and helper binaries"
+                }]
+            }),
+        })?;
+
+        let (stdout, _) = renderer.into_writers();
+        assert_eq!(
+            String::from_utf8(stdout)?,
+            "Removed:\n  /home/reader/.local/bin/firestone\nKept:\n  /home/reader/.local/share/firestone (machines, images, and helper binaries)\n"
+        );
+        Ok(())
+    }
+
+    /// The host sample prints levels, and an absent figure prints `-`.
+    #[test]
+    fn human_host_metrics_result_prints_absent_figures_as_dashes() -> TestResult {
+        let mut renderer =
+            Renderer::new(Vec::new(), Vec::new(), RenderOptions::human(false, false));
+
+        renderer.emit(Event::Result {
+            action: "host-metrics".to_owned(),
+            payload: serde_json::json!({
+                "sampled_at": "2026-09-02T12:00:00Z",
+                "cpu": {
+                    "cores": 8,
+                    "load_average_1m": 0.42,
+                    "load_average_5m": null,
+                    "load_average_15m": null
+                },
+                "memory": {"total_bytes": null, "available_bytes": null},
+                "disk": {
+                    "path": "/home/reader/.local/share/firestone",
+                    "total_bytes": 1024,
+                    "available_bytes": 512
+                }
+            }),
+        })?;
+
+        let (stdout, _) = renderer.into_writers();
+        assert_eq!(
+            String::from_utf8(stdout)?,
+            "sampled at 2026-09-02T12:00:00Z\ncpu       8 cores, load 0.42 - -\nmemory    - bytes available of - bytes\ndisk      512 bytes available of 1024 bytes at /home/reader/.local/share/firestone\n"
+        );
+        Ok(())
+    }
+
     #[test]
     fn human_doctor_report_with_control_bearing_text_emits_sanitized_lines() -> TestResult {
         let mut renderer =
             Renderer::new(Vec::new(), Vec::new(), RenderOptions::human(false, false));
         let report = DoctorReport {
             checks: vec![DoctorCheck {
+                fixed: false,
                 id: DoctorCheckId::Kvm,
                 status: DoctorStatus::Fail,
                 reason: "cannot open /dev/kvm\u{1b}[31m\n拒绝".to_owned(),

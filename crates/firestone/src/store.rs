@@ -18,18 +18,18 @@ use firestone_core::{
     Action, Arch, ByteSize, Catalog, CatalogArchitectureSummary, CatalogEntry, CatalogEntrySummary,
     Cmd, CpResult, DependencyManifest, DispatchFuture, Dispatcher, DoctorContext, DoctorOptions,
     ErrorKind, Event, EventSink, ExtractedPasstHelper, FirestoneError, GlobalConfig,
-    ImagePullRequest, ImageStore, InternalHelper, Level, LiveMachineState, LogSource, LogsResult,
-    MachineLock, MachineRecord, MachineSpec, MachineSpecPatch, MachineState, MachineStatus,
-    MachineSummary, MachineView, MetricsCpu, MetricsMemory, MetricsResult, Paths, PruneItem,
-    PruneKind, PruneResult, ReadinessOptions, RealValidationHost, RemoveResult, ResizeResult,
-    ShimClient, ShimTimeouts, SpecResult, SpecWarningPayload, StartResult, StateImage, StateStore,
-    StateVersion, StopResult, Supervision, ValidationContext, VersionDependency, VersionIdentity,
-    VersionPaths, VersionResult, VmmApi, atomic, cancel_prepared, classify_cp_operands,
-    disk_shrink_error, forwards_differ, launch_prepared_cancellable, overlay_virtual_size,
-    overlay_virtual_size_shared, prepare_start, project_device_counters,
-    read_reconciled_machine_state_live, read_reconciled_machine_state_live_locked, run_doctor,
-    sample_vmm_process, scp_command_plan, stop_unsupervised, validate_machine_spec,
-    wait_for_ssh_ready,
+    HostMetricsResult, ImagePullRequest, ImageStore, InternalHelper, Level, LiveMachineState,
+    LogSource, LogsResult, MachineLock, MachineRecord, MachineSpec, MachineSpecPatch, MachineState,
+    MachineStatus, MachineSummary, MachineView, MetricsCpu, MetricsMemory, MetricsResult, Paths,
+    PruneItem, PruneKind, PruneResult, ReadinessOptions, RealValidationHost, RemoveResult,
+    ResizeResult, ShimClient, ShimTimeouts, SpecResult, SpecWarningPayload, StartResult,
+    StateImage, StateStore, StateVersion, StopResult, Supervision, ValidationContext,
+    VersionDependency, VersionIdentity, VersionPaths, VersionResult, VmmApi, atomic,
+    cancel_prepared, classify_cp_operands, disk_shrink_error, forwards_differ,
+    launch_prepared_cancellable, overlay_virtual_size, overlay_virtual_size_shared, prepare_start,
+    project_device_counters, read_reconciled_machine_state_live,
+    read_reconciled_machine_state_live_locked, run_doctor, sample_host, sample_vmm_process,
+    scp_command_plan, stop_unsupervised, validate_machine_spec, wait_for_ssh_ready,
 };
 use firestone_core::{CloneResult, StepId};
 use firestone_core::{
@@ -1436,6 +1436,39 @@ impl LocalDispatcher {
                 net,
             },
         )
+    }
+
+    /// Samples the host's own processor, memory, and data-directory capacity.
+    ///
+    /// The sample reads `/proc` and one `statvfs`; it takes no machine lock,
+    /// talks to no VMM, and works with no machines at all (SPEC §25.5).
+    fn host_metrics(&self, events: &mut dyn EventSink) -> Result<(), FirestoneError> {
+        let sampled_at = jiff::Timestamp::now().to_string();
+        let (cpu, memory, disk) = sample_host(self.paths.data_dir());
+        emit_result(
+            events,
+            "host-metrics",
+            &HostMetricsResult {
+                sampled_at,
+                cpu,
+                memory,
+                disk,
+            },
+        )
+    }
+
+    /// Machines that are running or in transition, in list order.
+    ///
+    /// `uninstall --purge` refuses while any of these exist, and names them.
+    pub fn running_machine_names(&self) -> Result<Vec<String>, FirestoneError> {
+        self.validate_machine_storage()?;
+        let mut names = Vec::new();
+        for name in self.prunable_machine_names()? {
+            if self.read_live_state(&name)?.state.status.is_active() {
+                names.push(name);
+            }
+        }
+        Ok(names)
     }
 
     /// Opens one spec write, taking the machine lock only when it can be taken.
@@ -3065,13 +3098,37 @@ impl LocalDispatcher {
         let machine_dir = self.paths.machine_dir(name)?;
         ensure_machine_exists(&self.paths, name, &machine_dir)?;
         let path = self.log_path(name, source)?;
-        let mut file = open_owned_data_file(
-            &self.paths,
-            &path,
-            "machine log",
-            ErrorKind::NotFound,
-            Some(format!("start machine {name:?} or choose another --source")),
-        )?;
+        // A machine that exists but has never written this log has no file
+        // yet. That is an empty log, not a missing machine, so a plain read
+        // returns nothing and a follow waits for the first line (SPEC §11.7).
+        let mut file = loop {
+            if let Some(file) = open_owned_data_file_if_present(&self.paths, &path, "machine log")?
+            {
+                break file;
+            }
+            if !follow {
+                return emit_result(
+                    events,
+                    "logs",
+                    &LogsResult {
+                        name: name.to_owned(),
+                        source,
+                        lines: 0,
+                        follow: false,
+                    },
+                );
+            }
+            if events.is_cancelled() {
+                return Ok(());
+            }
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(FirestoneError::new(
+                    ErrorKind::Interrupted,
+                    format!("log follow for machine {name:?} was interrupted"),
+                ));
+            }
+            thread::sleep(LOG_FOLLOW_INTERVAL);
+        };
         let (initial, emitted_lines, mut offset) = tail_log(&mut file, lines, &path)?;
         if !initial.is_empty() {
             events.emit(Event::Output {
@@ -3263,6 +3320,7 @@ impl Dispatcher for LocalDispatcher {
                     emit_result(events, "cp", &result)
                 }
                 Action::Metrics { name } => self.metrics(&name, events),
+                Action::HostMetrics => self.host_metrics(events),
                 Action::CatalogList => self.catalog_list(events),
                 Action::ImageList => self.image_list(events),
                 Action::ImagePull { r#ref, sha256 } => self.image_pull(r#ref, sha256, events),
@@ -3560,6 +3618,23 @@ fn open_owned_data_file(
         })?;
     paths.validate_owned_data_file_handle(path, label, 0o600, &file)?;
     Ok(file)
+}
+
+/// Opens one owned log if it exists, reporting absence instead of failing.
+///
+/// Every other guard is unchanged: a symlink, a wrong mode, or a foreign owner
+/// is still an error, because those are not the same thing as "not written
+/// yet".
+fn open_owned_data_file_if_present(
+    paths: &Paths,
+    path: &Path,
+    label: &str,
+) -> Result<Option<File>, FirestoneError> {
+    match open_owned_data_file(paths, path, label, ErrorKind::NotFound, None) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn tail_log(
@@ -5149,6 +5224,78 @@ esac
                 .filter(|event| matches!(event, Event::Result { action, .. } if action == "logs"))
                 .count(),
             1
+        );
+        Ok(())
+    }
+
+    /// SPEC §11.7. A machine that has never started has written no log, which
+    /// is an empty log rather than a missing one.
+    #[tokio::test]
+    async fn logs_before_first_start_return_an_empty_successful_result()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        create_machine(&dispatcher, "fresh", MachineSpec::default()).await?;
+        assert!(!paths.machine_console_log("fresh")?.exists());
+        let mut events = Vec::new();
+
+        dispatcher
+            .run(
+                Action::Logs {
+                    name: "fresh".to_owned(),
+                    source: LogSource::Console,
+                    lines: 200,
+                    follow: false,
+                },
+                &mut events,
+            )
+            .await?;
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Output { .. })),
+            "an unwritten log emits no output"
+        );
+        let payload = events
+            .iter()
+            .find_map(|event| match event {
+                Event::Result { action, payload } if action == "logs" => Some(payload),
+                _ => None,
+            })
+            .ok_or("logs emitted no terminal result")?;
+        assert_eq!(payload["name"], "fresh");
+        assert_eq!(payload["lines"], 0);
+        assert_eq!(payload["follow"], false);
+        Ok(())
+    }
+
+    /// The empty result is only for a machine that exists. An unknown name is
+    /// still not found.
+    #[tokio::test]
+    async fn logs_for_an_unknown_machine_stay_not_found() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_directory, dispatcher, _paths) = fixture()?;
+        let mut events = Vec::new();
+
+        let error = dispatcher
+            .run(
+                Action::Logs {
+                    name: "absent".to_owned(),
+                    source: LogSource::Console,
+                    lines: 200,
+                    follow: false,
+                },
+                &mut events,
+            )
+            .await
+            .err()
+            .ok_or("an unknown machine must not read as an empty log")?;
+
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Result { .. }))
         );
         Ok(())
     }
@@ -6764,6 +6911,39 @@ esac
             .err()
             .ok_or("metrics for a missing machine unexpectedly succeeded")?;
         assert_eq!(error.kind(), ErrorKind::NotFound);
+        Ok(())
+    }
+
+    /// SPEC §25.5. The host sample needs no machine, no VMM, and no lock, and
+    /// it names the directory it measured.
+    #[tokio::test]
+    async fn host_metrics_sample_reports_the_data_directory_with_no_machines()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        let mut events = Vec::new();
+
+        dispatcher.run(Action::HostMetrics, &mut events).await?;
+
+        let payload = events
+            .iter()
+            .find_map(|event| match event {
+                Event::Result { action, payload } if action == "host-metrics" => Some(payload),
+                _ => None,
+            })
+            .ok_or("host metrics emitted no result")?;
+        assert!(payload["sampled_at"].is_string());
+        assert_eq!(
+            payload["disk"]["path"],
+            paths.data_dir().display().to_string()
+        );
+        assert!(payload["disk"]["total_bytes"].as_u64().unwrap_or_default() > 0);
+        assert!(payload["cpu"]["cores"].as_u64().unwrap_or_default() >= 1);
+        for field in ["load_average_1m", "load_average_5m", "load_average_15m"] {
+            assert!(
+                payload["cpu"][field].is_number() || payload["cpu"][field].is_null(),
+                "{field} must be a number or null"
+            );
+        }
         Ok(())
     }
 

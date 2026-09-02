@@ -306,6 +306,14 @@ async fn non_stream_routes_project_exact_actions_statuses_and_payloads() -> Test
         },
         Case {
             method: Method::GET,
+            uri: "/v1/host/metrics",
+            body: None,
+            result_action: "host-metrics",
+            expected_action: Action::HostMetrics,
+            status: StatusCode::OK,
+        },
+        Case {
+            method: Method::GET,
             uri: "/v1/machines",
             body: None,
             result_action: "list",

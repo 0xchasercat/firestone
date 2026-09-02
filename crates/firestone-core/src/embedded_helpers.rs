@@ -380,8 +380,20 @@ fn materialize_with(
     paths.validate_bin_data_directory()?;
 
     let destination = paths.binary_file(identity.install_name)?;
-    if verify_installed(paths, &destination, identity)? {
+    let installed = inspect_installed(paths, &destination, identity)?;
+    if installed == InstalledState::Matches {
         return Ok(destination);
+    }
+    if let InstalledState::Superseded { reason } = &installed {
+        // The owned bin directory holds artifacts derived from the manifest
+        // this build carries, so the manifest wins over what an older build
+        // left behind (SPEC §17.2).
+        tracing::info!(
+            dependency = identity.dependency,
+            path = %destination.display(),
+            reason = reason.as_str(),
+            "replacing a superseded helper with this build's payload"
+        );
     }
 
     let mut partial = TempBuilder::new()
@@ -426,20 +438,37 @@ fn materialize_with(
         .with_hint(identity.origin.mismatch_hint()));
     }
 
-    match partial.persist_noclobber(&destination) {
-        Ok(file) => file.sync_all().map_err(|source| {
-            artifact_io_error(identity, "sync published file", &destination, source)
-        })?,
-        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
-            drop(error.file);
-        }
-        Err(error) => {
-            return Err(artifact_io_error(
+    // A superseded file is replaced in place; an absent one is published
+    // without clobbering, so two callers racing on identical bytes still
+    // publish exactly once.
+    if matches!(installed, InstalledState::Superseded { .. }) {
+        let file = partial.persist(&destination).map_err(|error| {
+            artifact_io_error(
                 identity,
-                "publish partial file",
+                "replace superseded file",
                 &destination,
                 error.error,
-            ));
+            )
+        })?;
+        file.sync_all().map_err(|source| {
+            artifact_io_error(identity, "sync published file", &destination, source)
+        })?;
+    } else {
+        match partial.persist_noclobber(&destination) {
+            Ok(file) => file.sync_all().map_err(|source| {
+                artifact_io_error(identity, "sync published file", &destination, source)
+            })?,
+            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+                drop(error.file);
+            }
+            Err(error) => {
+                return Err(artifact_io_error(
+                    identity,
+                    "publish partial file",
+                    &destination,
+                    error.error,
+                ));
+            }
         }
     }
     sync_directory(&paths.bin_dir(), identity)?;
@@ -510,18 +539,64 @@ fn acquire_helper_lock(paths: &Paths) -> Result<Flock<File>, FirestoneError> {
         .map_err(|(_, source)| lock_io_error("acquire", &lock_path, io::Error::from(source)))
 }
 
+/// What the owned bin directory already holds for one artifact identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InstalledState {
+    /// Nothing is published under the install name.
+    Absent,
+    /// The published bytes are exactly this build's payload.
+    Matches,
+    /// A published file this build no longer recognizes: an earlier release
+    /// installed different bytes under the same install name.
+    Superseded { reason: String },
+}
+
+/// Returns whether the published artifact matches, erroring on a mismatch.
+///
+/// Callers that cannot rewrite the destination — a read-only lookup, or the
+/// readback after publication — use this; the publisher uses
+/// [`inspect_installed`] so it can replace a superseded file instead.
 fn verify_installed(
     paths: &Paths,
     destination: &Path,
     identity: ArtifactIdentity<'_>,
 ) -> Result<bool, FirestoneError> {
+    match inspect_installed(paths, destination, identity)? {
+        InstalledState::Matches => Ok(true),
+        InstalledState::Absent => Ok(false),
+        InstalledState::Superseded { reason } => Err(FirestoneError::new(
+            ErrorKind::Checksum,
+            format!(
+                "{} '{}' at {} {reason}",
+                identity.origin.adjective(),
+                identity.dependency,
+                destination.display()
+            ),
+        )
+        .with_hint(identity.origin.mismatch_hint())),
+    }
+}
+
+/// Classifies the published artifact without judging what to do about it.
+///
+/// Every guard the publisher relies on still runs here and still errors: the
+/// destination must be a regular current-user-owned file in the owned bin
+/// directory, opened without following a symlink, at the expected mode. Only a
+/// length or hash difference is reported as superseded.
+fn inspect_installed(
+    paths: &Paths,
+    destination: &Path,
+    identity: ArtifactIdentity<'_>,
+) -> Result<InstalledState, FirestoneError> {
     let mut options = OpenOptions::new();
     options
         .read(true)
         .custom_flags(O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
     let mut file = match options.open(destination) {
         Ok(file) => file,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Ok(InstalledState::Absent);
+        }
         Err(source) => {
             return Err(artifact_io_error(
                 identity,
@@ -542,37 +617,20 @@ fn verify_installed(
     })?;
     if let Some(expected_length) = identity.expected_length {
         if metadata.len() != expected_length {
-            return Err(FirestoneError::new(
-                ErrorKind::Checksum,
-                format!(
-                    "{} '{}' at {} has length {}; expected {}",
-                    identity.origin.adjective(),
-                    identity.dependency,
-                    destination.display(),
-                    metadata.len(),
-                    expected_length
-                ),
-            )
-            .with_hint(identity.origin.mismatch_hint()));
+            return Ok(InstalledState::Superseded {
+                reason: format!("has length {}; expected {expected_length}", metadata.len()),
+            });
         }
     }
     let actual = sha256_reader(&mut file).map_err(|source| {
         artifact_io_error(identity, "hash installed file", destination, source)
     })?;
     if actual != identity.sha256 {
-        return Err(FirestoneError::new(
-            ErrorKind::Checksum,
-            format!(
-                "{} '{}' at {} has checksum {actual}; expected {}",
-                identity.origin.adjective(),
-                identity.dependency,
-                destination.display(),
-                identity.sha256
-            ),
-        )
-        .with_hint(identity.origin.mismatch_hint()));
+        return Ok(InstalledState::Superseded {
+            reason: format!("has checksum {actual}; expected {}", identity.sha256),
+        });
     }
-    Ok(true)
+    Ok(InstalledState::Matches)
 }
 
 fn sync_directory(path: &Path, identity: ArtifactIdentity<'_>) -> Result<(), FirestoneError> {
@@ -898,21 +956,49 @@ sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         Ok(())
     }
 
+    /// An installed helper that does not match this build's payload was written
+    /// by an earlier release under the same install name. The manifest this
+    /// build carries supersedes it, so the file is replaced rather than
+    /// stranding the upgrade (SPEC §17.2).
     #[test]
-    fn materialize_existing_mismatch_refuses_overwrite() -> Result<(), Box<dyn std::error::Error>> {
+    fn materialize_existing_mismatch_upgrades_in_place() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = test_paths(directory.path())?;
+        paths.ensure_owned_data_directory(&paths.bin_dir(), "binary directory", true)?;
+        let destination = paths.binary_file(TEST_HELPER.install_name())?;
+        fs::write(&destination, b"bytes an older release installed")?;
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))?;
+
+        let installed = materialize(&paths, TEST_HELPER)?;
+
+        assert_eq!(installed, destination);
+        assert_eq!(fs::read(&destination)?, TEST_BYTES);
+        assert_eq!(
+            fs::metadata(&destination)?.permissions().mode() & 0o7777,
+            0o755
+        );
+        Ok(())
+    }
+
+    /// The supersede path is only for a plain owned file. A destination whose
+    /// mode says it is not ours — the same validator that rejects a foreign
+    /// owner — is still refused with the file left alone.
+    #[test]
+    fn materialize_unowned_destination_mode_refuses_overwrite()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let paths = test_paths(directory.path())?;
         paths.ensure_owned_data_directory(&paths.bin_dir(), "binary directory", true)?;
         let destination = paths.binary_file(TEST_HELPER.install_name())?;
         fs::write(&destination, b"wrong")?;
-        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))?;
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o777))?;
 
         let error = match materialize(&paths, TEST_HELPER) {
             Err(error) => error,
-            Ok(_) => panic!("mismatched helper must fail"),
+            Ok(_) => panic!("a group- and world-writable helper must fail"),
         };
 
-        assert_eq!(error.kind(), ErrorKind::Checksum);
+        assert_eq!(error.kind(), ErrorKind::Dependency);
         assert_eq!(fs::read(destination)?, b"wrong");
         Ok(())
     }

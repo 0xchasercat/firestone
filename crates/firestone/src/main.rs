@@ -4,13 +4,14 @@ mod render;
 mod serve;
 mod store;
 mod ui;
+mod uninstall;
 
 use std::{
     env,
     ffi::{OsStr, OsString},
     fs, io,
     io::{IsTerminal, Write as _},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     os::unix::process::ExitStatusExt,
     path::Path,
     process::ExitCode,
@@ -536,7 +537,12 @@ where
             let (global, catalog) = load_user_configuration(&paths)?;
             let dispatcher =
                 LocalDispatcher::new(paths, global, catalog).with_source_base(source_base);
-            let SystemCommand::Prune(arguments) = arguments.command;
+            let arguments = match arguments.command {
+                SystemCommand::Metrics => {
+                    return dispatcher.run(Action::HostMetrics, renderer).await;
+                }
+                SystemCommand::Prune(arguments) => arguments,
+            };
             let machines = arguments.machines || arguments.all;
             let images = arguments.images || arguments.all;
             let mut force = arguments.force || yes;
@@ -765,6 +771,9 @@ where
                 .with_source_base(source_base);
             serve::run(&paths, listener, Arc::new(dispatcher), &global, auth, None)
         }
+        Command::Uninstall(arguments) => {
+            run_uninstall_command(arguments, paths, source_base, yes, terminal, renderer)
+        }
         Command::Ui(arguments) => {
             if yes {
                 return Err(FirestoneError::new(
@@ -778,6 +787,114 @@ where
     }
 }
 
+/// Removes this installation: the executable, and with `--purge` the data.
+///
+/// The confirmation lists the exact paths before anything is deleted, and
+/// `--purge` is confirmed twice because it destroys machines and images that
+/// no reinstall brings back.
+fn run_uninstall_command<Stdout, Stderr>(
+    arguments: cli::UninstallArgs,
+    paths: Paths,
+    source_base: std::path::PathBuf,
+    yes: bool,
+    terminal: TerminalMode,
+    renderer: &mut Renderer<Stdout, Stderr>,
+) -> Result<(), FirestoneError>
+where
+    Stdout: io::Write + Send,
+    Stderr: io::Write + Send,
+{
+    let plan = uninstall::plan(&paths, arguments.purge)?;
+    if arguments.purge {
+        let (global, catalog) = load_user_configuration(&paths)?;
+        let dispatcher =
+            LocalDispatcher::new(paths.clone(), global, catalog).with_source_base(source_base);
+        let running = dispatcher.running_machine_names()?;
+        if !running.is_empty() {
+            return Err(FirestoneError::new(
+                ErrorKind::Conflict,
+                format!("machine(s) still running: {}", running.join(", ")),
+            )
+            .with_hint("stop them with firestone stop NAME, then retry"));
+        }
+    }
+
+    if !yes && terminal.interactive() {
+        renderer.interactive_line("This removes:")?;
+        renderer.interactive_line(&format!("  {}", plan.executable.display()))?;
+        for directory in &plan.directories {
+            renderer.interactive_line(&format!(
+                "  {} ({})",
+                directory.path.display(),
+                directory.holds
+            ))?;
+        }
+        for directory in &plan.kept {
+            renderer.interactive_line(&format!(
+                "Keeps {} ({})",
+                directory.path.display(),
+                directory.holds
+            ))?;
+        }
+        if !confirm(renderer, "Remove firestone? [y/N] ")? {
+            return Err(FirestoneError::new(
+                ErrorKind::Generic,
+                "uninstall cancelled",
+            ));
+        }
+        if arguments.purge
+            && !confirm(
+                renderer,
+                "This deletes every machine and image on this host. Continue? [y/N] ",
+            )?
+        {
+            return Err(FirestoneError::new(
+                ErrorKind::Generic,
+                "uninstall cancelled",
+            ));
+        }
+    }
+
+    let result = uninstall::apply(&plan)?;
+    renderer.emit(Event::Result {
+        action: "uninstall".to_owned(),
+        payload: serde_json::to_value(&result).map_err(|source| {
+            FirestoneError::new(ErrorKind::Generic, "cannot encode the uninstall result")
+                .with_source(source)
+        })?,
+    })
+}
+
+/// Turns `--host`/`--port` into the TCP listener they spell.
+///
+/// The pair is sugar for `--listen tcp:ADDR:PORT` and nothing more: the
+/// loopback rule of §16.1 still applies, and a TCP listener still needs
+/// `--token`. `--host` defaults to `127.0.0.1`.
+fn serve_sugar_address(arguments: &cli::ServeArgs) -> Result<Option<SocketAddr>, FirestoneError> {
+    let Some(port) = arguments.port else {
+        return Ok(None);
+    };
+    let host = arguments.host.as_deref().unwrap_or("127.0.0.1");
+    let ip: IpAddr = host.parse().map_err(|_| {
+        FirestoneError::new(
+            ErrorKind::Usage,
+            format!("--host '{host}' is not an IP address"),
+        )
+        .with_hint("pass an IP literal such as --host 127.0.0.1")
+    })?;
+    let address = SocketAddr::new(ip, port);
+    if !address.ip().is_loopback() {
+        return Err(FirestoneError::new(
+            ErrorKind::Usage,
+            format!(
+                "tcp listener address '{address}' is not a loopback address; use tcp:127.0.0.1:PORT"
+            ),
+        )
+        .with_hint("Firestone binds loopback only; put a reverse proxy in front instead"));
+    }
+    Ok(Some(address))
+}
+
 /// Resolves `firestone serve --listen/--token` into a transport and its gate.
 ///
 /// `--token` is required for a TCP listener and refused for a Unix one, so an
@@ -786,7 +903,11 @@ fn resolve_serve_transport(
     paths: &Paths,
     arguments: &cli::ServeArgs,
 ) -> Result<(ServeListener, UiAuth), FirestoneError> {
-    match &arguments.listen {
+    let listen = match serve_sugar_address(arguments)? {
+        Some(address) => Some(ListenAddress::Tcp(address)),
+        None => arguments.listen.clone(),
+    };
+    match &listen {
         Some(ListenAddress::Tcp(address)) => {
             let Some(file) = arguments.token.as_deref() else {
                 return Err(FirestoneError::new(
@@ -1662,6 +1783,17 @@ fn doctor_manual_commands(events: &[Event]) -> Result<Option<String>, FirestoneE
         .and_then(|check| check.fix))
 }
 
+/// Runs `firestone doctor`, repairing what needs no administrator.
+///
+/// Every repair the CLI can make on its own — creating owned directories,
+/// downloading the vendored binaries, generating the SSH key — runs on a plain
+/// `doctor`, because telling a reader to rerun the same command with one more
+/// flag is not a diagnosis (SPEC §17.3). The one repair that would ask for
+/// elevation, the AppArmor `passt` profile, still belongs to `--fix`: without
+/// it the run reports the check and points there.
+///
+/// `Action::Doctor { fix: false }` keeps its read-only meaning, so the REST
+/// and UI doctor reads download nothing.
 async fn run_doctor_command<Stdout, Stderr>(
     dispatcher: &LocalDispatcher,
     fix: bool,
@@ -1678,7 +1810,7 @@ where
         return dispatcher
             .run(
                 Action::Doctor {
-                    fix,
+                    fix: true,
                     elevation_confirmed: false,
                 },
                 renderer,
@@ -2098,9 +2230,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CreateRequest, TerminalMode, doctor_elevation_prompt_allowed, doctor_manual_commands,
-        finish_command, load_create_spec, load_global_config, render_options, run_with_inputs,
-        signal_handler_error,
+        CreateRequest, TerminalMode, block_on, doctor_elevation_prompt_allowed,
+        doctor_manual_commands, finish_command, load_create_spec, load_global_config,
+        render_options, run_with_inputs, serve_sugar_address, signal_handler_error,
     };
     use crate::{
         cli::Cli,
@@ -2186,6 +2318,7 @@ mod tests {
     fn doctor_manual_commands_require_specific_apparmor_fix_result() -> TestResult {
         let report = DoctorReport {
             checks: vec![DoctorCheck {
+                fixed: false,
                 id: DoctorCheckId::UserNamespaces,
                 status: DoctorStatus::Fail,
                 reason:
@@ -2307,6 +2440,7 @@ mod tests {
     fn command_with_failed_doctor_report_returns_exit_five() -> TestResult {
         let report = DoctorReport {
             checks: vec![DoctorCheck {
+                fixed: false,
                 id: DoctorCheckId::Kvm,
                 status: DoctorStatus::Fail,
                 reason: "cannot open /dev/kvm".to_owned(),
@@ -2353,9 +2487,11 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn doctor_with_missing_catalog_and_wrong_owner_storage_emits_one_report_result()
-    -> TestResult {
+    /// Doctor runs on the CLI's own executor, not inside Tokio, because a
+    /// plain `doctor` now applies the repairs `--fix` used to gate and those
+    /// use a blocking HTTP client.
+    #[test]
+    fn doctor_with_missing_catalog_and_wrong_owner_storage_emits_one_report_result() -> TestResult {
         let directory = tempfile::tempdir()?;
         let root = std::fs::canonicalize(directory.path())?;
         let mut inputs = path_inputs(&root);
@@ -2373,7 +2509,7 @@ mod tests {
 
         let cli = Cli::try_parse_from(["firestone", "--json", "doctor"])?;
         let mut renderer = Renderer::new(Vec::new(), Vec::new(), RenderOptions::json());
-        run_with_inputs(cli, &mut renderer, inputs).await?;
+        block_on(run_with_inputs(cli, &mut renderer, inputs))?;
 
         assert!(!missing_catalog.exists());
         let (stdout, stderr) = renderer.into_writers();
@@ -2390,6 +2526,83 @@ mod tests {
         assert_eq!(doctor_results.len(), 1);
         assert!(doctor_results[0]["payload"]["checks"].is_array());
         assert!(stderr.is_empty());
+        Ok(())
+    }
+
+    /// SPEC §16.1. `--port` alone binds loopback, `--host` picks which
+    /// loopback address, and a routable one is refused with the same message
+    /// `--listen tcp:` gives.
+    #[test]
+    fn serve_host_and_port_resolve_to_the_listener_they_spell() -> TestResult {
+        fn arguments(host: Option<&str>, port: Option<u16>) -> crate::cli::ServeArgs {
+            crate::cli::ServeArgs {
+                listen: None,
+                host: host.map(ToOwned::to_owned),
+                port,
+                token: None,
+            }
+        }
+
+        assert_eq!(serve_sugar_address(&arguments(None, None))?, None);
+        assert_eq!(
+            serve_sugar_address(&arguments(None, Some(8080)))?,
+            Some("127.0.0.1:8080".parse()?)
+        );
+        assert_eq!(
+            serve_sugar_address(&arguments(Some("::1"), Some(8080)))?,
+            Some("[::1]:8080".parse()?)
+        );
+
+        let routable = serve_sugar_address(&arguments(Some("192.168.1.10"), Some(8080)))
+            .err()
+            .ok_or("a routable host must be refused")?;
+        assert_eq!(routable.kind(), firestone_core::ErrorKind::Usage);
+        assert!(routable.message().contains("not a loopback address"));
+
+        let unparsed = serve_sugar_address(&arguments(Some("localhost"), Some(8080)))
+            .err()
+            .ok_or("a name is not an address")?;
+        assert_eq!(unparsed.kind(), firestone_core::ErrorKind::Usage);
+        Ok(())
+    }
+
+    /// SPEC §17.3. A plain `doctor` applies the repairs that need no
+    /// administrator, so it reports what a repair pass reports. This home is
+    /// owned by another uid, so the repair fails at the first owned directory
+    /// and the run never reaches the network: what proves the repair path ran
+    /// is the failure a read-only inspection could not produce.
+    #[test]
+    fn doctor_without_fix_still_runs_the_unprivileged_repairs() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = std::fs::canonicalize(directory.path())?;
+        let mut inputs = path_inputs(&root);
+        inputs.uid = std::fs::metadata(&root)?.uid().wrapping_add(1);
+
+        let cli = Cli::try_parse_from(["firestone", "--json", "doctor"])?;
+        let mut renderer = Renderer::new(Vec::new(), Vec::new(), RenderOptions::json());
+        let _ = block_on(run_with_inputs(cli, &mut renderer, inputs));
+
+        let (stdout, _) = renderer.into_writers();
+        let report = stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(serde_json::from_slice::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .find(|event| event["type"] == "Result" && event["action"] == "doctor")
+            .ok_or("doctor emitted no report")?;
+        let checks = report["payload"]["checks"]
+            .as_array()
+            .ok_or("doctor report has no checks")?;
+        let data_space = checks
+            .iter()
+            .find(|check| check["id"] == "data_space")
+            .ok_or("doctor report has no data_space check")?;
+        let reason = data_space["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("fix failed"),
+            "plain doctor did not attempt the repair: {reason}"
+        );
         Ok(())
     }
 }

@@ -4,7 +4,7 @@
   "info": {
     "title": "Firestone REST API",
     "version": "0.1.0",
-    "description": "Static contract for the Firestone REST adapter. The API is HTTP/1.1 over a private Unix-domain socket, where socket ownership and mode 0600 are the authentication boundary, or over a loopback TCP listener, which must carry a token file and passes a Host allowlist, a constant-time token comparison, and an origin check before any handler runs. The document lists the 28 methods explicitly authored in the Firestone router. Axum also performs its normal implicit HEAD handling for GET registrations, but those incidental HEAD variants are not separate Firestone operations. Unknown paths and unsupported methods both return the stable 404 ErrorEnvelope. JSON successes and errors use application/json without a charset; action progress defaults to application/x-ndjson; logs use text/plain. Closing a mutation stream stops delivery while the shared action continues to a safe point; closing a followed log stream cancels that open-ended read."
+    "description": "Static contract for the Firestone REST adapter. The API is HTTP/1.1 over a private Unix-domain socket, where socket ownership and mode 0600 are the authentication boundary, or over a loopback TCP listener, which must carry a token file and passes a Host allowlist, a constant-time token comparison, and an origin check before any handler runs. The document lists the 29 methods explicitly authored in the Firestone router. Axum also performs its normal implicit HEAD handling for GET registrations, but those incidental HEAD variants are not separate Firestone operations. Unknown paths and unsupported methods both return the stable 404 ErrorEnvelope. JSON successes and errors use application/json without a charset; action progress defaults to application/x-ndjson; logs use text/plain. Closing a mutation stream stops delivery while the shared action continues to a safe point; closing a followed log stream cancels that open-ended read."
   },
   "servers": [
     {
@@ -978,6 +978,39 @@
             "$ref": "#/components/parameters/MachineName"
           }
         ]
+      }
+    },
+    "/v1/host/metrics": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "operationId": "getHostMetrics",
+        "summary": "Sample host metrics once",
+        "description": "Returns one sample of the host itself: processor count and kernel load averages from /proc/loadavg, memory levels from /proc/meminfo, and the capacity of the filesystem holding the Firestone data directory. The read takes no machine lock and needs no machine. A figure the host does not expose is null. Request bodies and undocumented query fields are ignored.",
+        "responses": {
+          "200": {
+            "description": "One host sample.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostMetricsResult"
+                },
+                "examples": {
+                  "default": {
+                    "$ref": "#/components/examples/HostMetrics"
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
       }
     },
     "/v1/catalog": {
@@ -4046,6 +4079,10 @@
           "reason": {
             "type": "string"
           },
+          "fixed": {
+            "type": "boolean",
+            "description": "True when this run repaired the check rather than finding it well. Omitted when false."
+          },
           "fix": {
             "type": "string"
           },
@@ -4059,7 +4096,7 @@
           "status",
           "reason"
         ],
-        "description": "fix and hint are omitted when absent; they are never emitted as null."
+        "description": "fix and hint are omitted when absent; they are never emitted as null. fixed is omitted when false."
       },
       "DoctorReport": {
         "type": "object",
@@ -5520,6 +5557,134 @@
           "memory",
           "block",
           "net"
+        ]
+      },
+      "HostMetricsCpu": {
+        "type": "object",
+        "properties": {
+          "cores": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Host processor count, or null when it cannot be read.",
+            "minimum": 1
+          },
+          "load_average_1m": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "Kernel one-minute load average, or null off Linux.",
+            "minimum": 0
+          },
+          "load_average_5m": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "Kernel five-minute load average, or null off Linux.",
+            "minimum": 0
+          },
+          "load_average_15m": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "Kernel fifteen-minute load average, or null off Linux.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "cores",
+          "load_average_1m",
+          "load_average_5m",
+          "load_average_15m"
+        ]
+      },
+      "HostMetricsMemory": {
+        "type": "object",
+        "properties": {
+          "total_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "MemTotal in bytes, or null when /proc/meminfo is unavailable.",
+            "minimum": 0
+          },
+          "available_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "MemAvailable in bytes, or null when /proc/meminfo is unavailable.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "total_bytes",
+          "available_bytes"
+        ]
+      },
+      "HostMetricsDisk": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The measured directory: Firestone's data directory."
+          },
+          "total_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Size of the filesystem holding that directory, or null when it cannot be measured.",
+            "minimum": 0
+          },
+          "available_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Bytes still available to this user there, or null when it cannot be measured.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "path",
+          "total_bytes",
+          "available_bytes"
+        ]
+      },
+      "HostMetricsResult": {
+        "type": "object",
+        "description": "One sample of the host itself. Firestone stores no history, and an unavailable figure is null rather than zero.",
+        "properties": {
+          "sampled_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "RFC 3339 instant at which the host sources were read."
+          },
+          "cpu": {
+            "$ref": "#/components/schemas/HostMetricsCpu"
+          },
+          "memory": {
+            "$ref": "#/components/schemas/HostMetricsMemory"
+          },
+          "disk": {
+            "$ref": "#/components/schemas/HostMetricsDisk"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "sampled_at",
+          "cpu",
+          "memory",
+          "disk"
         ]
       },
       "CloneMachineRequest": {
@@ -7000,6 +7165,26 @@
           },
           "rng": {
             "src": "/dev/urandom"
+          }
+        }
+      },
+      "HostMetrics": {
+        "value": {
+          "sampled_at": "2026-09-02T12:00:00Z",
+          "cpu": {
+            "cores": 8,
+            "load_average_1m": 0.42,
+            "load_average_5m": 0.55,
+            "load_average_15m": 0.61
+          },
+          "memory": {
+            "total_bytes": 16707784704,
+            "available_bytes": 9439277056
+          },
+          "disk": {
+            "path": "/home/reader/.local/share/firestone",
+            "total_bytes": 494384795648,
+            "available_bytes": 201326592000
           }
         }
       },

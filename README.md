@@ -10,14 +10,13 @@ Linux x86_64:
 curl -fsSL https://raw.githubusercontent.com/0xchasercat/firestone/main/install.sh | sh
 ```
 
-Then check the host and let Firestone repair what it owns:
+Then check the host:
 
 ```sh
 firestone doctor
-firestone doctor --fix
 ```
 
-`doctor --fix` creates Firestone's directories, unpacks its embedded helpers, downloads the pinned firmware, and generates its SSH key. It changes no sysctl and no device permission; for those it prints the exact command for you to run. The one privileged step it can take, an AppArmor profile on Ubuntu, is shown in full and confirmed by you first. Building from source is covered on the [install page](docs/install.md#build-from-source).
+Doctor creates Firestone's directories, unpacks its embedded helpers, downloads the pinned firmware, and generates its SSH key as it goes. It changes no sysctl and no device permission; for those it prints the exact command for you to run. The one privileged step it can take, an AppArmor profile on Ubuntu, waits for `firestone doctor --fix`, and is shown in full and confirmed by you first. Building from source is covered on the [install page](docs/install.md#build-from-source).
 
 ## Sixty seconds
 

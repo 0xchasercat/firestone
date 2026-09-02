@@ -613,6 +613,8 @@ _arguments "${_arguments_options[@]}" : \
 (serve)
 _arguments "${_arguments_options[@]}" : \
 '--listen=[Listen at a private Unix socket, or at a loopback TCP address]:unix:PATH|tcp:HOST:PORT:_default' \
+'(--listen)--host=[Loopback address to bind with --port. Defaults to 127.0.0.1]:ADDR:_default' \
+'(--listen)--port=[Loopback TCP port to bind. Same listener as --listen tcp\:127.0.0.1\:PORT]:PORT:_default' \
 '--token=[File holding the 64-hexadecimal-character session token. TCP only]:FILE:_files' \
 '--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
 '--json[Print events as newline-delimited JSON and disable human output]' \
@@ -854,6 +856,21 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(metrics)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 ":: :_firestone__subcmd__system__subcmd__help_commands" \
@@ -870,6 +887,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(metrics)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -881,6 +902,22 @@ esac
         esac
     ;;
 esac
+;;
+(uninstall)
+_arguments "${_arguments_options[@]}" : \
+'--home=[Override the Firestone home root (config, data, and runtime)]:DIR:_files' \
+'--purge[Also delete the config, data, and runtime directories]' \
+'--json[Print events as newline-delimited JSON and disable human output]' \
+'-q[Print only errors and command results]' \
+'--quiet[Print only errors and command results]' \
+'*-v[Increase log detail. Pass twice for debug output]' \
+'*--verbose[Increase log detail. Pass twice for debug output]' \
+'--no-color[Disable colored output]' \
+'-y[Assume yes when a command may prompt]' \
+'--yes[Assume yes when a command may prompt]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
 ;;
 (help)
 _arguments "${_arguments_options[@]}" : \
@@ -1070,9 +1107,17 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(metrics)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
         esac
     ;;
 esac
+;;
+(uninstall)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
 ;;
 (help)
 _arguments "${_arguments_options[@]}" : \
@@ -1118,6 +1163,7 @@ _firestone_commands() {
 'clone:Copy a stopped machine'\''s spec and disk to a new machine' \
 'snapshot:Capture, list, restore, and remove machine snapshots' \
 'system:Inspect and reclaim host-wide Firestone storage' \
+'uninstall:Remove the firestone executable, and with --purge its data' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'firestone commands' commands "$@"
@@ -1191,6 +1237,7 @@ _firestone__subcmd__help_commands() {
 'clone:Copy a stopped machine'\''s spec and disk to a new machine' \
 'snapshot:Capture, list, restore, and remove machine snapshots' \
 'system:Inspect and reclaim host-wide Firestone storage' \
+'uninstall:Remove the firestone executable, and with --purge its data' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'firestone help commands' commands "$@"
@@ -1375,8 +1422,14 @@ _firestone__subcmd__help__subcmd__stop_commands() {
 _firestone__subcmd__help__subcmd__system_commands() {
     local commands; commands=(
 'prune:Reclaim disk space held by Firestone'\''s own artifacts' \
+'metrics:Print one sample of host CPU, memory, and data-directory space' \
     )
     _describe -t commands 'firestone help system commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__system__subcmd__metrics_commands] )) ||
+_firestone__subcmd__help__subcmd__system__subcmd__metrics_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help system metrics commands' commands "$@"
 }
 (( $+functions[_firestone__subcmd__help__subcmd__system__subcmd__prune_commands] )) ||
 _firestone__subcmd__help__subcmd__system__subcmd__prune_commands() {
@@ -1387,6 +1440,11 @@ _firestone__subcmd__help__subcmd__system__subcmd__prune_commands() {
 _firestone__subcmd__help__subcmd__ui_commands() {
     local commands; commands=()
     _describe -t commands 'firestone help ui commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__help__subcmd__uninstall_commands] )) ||
+_firestone__subcmd__help__subcmd__uninstall_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone help uninstall commands' commands "$@"
 }
 (( $+functions[_firestone__subcmd__help__subcmd__version_commands] )) ||
 _firestone__subcmd__help__subcmd__version_commands() {
@@ -1609,6 +1667,7 @@ _firestone__subcmd__stop_commands() {
 _firestone__subcmd__system_commands() {
     local commands; commands=(
 'prune:Reclaim disk space held by Firestone'\''s own artifacts' \
+'metrics:Print one sample of host CPU, memory, and data-directory space' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'firestone system commands' commands "$@"
@@ -1617,6 +1676,7 @@ _firestone__subcmd__system_commands() {
 _firestone__subcmd__system__subcmd__help_commands() {
     local commands; commands=(
 'prune:Reclaim disk space held by Firestone'\''s own artifacts' \
+'metrics:Print one sample of host CPU, memory, and data-directory space' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'firestone system help commands' commands "$@"
@@ -1626,10 +1686,20 @@ _firestone__subcmd__system__subcmd__help__subcmd__help_commands() {
     local commands; commands=()
     _describe -t commands 'firestone system help help commands' commands "$@"
 }
+(( $+functions[_firestone__subcmd__system__subcmd__help__subcmd__metrics_commands] )) ||
+_firestone__subcmd__system__subcmd__help__subcmd__metrics_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone system help metrics commands' commands "$@"
+}
 (( $+functions[_firestone__subcmd__system__subcmd__help__subcmd__prune_commands] )) ||
 _firestone__subcmd__system__subcmd__help__subcmd__prune_commands() {
     local commands; commands=()
     _describe -t commands 'firestone system help prune commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__system__subcmd__metrics_commands] )) ||
+_firestone__subcmd__system__subcmd__metrics_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone system metrics commands' commands "$@"
 }
 (( $+functions[_firestone__subcmd__system__subcmd__prune_commands] )) ||
 _firestone__subcmd__system__subcmd__prune_commands() {
@@ -1640,6 +1710,11 @@ _firestone__subcmd__system__subcmd__prune_commands() {
 _firestone__subcmd__ui_commands() {
     local commands; commands=()
     _describe -t commands 'firestone ui commands' commands "$@"
+}
+(( $+functions[_firestone__subcmd__uninstall_commands] )) ||
+_firestone__subcmd__uninstall_commands() {
+    local commands; commands=()
+    _describe -t commands 'firestone uninstall commands' commands "$@"
 }
 (( $+functions[_firestone__subcmd__version_commands] )) ||
 _firestone__subcmd__version_commands() {
