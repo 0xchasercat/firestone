@@ -891,8 +891,8 @@ fn response_header(response: &[u8], name: &str) -> TestResult<Option<String>> {
 }
 
 const EXPECTED_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
-img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; \
-form-action 'self'; frame-ancestors 'none'";
+img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'self'; \
+base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
 #[test]
 fn ui_binds_an_ephemeral_loopback_port_and_announces_a_reachable_url() -> TestResult {

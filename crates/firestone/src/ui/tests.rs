@@ -22,6 +22,17 @@ use tower::ServiceExt as _;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+/// What the fake dispatcher answers a log read with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogsAnswer {
+    /// A transcript, with the escape sequences the sanitizer has to handle.
+    Transcript,
+    /// Nothing written yet, answered as an empty result.
+    Empty,
+    /// Nothing written yet, answered as a refusal.
+    Refused,
+}
+
 /// Answers every read action with a fixed, contract-shaped payload.
 struct FakeDispatcher {
     machines: Value,
@@ -32,6 +43,15 @@ struct FakeDispatcher {
     /// The `images-ls` payload, so the cached-images table can be driven with
     /// more than the one entry the picker needs.
     images: Value,
+    /// The published `VmConfig`, or `None` for a machine that has never
+    /// started: the real dispatcher refuses that read by naming the file it
+    /// cannot open, and the tab must not render that.
+    vmconfig: Option<Value>,
+    /// What a log read answers for a machine that has never started. Both
+    /// shapes exist in the wild — a refusal from an older core, an empty
+    /// result from a newer one — and the tab renders the same quiet empty
+    /// state for either.
+    logs: LogsAnswer,
     /// Injected to prove failures render as pages and fragments rather than
     /// panicking or leaking a blank response.
     fail: Option<ErrorKind>,
@@ -82,6 +102,8 @@ impl Default for FakeDispatcher {
                 642_000_000,
                 None
             )]),
+            vmconfig: Some(json!({ "cpus": { "boot_vcpus": 4, "max_vcpus": 4 } })),
+            logs: LogsAnswer::Transcript,
             fail: None,
         }
     }
@@ -182,10 +204,17 @@ impl Dispatcher for FakeDispatcher {
                 Action::Show {
                     vmconfig: false, ..
                 } => ("show", self.machine.clone()),
-                Action::Show { vmconfig: true, .. } => (
-                    "show-vmconfig",
-                    json!({ "cpus": { "boot_vcpus": 4, "max_vcpus": 4 } }),
-                ),
+                Action::Show { vmconfig: true, .. } => match &self.vmconfig {
+                    Some(config) => ("show-vmconfig", config.clone()),
+                    // Exactly what the real dispatcher answers for a machine
+                    // that has never started, path and all.
+                    None => {
+                        return Err(FirestoneError::new(
+                            ErrorKind::NotFound,
+                            "cannot open machine VmConfig /root/.local/share/firestone/machines/web/vmconfig.json",
+                        ));
+                    }
+                },
                 Action::ImageList => ("images-ls", self.images.clone()),
                 Action::SnapshotList { .. } => ("snapshot-list", self.snapshots.clone()),
                 Action::CatalogList => ("catalog", self.catalog.clone()),
@@ -215,6 +244,16 @@ impl Dispatcher for FakeDispatcher {
                             "runtime": "/run/user/1000/firestone"
                         }
                     }),
+                ),
+                Action::Logs { .. } if self.logs == LogsAnswer::Refused => {
+                    return Err(FirestoneError::new(
+                        ErrorKind::NotFound,
+                        "no console log for web",
+                    ));
+                }
+                Action::Logs { .. } if self.logs == LogsAnswer::Empty => (
+                    "logs",
+                    json!({ "name": "web", "source": "console", "lines": 400, "follow": false }),
                 ),
                 Action::Logs { .. } => {
                     // Deliberately includes a control character, markup, an SGR
@@ -524,6 +563,216 @@ async fn a_machine_that_never_started_explains_its_missing_vmconfig() -> TestRes
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("boot_vcpus"));
     Ok(())
+}
+
+/// The screens say what they hold, in a fragment.
+///
+/// Each of these subtitles and empty states used to teach the reader how
+/// Firestone works internally, at the top of a page they had already chosen to
+/// open. The strings named here are the ones that went, and this test is what
+/// keeps them gone.
+#[tokio::test]
+async fn no_page_subtitle_or_empty_state_explains_firestone_to_the_reader() -> TestResult {
+    let router = app(FakeDispatcher {
+        machines: json!([]),
+        images: json!([]),
+        ..FakeDispatcher::default()
+    })?;
+
+    let mut bodies = Vec::new();
+    for uri in ["/", "/machines", "/catalog", "/machines/web"] {
+        let (_, _, body) = get(&router, uri).await?;
+        bodies.push(body);
+    }
+    for uri in [
+        "/ui/machines/rows",
+        "/ui/overview/machines",
+        "/ui/catalog/images",
+        "/ui/machines/web/tab/snapshots",
+        "/ui/machines/web/tab/vmconfig",
+    ] {
+        let (_, _, body) = get_fragment(&router, uri).await?;
+        bodies.push(body);
+    }
+
+    for retired in [
+        "serving the same actions as the CLI",
+        "desired state reconciled on start",
+        "Merged built-in + user catalog",
+        "The local image store. A machine pins",
+        "guaranteed as such",
+        "Restoring one replaces all three",
+        "A machine is a spec plus its reconciled state",
+        "Firestone writes the canonical VmConfig",
+        "cannot open machine VmConfig",
+        "resolves and stores the image it needs on first start",
+    ] {
+        for body in &bodies {
+            assert!(
+                !body.contains(retired),
+                "a retired string is back: {retired}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The overview header carries one version string, and the release and commit
+/// are on its hover title rather than in the line.
+#[tokio::test]
+async fn the_overview_header_and_footer_carry_one_version_string() -> TestResult {
+    let router = app(FakeDispatcher::default())?;
+    let (_, _, body) = get(&router, "/").await?;
+
+    assert!(
+        body.contains("Daemonless · firestone 0.1.3</div>"),
+        "the subtitle is not the version alone"
+    );
+    assert!(
+        body.contains(r#"title="release 0.1.3">firestone 0.1.3</span>"#),
+        "the footer does not carry one version string with the release on hover"
+    );
+    assert!(
+        !body.contains("firestone 0.1.3 · release"),
+        "the version line still repeats itself"
+    );
+    Ok(())
+}
+
+/// The machines page counts machines. It does not explain reconciliation.
+#[tokio::test]
+async fn the_machines_page_subtitle_is_a_count() -> TestResult {
+    let router = app(FakeDispatcher::default())?;
+    let (_, _, body) = get(&router, "/machines").await?;
+    assert!(body.contains("3 machines · 1 running"));
+    Ok(())
+}
+
+/// A machine that has never started has no published config. That is an
+/// ordinary state, and the refusal names a file path the reader cannot act on,
+/// so the tab shows its empty state and drops the message.
+#[tokio::test]
+async fn a_machine_with_no_published_config_shows_an_empty_state_and_no_error() -> TestResult {
+    let router = app(FakeDispatcher {
+        vmconfig: None,
+        ..FakeDispatcher::default()
+    })?;
+    let (status, _, body) = get_fragment(&router, "/ui/machines/web/tab/vmconfig").await?;
+    assert_eq!(status, StatusCode::OK, "an absent config is not a failure");
+    assert!(body.contains("No config yet"));
+    assert!(body.contains("Generated when the machine first starts."));
+    assert!(
+        !body.contains("cannot open machine VmConfig"),
+        "the raw refusal reached the page"
+    );
+    assert!(!body.contains("/root/"), "a host path reached the page");
+    Ok(())
+}
+
+/// The logs tab before a machine's first start (SPEC §16.5).
+///
+/// Nothing here may produce a status a browser would toast. The empty read and
+/// the refused read render the same quiet empty state, so this holds whether
+/// or not the core answers an empty result.
+#[tokio::test]
+async fn the_logs_tab_is_quiet_before_a_machine_has_written_anything() -> TestResult {
+    for answer in [LogsAnswer::Empty, LogsAnswer::Refused] {
+        let router = app(FakeDispatcher {
+            logs: answer,
+            ..FakeDispatcher::default()
+        })?;
+        let (status, _, body) = get_fragment(&router, "/ui/machines/web/tab/logs").await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the logs tab answered {status} for {answer:?}"
+        );
+        assert!(body.contains("No output yet"), "no empty state");
+        assert!(body.contains("Output appears once the machine starts."));
+        assert!(body.contains("data-fs-logview-empty"));
+        // The transcript is still there, hidden, so the follow stream has
+        // somewhere to write the first byte into.
+        assert!(body.contains("data-fs-logview"));
+        assert!(
+            !body.contains("fs-inline-notice--fail"),
+            "a notice rendered"
+        );
+    }
+    Ok(())
+}
+
+/// And a machine that has written something renders the transcript, not the
+/// empty state.
+#[tokio::test]
+async fn the_logs_tab_renders_the_transcript_when_there_is_one() -> TestResult {
+    let router = app(FakeDispatcher::default())?;
+    let (_, _, body) = get_fragment(&router, "/ui/machines/web/tab/logs").await?;
+    assert!(body.contains("boot ok"));
+    assert!(!body.contains("data-fs-logview-empty"));
+    Ok(())
+}
+
+/// The host usage strip (SPEC §16.5.7).
+///
+/// The server renders the frame and nothing else: every figure is written by
+/// app.js from `GET /v1/host/metrics`. It is served hidden, so a build whose
+/// server does not answer that route shows no strip rather than a row of em
+/// dashes, and the allocation cards above it are untouched.
+#[tokio::test]
+async fn the_overview_carries_a_hidden_host_usage_strip_beside_the_allocation_cards() -> TestResult
+{
+    let router = app(FakeDispatcher::default())?;
+    let (_, _, body) = get(&router, "/").await?;
+
+    assert!(body.contains("data-fs-host-usage"), "no host usage strip");
+    assert!(
+        body.contains(r#"id="fs-host-usage" data-fs-host-usage hidden"#),
+        "the strip must be served hidden and revealed only by a real sample"
+    );
+    for tile in ["cpu", "memory", "disk"] {
+        assert!(
+            body.contains(&format!(r#"data-fs-host-tile="{tile}""#)),
+            "the {tile} tile is missing"
+        );
+    }
+    assert!(body.contains(r#"data-fs-host-spark="cpu""#), "no sparkline");
+    assert!(body.contains("data-fs-host-meter"), "no meter");
+    // The allocation cards stay.
+    assert!(body.contains(r#"id="fs-stats""#), "the stat cards are gone");
+    // No colour, no inline style: the same rules the machine strip follows.
+    assert!(!body.contains(" style=\""));
+
+    // And it is outside every polled region, because a swap would throw away
+    // the ring buffer the sparkline is drawn from.
+    let (_, _, stats) = get_fragment(&router, "/ui/overview/stats").await?;
+    assert!(!stats.contains("data-fs-host-usage"));
+    Ok(())
+}
+
+/// The strip's client: one route, one cadence, and a failed read hides it.
+#[test]
+fn the_host_usage_strip_polls_one_route_and_hides_itself_when_it_fails() {
+    let source = include_str!("../../assets/ui/app.js");
+    assert!(
+        source.contains("/v1/host/metrics"),
+        "app.js does not read the host metrics route"
+    );
+    assert!(
+        source.contains("var HOST_POLL_MS = 5000;"),
+        "the host strip is not on the five-second cadence"
+    );
+    let section = source
+        .split("SECTION: host usage strip")
+        .nth(1)
+        .expect("the host usage section must exist");
+    assert!(
+        section.contains("strip.hidden = true"),
+        "a failed read must hide the strip"
+    );
+    assert!(
+        !section.contains("toast("),
+        "a host that does not serve the route is not an incident"
+    );
 }
 
 #[tokio::test]
@@ -1253,11 +1502,46 @@ async fn the_detail_spec_reports_cloud_init_by_shape_and_never_by_value() -> Tes
     assert!(spec.contains("ssh_pwauth"));
 
     // An unconfigured machine reports the same rows, emptily rather than not
-    // at all.
+    // at all — in words, because a spec tab that prints its own JSON tokens is
+    // a debug dump (§16.5.9).
     let bare = app(FakeDispatcher::default())?;
     let (_, _, empty) = get_fragment(&bare, "/ui/machines/web/tab/spec").await?;
-    assert!(empty.contains("user_data_inline") && empty.contains("null"));
-    assert!(empty.contains("unset"), "an unset password must say so");
+    assert!(empty.contains("user_data_inline") && empty.contains("not set"));
+    assert!(empty.contains("not set"), "an unset password must say so");
+    for token in [">null<", ">[]<", ">true<", ">false<", ">unset<"] {
+        assert!(
+            !empty.contains(token),
+            "the spec tab rendered the raw token {token}"
+        );
+    }
+    Ok(())
+}
+
+/// The whole rendering table, at the router level: a default machine's spec
+/// tab reads as sentences rather than as JSON.
+#[tokio::test]
+async fn the_spec_tab_renders_absent_values_as_words() -> TestResult {
+    let router = app(FakeDispatcher::default())?;
+    let (_, _, spec) = get_fragment(&router, "/ui/machines/web/tab/spec").await?;
+
+    // `arch: null` is not a fact anybody wanted. The host's own architecture
+    // is, and the version payload already carries it.
+    assert!(
+        spec.contains("x86_64 (host default)"),
+        "an unset arch must name the architecture the host will give it"
+    );
+    assert!(!spec.contains("null (host)"));
+    // Absent optionals, empty lists, and flags.
+    assert!(spec.contains("not set"), "an absent optional must say so");
+    assert!(spec.contains("none"), "an empty list must say so");
+    assert!(
+        spec.contains("generated at start"),
+        "the mac row is missing"
+    );
+    assert!(
+        spec.contains("the embedded build"),
+        "the vmm row is missing"
+    );
     Ok(())
 }
 
@@ -1607,13 +1891,19 @@ async fn the_overview_caps_how_many_rows_poll_for_metrics() -> TestResult {
 /// policy edit has to be made here as well, deliberately, in a diff a reviewer
 /// reads as a security change.
 const STRICT_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
-img-src 'self' data:; font-src 'self'; connect-src 'self'; \
+img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'self'; \
 base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
 /// The terminal page's policy: the same, plus `'wasm-unsafe-eval'`.
 const TERMINAL_CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; \
 style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; \
-base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+frame-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
+/// The framed terminal's policy: the terminal's, with `frame-ancestors 'self'`
+/// so the detail page's Console tab may frame exactly this one document.
+const TERMINAL_EMBED_CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; \
+style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; \
+frame-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'self'";
 
 /// The router as it is actually served: wrapped in the shared security
 /// headers, with no loopback gate (the Unix-socket transport).
@@ -1774,6 +2064,33 @@ async fn only_the_terminal_page_relaxes_the_content_security_policy() -> TestRes
         Some(TERMINAL_CSP)
     );
 
+    // The framed variant, and only it, may be framed — by this origin only.
+    assert_eq!(
+        csp_of(&router, "/machines/web/terminal?embed=1")
+            .await?
+            .as_deref(),
+        Some(TERMINAL_EMBED_CSP),
+        "the embedded terminal must carry exactly the framable wasm policy"
+    );
+    assert_eq!(
+        csp_of(&router, "/machines/web/terminal?tab=shell&embed=1")
+            .await?
+            .as_deref(),
+        Some(TERMINAL_EMBED_CSP)
+    );
+    // The flag is one exact value. Anything else is the standalone page, which
+    // nothing may frame: this decides a policy, so a lenient parse here would
+    // be a way to reach the framable variant by accident.
+    for spelling in ["embed=0", "embed=true", "embed=yes", "embed=", "embed=11"] {
+        assert_eq!(
+            csp_of(&router, &format!("/machines/web/terminal?{spelling}"))
+                .await?
+                .as_deref(),
+            Some(TERMINAL_CSP),
+            "{spelling} reached the framable policy"
+        );
+    }
+
     // Every other surface keeps the strict policy byte for byte: the screens,
     // a fragment, the assets the terminal itself loads, and the 404 for a
     // path that merely looks like the terminal's.
@@ -1798,14 +2115,25 @@ async fn only_the_terminal_page_relaxes_the_content_security_policy() -> TestRes
         );
     }
 
-    // The relaxation is one token, and it is not 'unsafe-eval'.
+    // Each relaxation is one token, and neither is 'unsafe-eval'.
     assert!(!TERMINAL_CSP.contains("'unsafe-eval';"));
     assert!(!TERMINAL_CSP.contains("unsafe-inline"));
+    assert!(!TERMINAL_EMBED_CSP.contains("'unsafe-eval';"));
+    assert!(!TERMINAL_EMBED_CSP.contains("unsafe-inline"));
     assert_eq!(
         TERMINAL_CSP.replace(" 'wasm-unsafe-eval'", ""),
         STRICT_CSP,
         "the two policies differ by more than the wasm token"
     );
+    assert_eq!(
+        TERMINAL_EMBED_CSP.replace("frame-ancestors 'self'", "frame-ancestors 'none'"),
+        TERMINAL_CSP,
+        "the embedded policy differs by more than frame-ancestors"
+    );
+    // Framing is same-origin only, on every policy the application serves.
+    for policy in [STRICT_CSP, TERMINAL_CSP, TERMINAL_EMBED_CSP] {
+        assert!(policy.contains("frame-src 'self'"));
+    }
     Ok(())
 }
 
@@ -1852,7 +2180,121 @@ async fn a_failed_terminal_page_falls_back_to_the_strict_policy() -> TestResult 
             .as_deref(),
         Some(STRICT_CSP)
     );
+    // The framed variant's error path is the same shell page, so it cannot
+    // hand out a framable policy either.
+    assert_eq!(
+        csp_of(&router, "/machines/ghost/terminal?embed=1")
+            .await?
+            .as_deref(),
+        Some(STRICT_CSP)
+    );
     Ok(())
+}
+
+/// The Console tab (SPEC §16.5.6).
+///
+/// The terminal is embedded where the reader already is, and the emulator's
+/// wasm token stays on the terminal document by framing it rather than by
+/// relaxing the detail page.
+#[tokio::test]
+async fn the_detail_page_embeds_the_terminal_and_offers_the_full_page_from_it() -> TestResult {
+    let router = app(FakeDispatcher::default())?;
+    let (status, _, body) = get(&router, "/machines/web?tab=console").await?;
+    assert_eq!(status, StatusCode::OK);
+
+    // The tab strip carries it, and the panel is a frame of the embed variant.
+    assert!(body.contains(">Console</a>"), "no Console tab in the strip");
+    assert!(
+        body.contains(r#"src="/machines/web/terminal?embed=1""#),
+        "the console panel does not frame the embedded terminal"
+    );
+    // The panel renders no terminal machinery of its own: one term.js, on the
+    // framed document.
+    assert!(
+        !body.contains("term.js"),
+        "the detail page loaded the terminal client itself"
+    );
+    assert!(
+        !body.contains("ghostty"),
+        "the detail page loaded the emulator"
+    );
+    assert!(!body.contains(" style=\""));
+
+    // The head's Terminal control opens that tab rather than leaving the page.
+    let (_, _, head) = get_fragment(&router, "/ui/machines/web/head").await?;
+    assert!(
+        head.contains(r#"href="/machines/web?tab=console""#),
+        "the head does not open the embedded console"
+    );
+
+    // The framed document drops the page chrome and offers the way out.
+    let (_, _, embed) = get(&router, "/machines/web/terminal?embed=1").await?;
+    assert!(
+        embed.contains(r#"id="fs-term-expand""#),
+        "no expand control"
+    );
+    assert!(
+        embed.contains(r#"data-fs-full-url="/machines/web/terminal?tab=console""#),
+        "the expand control has nowhere to go"
+    );
+    assert!(
+        !embed.contains("fs-term__back"),
+        "the framed terminal kept the back link"
+    );
+    // The transports are the same ones the full page opens.
+    assert!(embed.contains(r#"data-fs-console-url="/v1/machines/web/console/ws""#));
+    assert!(embed.contains(r#"data-fs-shell-url="/v1/machines/web/shell/ws""#));
+
+    // The standalone page is unchanged: back link, no expand control.
+    let (_, _, full) = get(&router, "/machines/web/terminal").await?;
+    assert!(full.contains("fs-term__back"));
+    assert!(!full.contains(r#"id="fs-term-expand""#));
+    Ok(())
+}
+
+/// Both transports need a live machine, so a stopped one carries no Console
+/// tab and `?tab=console` lands on the spec tab rather than on a panel that
+/// could only apologise.
+#[tokio::test]
+async fn a_stopped_machine_offers_no_console_tab() -> TestResult {
+    let router = app(FakeDispatcher {
+        machine: machine_view("staging-db", "stopped"),
+        ..FakeDispatcher::default()
+    })?;
+    let (status, _, body) = get(&router, "/machines/staging-db?tab=console").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.contains(">Console</a>"),
+        "a stopped machine offers one"
+    );
+    assert!(!body.contains("terminal?embed=1"), "it framed one anyway");
+    assert!(
+        body.contains("fs-spec-grid"),
+        "it did not fall back to spec"
+    );
+    Ok(())
+}
+
+/// term.js hands the socket over before the top window moves.
+#[test]
+fn the_embedded_terminal_closes_its_socket_before_it_expands() {
+    let source = include_str!("../../assets/ui/term.js");
+    assert!(
+        source.contains("function expandToFullPage"),
+        "term.js has no expand handoff"
+    );
+    let handoff = source
+        .split("function expandToFullPage")
+        .nth(1)
+        .expect("the expand handoff must have a body");
+    let teardown = handoff.find("teardown()").expect("no teardown on expand");
+    let navigate = handoff
+        .find("location.assign")
+        .expect("the expand control navigates nowhere");
+    assert!(
+        teardown < navigate,
+        "the socket must be closed before the top window navigates"
+    );
 }
 
 #[tokio::test]
@@ -1860,12 +2302,12 @@ async fn the_terminal_link_is_offered_only_while_a_machine_is_running() -> TestR
     let running = app(FakeDispatcher::default())?;
     let (_, _, body) = get(&running, "/machines/web").await?;
     assert!(
-        body.contains("href=\"/machines/web/terminal\""),
-        "a running machine offers no terminal link"
+        body.contains("href=\"/machines/web?tab=console\""),
+        "a running machine offers no terminal control"
     );
     // The same head rendered as a fragment must agree with the page.
     let (_, _, head) = get_fragment(&running, "/ui/machines/web/head").await?;
-    assert!(head.contains("href=\"/machines/web/terminal\""));
+    assert!(head.contains("href=\"/machines/web?tab=console\""));
 
     let stopped = app(FakeDispatcher {
         machine: machine_view("staging-db", "stopped"),
@@ -1873,7 +2315,7 @@ async fn the_terminal_link_is_offered_only_while_a_machine_is_running() -> TestR
     })?;
     let (_, _, body) = get(&stopped, "/machines/staging-db").await?;
     assert!(
-        !body.contains("/terminal\""),
+        !body.contains("?tab=console\""),
         "a stopped machine offers a terminal that cannot connect"
     );
     Ok(())
@@ -2093,9 +2535,15 @@ async fn the_snapshots_tab_explains_itself_when_a_machine_has_none() -> TestResu
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("data-fs-snapshot-empty"), "no empty state");
     assert!(body.contains("No snapshots yet"));
-    // The empty state still states what a restore does, because that is the
-    // fact worth knowing before the first snapshot exists.
-    assert!(body.contains("Restoring one replaces all three"));
+    // The empty state says what would put something here, in one line. What a
+    // snapshot costs and what a restore replaces belong in those two dialogs,
+    // where the reader is deciding rather than reading a panel.
+    assert!(body.contains("Take one to save this machine"));
+    assert!(body.contains("disk and spec."));
+    assert!(
+        !body.contains("Restoring one replaces all three"),
+        "the empty state is lecturing again"
+    );
     assert!(!body.contains("data-fs-snapshot-row"));
     Ok(())
 }

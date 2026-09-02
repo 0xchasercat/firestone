@@ -110,7 +110,7 @@ async fn machines_body(state: &UiState, query: &str) -> Result<String, Firestone
             machines => rows,
             machine_count => all.len(),
             subtitle => format!(
-                "{} {} · {running} running · desired state reconciled on start",
+                "{} {} · {running} running",
                 all.len(),
                 if all.len() == 1 { "machine" } else { "machines" },
             ),
@@ -136,16 +136,20 @@ async fn detail_body(
     query: &TabQuery,
 ) -> Result<String, FirestoneError> {
     let view = show_machine(state, name).await?;
-    let machine = MachineDetail::new(name, &view);
+    let machine = MachineDetail::new(name, &view, &host_arch(state).await);
     let tab = query.tab.as_deref().unwrap_or("spec");
     let source = query.source.as_deref().unwrap_or("console");
+    let console = machine.is_running;
 
     let mut ctx = tab_context(state, name, &machine, tab, source, query.follow).await?;
     ctx.insert("machine".to_owned(), Value::from_serialize(&machine));
-    ctx.insert("tabs".to_owned(), Value::from_serialize(tabs(name, tab)));
+    ctx.insert(
+        "tabs".to_owned(),
+        Value::from_serialize(tabs(name, tab, console)),
+    );
     ctx.insert(
         "tab_template".to_owned(),
-        Value::from(tab_template(tab).to_owned()),
+        Value::from(tab_template(tab, console).to_owned()),
     );
 
     render("ui/detail.html", Value::from_object(ctx))
@@ -176,21 +180,29 @@ async fn catalog_body(state: &UiState) -> Result<String, FirestoneError> {
 /// stopped machine's terminal must explain itself rather than 404: the
 /// overlay names the reason and the Reconnect button is the retry.
 ///
-/// This is the one response in the application that carries the wasm-capable
+/// This is the only response in the application that carries a wasm-capable
 /// Content-Security-Policy, and it asks for it by marking itself — see
 /// [`crate::ui::auth::WasmPolicy`].
+///
+/// `?embed=1` renders the same terminal without the page chrome, for the
+/// Console tab on the machine detail screen to frame. That variant is the one
+/// response whose `frame-ancestors` is `'self'` rather than `'none'`; the
+/// standalone page stays unframeable.
 pub async fn terminal(
     State(state): State<UiState>,
     headers: HeaderMap,
     Path(name): Path<String>,
     Query(query): Query<TabQuery>,
 ) -> Response {
-    match terminal_body(&state, &name, query.tab.as_deref()).await {
+    let embedded = query.is_embed();
+    match terminal_body(&state, &name, query.tab.as_deref(), embedded).await {
         Ok(body) => {
             let mut response = html(StatusCode::OK, body);
-            response
-                .extensions_mut()
-                .insert(crate::ui::auth::WasmPolicy);
+            response.extensions_mut().insert(if embedded {
+                crate::ui::auth::WasmPolicy::Embedded
+            } else {
+                crate::ui::auth::WasmPolicy::Standalone
+            });
             response
         }
         Err(error) => failure(&state, headers, error).await,
@@ -201,14 +213,15 @@ async fn terminal_body(
     state: &UiState,
     name: &str,
     tab: Option<&str>,
+    embed: bool,
 ) -> Result<String, FirestoneError> {
     let view = show_machine(state, name).await?;
-    let detail = MachineDetail::new(name, &view);
+    let detail = MachineDetail::new(name, &view, "");
     render(
         "ui/terminal.html",
         context! {
             build => state.build.as_str(),
-            terminal => TerminalPage::new(&detail, tab),
+            terminal => TerminalPage::new(&detail, tab, embed),
         },
     )
 }
@@ -228,10 +241,13 @@ struct TerminalPage {
     status: String,
     tab: &'static str,
     note: &'static str,
+    /// Rendered inside the detail page's Console tab: no back link, and an
+    /// expand control that hands the session to the full page.
+    embed: bool,
 }
 
 impl TerminalPage {
-    fn new(machine: &MachineDetail, tab: Option<&str>) -> Self {
+    fn new(machine: &MachineDetail, tab: Option<&str>, embed: bool) -> Self {
         // The console is the default because it is the one transport that
         // works before a machine has a network, a user, or an sshd.
         let tab = if tab == Some("shell") {
@@ -248,6 +264,7 @@ impl TerminalPage {
                 "shell" => "SSH over vsock on a host pseudo-terminal · resize is honoured",
                 _ => "serial console · single client · resize is the guest's to decide",
             },
+            embed,
         }
     }
 }
@@ -310,9 +327,11 @@ pub async fn machine_rows(
 pub async fn machine_head(State(state): State<UiState>, Path(name): Path<String>) -> Response {
     let result = async {
         let view = show_machine(&state, &name).await?;
+        // The head renders no spec rows, so it needs no host architecture and
+        // does not spend a version read on a five-second poll.
         render(
             "ui/_detail_head.html",
-            context! { machine => MachineDetail::new(&name, &view) },
+            context! { machine => MachineDetail::new(&name, &view, "") },
         )
     }
     .await;
@@ -326,11 +345,12 @@ pub async fn machine_tab(
 ) -> Response {
     let result = async {
         let view = show_machine(&state, &name).await?;
-        let machine = MachineDetail::new(&name, &view);
+        let machine = MachineDetail::new(&name, &view, &host_arch(&state).await);
         let source = query.source.as_deref().unwrap_or("console");
+        let console = machine.is_running;
         let mut ctx = tab_context(&state, &name, &machine, &tab, source, query.follow).await?;
         ctx.insert("machine".to_owned(), Value::from_serialize(&machine));
-        render(tab_template(&tab), Value::from_object(ctx))
+        render(tab_template(&tab, console), Value::from_object(ctx))
     }
     .await;
     fragment(result)
@@ -1171,7 +1191,7 @@ where
 pub async fn edit_form(State(state): State<UiState>, Path(name): Path<String>) -> Response {
     let result = async {
         let view = show_machine(&state, &name).await?;
-        let machine = MachineDetail::new(&name, &view);
+        let machine = MachineDetail::new(&name, &view, "");
         let form = CreateForm::from_defaults(&view.spec);
         let original = serde_json::to_string(&form).unwrap_or_else(|_| "{}".to_owned());
         render(
@@ -1199,8 +1219,14 @@ pub async fn edit_form(State(state): State<UiState>, Path(name): Path<String>) -
 /// One function decides this, so the strip and the panel can never disagree:
 /// an unknown name is the spec tab in both, which is what keeps exactly one
 /// tab marked active for any input a URL can carry.
-fn resolve_tab(tab: &str) -> &'static str {
+///
+/// `console` is whether this machine offers the Console tab at all. Both
+/// terminal transports need a running machine, so a stopped one carries no
+/// Console tab and `?tab=console` resolves to the spec tab rather than to a
+/// panel that could only apologise.
+fn resolve_tab(tab: &str, console: bool) -> &'static str {
     match tab {
+        "console" if console => "console",
         "logs" => "logs",
         "vmconfig" => "vmconfig",
         "snapshots" => "snapshots",
@@ -1208,8 +1234,9 @@ fn resolve_tab(tab: &str) -> &'static str {
     }
 }
 
-fn tab_template(tab: &str) -> &'static str {
-    match resolve_tab(tab) {
+fn tab_template(tab: &str, console: bool) -> &'static str {
+    match resolve_tab(tab, console) {
+        "console" => "ui/tab_console.html",
         "logs" => "ui/tab_logs.html",
         "vmconfig" => "ui/tab_vmconfig.html",
         "snapshots" => "ui/tab_snapshots.html",
@@ -1225,15 +1252,17 @@ struct Tab {
     fragment: String,
 }
 
-fn tabs(name: &str, active: &str) -> Vec<Tab> {
-    let selected = resolve_tab(active);
+fn tabs(name: &str, active: &str, console: bool) -> Vec<Tab> {
+    let selected = resolve_tab(active, console);
     [
         ("spec", "Spec"),
+        ("console", "Console"),
         ("logs", "Logs"),
         ("snapshots", "Snapshots"),
         ("vmconfig", "VM Config"),
     ]
     .into_iter()
+    .filter(|(id, _)| *id != "console" || console)
     .map(|(id, label)| Tab {
         label,
         active: id == selected,
@@ -1271,7 +1300,11 @@ async fn tab_context(
             // tab on a stopped machine does not leave a dead indicator
             // pulsing.
             let follow = follow.unwrap_or(machine.is_running) && machine.is_running;
-            let text = read_logs(state, name, parsed).await?;
+            // Opening the tab on a machine that has never started must not
+            // raise anything. A read that comes back empty and a read the
+            // dispatcher refuses render the same quiet empty state, so this
+            // path never produces a status a browser would toast (SPEC §16.5).
+            let text = read_logs(state, name, parsed).await.unwrap_or_default();
 
             ctx.insert("logs".to_owned(), Value::from(text));
             ctx.insert("source".to_owned(), Value::from(source.to_owned()));
@@ -1283,9 +1316,10 @@ async fn tab_context(
             );
         }
         "vmconfig" => {
-            let (config, unavailable) = read_vmconfig(state, name).await;
-            ctx.insert("vmconfig".to_owned(), Value::from(config));
-            ctx.insert("unavailable".to_owned(), Value::from(unavailable));
+            ctx.insert(
+                "vmconfig".to_owned(),
+                Value::from(read_vmconfig(state, name).await),
+            );
         }
         // A read like every other tab: `Action::SnapshotList` is the same
         // action `GET /v1/machines/{name}/snapshots` dispatches, and every
@@ -1383,6 +1417,17 @@ async fn show_machine(state: &UiState, name: &str) -> Result<MachineView, Firest
     )
 }
 
+/// This host's architecture, for the spec tab's `arch` row.
+///
+/// A failed version read is not a reason to fail a machine page, so the answer
+/// degrades to an empty string and the row says only `host default`.
+async fn host_arch(state: &UiState) -> String {
+    version_info(state)
+        .await
+        .map(|version| version.architecture)
+        .unwrap_or_default()
+}
+
 async fn version_info(state: &UiState) -> Result<VersionInfo, FirestoneError> {
     let result: VersionResult = decode(
         api::dispatch_payload(&state.dispatcher, Action::Version, "version").await?,
@@ -1411,9 +1456,11 @@ async fn read_logs(
 }
 
 /// A machine that has never started has no published config. That is an
-/// ordinary state, not an error, so it renders as an explanation.
-async fn read_vmconfig(state: &UiState, name: &str) -> (String, String) {
-    match api::dispatch_payload(
+/// ordinary state, not an error, so the tab renders its empty state and the
+/// refusal is dropped: the message names a path inside the machine directory,
+/// which tells the reader nothing they can act on and reads as a fault.
+async fn read_vmconfig(state: &UiState, name: &str) -> String {
+    api::dispatch_payload(
         &state.dispatcher,
         Action::Show {
             name: name.to_owned(),
@@ -1422,13 +1469,8 @@ async fn read_vmconfig(state: &UiState, name: &str) -> (String, String) {
         "show-vmconfig",
     )
     .await
-    {
-        Ok(value) => (
-            serde_json::to_string_pretty(&value).unwrap_or_default(),
-            String::new(),
-        ),
-        Err(error) => (String::new(), error.info().message),
-    }
+    .map(|value| serde_json::to_string_pretty(&value).unwrap_or_default())
+    .unwrap_or_default()
 }
 
 async fn catalog_cards_data(state: &UiState) -> Result<Vec<CatalogCard>, FirestoneError> {
@@ -1701,10 +1743,7 @@ fn html_escape(value: &str) -> String {
 }
 
 fn subtitle(version: &VersionInfo) -> String {
-    format!(
-        "Daemonless · {} · serving the same actions as the CLI",
-        version.identity
-    )
+    format!("Daemonless · {}", version.identity)
 }
 
 // ---------------------------------------------------------------- queries --
@@ -1719,6 +1758,17 @@ pub struct TabQuery {
     pub tab: Option<String>,
     pub source: Option<String>,
     pub follow: Option<bool>,
+    /// `embed=1` on the terminal page. Read as a string and compared to one
+    /// value, so every other spelling is the standalone page: the flag decides
+    /// which Content-Security-Policy the response carries, and a lenient parse
+    /// there is a way to reach the framable variant by accident.
+    pub embed: Option<String>,
+}
+
+impl TabQuery {
+    fn is_embed(&self) -> bool {
+        self.embed.as_deref() == Some("1")
+    }
 }
 
 #[cfg(test)]
@@ -1750,21 +1800,41 @@ mod tests {
 
     #[test]
     fn tab_template_falls_back_to_spec_for_unknown_names() {
-        assert_eq!(tab_template("logs"), "ui/tab_logs.html");
-        assert_eq!(tab_template("vmconfig"), "ui/tab_vmconfig.html");
-        assert_eq!(tab_template("spec"), "ui/tab_spec.html");
-        assert_eq!(tab_template("../../etc/passwd"), "ui/tab_spec.html");
+        assert_eq!(tab_template("logs", true), "ui/tab_logs.html");
+        assert_eq!(tab_template("vmconfig", true), "ui/tab_vmconfig.html");
+        assert_eq!(tab_template("spec", true), "ui/tab_spec.html");
+        assert_eq!(tab_template("../../etc/passwd", true), "ui/tab_spec.html");
+        assert_eq!(tab_template("console", true), "ui/tab_console.html");
+        // Both transports need a running machine, so a stopped one has no
+        // console panel to resolve to.
+        assert_eq!(tab_template("console", false), "ui/tab_spec.html");
     }
 
     #[test]
     fn tabs_mark_exactly_one_active_for_any_input() {
-        for requested in ["spec", "logs", "vmconfig", "nonsense"] {
-            let active = tabs("web", requested)
-                .iter()
-                .filter(|tab| tab.active)
-                .count();
-            assert_eq!(active, 1, "tab {requested} did not select exactly one");
+        for console in [true, false] {
+            for requested in ["spec", "console", "logs", "vmconfig", "nonsense"] {
+                let active = tabs("web", requested, console)
+                    .iter()
+                    .filter(|tab| tab.active)
+                    .count();
+                assert_eq!(
+                    active, 1,
+                    "tab {requested} did not select exactly one (console: {console})"
+                );
+            }
         }
+        // The Console tab is offered only where it can attach.
+        assert!(
+            tabs("web", "spec", true)
+                .iter()
+                .any(|tab| tab.label == "Console")
+        );
+        assert!(
+            !tabs("web", "spec", false)
+                .iter()
+                .any(|tab| tab.label == "Console")
+        );
     }
 
     #[test]

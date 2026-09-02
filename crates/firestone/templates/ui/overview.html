@@ -32,6 +32,47 @@
     {% include "ui/_stats.html" %}
   </div>
 
+  {# Host usage.
+
+     The allocation cards above say what the fleet was promised; this strip
+     says what the host is actually doing with it. It is written entirely by
+     app.js from GET /v1/host/metrics, so it starts hidden and stays hidden on
+     a host whose build does not serve that route: a strip of em dashes would
+     be worse than no strip. It sits outside every polled region for the same
+     reason the machine strip does — a swap would throw away the ring buffer
+     the sparkline is drawn from. #}
+  <div class="fs-hoststrip" id="fs-host-usage" data-fs-host-usage hidden>
+    <div class="fs-hoststrip__tile" data-fs-host-tile="cpu">
+      <div class="fs-hoststrip__label">Host CPU</div>
+      <div class="fs-hoststrip__value" data-fs-host-value>—</div>
+      <div class="fs-hoststrip__sub" data-fs-host-sub>—</div>
+      <svg class="fs-spark" viewBox="0 0 100 28" preserveAspectRatio="none"
+           aria-hidden="true" focusable="false">
+        <polyline class="fs-spark__line" data-fs-host-spark="cpu" points=""></polyline>
+      </svg>
+    </div>
+
+    <div class="fs-hoststrip__tile" data-fs-host-tile="memory">
+      <div class="fs-hoststrip__label">Host memory</div>
+      <div class="fs-hoststrip__value" data-fs-host-value>—</div>
+      <div class="fs-hoststrip__sub" data-fs-host-sub>—</div>
+      <svg class="fs-meter" viewBox="0 0 100 4" preserveAspectRatio="none"
+           aria-hidden="true" focusable="false">
+        <rect class="fs-meter__fill" data-fs-host-meter x="0" y="0" width="0" height="4"></rect>
+      </svg>
+    </div>
+
+    <div class="fs-hoststrip__tile" data-fs-host-tile="disk">
+      <div class="fs-hoststrip__label">Data disk free</div>
+      <div class="fs-hoststrip__value" data-fs-host-value>—</div>
+      <div class="fs-hoststrip__sub" data-fs-host-sub>—</div>
+      <svg class="fs-meter" viewBox="0 0 100 4" preserveAspectRatio="none"
+           aria-hidden="true" focusable="false">
+        <rect class="fs-meter__fill" data-fs-host-meter x="0" y="0" width="0" height="4"></rect>
+      </svg>
+    </div>
+  </div>
+
   <div class="fs-panel fs-mb-24">
     <div class="fs-panel__head">
       <div class="fs-panel__title">Host checks</div>
@@ -85,13 +126,15 @@
       {{ m.empty(
           "image",
           "No images cached",
-          "Pull one from the catalog, or create a machine and Firestone resolves and stores the image it needs on first start.",
+          "Pull one from the catalog to get started.",
           "Open catalog", "/catalog"
       ) }}
       {% endfor %}
     </div>
   </div>
 
-  <span class="fs-note fs-note--footer">{{ version.identity }}</span>
+  {# One version string. The release and the commit are on the hover title:
+     worth having, not worth a line of chrome on every screen. #}
+  <span class="fs-note fs-note--footer" title="{{ version.detail }}">{{ version.identity }}</span>
 </div>
 <div id="fs-dialog-slot"></div>

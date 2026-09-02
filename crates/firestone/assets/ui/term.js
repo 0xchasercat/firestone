@@ -50,7 +50,10 @@
     shell: root.getAttribute("data-fs-shell-url") || "",
     state: root.getAttribute("data-fs-state-url") || "",
     module: root.getAttribute("data-fs-module-url") || "",
-    wasm: root.getAttribute("data-fs-wasm-url") || ""
+    wasm: root.getAttribute("data-fs-wasm-url") || "",
+    /* Where the expand control sends the top window when this document is
+     * framed by the machine detail page's Console tab. */
+    full: root.getAttribute("data-fs-full-url") || ""
   };
 
   var screenEl = document.getElementById("fs-term-screen");
@@ -62,6 +65,8 @@
   var reconnect = document.getElementById("fs-term-reconnect");
   var note = document.getElementById("fs-term-note");
   var geometry = document.getElementById("fs-term-geometry");
+  /* Present only on the `embed=1` variant the detail page frames. */
+  var expand = document.getElementById("fs-term-expand");
 
   var encoder = new TextEncoder();
 
@@ -756,6 +761,30 @@
     connect(tab);
   }
 
+  /* Hands this session to the full-window page.
+   *
+   * The console broker is single-client and the CLI shares it, so the page
+   * about to open needs this socket gone. Tearing down first sends the close
+   * frame while this document is still alive, which is the earliest a browser
+   * will send one; navigating first would leave the server to notice the
+   * unload instead. The handoff is still two connections either side of one
+   * server-side close, so a slow close can leave the new page briefly on the
+   * BUSY overlay — its Reconnect button is the retry, and nothing reconnects
+   * on its own, because retaking a single-client console is an operator's
+   * decision (SPEC §16.5.6).
+   *
+   * `window.top` is same-origin by construction: the only document that may
+   * frame this one is this same origin, which is what `frame-ancestors 'self'`
+   * on the embedded response means. */
+  function expandToFullPage() {
+    if (!config.full) {
+      return;
+    }
+    teardown();
+    var target = window.top || window;
+    target.location.assign(config.full);
+  }
+
   root.addEventListener("click", function (event) {
     var tab = event.target.closest ? event.target.closest("[data-fs-term-tab]") : null;
     if (tab) {
@@ -765,6 +794,10 @@
       } else if (session && session.terminal) {
         session.terminal.focus();
       }
+      return;
+    }
+    if (expand && (event.target === expand || expand.contains(event.target))) {
+      expandToFullPage();
       return;
     }
     if (reconnect && event.target === reconnect) {

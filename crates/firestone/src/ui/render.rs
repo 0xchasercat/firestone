@@ -92,6 +92,10 @@ const TEMPLATES: &[(&str, &str)] = &[
         include_str!("../../templates/ui/tab_snapshots.html"),
     ),
     (
+        "ui/tab_console.html",
+        include_str!("../../templates/ui/tab_console.html"),
+    ),
+    (
         "ui/create.html",
         include_str!("../../templates/ui/create.html"),
     ),

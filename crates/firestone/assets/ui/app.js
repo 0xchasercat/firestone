@@ -1078,6 +1078,14 @@
   });
 
   document.body.addEventListener("htmx:responseError", function (event) {
+    /* The logs tab never notifies. A machine that has never started has
+     * written nothing, and the tab already says so in its own empty state; a
+     * toast on top of that reports a fault where there is none. The server
+     * answers this path quietly, and this keeps it quiet against an older
+     * build that still refuses the read. */
+    if (isLogsTabRequest(event.detail.pathInfo)) {
+      return;
+    }
     var xhr = event.detail.xhr;
     var envelope;
     try {
@@ -1091,6 +1099,21 @@
         : "the request failed with " + xhr.status;
     toast("request failed", message, "fail");
   });
+
+  /* True for a read of the logs tab fragment, whatever query it carries. The
+   * path is compared by hand rather than by pattern: this file keeps braces
+   * and quotes out of regular-expression literals. */
+  function isLogsTabRequest(pathInfo) {
+    var path = pathInfo && (pathInfo.requestPath || pathInfo.path);
+    if (typeof path !== "string") {
+      return false;
+    }
+    var query = path.indexOf("?");
+    if (query >= 0) {
+      path = path.slice(0, query);
+    }
+    return path.length >= 9 && path.slice(-9) === "/tab/logs";
+  }
 
   document.body.addEventListener("htmx:sendError", function () {
     toast(
@@ -1654,8 +1677,23 @@
   }
 
   function appendLogChunk(view, chunk) {
+    revealLogView(view);
     ensureLogViewRendered(view);
     logRendererFor(view).push(chunk);
+  }
+
+  /* The tab renders an empty state when the first read came back with nothing,
+   * which is what a machine that has never started looks like. The first byte
+   * off the follow stream retires it and shows the transcript. */
+  function revealLogView(view) {
+    if (!view.hidden) {
+      return;
+    }
+    view.hidden = false;
+    var empty = qs("[data-fs-logview-empty]");
+    if (empty) {
+      empty.remove();
+    }
   }
 
   function renderLogViews() {
@@ -4013,8 +4051,10 @@
         "/ui/machines/" + encodeURIComponent(machine) + "/edit"
       );
     } else if (kind === "terminal" && machine) {
+      /* The Console tab, which is what the detail head's Terminal control
+       * opens: the palette navigates where the screen navigates. */
       window.location.assign(
-        "/machines/" + encodeURIComponent(machine) + "/terminal"
+        "/machines/" + encodeURIComponent(machine) + "?tab=console"
       );
     }
   }
@@ -4036,4 +4076,322 @@
     prunePayload: prunePayload,
     pruneRequest: pruneRequest
   };
+})();
+
+/* ==========================================================================
+ * SECTION: host usage strip                                          (P2-UI)
+ * ==========================================================================
+ *
+ * The overview's allocation cards say what the fleet was promised. This strip
+ * says what the host is doing with it: `GET /v1/host/metrics`, polled every
+ * five seconds, drawn with the same hand-written sparkline and meter
+ * machinery the machine tiles use.
+ *
+ * Three properties are deliberate.
+ *
+ *   - It degrades to nothing. The strip is served hidden and only reveals
+ *     itself once a sample has parsed, so a build whose server does not answer
+ *     that route shows no strip rather than a row of em dashes. A read that
+ *     starts failing hides it again.
+ *   - It stores no history on the host. Like the machine strip, the ring
+ *     buffer lives in this tab and a reload starts over.
+ *   - It reads defensively. `used_percent` is used when the payload carries
+ *     one; otherwise a percentage is derived from two samples of the
+ *     cumulative total and idle counters, which is the same arithmetic §16.5.7
+ *     already specifies for a machine. Memory accepts either `used_bytes` or
+ *     `available_bytes`. A counter that is absent stays absent and is never
+ *     read as zero.
+ *
+ * Its own IIFE, and its own state, so the block above can be reorganised
+ * without touching it.
+ */
+(function () {
+  "use strict";
+
+  var HOST_METRICS_URL = "/v1/host/metrics";
+  var HOST_POLL_MS = 5000;
+  /* Same backoff as the machine strip: a host that is not answering is polled
+   * slowly rather than abandoned, so a serve that gains the route recovers
+   * without a reload. */
+  var HOST_IDLE_MS = 15000;
+  var HOST_SAMPLES = 60;
+  var SPARK_W = 100;
+  var SPARK_H = 28;
+  var METER_W = 100;
+
+  var shared = window.firestoneMetrics || {};
+  var sparklinePoints = shared.sparklinePoints;
+  var formatByteSize = shared.formatByteSize;
+
+  var strip = null;
+  var timer = null;
+  var samples = [];
+
+  function qs(selector, scope) {
+    return (scope || document).querySelector(selector);
+  }
+
+  function number(value) {
+    return typeof value === "number" && isFinite(value) ? value : null;
+  }
+
+  /* RFC 3339 with nanosecond precision; the ECMAScript date grammar specifies
+   * three fractional digits, so the tail is trimmed rather than left to a
+   * lenient parser. An unparseable instant falls back to when it was read. */
+  function timestamp(text, fallbackMs) {
+    if (typeof text !== "string") {
+      return fallbackMs;
+    }
+    var dot = text.indexOf(".");
+    var trimmed = text;
+    if (dot >= 0) {
+      var tail = text.slice(dot + 1);
+      var digits = 0;
+      while (digits < tail.length && tail.charCodeAt(digits) >= 48 && tail.charCodeAt(digits) <= 57) {
+        digits += 1;
+      }
+      trimmed =
+        text.slice(0, dot + 1) + tail.slice(0, Math.min(digits, 3)) + tail.slice(digits);
+    }
+    var parsed = Date.parse(trimmed);
+    return isFinite(parsed) ? parsed : fallbackMs;
+  }
+
+  function sampleOf(payload, receivedMs) {
+    if (!payload || typeof payload !== "object") {
+      return null;
+    }
+    var cpu = payload.cpu || {};
+    var memory = payload.memory || {};
+    var disk = payload.disk || {};
+
+    var total = number(memory.total_bytes);
+    var used = number(memory.used_bytes);
+    if (used === null) {
+      var available = number(memory.available_bytes);
+      if (available !== null && total !== null) {
+        used = Math.max(0, total - available);
+      }
+    }
+
+    /* The host route reports kernel load averages, not cumulative CPU time.
+     * Load over cores is the busy share: load 8 on 32 cores is 25 percent. */
+    var cpuPercent = number(cpu.used_percent);
+    if (cpuPercent === null) {
+      var load = number(cpu.load_average_1m);
+      var cores = number(cpu.cores);
+      if (load !== null && cores !== null && cores > 0) {
+        cpuPercent = Math.max(0, Math.min(100, (load / cores) * 100));
+      }
+    }
+    var diskFree = number(disk.free_bytes);
+    if (diskFree === null) {
+      diskFree = number(disk.available_bytes);
+    }
+
+    return {
+      at: timestamp(payload.sampled_at, receivedMs),
+      cpuPercent: cpuPercent,
+      cpuTotalNs: number(cpu.total_time_ns),
+      cpuIdleNs: number(cpu.idle_time_ns),
+      cores: number(cpu.cores),
+      memoryTotal: total,
+      memoryUsed: used,
+      diskTotal: number(disk.total_bytes),
+      diskFree: diskFree
+    };
+  }
+
+  /* Per cent busy across every core. A reported figure wins; otherwise the
+   * pair of cumulative counters is differenced. A counter that went backwards
+   * is a rebooted host or a restarted collector, not negative work, so that
+   * pair is dropped. */
+  function cpuPercent(previous, next) {
+    if (next.cpuPercent !== null) {
+      return Math.max(0, Math.min(100, next.cpuPercent));
+    }
+    if (
+      !previous ||
+      previous.cpuTotalNs === null ||
+      next.cpuTotalNs === null ||
+      previous.cpuIdleNs === null ||
+      next.cpuIdleNs === null
+    ) {
+      return null;
+    }
+    var total = next.cpuTotalNs - previous.cpuTotalNs;
+    var idle = next.cpuIdleNs - previous.cpuIdleNs;
+    if (!(total > 0) || idle < 0) {
+      return null;
+    }
+    return Math.max(0, Math.min(100, ((total - idle) / total) * 100));
+  }
+
+  function cpuSeries() {
+    var series = [];
+    for (var index = 0; index < samples.length; index += 1) {
+      var value = cpuPercent(index === 0 ? null : samples[index - 1], samples[index]);
+      if (value !== null) {
+        series.push(value);
+      }
+    }
+    return series;
+  }
+
+  function bytes(value) {
+    return value === null || typeof formatByteSize !== "function"
+      ? "—"
+      : formatByteSize(value);
+  }
+
+  function tile(name) {
+    return strip ? qs('[data-fs-host-tile="' + name + '"]', strip) : null;
+  }
+
+  function setTile(node, value, sub) {
+    if (!node) {
+      return;
+    }
+    var valueNode = qs("[data-fs-host-value]", node);
+    var subNode = qs("[data-fs-host-sub]", node);
+    if (valueNode) {
+      valueNode.textContent = value;
+    }
+    if (subNode) {
+      subNode.textContent = sub;
+    }
+  }
+
+  /* An attribute, not a style: the policy has no 'unsafe-inline'. */
+  function setMeter(node, fraction) {
+    if (!node) {
+      return;
+    }
+    var fill = qs("[data-fs-host-meter]", node);
+    if (!fill) {
+      return;
+    }
+    var bounded = fraction === null ? 0 : Math.max(0, Math.min(1, fraction));
+    fill.setAttribute("width", String(Math.round(bounded * METER_W * 100) / 100));
+  }
+
+  function render() {
+    var latest = samples.length ? samples[samples.length - 1] : null;
+    if (!strip || !latest) {
+      return;
+    }
+
+    var series = cpuSeries();
+    var cpu = series.length ? series[series.length - 1] : null;
+    var cpuTile = tile("cpu");
+    setTile(
+      cpuTile,
+      cpu === null ? "—" : Math.round(cpu) + "%",
+      latest.cores === null
+        ? "collecting…"
+        : latest.cores + (latest.cores === 1 ? " core" : " cores")
+    );
+    if (cpuTile && typeof sparklinePoints === "function") {
+      var line = qs('[data-fs-host-spark="cpu"]', cpuTile);
+      if (line) {
+        line.setAttribute("points", sparklinePoints(series, SPARK_W, SPARK_H, 100));
+      }
+    }
+
+    var memoryTile = tile("memory");
+    setTile(
+      memoryTile,
+      bytes(latest.memoryUsed),
+      latest.memoryTotal === null ? "—" : "of " + bytes(latest.memoryTotal)
+    );
+    setMeter(
+      memoryTile,
+      latest.memoryUsed === null || latest.memoryTotal === null || !(latest.memoryTotal > 0)
+        ? null
+        : latest.memoryUsed / latest.memoryTotal
+    );
+
+    var diskTile = tile("disk");
+    setTile(
+      diskTile,
+      bytes(latest.diskFree),
+      latest.diskTotal === null ? "—" : "of " + bytes(latest.diskTotal)
+    );
+    setMeter(
+      diskTile,
+      latest.diskFree === null || latest.diskTotal === null || !(latest.diskTotal > 0)
+        ? null
+        : (latest.diskTotal - latest.diskFree) / latest.diskTotal
+    );
+  }
+
+  function hide() {
+    samples.length = 0;
+    if (strip) {
+      strip.hidden = true;
+    }
+  }
+
+  async function readHost() {
+    try {
+      var response = await fetch(HOST_METRICS_URL, {
+        headers: { Accept: "application/json" }
+      });
+      if (!response.ok) {
+        return null;
+      }
+      return sampleOf(await response.json(), Date.now());
+    } catch (error) {
+      /* A host that does not serve this route is not an incident. The strip
+       * simply stays hidden; nothing is reported and nothing is toasted. */
+      return null;
+    }
+  }
+
+  async function tick() {
+    var sample = await readHost();
+    if (!strip || !strip.isConnected) {
+      return;
+    }
+    var delay = HOST_POLL_MS;
+    if (sample) {
+      samples.push(sample);
+      if (samples.length > HOST_SAMPLES) {
+        samples.shift();
+      }
+      strip.hidden = false;
+      render();
+    } else {
+      hide();
+      delay = HOST_IDLE_MS;
+    }
+    timer = window.setTimeout(tick, delay);
+  }
+
+  function stop() {
+    if (timer !== null) {
+      window.clearTimeout(timer);
+      timer = null;
+    }
+    strip = null;
+    samples.length = 0;
+  }
+
+  function sync() {
+    var found = document.querySelector("[data-fs-host-usage]");
+    if (!found) {
+      stop();
+      return;
+    }
+    if (found === strip) {
+      return;
+    }
+    stop();
+    strip = found;
+    tick();
+  }
+
+  document.addEventListener("DOMContentLoaded", sync);
+  document.body.addEventListener("htmx:afterSwap", sync);
+  window.addEventListener("beforeunload", stop);
 })();

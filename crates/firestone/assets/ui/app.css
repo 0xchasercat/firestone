@@ -3228,3 +3228,110 @@ textarea {
   font-weight: 400;
   color: var(--text3);
 }
+
+/* ==========================================================================
+   embedded console, host usage strip                              (P2-UI)
+   ========================================================================== */
+
+/* --------------------------------------------------------------- console -- */
+
+/* The Console tab frames the terminal document rather than rendering it here,
+   so the emulator's 'wasm-unsafe-eval' stays on that document. The frame is
+   sized like a panel; the terminal inside it owns its own layout. */
+.fs-console {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--terminal);
+}
+
+.fs-console__frame {
+  display: block;
+  width: 100%;
+  height: 520px;
+  border: 0;
+}
+
+@media (max-width: 900px) {
+  .fs-console__frame {
+    height: 380px;
+  }
+}
+
+/* Framed, the terminal fills the frame rather than the viewport: 100dvh inside
+   an iframe is the frame's own box, which would leave the footer below the
+   fold on a short frame. */
+.fs-termbody--embed,
+.fs-termbody--embed .fs-term {
+  height: 100%;
+}
+
+.fs-term__expand {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text2);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.fs-term__expand:hover {
+  color: var(--text);
+  border-color: var(--line2);
+}
+
+.fs-term__expand-icon {
+  font-size: 13px;
+  line-height: 1;
+}
+
+/* ----------------------------------------------------------- host usage -- */
+
+/* Written entirely by app.js from GET /v1/host/metrics and served hidden, so a
+   host that does not answer that route shows nothing here at all. */
+.fs-hoststrip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+.fs-hoststrip__tile {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+  padding: 12px 14px;
+}
+
+.fs-hoststrip__label {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text3);
+}
+
+.fs-hoststrip__value {
+  margin-top: 4px;
+  font-family: var(--mono);
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.fs-hoststrip__sub {
+  margin-top: 2px;
+  font-size: 11.5px;
+  color: var(--text3);
+}
+
+@media (max-width: 900px) {
+  .fs-hoststrip {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

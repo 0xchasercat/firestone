@@ -38,9 +38,13 @@ const COOKIE_ATTRIBUTES: &str = "; Path=/; HttpOnly; SameSite=Strict; Max-Age=86
 ///
 /// The policy has no `'unsafe-inline'` anywhere. Every script and stylesheet
 /// must be a same-origin asset, which is what the shipped UI templates use.
+/// `frame-src 'self'` is here rather than on the detail screen alone because
+/// htmx navigation keeps the first document that loaded: a policy attached to
+/// `/machines/{name}` would not apply once the reader reached that screen from
+/// `/machines`. Same-origin frames only, and it grants no script capability.
 const CONTENT_SECURITY_POLICY: &str = concat!(
     "default-src 'none'; script-src 'self'; style-src 'self'; ",
-    "img-src 'self' data:; font-src 'self'; connect-src 'self'; ",
+    "img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'self'; ",
     "base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 );
 
@@ -55,11 +59,23 @@ const CONTENT_SECURITY_POLICY: &str = concat!(
 /// first writing a file into the executable's own asset table.
 const TERMINAL_CONTENT_SECURITY_POLICY: &str = concat!(
     "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; ",
-    "img-src 'self' data:; font-src 'self'; connect-src 'self'; ",
+    "img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'self'; ",
     "base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 );
 
-/// A handler's request for [`TERMINAL_CONTENT_SECURITY_POLICY`].
+/// The policy for `…/terminal?embed=1`, the variant the machine detail page
+/// frames.
+///
+/// It differs from the terminal policy in exactly one token: `frame-ancestors`
+/// is `'self'` rather than `'none'`, so this one document may be framed, and
+/// only by this same origin. The standalone terminal page stays unframeable.
+const TERMINAL_EMBED_CONTENT_SECURITY_POLICY: &str = concat!(
+    "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; ",
+    "img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'self'; ",
+    "base-uri 'none'; form-action 'self'; frame-ancestors 'self'"
+);
+
+/// A handler's request for one of the two wasm-capable policies.
 ///
 /// The relaxation is a property of one response, not of a route table or a
 /// path prefix, so it travels with the response the handler built: the
@@ -67,8 +83,14 @@ const TERMINAL_CONTENT_SECURITY_POLICY: &str = concat!(
 /// [`security_headers`] reads it back. A route that never inserts it cannot
 /// acquire the weaker policy by being renamed, moved, or matched by a
 /// wildcard, and nothing outside this crate can construct one.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct WasmPolicy;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WasmPolicy {
+    /// The full-window terminal page: wasm, and framed by nobody.
+    Standalone,
+    /// The `embed=1` variant the detail page frames: wasm, framed by this
+    /// origin only.
+    Embedded,
+}
 
 /// A 32-byte session secret for the loopback transport.
 ///
@@ -309,15 +331,15 @@ pub fn secured(app: Router, gate: Option<LoopbackGate>) -> Router {
 
 async fn security_headers(request: Request<Body>, next: Next) -> Response {
     let mut response = next.run(request).await;
-    // One response in the whole application asks for the wasm-capable policy,
-    // and it asks by marking itself. Everything else — every screen, every
-    // fragment, every asset, and every rejection this gate itself produces —
-    // gets the strict policy, including a response that merely 404s a path
-    // that looks like the terminal's.
-    let policy = if response.extensions().get::<WasmPolicy>().is_some() {
-        TERMINAL_CONTENT_SECURITY_POLICY
-    } else {
-        CONTENT_SECURITY_POLICY
+    // Two responses in the whole application ask for a wasm-capable policy,
+    // and they ask by marking themselves. Everything else — every screen,
+    // every fragment, every asset, and every rejection this gate itself
+    // produces — gets the strict policy, including a response that merely 404s
+    // a path that looks like the terminal's.
+    let policy = match response.extensions().get::<WasmPolicy>() {
+        Some(WasmPolicy::Standalone) => TERMINAL_CONTENT_SECURITY_POLICY,
+        Some(WasmPolicy::Embedded) => TERMINAL_EMBED_CONTENT_SECURITY_POLICY,
+        None => CONTENT_SECURITY_POLICY,
     };
     let headers = response.headers_mut();
     for (name, value) in [
@@ -1275,25 +1297,38 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn the_two_policies_differ_by_exactly_the_wasm_token() {
-        // The terminal page needs WebAssembly.compile and nothing else. If a
-        // future edit widens the relaxed policy in any other direction, this
-        // is where it has to be justified.
+    fn the_three_policies_differ_by_exactly_one_token_each() {
+        // The terminal page needs WebAssembly.compile and nothing else, and
+        // the embedded variant needs to be framable by this origin and nothing
+        // else. If a future edit widens either relaxation in any other
+        // direction, this is where it has to be justified.
         assert_eq!(
             super::TERMINAL_CONTENT_SECURITY_POLICY.replace(" 'wasm-unsafe-eval'", ""),
             super::CONTENT_SECURITY_POLICY
+        );
+        assert_eq!(
+            super::TERMINAL_EMBED_CONTENT_SECURITY_POLICY
+                .replace("frame-ancestors 'self'", "frame-ancestors 'none'"),
+            super::TERMINAL_CONTENT_SECURITY_POLICY
         );
         assert!(super::TERMINAL_CONTENT_SECURITY_POLICY.contains("'wasm-unsafe-eval'"));
         for policy in [
             super::CONTENT_SECURITY_POLICY,
             super::TERMINAL_CONTENT_SECURITY_POLICY,
+            super::TERMINAL_EMBED_CONTENT_SECURITY_POLICY,
         ] {
             assert!(!policy.contains("unsafe-inline"));
             assert!(!policy.contains("'unsafe-eval'"));
             assert!(policy.contains("default-src 'none'"));
             assert!(policy.contains("connect-src 'self'"));
-            assert!(policy.contains("frame-ancestors 'none'"));
+            // Framing is same-origin only, everywhere.
+            assert!(policy.contains("frame-src 'self'"));
+            assert!(!policy.contains("frame-src *"));
         }
+        // Only the embedded variant may be framed at all.
+        assert!(super::CONTENT_SECURITY_POLICY.contains("frame-ancestors 'none'"));
+        assert!(super::TERMINAL_CONTENT_SECURITY_POLICY.contains("frame-ancestors 'none'"));
+        assert!(super::TERMINAL_EMBED_CONTENT_SECURITY_POLICY.contains("frame-ancestors 'self'"));
     }
 
     #[tokio::test]
@@ -1307,7 +1342,19 @@ mod tests {
                     "/wasm",
                     get(|| async {
                         let mut response = axum::response::Response::new(Body::from("wasm"));
-                        response.extensions_mut().insert(super::WasmPolicy);
+                        response
+                            .extensions_mut()
+                            .insert(super::WasmPolicy::Standalone);
+                        response
+                    }),
+                )
+                .route(
+                    "/wasm-embed",
+                    get(|| async {
+                        let mut response = axum::response::Response::new(Body::from("embed"));
+                        response
+                            .extensions_mut()
+                            .insert(super::WasmPolicy::Embedded);
                         response
                     }),
                 ),
@@ -1317,6 +1364,7 @@ mod tests {
         for (uri, expected) in [
             ("/plain", super::CONTENT_SECURITY_POLICY),
             ("/wasm", super::TERMINAL_CONTENT_SECURITY_POLICY),
+            ("/wasm-embed", super::TERMINAL_EMBED_CONTENT_SECURITY_POLICY),
         ] {
             let response = send(
                 &app,
