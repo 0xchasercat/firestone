@@ -17,9 +17,14 @@ A forward with no bind address listens on every host address. Bind to `127.0.0.1
 
 ### Forwards apply on restart
 
-`passt` fixes its mappings when it spawns and offers no way to change them afterwards, and a Cloud Hypervisor vhost-user session does not survive a `passt` restart. There is no hot-apply for port forwards, and Firestone does not pretend otherwise.
+`passt` fixes its mappings when it spawns and offers no way to change them afterwards, and a Cloud Hypervisor vhost-user session does not survive a `passt` restart. There is no hot-apply for port forwards.
 
-Editing forwards on a running machine leaves the configured set and the applied set different. `ls` marks that row's `FORWARDS` cell with a trailing `*` and prints the legend `* forwards pending restart` after the table; the cell still shows the applied forwards, because those are the ones you can reach right now. `show` prints `forwards pending restart` to stderr, keeping stdout one valid JSON document. A spec write through `edit`, `PUT` or `PATCH` emits the warning `port forwards apply on restart`. The web interface renders a `pending restart` badge beside the forward chips, never instead of them.
+Editing forwards on a running machine creates a mismatch between the configured and active sets. To keep behavior predictable, the system handles pending forward changes across interfaces as follows:
+
+* `ls`: Appends an asterisk (`*`) to the `FORWARDS` cell and displays `* forwards pending restart` beneath the table. The cell continues displaying active forwards since those are the only reachable ports.
+* `show`: Prints active forwards to `stdout` (preserving clean JSON output) and writes `forwards pending restart` to `stderr`.
+* API / CLI Writes: Mutations via `edit`, `PUT`, or `PATCH` return a `port forwards apply on restart` warning.
+* Web UI: Appends a "pending restart" badge next to the active forward chips.
 
 `firestone restart NAME` clears it. Nothing else does.
 
@@ -69,4 +74,4 @@ firestone create review ubuntu --mount "$PWD:/src:ro"
 
 Firestone starts one pinned `virtiofsd` per mount. Treat a read-write mount as guest write access to that host tree, because that is what it is. A `:ro` mount limits guest writes, but it is not a reason to share a tree holding secrets. If user namespaces are unavailable, doctor warns that `virtiofsd` runs with `--sandbox none`.
 
-Static addressing for a tap guest is in [cloud-init](cloud-init.md), and the trust boundaries a forward or a mount opens are in [security](security.md). The page list is in the [documentation index](README.md).
+Static addressing for a tap guest is in [cloud-init](cloud-init.md), and the trust boundaries a forward or a mount opens are in [security](security.md). The page list is in the [documentation index](./).

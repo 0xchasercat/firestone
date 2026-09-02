@@ -112,7 +112,7 @@ The default copy is a full qcow2 overlay copy that keeps the shared base, so pac
 
 Nothing runtime is carried over: no `known_hosts`, no seed, no VM configuration, no logs, no snapshots. The MAC address and the instance id are derived from the machine name at first start, so the clone allocates its own.
 
-Two limits are worth knowing before you clone something important. A source that pins `network.mac` explicitly passes that address to the clone verbatim, and Firestone warns naming both machines; change it before running both on the same L2 segment. And a copied overlay carries the guest's `/etc/machine-id` and `/etc/hostname`, because Firestone does not rewrite guest filesystems. Run `systemd-firstboot --setup-machine-id` inside the clone when a unique guest identity matters, or use `--fresh-disk`.
+Two limits before you clone something important. A source that pins `network.mac` explicitly passes that address to the clone verbatim, and Firestone warns naming both machines; change it before running both on the same L2 segment. And a copied overlay carries the guest's `/etc/machine-id` and `/etc/hostname`, because Firestone does not rewrite guest filesystems. Run `systemd-firstboot --setup-machine-id` inside the clone when a unique guest identity matters, or use `--fresh-disk`.
 
 ## Resize
 
@@ -146,7 +146,7 @@ Disk is deliberately not part of `resize`. Raise `disk` in the spec and start th
 firestone metrics dev
 ```
 
-```text
+```
 sampled at 2026-09-02T12:00:00Z
 cpu       2 vcpus, 9500000000 ns cpu time
 memory    - bytes rss, 2147483648 bytes allocated, 1073741824 bytes guest actual
@@ -161,4 +161,4 @@ An unavailable figure prints as `-` and serializes as `null`. It is never a zero
 
 A machine that is not running fails with `conflict`, which is exit code 4 and HTTP 409.
 
-Related: [images](images.md) for what a machine boots, [networking](networking.md) for forwards and mounts, and [cloud-init](cloud-init.md) for provisioning. The page list is in the [documentation index](README.md).
+Related: [images](images.md) for what a machine boots, [networking](networking.md) for forwards and mounts, and [cloud-init](cloud-init.md) for provisioning. The page list is in the [documentation index](./).

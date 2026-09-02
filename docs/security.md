@@ -1,6 +1,6 @@
 # Security
 
-The trust boundaries Firestone claims, plus every path it resolves and every file it keeps.
+Firestone's security posture and trust boundaries.
 
 ## Security model
 
@@ -22,12 +22,12 @@ Cloud-init inputs and rendered seed files stay on disk in the machine directory.
 
 Firestone resolves every path once, at process startup:
 
-| Purpose | Default | Override |
-|---|---|---|
-| Config | `$XDG_CONFIG_HOME/firestone`, else `~/.config/firestone` | `FIRESTONE_CONFIG_DIR` |
-| Data | `$XDG_DATA_HOME/firestone`, else `~/.local/share/firestone` | `FIRESTONE_DATA_DIR` |
-| Runtime | `$XDG_RUNTIME_DIR/firestone`, else `/tmp/firestone-<uid>` | `FIRESTONE_RUNTIME_DIR` |
-| Isolated root | Not set by default | `FIRESTONE_HOME`, or `--home`, which maps to `config`, `data` and `run` children |
+| Purpose       | Default                                                     | Override                                                                         |
+| ------------- | ----------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| Config        | `$XDG_CONFIG_HOME/firestone`, else `~/.config/firestone`    | `FIRESTONE_CONFIG_DIR`                                                           |
+| Data          | `$XDG_DATA_HOME/firestone`, else `~/.local/share/firestone` | `FIRESTONE_DATA_DIR`                                                             |
+| Runtime       | `$XDG_RUNTIME_DIR/firestone`, else `/tmp/firestone-<uid>`   | `FIRESTONE_RUNTIME_DIR`                                                          |
+| Isolated root | Not set by default                                          | `FIRESTONE_HOME`, or `--home`, which maps to `config`, `data` and `run` children |
 
 Use an isolated root for experiments, so nothing you try touches your real machines:
 
@@ -38,13 +38,13 @@ firestone --home "$PWD/.firestone-sandbox" create sandbox ubuntu
 
 Under the data directory:
 
-- `bin/` holds checksum-verified pinned binaries.
-- `ssh/id_ed25519` and its `.pub` are Firestone's identity.
-- `images/image-<digest>.qcow2` and a JSON sidecar are one stored base image.
-- `machines/<name>/firestone.toml` is desired state, mode 0600.
-- `machines/<name>/state.json` is runtime facts.
-- `machines/<name>/` also holds `disk.qcow2`, `seed.img` or `config.img`, `vmconfig.json`, `known_hosts`, `snapshots/` and the logs.
+* `bin/` holds checksum-verified pinned binaries.
+* `ssh/id_ed25519` and its `.pub` are Firestone's identity.
+* `images/image-<digest>.qcow2` and a JSON sidecar are one stored base image.
+* `machines/<name>/firestone.toml` is desired state, mode 0600.
+* `machines/<name>/state.json` is runtime facts.
+* `machines/<name>/` also holds `disk.qcow2`, `seed.img` or `config.img`, `vmconfig.json`, `known_hosts`, `snapshots/` and the logs.
 
-Change desired state with `firestone edit NAME`, a REST `PUT` or `PATCH`, or the web interface's edit dialog. Do not hand-edit `state.json`, a lock file, an image sidecar, a socket or a pid file. Those are Firestone's record of what is true, not what you want.
+Change desired state with `firestone edit NAME`, a REST `PUT` or `PATCH`, or the web interface's edit dialog. Do not hand-edit `state.json`, a lock file, an image sidecar, a socket or a pid file.&#x20;
 
-How cloud-init secrets are stored is in [cloud-init](cloud-init.md), and the listener modes are in [CLI and REST](cli-and-rest.md). The page list is in the [documentation index](README.md).
+How cloud-init secrets are stored is in [cloud-init](cloud-init.md), and the listener modes are in [CLI and REST](cli-and-rest.md). The page list is in the [documentation index](./).
