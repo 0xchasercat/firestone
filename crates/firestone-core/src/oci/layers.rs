@@ -312,8 +312,8 @@ pub fn append_firestone_init<W: Write>(
     output: &mut W,
     init_binary: &[u8],
 ) -> Result<(), FirestoneError> {
-    write_injected_marker(output)?;
-    write_injected_init(output, init_binary)
+    write_injected_marker(output, FIRESTONE_OCI_MARKER_PATH.as_bytes())?;
+    write_injected_init(output, FIRESTONE_INIT_PATH.as_bytes(), init_binary)
 }
 
 /// A surviving member, keyed in the plan by its normalized path.
@@ -324,6 +324,9 @@ struct MergedEntry {
     kind: MergedKind,
     link_target: Option<Vec<u8>>,
     local_target: Option<(u64, u64)>,
+    /// A symlink's target exactly as the layer recorded it, kept so the
+    /// injection can resolve its own parent through the tree's own links.
+    symlink_target: Option<Vec<u8>>,
 }
 
 /// The classes of member the overlay rules distinguish.
@@ -382,7 +385,9 @@ fn build_plan(request: &MergeRequest<'_>) -> Result<MergePlan, FirestoneError> {
             }
 
             let Some(path) = normalize_entry_path(&member.path, &label)? else {
-                // The archive's own root directory entry: nothing to merge.
+                // The archive's own root directory entry: nothing to merge,
+                // but its payload still has to be stepped over.
+                cursor.skip_data()?;
                 continue;
             };
             let (parent, name) = split_last_component(&path);
@@ -420,6 +425,9 @@ fn build_plan(request: &MergeRequest<'_>) -> Result<MergePlan, FirestoneError> {
                 let local_target = link_target
                     .as_ref()
                     .and_then(|target| local_files.get(target).copied());
+                let symlink_target = (kind == MergedKind::Symlink)
+                    .then(|| member.link.clone())
+                    .flatten();
                 entries.insert(
                     path,
                     MergedEntry {
@@ -428,6 +436,7 @@ fn build_plan(request: &MergeRequest<'_>) -> Result<MergePlan, FirestoneError> {
                         kind,
                         link_target,
                         local_target,
+                        symlink_target,
                     },
                 );
             }
@@ -513,10 +522,13 @@ fn write_merged<W: Write>(
         .enumerate()
         .map(|(index, source)| LayerCursor::new(index, *source))
         .collect();
+    let init_path = resolve_injection_path(&plan.entries, FIRESTONE_INIT_PATH.as_bytes());
+    let marker_path = resolve_injection_path(&plan.entries, FIRESTONE_OCI_MARKER_PATH.as_bytes());
     let mut injected: Vec<&[u8]> = Vec::new();
     if request.injected_init.is_some() {
-        injected.push(FIRESTONE_OCI_MARKER_PATH.as_bytes());
-        injected.push(FIRESTONE_INIT_PATH.as_bytes());
+        injected.push(marker_path.as_slice());
+        injected.push(init_path.as_slice());
+        injected.sort_unstable();
     }
     let init_binary = request.injected_init.unwrap_or_default();
     let mut injected_index = 0usize;
@@ -530,6 +542,7 @@ fn write_merged<W: Write>(
             unpacked = unpacked.saturating_add(write_injected(
                 output,
                 injected[injected_index],
+                &init_path,
                 init_binary,
             )?);
             injected_index += 1;
@@ -552,6 +565,7 @@ fn write_merged<W: Write>(
         unpacked = unpacked.saturating_add(write_injected(
             output,
             injected[injected_index],
+            &init_path,
             init_binary,
         )?);
         injected_index += 1;
@@ -679,34 +693,41 @@ fn write_entry<W: Write>(
 fn write_injected<W: Write>(
     output: &mut W,
     path: &[u8],
+    init_path: &[u8],
     init_binary: &[u8],
 ) -> Result<u64, FirestoneError> {
-    if path == FIRESTONE_INIT_PATH.as_bytes() {
-        write_injected_init(output, init_binary)?;
+    if path == init_path {
+        write_injected_init(output, path, init_binary)?;
         Ok(init_binary.len() as u64)
     } else {
-        write_injected_marker(output)?;
+        write_injected_marker(output, path)?;
         Ok(0)
     }
 }
 
 /// Writes the empty `/etc/firestone-oci` marker.
-fn write_injected_marker<W: Write>(output: &mut W) -> Result<(), FirestoneError> {
-    let header = injected_header(FIRESTONE_OCI_MARKER_PATH, 0o644, 0)?;
+fn write_injected_marker<W: Write>(output: &mut W, path: &[u8]) -> Result<(), FirestoneError> {
+    let header = injected_header(path, 0o644, 0)?;
     output.write_all(header.as_bytes()).map_err(write_error)
 }
 
 /// Writes the `/sbin/firestone-init` regular file.
-fn write_injected_init<W: Write>(output: &mut W, init_binary: &[u8]) -> Result<(), FirestoneError> {
+fn write_injected_init<W: Write>(
+    output: &mut W,
+    path: &[u8],
+    init_binary: &[u8],
+) -> Result<(), FirestoneError> {
     let size = init_binary.len() as u64;
-    let header = injected_header(FIRESTONE_INIT_PATH, 0o755, size)?;
+    let header = injected_header(path, 0o755, size)?;
     output.write_all(header.as_bytes()).map_err(write_error)?;
     output.write_all(init_binary).map_err(write_error)?;
     write_padding(output, size)
 }
 
 /// Builds a deterministic ustar header for an injected member.
-fn injected_header(path: &str, mode: u32, size: u64) -> Result<Header, FirestoneError> {
+fn injected_header(path: &[u8], mode: u32, size: u64) -> Result<Header, FirestoneError> {
+    let rendered = String::from_utf8_lossy(path).into_owned();
+    let path = rendered.as_str();
     let mut header = Header::new_ustar();
     header
         .set_path(path)
@@ -776,6 +797,73 @@ fn split_last_component(path: &[u8]) -> (&[u8], &[u8]) {
         Some(index) => (&path[..index], &path[index + 1..]),
         None => (&[], path),
     }
+}
+
+/// How many symlinks one injection path may traverse before it gives up.
+const MAX_INJECTION_LINK_HOPS: usize = 8;
+
+/// Lexically joins a target onto a base, resolving `.` and `..` inside the root.
+///
+/// An absolute target starts again from the root, and a `..` that would leave
+/// the root is clamped there, so the result always names a path inside the
+/// merged tree.
+fn lexical_join(base: &[u8], target: &[u8]) -> Vec<u8> {
+    let mut components: Vec<&[u8]> = Vec::new();
+    let absolute = target.first() == Some(&b'/');
+    let sources: [&[u8]; 2] = if absolute {
+        [b"", target]
+    } else {
+        [base, target]
+    };
+    for source in sources {
+        for component in source.split(|byte| *byte == b'/') {
+            match component {
+                b"" | b"." => {}
+                b".." => {
+                    components.pop();
+                }
+                other => components.push(other),
+            }
+        }
+    }
+    components.join(&b'/')
+}
+
+/// Resolves one injected member's path through the merged tree's own symlinks.
+///
+/// SPEC §8.5 injects `/sbin/firestone-init`, and every usrmerged image — Debian,
+/// Ubuntu, and the long tail built on them, `nginx:latest` included — ships
+/// `sbin` as a symlink to `usr/sbin`. A tar member written under a symlinked
+/// parent is not a file in the directory that link names, and the pinned
+/// `mkfs.ext4` refuses the archive rather than guessing. Resolving the parent
+/// here puts the payload in the real directory; the guest kernel's
+/// `init=/sbin/firestone-init` still reaches it, because it follows the same
+/// link.
+fn resolve_injection_path(entries: &BTreeMap<Vec<u8>, MergedEntry>, path: &[u8]) -> Vec<u8> {
+    let (parent, name) = split_last_component(path);
+    let mut resolved: Vec<u8> = Vec::new();
+    for component in parent.split(|byte| *byte == b'/') {
+        if component.is_empty() {
+            continue;
+        }
+        let mut candidate = join_path(&resolved, component);
+        for _ in 0..MAX_INJECTION_LINK_HOPS {
+            let Some(target) = entries
+                .get(&candidate)
+                .and_then(|entry| entry.symlink_target.as_deref())
+            else {
+                break;
+            };
+            let (link_parent, _) = split_last_component(&candidate);
+            let next = lexical_join(link_parent, target);
+            if next.is_empty() || next == candidate {
+                break;
+            }
+            candidate = next;
+        }
+        resolved = candidate;
+    }
+    join_path(&resolved, name)
 }
 
 /// Joins a normalized parent with one component.
@@ -1784,6 +1872,85 @@ mod tests {
         assert_eq!(injected.mode, 0o755);
         assert_eq!((injected.uid, injected.gid), (0, 0));
         assert_eq!(injected.data, init);
+        Ok(())
+    }
+
+    /// Every usrmerged image ships `sbin` as a symlink to `usr/sbin`, and a tar
+    /// member under a symlinked parent is not a file in the directory the link
+    /// names. The injection follows the tree's own link instead (SPEC §8.5).
+    #[test]
+    fn merge_layers_injection_follows_a_usrmerged_sbin_symlink() -> TestResult {
+        let layer = build_layer(&[
+            symlink_entry("sbin", "usr/sbin"),
+            dir_entry("usr"),
+            dir_entry("usr/sbin"),
+        ])?;
+        let init = b"init-binary-bytes".as_slice();
+
+        let entries = read_back(&merge_with(&[layer], MergeLimits::default(), Some(init))?)?;
+
+        assert_eq!(
+            paths(&entries),
+            vec![
+                "etc/firestone-oci",
+                "sbin",
+                "usr",
+                "usr/sbin",
+                "usr/sbin/firestone-init"
+            ]
+        );
+        let injected =
+            find(&entries, "usr/sbin/firestone-init").ok_or("firestone-init is missing")?;
+        assert_eq!(injected.entry_type, EntryType::Regular);
+        assert_eq!(injected.mode, 0o755);
+        assert_eq!(injected.data, init);
+        let link = find(&entries, "sbin").ok_or("the sbin symlink is missing")?;
+        assert_eq!(link.entry_type, EntryType::Symlink);
+        assert_eq!(link.link.as_deref(), Some("usr/sbin"));
+        Ok(())
+    }
+
+    /// An absolute link, a relative one with `..`, and a chain all resolve.
+    #[test]
+    fn merge_layers_injection_resolves_absolute_relative_and_chained_links() -> TestResult {
+        for (target, expected) in [
+            ("/usr/sbin", "usr/sbin/firestone-init"),
+            ("../usr/sbin", "usr/sbin/firestone-init"),
+        ] {
+            let layer = build_layer(&[
+                symlink_entry("sbin", target),
+                dir_entry("usr"),
+                dir_entry("usr/sbin"),
+            ])?;
+            let entries = read_back(&merge_with(
+                &[layer],
+                MergeLimits::default(),
+                Some(b"init".as_slice()),
+            )?)?;
+            assert!(
+                find(&entries, expected).is_some(),
+                "{target} did not resolve to {expected}: {:?}",
+                paths(&entries)
+            );
+        }
+        // A chain resolves link by link, and the second hop is relative to the
+        // link's own directory, exactly as the kernel resolves it.
+        let chained = build_layer(&[
+            symlink_entry("sbin", "usr/sbin"),
+            dir_entry("usr"),
+            dir_entry("usr/bin"),
+            symlink_entry("usr/sbin", "bin"),
+        ])?;
+        let entries = read_back(&merge_with(
+            &[chained],
+            MergeLimits::default(),
+            Some(b"init".as_slice()),
+        )?)?;
+        assert!(
+            find(&entries, "usr/bin/firestone-init").is_some(),
+            "a chained link did not resolve: {:?}",
+            paths(&entries)
+        );
         Ok(())
     }
 
