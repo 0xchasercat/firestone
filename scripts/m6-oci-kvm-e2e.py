@@ -823,11 +823,18 @@ def scenario_digest_reference(
         "the digest-pinned reference selected a different manifest",
     )
     require(
-        sidecar["stored_sha256"] == tagged["stored_sha256"],
-        "the digest-pinned pull packed different bytes than the tagged pull",
+        sidecar["oci"]["config_digest"] == tagged["config_digest"],
+        "the digest-pinned reference resolved a different image config",
     )
-    # SPEC 8.5: the stable id hashes the canonical reference too, so a digest
-    # reference is its own image even when it packs identical bytes.
+    require(
+        sidecar["oci"]["entrypoint"] == tagged["entrypoint"]
+        and sidecar["oci"]["cmd"] == tagged["cmd"],
+        "the digest-pinned reference produced a different runtime configuration",
+    )
+    # SPEC 8.5: the stable id hashes the canonical reference alongside the
+    # manifest digest, so a digest reference is its own image. Its packed bytes
+    # differ too, because `mkfs.ext4` assigns a fresh filesystem UUID on every
+    # run; SPEC fixes the canonical tar, not the ext4 image built from it.
     require(image_id != tagged["image_id"], "the digest reference reused the tagged image id")
     console = wait_for_console(harness, name, "started `/bin/sh` as pid", CONSOLE_WAIT_SECONDS)
     require(INIT_PREFIX in console, "the digest-pinned machine did not run firestone-init")
@@ -845,8 +852,11 @@ def scenario_digest_reference(
         "tagged_image_id": tagged["image_id"],
         "manifest_digest": sidecar["oci"]["manifest_digest"],
         "stored_sha256": sidecar["stored_sha256"],
-        "identical_bytes": True,
+        "tagged_stored_sha256": tagged["stored_sha256"],
+        "identical_manifest_and_config": True,
         "distinct_stable_id": True,
+        "packed_bytes_differ_by_ext4_uuid": sidecar["stored_sha256"]
+        != tagged["stored_sha256"],
     }
 
 
