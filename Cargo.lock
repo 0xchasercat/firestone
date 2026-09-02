@@ -532,7 +532,7 @@ checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
 name = "firestone"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "clap",
@@ -569,7 +569,7 @@ dependencies = [
 
 [[package]]
 name = "firestone-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "fatfs",
  "firestone-initproto",
@@ -599,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "firestone-init"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "firestone-initproto",
  "nix",
@@ -607,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "firestone-initproto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
