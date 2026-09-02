@@ -6,10 +6,15 @@
   nothing here is an htmx swap — the only live thing is the WebSocket term.js
   opens against the §16.3 transports.
 
-  This is also the one response that carries the relaxed policy
+  This is also the one page that carries the relaxed policy
   `script-src 'self' 'wasm-unsafe-eval'`, which the handler selects by marking
   the response. Every script below is still a same-origin file: there is no
   inline script and no inline style anywhere on this page.
+
+  `embed=1` renders the same page without its chrome, for the machine detail
+  screen's Console tab to frame, and that response is the only one whose
+  `frame-ancestors` is `'self'`. Framing is how the wasm token stays on this
+  document instead of spreading to the detail screen.
 -#}
 {%- import "ui/_macros.html" as m -%}
 <!DOCTYPE html>
@@ -25,11 +30,12 @@
 <script src="/ui/static/theme.js?v={{ build }}"></script>
 <script src="/ui/static/term.js?v={{ build }}" defer></script>
 </head>
-<body class="fs-termbody">
+<body class="fs-termbody{% if terminal.embed %} fs-termbody--embed{% endif %}">
 <div class="fs-term"
      id="fs-term"
      data-fs-machine="{{ terminal.name }}"
      data-fs-tab="{{ terminal.tab }}"
+     data-fs-full-url="/machines/{{ terminal.slug }}/terminal?tab={{ terminal.tab }}"
      data-fs-console-url="/v1/machines/{{ terminal.slug }}/console/ws"
      data-fs-shell-url="/v1/machines/{{ terminal.slug }}/shell/ws"
      data-fs-state-url="/v1/machines/{{ terminal.slug }}"
@@ -37,10 +43,20 @@
      data-fs-wasm-url="/ui/static/ghostty-vt.wasm?v={{ build }}">
 
   <header class="fs-term__bar">
+    {# Framed inside the detail page, the machine name and the way back are
+       already on screen. What the frame needs instead is the way out, and
+       term.js closes the socket on it before the top window moves. #}
+    {% if terminal.embed %}
+    <button type="button" class="fs-term__expand" id="fs-term-expand">
+      <span class="fs-term__expand-icon" aria-hidden="true">⤢</span>
+      <span>Expand</span>
+    </button>
+    {% else %}
     <a class="fs-term__back" href="/machines/{{ terminal.slug }}">
       <span class="fs-term__back-arrow" aria-hidden="true">←</span>
       <span class="fs-term__back-name">{{ terminal.name }}</span>
     </a>
+    {% endif %}
     {{ m.status(terminal.status, true) }}
 
     <div class="fs-term__tabs" role="tablist" aria-label="Terminal transport">

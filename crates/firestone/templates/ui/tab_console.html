@@ -1,0 +1,25 @@
+{#-
+  The Console tab (SPEC §16.5.6).
+
+  The terminal is embedded here rather than reached by leaving the page, so
+  attaching to a machine is one click from the machine you are already looking
+  at. It is an <iframe> and not markup on this page for one reason: the
+  emulator needs `'wasm-unsafe-eval'`, and framing keeps that token on the
+  terminal document instead of spreading it to the whole detail screen. The
+  framed response is the only one in the application whose `frame-ancestors`
+  is `'self'`.
+
+  The expand control lives inside the frame, where term.js can close the
+  socket before the top window navigates: the console broker is single-client,
+  and the full page is about to ask for the same one.
+-#}
+<div class="fs-tabpanel">
+  <div class="fs-console" data-fs-console="{{ machine.name }}">
+    <iframe class="fs-console__frame"
+            title="{{ machine.name }} terminal"
+            src="/machines/{{ machine.name | urlencode }}/terminal?embed=1"></iframe>
+  </div>
+  <span class="fs-note fs-note--footer">
+    console and shell over the /v1 WebSocket transports · single client each
+  </span>
+</div>

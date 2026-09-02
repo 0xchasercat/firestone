@@ -9,11 +9,12 @@
     {% if vmconfig %}
     <pre class="fs-code">{{ vmconfig }}</pre>
     {% else %}
+    {# No raw refusal here. A machine that has never started has no config
+       file, and the message naming that missing path reads as a fault. #}
     {{ m.empty(
         "config",
-        "No config published yet",
-        "Firestone writes the canonical VmConfig when the machine first starts."
-          ~ (" · " ~ unavailable if unavailable else "")
+        "No config yet",
+        "Generated when the machine first starts."
     ) }}
     {% endif %}
   </div>

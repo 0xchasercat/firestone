@@ -2,7 +2,7 @@
   <div class="fs-page-head">
     <div>
       <h1 class="fs-page-head__title">Image catalog</h1>
-      <div class="fs-page-head__sub">Merged built-in + user catalog, independent of the local image cache</div>
+      <div class="fs-page-head__sub">Images this host can run</div>
     </div>
     <div class="fs-page-head__actions" data-fs-notice-slot>
       <input class="fs-input fs-input--mono fs-input--ref"
@@ -37,10 +37,7 @@
   <div class="fs-page-head fs-page-head--section">
     <div>
       <h2 class="fs-page-head__title fs-page-head__title--section">Cached images</h2>
-      <div class="fs-page-head__sub">
-        The local image store. A machine pins the exact image it booted, so an
-        image something references is refused rather than silently removed.
-      </div>
+      <div class="fs-page-head__sub">Images on this host's disk</div>
     </div>
     <div class="fs-page-head__actions" data-fs-notice-slot>
       <button type="button" class="fs-btn" data-fs-prune="images">Prune unused images</button>

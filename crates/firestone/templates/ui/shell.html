@@ -91,14 +91,13 @@
     <div class="fs-dialog__body">
       <p data-fs-snapshot-tier="cold" hidden>
         <strong data-fs-snapshot-name></strong> is not running, so this is a
-        <strong>cold</strong> snapshot: a file copy of its disk and spec, and
-        guaranteed as such.
+        <strong>cold</strong> snapshot: a file copy of its disk and spec.
       </p>
       <p data-fs-snapshot-tier="warm" hidden>
         <strong data-fs-snapshot-name></strong> is running, so this is a
-        <strong>warm</strong> snapshot. Firestone pauses the guest, writes its
-        memory and its disk, then resumes it. The pause is brief but it is real,
-        and the guest observes it.
+        <strong>warm</strong> snapshot. The guest pauses while its memory and
+        disk are written, then resumes. The pause is brief, and the guest
+        observes it.
       </p>
       <label class="fs-field">
         <span class="fs-field__label">Snapshot name <span class="fs-field__opt">optional</span></span>

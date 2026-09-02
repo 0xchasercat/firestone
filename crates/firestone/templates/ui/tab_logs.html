@@ -1,3 +1,4 @@
+{% import "ui/_macros.html" as m %}
 <div class="fs-tabpanel">
   <div class="fs-panel fs-panel--clip">
     <div class="fs-logbar">
@@ -21,6 +22,16 @@
       </button>
     </div>
 
+    {# A machine that has never started has written nothing, which is an
+       ordinary state rather than a failure: the read is quiet on this path
+       and the empty state stands in for the transcript. app.js clears it and
+       reveals the <pre> as soon as a byte arrives on the follow stream. #}
+    {% if not logs %}
+    <div data-fs-logview-empty>
+      {{ m.empty("config", "No output yet", "Output appears once the machine starts.") }}
+    </div>
+    {% endif %}
+
     {# Sanitized text/plain from the API: newlines and SGR colour preserved,
        every other escape sequence already replaced with U+FFFD. Inserted as
        text; app.js then turns the surviving SGR into classed spans. #}
@@ -30,6 +41,7 @@
          data-fs-source="{{ source }}"
          data-fs-follow="{{ 'true' if follow else 'false' }}"
          tabindex="0"
+         {% if not logs %}hidden{% endif %}
          aria-label="{{ source }} log for {{ machine.name }}">{{ logs }}</pre>
 
     <div class="fs-panel__foot">

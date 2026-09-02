@@ -44,7 +44,11 @@ pub struct CachedImageMetadata {
 pub struct VersionInfo {
     pub version: String,
     pub architecture: String,
+    /// The one version string a page prints: `firestone 0.2.1`.
     pub identity: String,
+    /// Release and commit, for the hover title beside that string. The commit
+    /// is worth having and is not worth a line of chrome on every screen.
+    pub detail: String,
     pub paths: VersionPathsInfo,
 }
 
@@ -65,10 +69,8 @@ impl From<&VersionResult> for VersionInfo {
         Self {
             version: result.version.clone(),
             architecture: result.architecture.clone(),
-            identity: format!(
-                "firestone {} · release {}{commit}",
-                result.version, result.identity.release
-            ),
+            identity: format!("firestone {}", result.version),
+            detail: format!("release {}{commit}", result.identity.release),
             paths: VersionPathsInfo {
                 config: result.paths.config.clone(),
                 data: result.paths.data.clone(),
@@ -86,6 +88,7 @@ impl VersionInfo {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             architecture: "unknown".to_owned(),
             identity: format!("firestone {}", env!("CARGO_PKG_VERSION")),
+            detail: String::new(),
             paths: VersionPathsInfo {
                 config: String::new(),
                 data: String::new(),
@@ -433,7 +436,12 @@ pub struct MachineDetail {
 }
 
 impl MachineDetail {
-    pub fn new(name: &str, view: &MachineView) -> Self {
+    /// `host_arch` is the architecture the version action reports for this
+    /// host. It is what the spec tab prints when `arch` is unset, because
+    /// "unset" means "whatever this host is" and the reader wants the answer
+    /// rather than the rule. An empty string means the version read failed;
+    /// the row then says `host default` and claims no architecture.
+    pub fn new(name: &str, view: &MachineView, host_arch: &str) -> Self {
         let status = status_token(view.state.status);
         let (action, action_label_long) = match view.state.status {
             MachineStatus::Running => (Some("stop"), "Stop"),
@@ -456,7 +464,7 @@ impl MachineDetail {
             action_label_long,
             is_running: view.state.status == MachineStatus::Running,
             meta: meta_rows(&view.state, view.supervision.is_some()),
-            spec_groups: spec_groups(&view.spec),
+            spec_groups: spec_groups(&view.spec, host_arch),
             forwards_pending: view.forwards_pending,
             // The applied set, exactly as §12.5 defines it: what a client can
             // reach right now, never the configured set the spec holds.
@@ -567,7 +575,14 @@ fn meta_rows(state: &MachineState, supervised: bool) -> Vec<Pair> {
     rows
 }
 
-fn spec_groups(spec: &MachineSpec) -> Vec<SpecGroup> {
+/// The spec tab, rendered for a reader rather than for a debugger.
+///
+/// A spec leaf the operator did not set is a fact about the machine, not a
+/// JSON token: `null`, `[]`, `true` and `unset` all say "read the schema
+/// first". Every row here answers in words instead — `not set`, `none`, `on`,
+/// `off` — and an unset `arch` prints the architecture this host will actually
+/// give the machine (SPEC §16.5.9).
+fn spec_groups(spec: &MachineSpec, host_arch: &str) -> Vec<SpecGroup> {
     vec![
         SpecGroup {
             title: "Resources",
@@ -580,7 +595,7 @@ fn spec_groups(spec: &MachineSpec) -> Vec<SpecGroup> {
                     key: "arch",
                     value: spec
                         .arch
-                        .map_or_else(|| "null (host)".to_owned(), |arch| arch.to_string()),
+                        .map_or_else(|| host_default_arch(host_arch), |arch| arch.to_string()),
                 },
                 Pair {
                     key: "cpus",
@@ -617,7 +632,7 @@ fn mounts_group(mounts: &[MountSpec]) -> SpecGroup {
         rows: if mounts.is_empty() {
             vec![Pair {
                 key: "mount",
-                value: "[]".to_owned(),
+                value: none(),
             }]
         } else {
             mounts
@@ -649,7 +664,7 @@ fn network_group(network: &NetworkSpec) -> SpecGroup {
             Pair {
                 key: "forward",
                 value: if network.forward.is_empty() {
-                    "[]".to_owned()
+                    none()
                 } else {
                     network
                         .forward
@@ -661,14 +676,14 @@ fn network_group(network: &NetworkSpec) -> SpecGroup {
             },
             Pair {
                 key: "tap",
-                value: network.tap.clone().unwrap_or_else(null),
+                value: network.tap.clone().unwrap_or_else(not_set),
             },
             Pair {
                 key: "mac",
                 value: network
                     .mac
                     .as_ref()
-                    .map_or_else(|| "null (generated)".to_owned(), ToString::to_string),
+                    .map_or_else(|| "generated at start".to_owned(), ToString::to_string),
             },
         ],
     }
@@ -680,13 +695,13 @@ fn cloud_init_group(cloud_init: &CloudInitSpec) -> SpecGroup {
         rows: vec![
             Pair {
                 key: "provisioning",
-                value: cloud_init.provisioning.to_string(),
+                value: on_off(cloud_init.provisioning),
             },
             // Paths only. Cloud-init contents are never read into the UI, and
             // never logged, per SPEC.
             Pair {
                 key: "user_data",
-                value: path_or_null(cloud_init.user_data.as_deref()),
+                value: path_or_unset(cloud_init.user_data.as_deref()),
             },
             // Inline user-data is configured content, so it is reported by
             // size and never by value: this fragment is rendered into a page,
@@ -697,16 +712,16 @@ fn cloud_init_group(cloud_init: &CloudInitSpec) -> SpecGroup {
                 value: cloud_init
                     .user_data_inline
                     .as_ref()
-                    .map_or_else(null, |inline| format!("{} bytes", inline.len())),
+                    .map_or_else(not_set, |inline| format!("{} bytes", inline.len())),
             },
             Pair {
                 key: "network_config",
-                value: path_or_null(cloud_init.network_config.as_deref()),
+                value: path_or_unset(cloud_init.network_config.as_deref()),
             },
             Pair {
                 key: "ssh_keys",
                 value: if cloud_init.ssh_keys.is_empty() {
-                    "[]".to_owned()
+                    none()
                 } else {
                     cloud_init
                         .ssh_keys
@@ -730,21 +745,21 @@ fn cloud_init_group(cloud_init: &CloudInitSpec) -> SpecGroup {
                 value: if cloud_init.password.is_some() {
                     "set".to_owned()
                 } else {
-                    "unset".to_owned()
+                    not_set()
                 },
             },
             Pair {
                 key: "ssh_pwauth",
-                value: cloud_init.ssh_pwauth.to_string(),
+                value: on_off(cloud_init.ssh_pwauth),
             },
         ],
     }
 }
 
-/// `[]` for nothing, otherwise a count with the right noun.
+/// `none` for nothing, otherwise a count with the right noun.
 fn count_or_empty(count: usize, singular: &str, plural: &str) -> String {
     match count {
-        0 => "[]".to_owned(),
+        0 => none(),
         1 => format!("1 {singular}"),
         _ => format!("{count} {plural}"),
     }
@@ -757,7 +772,7 @@ fn vmm_group(vmm: &VmmSpec) -> SpecGroup {
             Pair {
                 key: "binary",
                 value: vmm.binary.as_deref().map_or_else(
-                    || "null (embedded)".to_owned(),
+                    || "the embedded build".to_owned(),
                     |path| path.display().to_string(),
                 ),
             },
@@ -768,7 +783,7 @@ fn vmm_group(vmm: &VmmSpec) -> SpecGroup {
             Pair {
                 key: "extra_args",
                 value: if vmm.extra_args.is_empty() {
-                    "[]".to_owned()
+                    none()
                 } else {
                     vmm.extra_args.join(" ")
                 },
@@ -778,7 +793,7 @@ fn vmm_group(vmm: &VmmSpec) -> SpecGroup {
                 value: vmm
                     .config_overlay
                     .as_ref()
-                    .map_or_else(null, |_| "set".to_owned()),
+                    .map_or_else(not_set, |_| "set".to_owned()),
             },
         ],
     }
@@ -798,12 +813,34 @@ fn dash() -> String {
     "—".to_owned()
 }
 
-fn null() -> String {
-    "null".to_owned()
+/// An optional leaf the spec does not set.
+fn not_set() -> String {
+    "not set".to_owned()
 }
 
-fn path_or_null(path: Option<&std::path::Path>) -> String {
-    path.map_or_else(null, |path| path.display().to_string())
+/// A list with no members. "Empty" is a shape; "none" is the answer.
+fn none() -> String {
+    "none".to_owned()
+}
+
+/// A spec flag, read as a switch rather than as a JSON literal.
+fn on_off(value: bool) -> String {
+    if value { "on" } else { "off" }.to_owned()
+}
+
+/// What the machine gets when `arch` is unset: this host's own architecture,
+/// named. An empty `host_arch` means the version read failed, so the row says
+/// only that the host decides.
+fn host_default_arch(host_arch: &str) -> String {
+    if host_arch.is_empty() {
+        "host default".to_owned()
+    } else {
+        format!("{host_arch} (host default)")
+    }
+}
+
+fn path_or_unset(path: Option<&std::path::Path>) -> String {
+    path.map_or_else(not_set, |path| path.display().to_string())
 }
 
 /// One catalog card.
@@ -1150,11 +1187,13 @@ fn short_id(id: &str) -> String {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod feature_tests {
-    use firestone_core::{PortForward, SnapshotKind, SnapshotSummary};
+    use firestone_core::{
+        MachineSpec, MachineSpecPatch, PortForward, SnapshotKind, SnapshotSummary,
+    };
 
     use super::{
-        CachedImage, CachedImageMetadata, ForwardChip, forward_chips, forward_href, image_rows,
-        short_id, snapshot_rows,
+        CachedImage, CachedImageMetadata, ForwardChip, forward_chips, forward_href,
+        host_default_arch, image_rows, short_id, snapshot_rows, spec_groups,
     };
 
     fn chip(text: &str, href: &str, protocol: &'static str) -> ForwardChip {
@@ -1281,5 +1320,64 @@ mod feature_tests {
     fn short_id_keeps_a_shorter_identity_whole() {
         assert_eq!(short_id("sha256-abc"), "sha256-abc");
         assert_eq!(short_id(""), "");
+    }
+
+    /// The spec tab's whole rendering table, in one place.
+    ///
+    /// It used to print the spec's own JSON tokens, so a default machine read
+    /// as `null`, `[]`, `true` and `unset` down the page. Each of those is a
+    /// fact the reader wanted in words, and this is the table that says which
+    /// words.
+    #[test]
+    fn spec_rows_render_absent_values_as_words_rather_than_json_tokens() {
+        let spec = MachineSpec::from_layers(
+            &MachineSpecPatch::default(),
+            &MachineSpecPatch::default(),
+            &MachineSpecPatch::default(),
+        )
+        .expect("the default spec must build");
+
+        let rows: std::collections::BTreeMap<&str, String> = spec_groups(&spec, "x86_64")
+            .into_iter()
+            .flat_map(|group| group.rows)
+            .map(|row| (row.key, row.value))
+            .collect();
+
+        // An unset arch is this host's architecture, named.
+        assert_eq!(rows["arch"], "x86_64 (host default)");
+        // Absent optionals.
+        assert_eq!(rows["tap"], "not set");
+        assert_eq!(rows["user_data"], "not set");
+        assert_eq!(rows["user_data_inline"], "not set");
+        assert_eq!(rows["network_config"], "not set");
+        assert_eq!(rows["config_overlay"], "not set");
+        assert_eq!(rows["password"], "not set");
+        // Empty lists.
+        assert_eq!(rows["forward"], "none");
+        assert_eq!(rows["mount"], "none");
+        assert_eq!(rows["ssh_keys"], "none");
+        assert_eq!(rows["ssh_authorized_keys"], "none");
+        assert_eq!(rows["extra_args"], "none");
+        // Flags.
+        assert_eq!(rows["provisioning"], "on");
+        assert_eq!(rows["ssh_pwauth"], "off");
+        // Values that are a fact rather than an absence.
+        assert_eq!(rows["mac"], "generated at start");
+        assert_eq!(rows["binary"], "the embedded build");
+
+        // No row is a JSON token, on any value the default spec produces.
+        for (key, value) in &rows {
+            for token in ["null", "[]", "true", "false", "unset"] {
+                assert_ne!(value, token, "the {key} row still renders {token}");
+            }
+        }
+    }
+
+    /// A version read that failed leaves the host architecture unknown, and an
+    /// unknown architecture is not worth inventing.
+    #[test]
+    fn an_unknown_host_architecture_claims_none() {
+        assert_eq!(host_default_arch(""), "host default");
+        assert_eq!(host_default_arch("aarch64"), "aarch64 (host default)");
     }
 }

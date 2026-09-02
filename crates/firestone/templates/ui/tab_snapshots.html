@@ -10,14 +10,13 @@
   <div class="fs-subhead">
     <div>
       <div class="fs-subhead__title">Snapshots</div>
+      {# The tier and what it costs belong in the create dialog, where the
+         reader is deciding. Here the line says what the panel holds. #}
       <div class="fs-subhead__sub">
         {% if machine.is_running %}
-        A snapshot of a running machine is <strong>warm</strong>: Firestone pauses
-        the guest, writes its memory and disk, then resumes it. The pause is brief
-        but it is real, and the guest observes it.
+        Warm snapshots of {{ machine.name }} · the guest pauses briefly
         {% else %}
-        A snapshot of a machine that is not running is <strong>cold</strong>: a file
-        copy of a quiescent machine, and guaranteed as such.
+        Cold snapshots of {{ machine.name }}
         {% endif %}
       </div>
     </div>
@@ -74,7 +73,7 @@
     {{ m.empty(
         "snapshot",
         "No snapshots yet",
-        "A snapshot copies this machine's disk, its spec and — while it runs — its guest memory. Restoring one replaces all three, so the machine comes back to the configuration its disk was captured under."
+        "Take one to save this machine's disk and spec."
     ) }}
   </div>
   {% endif %}
