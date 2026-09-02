@@ -6,5 +6,6 @@ site:
       key: docs
       title: Documentation
       path: docs
+      default: true
       content:
         directory: ./docs
