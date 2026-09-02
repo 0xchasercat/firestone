@@ -381,7 +381,10 @@ fn build_plan(request: &MergeRequest<'_>) -> Result<MergePlan, FirestoneError> {
                 )));
             }
 
-            let path = normalize_entry_path(&member.path, &label)?;
+            let Some(path) = normalize_entry_path(&member.path, &label)? else {
+                // The archive's own root directory entry: nothing to merge.
+                continue;
+            };
             let (parent, name) = split_last_component(&path);
 
             if name == OPAQUE_MARKER {
@@ -578,7 +581,7 @@ fn write_entry<W: Write>(
     let member = cursor.seek_to(entry.ordinal)?;
     let label = cursor.label();
     let observed = normalize_entry_path(&member.path, &label)?;
-    if observed.as_slice() != path {
+    if observed.as_deref() != Some(path) {
         return Err(layer_error(
             format!("layer {label} changed while it was being merged"),
             "re-pull the image and merge it again",
@@ -788,7 +791,13 @@ fn join_path(parent: &[u8], name: &[u8]) -> Vec<u8> {
 }
 
 /// Normalizes and hardens an entry path.
-fn normalize_entry_path(raw: &[u8], layer: &str) -> Result<Vec<u8>, FirestoneError> {
+///
+/// `Ok(None)` means the member is the archive root itself. `./` and `.` are the
+/// root directory entry that GNU tar writes first, and a large share of real
+/// registry layers carry one; it names no content, cannot escape anything, and
+/// `mkfs.ext4 -d` owns the root directory's own metadata, so the merge skips it
+/// rather than refusing the whole image (SPEC §8.5).
+fn normalize_entry_path(raw: &[u8], layer: &str) -> Result<Option<Vec<u8>>, FirestoneError> {
     if raw.first() == Some(&b'/') {
         return Err(traversal_error(raw, layer, "the path is absolute"));
     }
@@ -796,13 +805,17 @@ fn normalize_entry_path(raw: &[u8], layer: &str) -> Result<Vec<u8>, FirestoneErr
 }
 
 /// Normalizes and hardens a hardlink target, tolerating a leading separator.
+///
+/// A link that resolves to the archive root names no member, so it stays an
+/// error here even though the root *entry* is now skipped.
 fn normalize_link_target(raw: &[u8], layer: &str) -> Result<Vec<u8>, FirestoneError> {
     let trimmed = raw.strip_prefix(b"/").unwrap_or(raw);
-    normalize_relative(trimmed, layer)
+    normalize_relative(trimmed, layer)?
+        .ok_or_else(|| traversal_error(raw, layer, "the path resolves to the archive root"))
 }
 
 /// Shared normalization: drops `.` and empty components, rejects `..` and NUL.
-fn normalize_relative(raw: &[u8], layer: &str) -> Result<Vec<u8>, FirestoneError> {
+fn normalize_relative(raw: &[u8], layer: &str) -> Result<Option<Vec<u8>>, FirestoneError> {
     if raw.is_empty() {
         return Err(traversal_error(raw, layer, "the path is empty"));
     }
@@ -824,13 +837,9 @@ fn normalize_relative(raw: &[u8], layer: &str) -> Result<Vec<u8>, FirestoneError
         }
     }
     if components.is_empty() {
-        return Err(traversal_error(
-            raw,
-            layer,
-            "the path resolves to the archive root",
-        ));
+        return Ok(None);
     }
-    Ok(components.join(&b'/'))
+    Ok(Some(components.join(&b'/')))
 }
 
 /// A PAX or GNU extension header captured verbatim.
@@ -1672,7 +1681,7 @@ mod tests {
 
     #[test]
     fn merge_layers_unsafe_entry_paths_are_rejected() -> TestResult {
-        for path in ["/etc/passwd", "../escape", "a/../../escape", "./"] {
+        for path in ["/etc/passwd", "../escape", "a/../../escape"] {
             let layer = build_layer(&[raw_name_entry(path)])?;
             let Err(error) = merge(&[layer]) else {
                 panic!("{path} must be rejected");
@@ -1681,6 +1690,41 @@ mod tests {
             assert!(error.message().contains("unsafe entry path"));
             assert!(error.hint().is_some());
         }
+        Ok(())
+    }
+
+    /// GNU tar writes the archive root as its first member, and a large share
+    /// of registry layers — `nginx:latest` among them — carry one. It names no
+    /// content and cannot escape, so it is skipped, not refused (SPEC §8.5).
+    #[test]
+    fn merge_layers_root_directory_entry_is_skipped_not_refused() -> TestResult {
+        for root in ["./", "."] {
+            let layer = build_layer(&[raw_name_entry(root), file_entry("etc/hostname", "app")])?;
+
+            let entries = read_back(&merge(&[layer])?)?;
+
+            assert_eq!(paths(&entries), vec!["etc/hostname"]);
+        }
+        Ok(())
+    }
+
+    /// A hard link that resolves to the archive root still names no member.
+    #[test]
+    fn merge_layers_hardlink_to_the_archive_root_is_rejected() -> TestResult {
+        let layer = build_layer(&[
+            file_entry("bin/real", "real"),
+            hardlink_entry("bin/link", "./"),
+        ])?;
+
+        let Err(error) = merge(&[layer]) else {
+            panic!("a hard link to the archive root must be rejected");
+        };
+        assert_eq!(error.kind(), ErrorKind::Dependency);
+        assert!(
+            error.message().contains("archive root"),
+            "{}",
+            error.message()
+        );
         Ok(())
     }
 
