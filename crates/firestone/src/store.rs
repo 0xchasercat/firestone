@@ -26,9 +26,10 @@ use firestone_core::{
     StateVersion, StopResult, Supervision, ValidationContext, VersionDependency, VersionIdentity,
     VersionPaths, VersionResult, VmmApi, atomic, cancel_prepared, classify_cp_operands,
     disk_shrink_error, forwards_differ, launch_prepared_cancellable, overlay_virtual_size,
-    prepare_start, project_device_counters, read_reconciled_machine_state_live,
-    read_reconciled_machine_state_live_locked, run_doctor, sample_vmm_process, scp_command_plan,
-    stop_unsupervised, validate_machine_spec, wait_for_ssh_ready,
+    overlay_virtual_size_shared, prepare_start, project_device_counters,
+    read_reconciled_machine_state_live, read_reconciled_machine_state_live_locked, run_doctor,
+    sample_vmm_process, scp_command_plan, stop_unsupervised, validate_machine_spec,
+    wait_for_ssh_ready,
 };
 use firestone_core::{CloneResult, StepId};
 use firestone_core::{
@@ -159,6 +160,41 @@ impl LocalDispatcher {
         })
     }
 
+    /// Refuses an SSH-dependent surface on a machine that boots `firestone-init`.
+    ///
+    /// SPEC §11.8: an OCI guest has no sshd, no vsock SSH listener and no guest
+    /// host key, so `shell` and `ssh-config` fail up front with a `usage` error
+    /// naming `console` and `logs` instead of waiting through a connection that
+    /// can never succeed. The boot mode is a property of the pinned image, so
+    /// the answer comes from the machine's own sidecar.
+    pub fn refuse_ssh_surface(
+        &self,
+        name: &str,
+        state: &MachineState,
+        surface: &str,
+    ) -> Result<(), FirestoneError> {
+        let Some(id) = state.image.id.as_deref() else {
+            return Ok(());
+        };
+        // A machine whose sidecar is gone has a bigger problem than its shell
+        // surface, and the SSH path reports that with its own error.
+        let Ok(kind) = firestone_core::stored_image_kind(&self.paths, id) else {
+            return Ok(());
+        };
+        if !kind.is_oci() {
+            return Ok(());
+        }
+        Err(FirestoneError::new(
+            ErrorKind::Usage,
+            format!(
+                "machine `{name}` runs an OCI image and has no sshd, so `{surface}` cannot reach it"
+            ),
+        )
+        .with_hint(format!(
+            "attach with `firestone console {name}` or read `firestone logs {name}`"
+        )))
+    }
+
     fn validate_machine_storage(&self) -> Result<(), FirestoneError> {
         self.paths
             .validate_owned_data_directory(self.paths.data_dir(), "data directory", true)?;
@@ -174,10 +210,7 @@ impl LocalDispatcher {
         let machine_dir = self.paths.machine_dir(name)?;
         let spec_path = self.paths.machine_spec(name)?;
         ensure_machine_exists(&self.paths, name, &machine_dir)?;
-        let lock_path = self.paths.machine_lock(name)?;
-        let lock = MachineLock::acquire(name, &lock_path, events)?;
-        ensure_machine_exists(&self.paths, name, &machine_dir)?;
-        let observed_state = self.read_live_state_locked(name, &lock)?;
+        let (_lock, observed_state, _running) = self.open_spec_write(name, &machine_dir, events)?;
         let original = read_file(&spec_path, "machine spec", ErrorKind::NotFound)?;
         let candidate = spec_path.with_extension("toml.edit");
         atomic::write_with_mode(&candidate, &original, MACHINE_SPEC_FILE_MODE)?;
@@ -1405,6 +1438,40 @@ impl LocalDispatcher {
         )
     }
 
+    /// Opens one spec write, taking the machine lock only when it can be taken.
+    ///
+    /// A running machine's shim owns the machine lock for the machine's whole
+    /// lifetime (§4.3), so a spec write that waited for it could never finish:
+    /// `firestone edit`, `PUT` and `PATCH` on a running machine always ended in
+    /// `busy` after the ten-second wait, which made §12.5's whole pending-
+    /// forwards contract — edit a running machine, see `forwards_pending`,
+    /// restart — unreachable. A spec write touches only `firestone.toml`, which
+    /// the shim never writes, so the running path takes no lock, exactly as
+    /// `resize` does (§9.5 step 4).
+    fn open_spec_write(
+        &self,
+        name: &str,
+        machine_dir: &Path,
+        events: &mut dyn EventSink,
+    ) -> Result<(Option<MachineLock>, LiveMachineState, bool), FirestoneError> {
+        let preliminary = self.read_live_state(name)?;
+        if preliminary.state.status == MachineStatus::Running {
+            return Ok((None, preliminary, true));
+        }
+        let lock_path = self.paths.machine_lock(name)?;
+        let lock = MachineLock::acquire(name, &lock_path, events)?;
+        ensure_machine_exists(&self.paths, name, machine_dir)?;
+        let observed = self.read_live_state_locked(name, &lock)?;
+        if observed.state.status == MachineStatus::Running {
+            return Err(FirestoneError::new(
+                ErrorKind::Conflict,
+                format!("machine `{name}` started while its specification was being written"),
+            )
+            .with_hint(format!("retry the change to machine {name:?}")));
+        }
+        Ok((Some(lock), observed, false))
+    }
+
     fn set_spec(
         &self,
         name: &str,
@@ -1414,13 +1481,10 @@ impl LocalDispatcher {
         self.validate_machine_storage()?;
         let machine_dir = self.paths.machine_dir(name)?;
         ensure_machine_exists(&self.paths, name, &machine_dir)?;
-        let lock_path = self.paths.machine_lock(name)?;
-        let lock = MachineLock::acquire(name, &lock_path, events)?;
-        ensure_machine_exists(&self.paths, name, &machine_dir)?;
-        let observed_state = self.read_live_state_locked(name, &lock)?;
+        let (_lock, observed_state, running) = self.open_spec_write(name, &machine_dir, events)?;
         let pinned_image_ref = pinned_image_reference(&observed_state.state);
         let warnings = self.validate_action_spec(&mut spec, pinned_image_ref)?;
-        self.refuse_disk_shrink(name, &spec)?;
+        self.refuse_disk_shrink(name, &spec, running)?;
         let previous = self.previous_spec_when_running(name, &observed_state.state)?;
         let document = render_spec(&spec)?;
         atomic::write_with_mode(
@@ -1444,10 +1508,7 @@ impl LocalDispatcher {
         self.validate_machine_storage()?;
         let machine_dir = self.paths.machine_dir(name)?;
         ensure_machine_exists(&self.paths, name, &machine_dir)?;
-        let lock_path = self.paths.machine_lock(name)?;
-        let lock = MachineLock::acquire(name, &lock_path, events)?;
-        ensure_machine_exists(&self.paths, name, &machine_dir)?;
-        let observed_state = self.read_live_state_locked(name, &lock)?;
+        let (_lock, observed_state, running) = self.open_spec_write(name, &machine_dir, events)?;
         let source = read_file(
             &self.paths.machine_spec(name)?,
             "machine spec",
@@ -1473,7 +1534,7 @@ impl LocalDispatcher {
             .iter()
             .map(SpecWarningPayload::from)
             .collect::<Vec<_>>();
-        self.refuse_disk_shrink(name, &loaded.spec)?;
+        self.refuse_disk_shrink(name, &loaded.spec, running)?;
         let previous = self.previous_spec_when_running(name, &observed_state.state)?;
         let document = render_spec(&loaded.spec)?;
         atomic::write_with_mode(
@@ -1499,7 +1560,12 @@ impl LocalDispatcher {
     ///
     /// qcow2 shrink truncates the guest filesystem. A machine that has never
     /// been started owns no overlay yet, so any `disk` remains free to change.
-    fn refuse_disk_shrink(&self, name: &str, spec: &MachineSpec) -> Result<(), FirestoneError> {
+    fn refuse_disk_shrink(
+        &self,
+        name: &str,
+        spec: &MachineSpec,
+        running: bool,
+    ) -> Result<(), FirestoneError> {
         let overlay = self.paths.machine_disk(name)?;
         let exists = overlay.try_exists().map_err(|source| {
             filesystem_error(
@@ -1512,7 +1578,17 @@ impl LocalDispatcher {
         if !exists {
             return Ok(());
         }
-        let Some(current) = overlay_virtual_size(&self.qemu_img_program()?, &overlay)? else {
+        let qemu_img = self.qemu_img_program()?;
+        // A running machine's VMM holds the overlay's qemu-img lock, so the
+        // plain inspection fails on exactly the machines `resize` and a
+        // running-machine spec write must inspect. Share the image for this
+        // read-only size question instead (SPEC §9.5).
+        let measured = if running {
+            overlay_virtual_size_shared(&qemu_img, &overlay)?
+        } else {
+            overlay_virtual_size(&qemu_img, &overlay)?
+        };
+        let Some(current) = measured else {
             return Ok(());
         };
         if spec.disk.as_bytes() < current {
@@ -1620,7 +1696,7 @@ impl LocalDispatcher {
             .map(SpecWarningPayload::from)
             .collect::<Vec<_>>();
 
-        self.refuse_disk_shrink(name, &loaded.spec)?;
+        self.refuse_disk_shrink(name, &loaded.spec, running)?;
 
         let applied_live = if running {
             let capacity = published_vmconfig_capacity(name, &self.read_published_vmconfig(name)?)?;
@@ -2086,6 +2162,11 @@ impl LocalDispatcher {
         let effective_forwards = prepared.forwards().to_vec();
         let effective_mounts = prepared.mounts().to_vec();
         let first_boot = prepared.seed_rewritten();
+        // SPEC §11.8: an OCI guest runs `firestone-init` and the image's
+        // entrypoint, with no sshd and no vsock SSH listener, so §9.3's boot
+        // and ssh readiness steps do not apply and `start --wait` is ready once
+        // the shim reports `running`.
+        let direct_kernel = prepared.direct_kernel();
         let effective_timeout = prepared.timeout();
         if self.start_cancellation.load(Ordering::Relaxed) {
             cancel_prepared(&self.paths, prepared, &lock)?;
@@ -2123,7 +2204,7 @@ impl LocalDispatcher {
             return Err(start_cancelled_error(name));
         }
 
-        if wait && spec.cloud_init.provisioning {
+        if wait && spec.cloud_init.provisioning && !direct_kernel {
             wait_for_ssh_ready(
                 ReadinessOptions {
                     paths: &self.paths,
@@ -6683,6 +6764,108 @@ esac
             .err()
             .ok_or("metrics for a missing machine unexpectedly succeeded")?;
         assert_eq!(error.kind(), ErrorKind::NotFound);
+        Ok(())
+    }
+
+    /// Writes one published image pair whose sidecar records the given kind.
+    fn publish_stored_image(
+        paths: &Paths,
+        id: &str,
+        kind: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let images = paths.images_dir();
+        fs::create_dir_all(&images)?;
+        fs::set_permissions(&images, fs::Permissions::from_mode(0o700))?;
+        let base = paths.image_base(id)?;
+        let body = b"QFI\xfbstored-image-body";
+        fs::write(&base, body)?;
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o400))?;
+        let digest = "1".repeat(64);
+        let mut sidecar = serde_json::json!({
+            "version": 1,
+            "id": id,
+            "generation": 1,
+            "source_ref": "docker.io/library/alpine:3.20",
+            "source_url": null,
+            "source_sha256": digest,
+            "stored_sha256": digest,
+            "architecture": "x86_64",
+            "firmware": null,
+            "source_format": "raw",
+            "stored_format": "qcow2",
+            "verification_algorithm": "sha256",
+            "verification_digest": digest,
+            "size": body.len(),
+            "pulled_at": "2026-09-02T00:00:00Z",
+        });
+        if kind == "oci" {
+            sidecar["kind"] = serde_json::json!("oci");
+            sidecar["oci"] = serde_json::json!({
+                "registry_ref": "docker.io/library/alpine:3.20",
+                "manifest_digest": format!("sha256:{digest}"),
+                "config_digest": format!("sha256:{digest}"),
+                "entrypoint": [],
+                "cmd": ["/bin/sh"],
+                "env": ["PATH=/usr/bin"],
+                "workdir": "/",
+                "user": null,
+                "boot": "firestone-init",
+            });
+        }
+        write_owned(&paths.image_metadata(id)?, sidecar.to_string().as_bytes())?;
+        Ok(())
+    }
+
+    #[test]
+    fn ssh_surfaces_are_refused_on_an_oci_machine_and_allowed_on_a_disk_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        let oci_id = format!("image-{}", "a".repeat(64));
+        let disk_id = format!("image-{}", "b".repeat(64));
+        publish_stored_image(&paths, &oci_id, "oci")?;
+        publish_stored_image(&paths, &disk_id, "disk")?;
+
+        let mut state = firestone_core::MachineState {
+            version: firestone_core::StateVersion,
+            status: MachineStatus::Running,
+            image: firestone_core::StateImage {
+                r#ref: "docker.io/library/alpine:3.20".to_owned(),
+                id: Some(oci_id),
+                sha256: Some("1".repeat(64)),
+            },
+            mac: None,
+            cid: 3,
+            instance_id: None,
+            shim_pid: None,
+            vmm_pid: None,
+            sidecar_pids: std::collections::BTreeMap::new(),
+            runtime_dir: paths.machine_runtime_dir("oci-machine")?,
+            started_at: None,
+            forwards: Vec::new(),
+            degraded: Vec::new(),
+            last_exit: None,
+        };
+        let refusal = dispatcher
+            .refuse_ssh_surface("oci-machine", &state, "firestone shell")
+            .err()
+            .ok_or("an OCI machine accepted the shell surface")?;
+        assert_eq!(refusal.kind(), ErrorKind::Usage);
+        assert!(
+            refusal.message().contains("no sshd"),
+            "{}",
+            refusal.message()
+        );
+        assert!(
+            refusal
+                .hint()
+                .is_some_and(|hint| hint.contains("console") && hint.contains("logs")),
+            "{refusal:?}"
+        );
+
+        state.image.id = Some(disk_id);
+        dispatcher.refuse_ssh_surface("disk-machine", &state, "firestone shell")?;
+        state.image.id = None;
+        dispatcher.refuse_ssh_surface("unpinned", &state, "firestone shell")?;
         Ok(())
     }
 }

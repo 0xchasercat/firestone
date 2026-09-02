@@ -3687,6 +3687,46 @@ fn stable_image_id(
     )
 }
 
+/// Reads one stored image's recorded boot mode straight from its sidecar.
+///
+/// The §11.8 SSH surfaces need exactly this one field, and they must answer
+/// before any connection attempt. `ImageStore::inspect` answers the same
+/// question but constructs a store, takes the store lock and re-hashes the
+/// whole qcow2 first, which would make `firestone shell` pay for a
+/// multi-gigabyte read before printing a usage error.
+///
+/// # Errors
+///
+/// Returns the sidecar's own error when it is missing, insecure, oversized, or
+/// not JSON.
+pub fn stored_image_kind(paths: &Paths, id: &str) -> Result<ImageKind, FirestoneError> {
+    #[derive(Deserialize)]
+    struct SidecarKind {
+        #[serde(default)]
+        kind: ImageKind,
+    }
+
+    validate_image_id(id)?;
+    let sidecar = paths.image_metadata(id)?;
+    let bytes = read_owned_bounded(
+        paths,
+        &sidecar,
+        "image sidecar",
+        SIDECAR_FILE_MODE,
+        MAX_SIDECAR_BYTES,
+    )?;
+    serde_json::from_slice::<SidecarKind>(&bytes)
+        .map(|sidecar| sidecar.kind)
+        .map_err(|source| {
+            FirestoneError::new(
+                ErrorKind::Dependency,
+                format!("cannot parse image sidecar '{}'", sidecar.display()),
+            )
+            .with_hint("replace the sidecar with strict version-one metadata")
+            .with_source(source)
+        })
+}
+
 /// Applies the §8.5 OCI classifier to one reference.
 ///
 /// Returns `Ok(Some(reference))` when the value is an OCI reference that parses,
@@ -4510,11 +4550,29 @@ fn validate_overlay_info(
 
 /// Uses the pinned qemu-img 8.2.2 JSON inspection argv from verify 4/5.
 fn qemu_info_with(qemu_img: &Path, path: &Path) -> Result<QemuInfo, FirestoneError> {
-    let output = Cmd::new(qemu_img.as_os_str())
+    qemu_info_shared(qemu_img, path, false)
+}
+
+/// The same inspection, optionally sharing an image another process has open.
+///
+/// `qemu-img info` takes an exclusive image lock by default, and a running
+/// Cloud Hypervisor already holds one on the machine overlay. Every read-only
+/// inspection of a live machine's overlay therefore has to pass `-U`, which
+/// asks qemu-img to share the image for this one header read.
+fn qemu_info_shared(
+    qemu_img: &Path,
+    path: &Path,
+    force_share: bool,
+) -> Result<QemuInfo, FirestoneError> {
+    let mut command = Cmd::new(qemu_img.as_os_str())
         .arg("info")
         .arg("--output=json")
         .arg("-f")
-        .arg("qcow2")
+        .arg("qcow2");
+    if force_share {
+        command = command.arg("-U");
+    }
+    let output = command
         .arg(path.as_os_str())
         .timeout(QEMU_INFO_TIMEOUT)
         .error_kind(ErrorKind::Dependency)
@@ -4561,8 +4619,32 @@ pub fn overlay_virtual_size(
     qemu_img: &Path,
     overlay: &Path,
 ) -> Result<Option<u64>, FirestoneError> {
+    overlay_virtual_size_with(qemu_img, overlay, false)
+}
+
+/// The same report for an overlay a running VMM already holds open.
+///
+/// `resize` and a spec write on a running machine both have to compare the
+/// requested `disk` with the live overlay (SPEC §9.5), and the VMM holds that
+/// image's qemu-img lock for the machine's whole lifetime. Without the shared
+/// read every such call fails with `Failed to lock byte 201` instead of
+/// answering the size question.
+pub fn overlay_virtual_size_shared(
+    qemu_img: &Path,
+    overlay: &Path,
+) -> Result<Option<u64>, FirestoneError> {
+    overlay_virtual_size_with(qemu_img, overlay, true)
+}
+
+fn overlay_virtual_size_with(
+    qemu_img: &Path,
+    overlay: &Path,
+    force_share: bool,
+) -> Result<Option<u64>, FirestoneError> {
     match fs::symlink_metadata(overlay) {
-        Ok(_) => Ok(Some(qemu_info_with(qemu_img, overlay)?.virtual_size)),
+        Ok(_) => Ok(Some(
+            qemu_info_shared(qemu_img, overlay, force_share)?.virtual_size,
+        )),
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(image_file_error("inspect", overlay, source)),
     }
@@ -5585,6 +5667,9 @@ else:
             .ok_or("an OCI start records a config identity")?;
         assert!(identity.starts_with("iid-oci-config-"));
         assert!(prepared.seed_rewritten());
+        // SPEC §11.8: the caller must skip §9.3's boot and ssh readiness steps
+        // for this machine, because an OCI guest never answers SSH.
+        assert!(prepared.direct_kernel());
 
         let vmconfig: serde_json::Value =
             serde_json::from_slice(&fs::read(fixture.paths.machine_vmconfig(name)?)?)?;
@@ -5729,6 +5814,8 @@ else:
             ShimTimeouts::default(),
         )?;
         assert_eq!(prepared.state().status, MachineStatus::Created);
+        // A firmware machine keeps §9.3's boot and ssh readiness steps.
+        assert!(!prepared.direct_kernel());
         Ok(())
     }
 

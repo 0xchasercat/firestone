@@ -2361,6 +2361,22 @@ fn resize_live_disk_grow_and_headroom_refusal_without_kvm() -> TestResult {
     assert_eq!(resize_body["desired_vcpus"], 6);
     assert_eq!(resize_body["desired_ram"], 4_294_967_296_u64);
 
+    // The running machine's VMM holds the overlay's qemu-img lock, so the
+    // live path's disk-shrink read shares the image; the stopped path does not.
+    let live_qemu_log = fs::read_to_string(bin.join("qemu-img.qemu.log"))?;
+    assert!(
+        live_qemu_log
+            .lines()
+            .any(|line| line.starts_with("info --output=json -f qcow2 -U ")),
+        "the live resize did not share the overlay read: {live_qemu_log}"
+    );
+    assert!(
+        live_qemu_log.lines().any(|line| {
+            line.starts_with("info --output=json -f qcow2 ") && !line.contains(" -U ")
+        }),
+        "the stopped resize should keep the exclusive read: {live_qemu_log}"
+    );
+
     // Desired state matches: the spec carries the live values.
     let show = firestone(&home, &path)
         .args(["--json", "show", "sizable"])
@@ -2504,5 +2520,109 @@ fn resize_live_disk_grow_and_headroom_refusal_without_kvm() -> TestResult {
         .ok_or("missing show result")?;
     assert_eq!(plain_view["payload"]["spec"]["cpus"], 2);
     assert_eq!(plain_view["payload"]["spec"]["memory"], "2G");
+    Ok(())
+}
+
+#[test]
+fn edit_of_a_running_machine_writes_the_spec_instead_of_waiting_for_the_shim_lock() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = fs::canonicalize(directory.path())?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(
+        env!("CARGO_BIN_EXE_firestone"),
+        fs::Permissions::from_mode(0o755),
+    )?;
+    let home = root.join("home");
+    let fake_vmm = compile_fake_vmm(&root)?;
+    let bin = root.join("bin");
+    fs::create_dir(&bin)?;
+    let qemu_img = bin.join("qemu-img");
+    fs::copy(&fake_vmm, &qemu_img)?;
+    fs::set_permissions(&qemu_img, fs::Permissions::from_mode(0o700))?;
+    let mut path_entries = vec![bin.clone()];
+    if let Some(existing) = env::var_os("PATH") {
+        path_entries.extend(env::split_paths(&existing));
+    }
+    let path = env::join_paths(path_entries)?;
+    let source = root.join("edit-base.qcow2");
+    fs::write(&source, b"QFI\xfbEDIT")?;
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600))?;
+    let firmware = root.join("edit-firmware.fd");
+    fs::write(&firmware, b"firmware")?;
+    fs::set_permissions(&firmware, fs::Permissions::from_mode(0o600))?;
+    let editor = root.join("editor.sh");
+    fs::write(
+        &editor,
+        b"#!/bin/sh\ntarget=\"$1\"\nedited=$(sed 's/^cpus = 2$/cpus = 3/' \"$target\")\n\
+          printf '%s\\n' \"$edited\" > \"$target\"\n"
+            .as_slice(),
+    )?;
+    fs::set_permissions(&editor, fs::Permissions::from_mode(0o700))?;
+    let _cleanup = MachineCleanup {
+        home: home.clone(),
+        path: path.clone(),
+        names: vec!["editable".to_owned()],
+    };
+
+    let created = create_fake_machine_with_spec(
+        &home,
+        &path,
+        "editable",
+        &source,
+        &firmware,
+        &fake_vmm,
+        "ignore-power",
+        &["--cpus", "2", "--memory", "2G"],
+    )?;
+    require_success(&created, "create editable")?;
+    let start = firestone(&home, &path)
+        .args([
+            "--json",
+            "start",
+            "editable",
+            "--no-wait",
+            "--timeout",
+            "20s",
+        ])
+        .output()?;
+    require_success(&start, "start editable")?;
+
+    // The shim owns the machine lock for the machine's whole lifetime, so this
+    // used to wait ten seconds and end in `busy`, which made every §12.5
+    // surface that edits a running machine unreachable.
+    let edited = firestone(&home, &path)
+        .args(["--json", "edit", "editable"])
+        .env("VISUAL", format!("sh {}", editor.display()))
+        .output()?;
+    require_success(&edited, "edit editable")?;
+    let records = ndjson(&edited)?;
+    let result = records.last().cloned().ok_or("missing edit result")?;
+    assert_eq!(result["action"], "edit");
+    assert_eq!(result["payload"]["spec"]["cpus"], 3);
+    assert!(
+        records.iter().any(|record| {
+            record["type"] == "Log"
+                && record["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("machine is running"))
+        }),
+        "edit did not warn that the machine is running: {records:?}"
+    );
+
+    let show = firestone(&home, &path)
+        .args(["--json", "show", "editable"])
+        .output()?;
+    require_success(&show, "show editable")?;
+    let view = ndjson(&show)?
+        .last()
+        .cloned()
+        .ok_or("missing show result")?;
+    assert_eq!(view["payload"]["spec"]["cpus"], 3);
+    assert_eq!(view["payload"]["state"]["status"], "running");
+
+    let stop = firestone(&home, &path)
+        .args(["--json", "stop", "editable", "--force", "--timeout", "5s"])
+        .output()?;
+    require_success(&stop, "stop editable")?;
     Ok(())
 }

@@ -148,6 +148,7 @@ pub struct PreparedStart {
     state: MachineState,
     previous_status: MachineStatus,
     seed_rewritten: bool,
+    direct_kernel: bool,
     timeout: Duration,
     forwards: Vec<String>,
     mounts: Vec<String>,
@@ -167,6 +168,16 @@ impl PreparedStart {
     #[must_use]
     pub const fn seed_rewritten(&self) -> bool {
         self.seed_rewritten
+    }
+
+    /// True when this machine boots the pinned kernel with `firestone-init`.
+    ///
+    /// SPEC §11.8: an OCI guest has no sshd and no vsock SSH listener, so steps
+    /// 7 and 8 of §9.3 do not apply to it and `start --wait` is ready as soon
+    /// as the shim reports `running`.
+    #[must_use]
+    pub const fn direct_kernel(&self) -> bool {
+        self.direct_kernel
     }
 
     #[must_use]
@@ -1194,6 +1205,7 @@ pub fn prepare_start(
             state,
             previous_status,
             seed_rewritten: boot_input.rewritten,
+            direct_kernel: prepared_image.image.metadata.kind.is_oci(),
             timeout: timeouts.launch_overall,
             forwards,
             mounts,
@@ -2948,6 +2960,73 @@ struct RestoreLaunch {
     marker: PathBuf,
 }
 
+/// True when two VmConfig documents differ only where a live resize moves them.
+///
+/// A live resize (SPEC §9.5) writes the new `cpus` and `memory` into
+/// `firestone.toml` while the published `vmconfig.json` keeps the values the
+/// machine booted with, so a warm snapshot taken after one captures a spec and
+/// a VmConfig that no longer render to each other. Cloud Hypervisor restores
+/// from the `config.json` inside the snapshot's own VM state, so those three
+/// numbers cannot affect the restore; what must not move is everything that
+/// names a device, a socket or a file, plus the two boot ceilings, which only
+/// a restart can change.
+fn vmconfig_differs_only_by_live_resize(captured: &[u8], published: &[u8]) -> bool {
+    let (Ok(Value::Object(mut left)), Ok(Value::Object(mut right))) = (
+        serde_json::from_slice::<Value>(captured),
+        serde_json::from_slice::<Value>(published),
+    ) else {
+        return false;
+    };
+    let (Some(Value::Object(left_cpus)), Some(Value::Object(right_cpus))) =
+        (left.remove("cpus"), right.remove("cpus"))
+    else {
+        return false;
+    };
+    let (Some(Value::Object(left_memory)), Some(Value::Object(right_memory))) =
+        (left.remove("memory"), right.remove("memory"))
+    else {
+        return false;
+    };
+    if left != right {
+        return false;
+    }
+    if left_cpus.get("max_vcpus") != right_cpus.get("max_vcpus") {
+        return false;
+    }
+    if !maps_match_except(&left_cpus, &right_cpus, &["boot_vcpus"]) {
+        return false;
+    }
+    if !maps_match_except(&left_memory, &right_memory, &["size", "hotplug_size"]) {
+        return false;
+    }
+    memory_ceiling(&left_memory) == memory_ceiling(&right_memory)
+}
+
+/// The boot memory ceiling: the size plus whatever hotplug headroom it declared.
+fn memory_ceiling(memory: &serde_json::Map<String, Value>) -> Option<u128> {
+    let size = u128::from(memory.get("size")?.as_u64()?);
+    let hotplug = match memory.get("hotplug_size") {
+        None | Some(Value::Null) => 0,
+        Some(value) => u128::from(value.as_u64()?),
+    };
+    Some(size + hotplug)
+}
+
+/// Compares two JSON objects while ignoring the named members on both sides.
+fn maps_match_except(
+    left: &serde_json::Map<String, Value>,
+    right: &serde_json::Map<String, Value>,
+    ignored: &[&str],
+) -> bool {
+    let project = |map: &serde_json::Map<String, Value>| {
+        map.iter()
+            .filter(|(key, _)| !ignored.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<serde_json::Map<String, Value>>()
+    };
+    project(left) == project(right)
+}
+
 /// Validates a pending warm restore against the VmConfig this launch published.
 ///
 /// The published VmConfig is derived from the restored `firestone.toml`, so it
@@ -2990,7 +3069,7 @@ fn prepare_restore_launch(
             "run `firestone snapshot restore {name} {snapshot}` again"
         )));
     }
-    if expected != vmconfig {
+    if expected != vmconfig && !vmconfig_differs_only_by_live_resize(&expected, vmconfig) {
         return Err(FirestoneError::new(
             ErrorKind::Conflict,
             format!(
@@ -7724,7 +7803,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     use super::{ProcessRecord, launch_bound_sidecar_record, process_record, verify_linux_process};
-    use super::{authorize_peer, import_custom_vmm, resolve_vmm_binary};
+    use super::{
+        authorize_peer, import_custom_vmm, resolve_vmm_binary, vmconfig_differs_only_by_live_resize,
+    };
     use crate::{
         Arch, DependencyManifest, ErrorKind, FirestoneError, MachineSpec, PathInputs, Paths,
     };
@@ -7945,5 +8026,51 @@ exec /bin/true \"$@\"
             require_error(large.validate(), "large timeout").kind(),
             ErrorKind::Usage
         );
+    }
+
+    fn restore_vmconfig(
+        boot_vcpus: u64,
+        max_vcpus: u64,
+        size: u64,
+        hotplug: u64,
+        disk: &str,
+    ) -> Vec<u8> {
+        serde_json::json!({
+            "cpus": {"boot_vcpus": boot_vcpus, "max_vcpus": max_vcpus},
+            "disks": [{"backing_files": true, "image_type": "Qcow2", "path": disk}],
+            "memory": {"hotplug_size": hotplug, "shared": true, "size": size},
+            "payload": {"firmware": "/data/bin/firmware"},
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[test]
+    fn vmconfig_drift_from_a_live_resize_is_accepted_by_the_warm_restore() {
+        let captured = restore_vmconfig(1, 8, 1_073_741_824, 7_516_192_768, "/m/disk.qcow2");
+        let republished = restore_vmconfig(6, 8, 4_294_967_296, 4_294_967_296, "/m/disk.qcow2");
+        assert!(vmconfig_differs_only_by_live_resize(
+            &captured,
+            &republished
+        ));
+        assert!(vmconfig_differs_only_by_live_resize(&captured, &captured));
+    }
+
+    #[test]
+    fn vmconfig_drift_in_a_boot_ceiling_or_a_path_is_refused_by_the_warm_restore() {
+        let captured = restore_vmconfig(1, 8, 1_073_741_824, 7_516_192_768, "/m/disk.qcow2");
+        let moved = restore_vmconfig(1, 8, 1_073_741_824, 7_516_192_768, "/other/disk.qcow2");
+        assert!(!vmconfig_differs_only_by_live_resize(&captured, &moved));
+        let wider_memory = restore_vmconfig(1, 8, 1_073_741_824, 8_589_934_592, "/m/disk.qcow2");
+        assert!(!vmconfig_differs_only_by_live_resize(
+            &captured,
+            &wider_memory
+        ));
+        let wider_cpus = restore_vmconfig(1, 16, 1_073_741_824, 7_516_192_768, "/m/disk.qcow2");
+        assert!(!vmconfig_differs_only_by_live_resize(
+            &captured,
+            &wider_cpus
+        ));
+        assert!(!vmconfig_differs_only_by_live_resize(b"{", &captured));
     }
 }
