@@ -502,6 +502,7 @@ version = "$FIRESTONE_INIT_VERSION"
 release_url = "$FIRESTONE_INIT_RELEASE_URL"
 availability = "binary"
 architectures = ["x86_64"]
+license = "MIT OR Apache-2.0"
 
 [dependency.firestone-init.x86_64]
 asset = "firestone-init-$FIRESTONE_INIT_VERSION-x86_64-unknown-linux-musl"

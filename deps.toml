@@ -144,6 +144,7 @@ version = "v0.1.0"
 release_url = "https://github.com/0xchasercat/firestone/releases/tag/firestone-init-v0.1.0-firestone.1"
 availability = "binary"
 architectures = ["x86_64"]
+license = "MIT OR Apache-2.0"
 
 [dependency.firestone-init.x86_64]
 asset = "firestone-init-v0.1.0-x86_64-unknown-linux-musl"
