@@ -15,16 +15,3 @@ site:
           default: true
           content:
             directory: ./docs
-    - type: section
-      key: section-2
-      title: API Reference
-      path: api-reference
-      children:
-        - type: space
-          key: space-1
-          title: API Reference
-          path: api-reference
-          default: true
-          draft: true
-          content:
-            directory: ./api-reference/api-reference
