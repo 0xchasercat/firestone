@@ -148,6 +148,7 @@ pub struct PreparedStart {
     state: MachineState,
     previous_status: MachineStatus,
     seed_rewritten: bool,
+    direct_kernel: bool,
     timeout: Duration,
     forwards: Vec<String>,
     mounts: Vec<String>,
@@ -167,6 +168,16 @@ impl PreparedStart {
     #[must_use]
     pub const fn seed_rewritten(&self) -> bool {
         self.seed_rewritten
+    }
+
+    /// True when this machine boots the pinned kernel with `firestone-init`.
+    ///
+    /// SPEC §11.8: an OCI guest has no sshd and no vsock SSH listener, so steps
+    /// 7 and 8 of §9.3 do not apply to it and `start --wait` is ready as soon
+    /// as the shim reports `running`.
+    #[must_use]
+    pub const fn direct_kernel(&self) -> bool {
+        self.direct_kernel
     }
 
     #[must_use]
@@ -1194,6 +1205,7 @@ pub fn prepare_start(
             state,
             previous_status,
             seed_rewritten: boot_input.rewritten,
+            direct_kernel: prepared_image.image.metadata.kind.is_oci(),
             timeout: timeouts.launch_overall,
             forwards,
             mounts,

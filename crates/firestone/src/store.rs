@@ -2127,6 +2127,11 @@ impl LocalDispatcher {
         let effective_forwards = prepared.forwards().to_vec();
         let effective_mounts = prepared.mounts().to_vec();
         let first_boot = prepared.seed_rewritten();
+        // SPEC §11.8: an OCI guest runs `firestone-init` and the image's
+        // entrypoint, with no sshd and no vsock SSH listener, so §9.3's boot
+        // and ssh readiness steps do not apply and `start --wait` is ready once
+        // the shim reports `running`.
+        let direct_kernel = prepared.direct_kernel();
         let effective_timeout = prepared.timeout();
         if self.start_cancellation.load(Ordering::Relaxed) {
             cancel_prepared(&self.paths, prepared, &lock)?;
@@ -2164,7 +2169,7 @@ impl LocalDispatcher {
             return Err(start_cancelled_error(name));
         }
 
-        if wait && spec.cloud_init.provisioning {
+        if wait && spec.cloud_init.provisioning && !direct_kernel {
             wait_for_ssh_ready(
                 ReadinessOptions {
                     paths: &self.paths,

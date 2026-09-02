@@ -5627,6 +5627,9 @@ else:
             .ok_or("an OCI start records a config identity")?;
         assert!(identity.starts_with("iid-oci-config-"));
         assert!(prepared.seed_rewritten());
+        // SPEC §11.8: the caller must skip §9.3's boot and ssh readiness steps
+        // for this machine, because an OCI guest never answers SSH.
+        assert!(prepared.direct_kernel());
 
         let vmconfig: serde_json::Value =
             serde_json::from_slice(&fs::read(fixture.paths.machine_vmconfig(name)?)?)?;
@@ -5771,6 +5774,8 @@ else:
             ShimTimeouts::default(),
         )?;
         assert_eq!(prepared.state().status, MachineStatus::Created);
+        // A firmware machine keeps §9.3's boot and ssh readiness steps.
+        assert!(!prepared.direct_kernel());
         Ok(())
     }
 
