@@ -8,6 +8,8 @@ publish = false
 # Deliberately minimal: this crate is linked into the static musl `firestone-init`
 # payload as well as into `firestone-core`, so it may never grow a dependency
 # that the guest binary cannot afford (SPEC §10.5).
+license.workspace = true
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
