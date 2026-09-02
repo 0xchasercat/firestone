@@ -217,8 +217,10 @@ grep -q 'download/v9.9.9/firestone-v9.9.9-x86_64-unknown-linux-musl$' "$fixture/
 [[ -f $install_dir/firestone ]] || fail 'the binary was not installed'
 mode=$(ls -l "$install_dir/firestone" | cut -c1-10)
 [[ $mode == '-rwxr-xr-x' ]] || fail "installed mode is $mode, expected -rwxr-xr-x"
-[[ -z $(find "$install_dir" -name '.firestone.install.*' -print -quit) ]] ||
-    fail 'a staging file was left behind'
+shopt -s nullglob
+staging_files=("$install_dir"/.firestone.install.*)
+shopt -u nullglob
+[[ ${#staging_files[@]} -eq 0 ]] || fail "a staging file was left behind: ${staging_files[*]}"
 
 # 6. An install directory outside PATH prints the exact export line.
 expect_output "$install_dir is not on PATH"
