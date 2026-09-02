@@ -511,7 +511,7 @@ impl ArtifactFetcher for HttpsDownloader {
                     ErrorKind::Dependency,
                     format!("cannot download dependency artifact from {url}"),
                 )
-                .with_hint("check network access and retry `firestone doctor --fix`")
+                .with_hint("check network access and retry `firestone doctor`")
                 .with_source(source)
             })?;
         if content_length_exceeds_limit(response.content_length()) {
@@ -538,7 +538,7 @@ fn copy_bounded(
             ErrorKind::Dependency,
             format!("cannot write dependency download from {url}"),
         )
-        .with_hint("check free space and retry `firestone doctor --fix`")
+        .with_hint("check free space and retry `firestone doctor`")
         .with_source(source)
     })?;
     if copied > maximum {
@@ -2786,7 +2786,7 @@ fn record_fix_failure(
 
 fn dependency_install_io_hint(directory: &Path) -> String {
     format!(
-        "check read/write permissions and free space for {} and retry `firestone doctor --fix`",
+        "check read/write permissions and free space for {} and retry `firestone doctor`",
         directory.display()
     )
 }
@@ -4154,11 +4154,7 @@ fi"#,
         let hash_hint = hash_error
             .hint()
             .ok_or("hash I/O error should have a hint")?;
-        for expected in [
-            "read/write permissions",
-            "free space",
-            "firestone doctor --fix",
-        ] {
+        for expected in ["read/write permissions", "free space", "firestone doctor"] {
             assert!(hash_hint.contains(expected));
         }
 

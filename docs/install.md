@@ -52,7 +52,7 @@ scripts/build-release.sh --target x86_64-unknown-linux-musl
 firestone uninstall
 ```
 
-It lists what it will remove, asks once, and then prints where your machines and images still live. Pass `--yes` to skip the question.
+It lists what it will remove, asks once, and then prints where your machines and images still live. Pass `--yes` to answer ahead of time. A run with no terminal, or one with `--json`, has nowhere to ask the question, so it stops and tells you to pass `--yes`.
 
 To delete the data too, add `--purge`:
 

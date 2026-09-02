@@ -5087,7 +5087,7 @@ fn resolve_vmm_binary(
                 artifact.version
             ),
         )
-        .with_hint("run `firestone doctor --fix` to reinstall the pinned VMM"));
+        .with_hint("run `firestone doctor` to reinstall the pinned VMM"));
     }
     Ok((binary, digest))
 }

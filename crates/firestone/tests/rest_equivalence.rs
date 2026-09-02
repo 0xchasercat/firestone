@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     error::Error,
     ffi::OsString,
@@ -26,6 +26,10 @@ const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(8);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(25);
+/// What a `doctor` check appends when a repair it attempted could not run.
+const FIX_FAILED_MARKER: &str = "; fix failed: ";
+/// A proxy no host answers, so no repair in this test can reach the network.
+const OFFLINE_PROXY: &str = "http://127.0.0.1:1";
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -91,12 +95,26 @@ impl Fixture {
         })
     }
 
+    /// A Firestone command against this fixture's home, with no way out.
+    ///
+    /// `doctor` repairs what needs no administrator, which includes downloading
+    /// the vendored binaries, so the proxy variables point every download at a
+    /// port nothing listens on: the test measures the CLI, not the network, and
+    /// the repair fails in milliseconds instead of fetching a release asset.
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_firestone"));
         command
             .arg("--home")
             .arg(&self.home)
-            .env("PATH", &self.path);
+            .env("PATH", &self.path)
+            .env("HTTPS_PROXY", OFFLINE_PROXY)
+            .env("https_proxy", OFFLINE_PROXY)
+            .env("HTTP_PROXY", OFFLINE_PROXY)
+            .env("http_proxy", OFFLINE_PROXY)
+            .env("ALL_PROXY", OFFLINE_PROXY)
+            .env("all_proxy", OFFLINE_PROXY)
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy");
         command
     }
 
@@ -602,6 +620,117 @@ fn take_doctor_fixed(payload: &mut Value) -> TestResult<usize> {
     Ok(fixed)
 }
 
+/// Removes what a failed repair wrote over a check, and names those checks.
+///
+/// The CLI's `doctor` attempts every repair that needs no administrator, and a
+/// repair that cannot run — no network for the vendored downloads, a directory
+/// it cannot write — appends its reason to the check's and may replace the
+/// check's `hint` and `fix` with its own (SPEC §17.3). The read-only REST
+/// report carries none of that. Everything before the tail still has to match,
+/// which is what this leaves in place, and the returned ids say which checks
+/// answer for their advice to the repair rather than to the diagnosis.
+fn take_doctor_fix_overlay(payload: &mut Value) -> TestResult<BTreeSet<String>> {
+    let checks = payload["checks"]
+        .as_array_mut()
+        .ok_or("doctor Result checks is not an array")?;
+    let mut overlaid = BTreeSet::new();
+    for check in checks {
+        let reason = check["reason"]
+            .as_str()
+            .ok_or("doctor Result reason is not a string")?;
+        let Some((kept, _)) = reason.split_once(FIX_FAILED_MARKER) else {
+            continue;
+        };
+        let kept = kept.to_owned();
+        let id = check["id"]
+            .as_str()
+            .ok_or("doctor Result check has no id")?
+            .to_owned();
+        let object = check
+            .as_object_mut()
+            .ok_or("doctor Result check is not an object")?;
+        object.insert("reason".to_owned(), Value::String(kept));
+        object.remove("hint");
+        object.remove("fix");
+        overlaid.insert(id);
+    }
+    Ok(overlaid)
+}
+
+/// Drops `hint` and `fix` from the named checks of one payload.
+///
+/// The counterpart of `take_doctor_fix_overlay` for the side that attempted no
+/// repair, so the two reports are compared on the fields a repair cannot touch.
+fn take_doctor_advice(payload: &mut Value, ids: &BTreeSet<String>) -> TestResult {
+    let checks = payload["checks"]
+        .as_array_mut()
+        .ok_or("doctor Result checks is not an array")?;
+    for check in checks {
+        let id = check["id"]
+            .as_str()
+            .ok_or("doctor Result check has no id")?
+            .to_owned();
+        if !ids.contains(&id) {
+            continue;
+        }
+        let object = check
+            .as_object_mut()
+            .ok_or("doctor Result check is not an object")?;
+        object.remove("hint");
+        object.remove("fix");
+    }
+    Ok(())
+}
+
+/// Removes the fix-failure tails and both advice fields from raw bytes.
+///
+/// A failed repair may write a `hint` where the diagnosis had none, so the
+/// advice fields are dropped from both payloads rather than compared here;
+/// their contents are compared field by field above, for every check the CLI
+/// did not try to repair. What the bytes still answer for is the framing and
+/// the key order of everything else. A JSON string ends at the first quote
+/// that is not escaped, and a backslash run of even length leaves it unescaped.
+fn redact_doctor_advice(payload: &[u8]) -> Vec<u8> {
+    let fields: [&[u8]; 2] = [br#""hint":""#, br#""fix":""#];
+    let tail = FIX_FAILED_MARKER.as_bytes();
+    let mut redacted: Vec<u8> = Vec::with_capacity(payload.len());
+    let mut index = 0;
+    while index < payload.len() {
+        let field = fields
+            .into_iter()
+            .find(|field| payload[index..].starts_with(field));
+        let opener = match field {
+            Some(field) => field,
+            None if payload[index..].starts_with(tail) => tail,
+            None => {
+                redacted.push(payload[index]);
+                index += 1;
+                continue;
+            }
+        };
+        index += opener.len();
+        let mut backslashes = 0;
+        while index < payload.len() {
+            let byte = payload[index];
+            if byte == b'"' && backslashes % 2 == 0 {
+                break;
+            }
+            backslashes = if byte == b'\\' { backslashes + 1 } else { 0 };
+            index += 1;
+        }
+        if field.is_none() {
+            // The tail ends inside `reason`, whose closing quote stays.
+            continue;
+        }
+        // Drop the closing quote, and the comma the sorted keys guarantee.
+        index += 1;
+        if payload.get(index) == Some(&b',') {
+            index += 1;
+        }
+    }
+    redacted
+}
+
 /// Removes the same marker from the raw payload bytes.
 ///
 /// The payload's keys are sorted, so `fixed` leads the check object and takes
@@ -632,15 +761,23 @@ fn assert_doctor_payload(cli: &TerminalResult, rest: &[u8]) -> TestResult {
     let rest_free = normalize_doctor_free_bytes(&mut rest_value)?;
     assert!(cli_free > 0 && rest_free > 0);
     take_doctor_fixed(&mut cli_value)?;
+    let overlaid = take_doctor_fix_overlay(&mut cli_value)?;
     assert_eq!(
         take_doctor_fixed(&mut rest_value)?,
         0,
         "the REST doctor read must repair nothing"
     );
+    assert!(
+        take_doctor_fix_overlay(&mut rest_value)?.is_empty(),
+        "the REST doctor read must attempt no repair"
+    );
+    take_doctor_advice(&mut rest_value, &overlaid)?;
     assert_eq!(rest_value, cli_value, "doctor stable fields changed");
     assert_eq!(
-        redact_doctor_free_bytes(rest)?,
-        redact_doctor_fixed(&redact_doctor_free_bytes(&cli.payload_bytes)?),
+        redact_doctor_advice(&redact_doctor_free_bytes(rest)?),
+        redact_doctor_advice(&redact_doctor_fixed(&redact_doctor_free_bytes(
+            &cli.payload_bytes
+        )?)),
         "doctor stable payload bytes or field order changed"
     );
     Ok(())

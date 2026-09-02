@@ -1187,7 +1187,7 @@ impl ImageStore {
         events: &mut dyn EventSink,
     ) -> Result<PulledImage, FirestoneError> {
         self.ensure_store()?;
-        let _lock = self.acquire_pull_lock()?;
+        let _lock = self.acquire_pull_lock(events)?;
         self.cleanup_stale_partials()?;
         let source = self.resolve(
             &request.image,
@@ -1383,7 +1383,7 @@ impl ImageStore {
         self.ensure_store()?;
         // This path may pull the machine's image itself, and it waits behind
         // any pull already in flight, so it takes the pull deadline.
-        let _lock = self.acquire_pull_lock()?;
+        let _lock = self.acquire_pull_lock(events)?;
         self.cleanup_stale_partials()?;
 
         let image = match (&state.image.id, &state.image.sha256) {
@@ -3035,8 +3035,26 @@ impl ImageStore {
     }
 
     /// Takes the store lock with the deadline a running pull needs.
-    fn acquire_pull_lock(&self) -> Result<ImageStoreLock, FirestoneError> {
-        ImageStoreLock::acquire(&self.paths, PULL_LOCK_TIMEOUT, LOCK_POLL_INTERVAL)
+    ///
+    /// The wait can last as long as the work it is waiting for, so a caller
+    /// that does not get the lock at once is told why it is standing still
+    /// rather than watching a silent command.
+    fn acquire_pull_lock(
+        &self,
+        events: &mut dyn EventSink,
+    ) -> Result<ImageStoreLock, FirestoneError> {
+        match ImageStoreLock::acquire(&self.paths, Duration::ZERO, LOCK_POLL_INTERVAL) {
+            Ok(lock) => Ok(lock),
+            Err(error) if error.kind() == ErrorKind::Busy => {
+                events.emit(Event::Log {
+                    level: Level::Info,
+                    message: "another image operation is running; waiting for it to finish"
+                        .to_owned(),
+                })?;
+                ImageStoreLock::acquire(&self.paths, PULL_LOCK_TIMEOUT, LOCK_POLL_INTERVAL)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn cleanup_stale_partials(&self) -> Result<(), FirestoneError> {

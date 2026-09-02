@@ -514,7 +514,7 @@ fn read_firestone_public_key(paths: &Paths) -> Result<String, FirestoneError> {
             ErrorKind::Dependency,
             format!("cannot open Firestone SSH public key at {}", path.display()),
         )
-        .with_hint("run `firestone doctor --fix` to generate the Firestone SSH key")
+        .with_hint("run `firestone doctor` to generate the Firestone SSH key")
         .with_source(source)
     })?;
     paths.validate_owned_data_file_handle(
@@ -533,14 +533,14 @@ fn read_firestone_public_key(paths: &Paths) -> Result<String, FirestoneError> {
                     path.display()
                 ),
             )
-            .with_hint("run `firestone doctor --fix` to regenerate the Firestone SSH key"));
+            .with_hint("run `firestone doctor` to regenerate the Firestone SSH key"));
         }
         Err(BoundedReadError::Io(source)) => {
             return Err(FirestoneError::new(
                 ErrorKind::Dependency,
                 format!("cannot read Firestone SSH public key at {}", path.display()),
             )
-            .with_hint("run `firestone doctor --fix` to regenerate the Firestone SSH key")
+            .with_hint("run `firestone doctor` to regenerate the Firestone SSH key")
             .with_source(source));
         }
     };
@@ -558,7 +558,7 @@ fn read_firestone_public_key(paths: &Paths) -> Result<String, FirestoneError> {
                 path.display()
             ),
         )
-        .with_hint("run `firestone doctor --fix` to regenerate the Firestone SSH key"));
+        .with_hint("run `firestone doctor` to regenerate the Firestone SSH key"));
     }
     keys.pop().map(|key| key.rendered).ok_or_else(|| {
         FirestoneError::new(
@@ -568,7 +568,7 @@ fn read_firestone_public_key(paths: &Paths) -> Result<String, FirestoneError> {
                 path.display()
             ),
         )
-        .with_hint("run `firestone doctor --fix` to regenerate the Firestone SSH key")
+        .with_hint("run `firestone doctor` to regenerate the Firestone SSH key")
     })
 }
 
@@ -2011,7 +2011,7 @@ mod tests {
         );
         assert_eq!(
             error.hint(),
-            Some("run `firestone doctor --fix` to generate the Firestone SSH key")
+            Some("run `firestone doctor` to generate the Firestone SSH key")
         );
         Ok(())
     }

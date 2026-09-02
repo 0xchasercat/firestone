@@ -772,7 +772,7 @@ where
             serve::run(&paths, listener, Arc::new(dispatcher), &global, auth, None)
         }
         Command::Uninstall(arguments) => {
-            run_uninstall_command(arguments, paths, source_base, yes, terminal, renderer)
+            run_uninstall_command(arguments, paths, source_base, json, yes, terminal, renderer)
         }
         Command::Ui(arguments) => {
             if yes {
@@ -787,15 +787,27 @@ where
     }
 }
 
+/// Answers whether this run can ask the reader to confirm the removal.
+///
+/// A prompt needs a terminal to print to and a terminal to read from, and
+/// `--json` is a machine-readable stream that no question belongs in. When
+/// the answer is `false`, `--yes` is the only way to remove anything.
+const fn uninstall_prompt_allowed(json: bool, terminal: TerminalMode) -> bool {
+    !json && terminal.interactive()
+}
+
 /// Removes this installation: the executable, and with `--purge` the data.
 ///
 /// The confirmation lists the exact paths before anything is deleted, and
 /// `--purge` is confirmed twice because it destroys machines and images that
-/// no reinstall brings back.
+/// no reinstall brings back. A run that cannot ask — no terminal, or `--json`
+/// — removes nothing without `--yes`: the deletion is unrecoverable, and a
+/// script that never sees the question must not be answered for.
 fn run_uninstall_command<Stdout, Stderr>(
     arguments: cli::UninstallArgs,
     paths: Paths,
     source_base: std::path::PathBuf,
+    json: bool,
     yes: bool,
     terminal: TerminalMode,
     renderer: &mut Renderer<Stdout, Stderr>,
@@ -819,41 +831,7 @@ where
         }
     }
 
-    if !yes && terminal.interactive() {
-        renderer.interactive_line("This removes:")?;
-        renderer.interactive_line(&format!("  {}", plan.executable.display()))?;
-        for directory in &plan.directories {
-            renderer.interactive_line(&format!(
-                "  {} ({})",
-                directory.path.display(),
-                directory.holds
-            ))?;
-        }
-        for directory in &plan.kept {
-            renderer.interactive_line(&format!(
-                "Keeps {} ({})",
-                directory.path.display(),
-                directory.holds
-            ))?;
-        }
-        if !confirm(renderer, "Remove firestone? [y/N] ")? {
-            return Err(FirestoneError::new(
-                ErrorKind::Generic,
-                "uninstall cancelled",
-            ));
-        }
-        if arguments.purge
-            && !confirm(
-                renderer,
-                "This deletes every machine and image on this host. Continue? [y/N] ",
-            )?
-        {
-            return Err(FirestoneError::new(
-                ErrorKind::Generic,
-                "uninstall cancelled",
-            ));
-        }
-    }
+    confirm_uninstall(&plan, arguments.purge, json, yes, terminal, renderer)?;
 
     let result = uninstall::apply(&plan)?;
     renderer.emit(Event::Result {
@@ -863,6 +841,74 @@ where
                 .with_source(source)
         })?,
     })
+}
+
+/// Asks before an uninstall removes anything, or refuses when it cannot ask.
+///
+/// The listing names every path first, and `--purge` is asked twice. `--yes`
+/// answers both questions ahead of time; nothing else does.
+///
+/// # Errors
+///
+/// Returns `usage` when there is no terminal to ask on and `--yes` was not
+/// given, and `generic` when the reader declines.
+fn confirm_uninstall<Stdout, Stderr>(
+    plan: &uninstall::UninstallPlan,
+    purge: bool,
+    json: bool,
+    yes: bool,
+    terminal: TerminalMode,
+    renderer: &mut Renderer<Stdout, Stderr>,
+) -> Result<(), FirestoneError>
+where
+    Stdout: io::Write + Send,
+    Stderr: io::Write + Send,
+{
+    if yes {
+        return Ok(());
+    }
+    if !uninstall_prompt_allowed(json, terminal) {
+        return Err(FirestoneError::new(
+            ErrorKind::Usage,
+            "uninstall needs a terminal to confirm the removal",
+        )
+        .with_hint("run it from a terminal, or pass --yes to remove without a question"));
+    }
+
+    renderer.interactive_line("This removes:")?;
+    renderer.interactive_line(&format!("  {}", plan.executable.display()))?;
+    for directory in &plan.directories {
+        renderer.interactive_line(&format!(
+            "  {} ({})",
+            directory.path.display(),
+            directory.holds
+        ))?;
+    }
+    for directory in &plan.kept {
+        renderer.interactive_line(&format!(
+            "Keeps {} ({})",
+            directory.path.display(),
+            directory.holds
+        ))?;
+    }
+    if !confirm(renderer, "Remove firestone? [y/N] ")? {
+        return Err(FirestoneError::new(
+            ErrorKind::Generic,
+            "uninstall cancelled",
+        ));
+    }
+    if purge
+        && !confirm(
+            renderer,
+            "This deletes every machine and image on this host. Continue? [y/N] ",
+        )?
+    {
+        return Err(FirestoneError::new(
+            ErrorKind::Generic,
+            "uninstall cancelled",
+        ));
+    }
+    Ok(())
 }
 
 /// Turns `--host`/`--port` into the TCP listener they spell.
@@ -2219,24 +2265,26 @@ mod tests {
     use std::{
         io::{self, Write},
         os::unix::fs::MetadataExt as _,
-        path::Path,
+        path::{Path, PathBuf},
     };
 
     use clap::Parser as _;
     use firestone_core::{
-        Catalog, DoctorCheck, DoctorCheckId, DoctorReport, DoctorStatus, Event, EventSink,
-        GlobalConfig, ImageRef, MachineSpecPatch, PathInputs, Paths,
+        Catalog, DoctorCheck, DoctorCheckId, DoctorReport, DoctorStatus, ErrorKind, Event,
+        EventSink, GlobalConfig, ImageRef, MachineSpecPatch, PathInputs, Paths,
     };
     use serde_json::json;
 
     use super::{
-        CreateRequest, TerminalMode, block_on, doctor_elevation_prompt_allowed,
+        CreateRequest, TerminalMode, block_on, confirm_uninstall, doctor_elevation_prompt_allowed,
         doctor_manual_commands, finish_command, load_create_spec, load_global_config,
         render_options, run_with_inputs, serve_sugar_address, signal_handler_error,
+        uninstall_prompt_allowed,
     };
     use crate::{
         cli::Cli,
         render::{OutputMode, RenderOptions, Renderer},
+        uninstall::{UninstallDirectory, UninstallPlan},
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -2312,6 +2360,95 @@ mod tests {
             false,
             TerminalMode::default()
         ));
+    }
+
+    fn uninstall_plan() -> UninstallPlan {
+        UninstallPlan {
+            executable: PathBuf::from("/home/user/.local/bin/firestone"),
+            directories: Vec::new(),
+            kept: vec![UninstallDirectory {
+                path: PathBuf::from("/home/user/.local/share/firestone"),
+                holds: "machines, images, and helper binaries",
+            }],
+        }
+    }
+
+    #[test]
+    fn uninstall_prompt_requires_a_terminal_and_human_output() {
+        let interactive = TerminalMode {
+            stdin: true,
+            stdout: false,
+            stderr: true,
+        };
+        assert!(uninstall_prompt_allowed(false, interactive));
+        assert!(!uninstall_prompt_allowed(true, interactive));
+        assert!(!uninstall_prompt_allowed(false, TerminalMode::default()));
+        assert!(!uninstall_prompt_allowed(
+            false,
+            TerminalMode {
+                stdin: false,
+                stdout: true,
+                stderr: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn confirm_uninstall_without_a_terminal_refuses_instead_of_removing() -> TestResult {
+        let mut renderer =
+            Renderer::new(Vec::new(), Vec::new(), RenderOptions::human(false, false));
+        let error = confirm_uninstall(
+            &uninstall_plan(),
+            true,
+            false,
+            false,
+            TerminalMode::default(),
+            &mut renderer,
+        )
+        .err()
+        .ok_or("a run with no terminal and no --yes must be refused")?;
+        assert_eq!(error.kind(), ErrorKind::Usage);
+        assert!(
+            error.message().contains("needs a terminal"),
+            "message was {}",
+            error.message()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn confirm_uninstall_under_json_refuses_without_yes() -> TestResult {
+        let mut renderer = Renderer::new(Vec::new(), Vec::new(), RenderOptions::json());
+        let error = confirm_uninstall(
+            &uninstall_plan(),
+            false,
+            true,
+            false,
+            TerminalMode {
+                stdin: true,
+                stdout: true,
+                stderr: true,
+            },
+            &mut renderer,
+        )
+        .err()
+        .ok_or("--json has nowhere to print a question")?;
+        assert_eq!(error.kind(), ErrorKind::Usage);
+        Ok(())
+    }
+
+    #[test]
+    fn confirm_uninstall_with_yes_asks_nothing() -> TestResult {
+        let mut renderer = Renderer::new(Vec::new(), Vec::new(), RenderOptions::json());
+        confirm_uninstall(
+            &uninstall_plan(),
+            true,
+            true,
+            true,
+            TerminalMode::default(),
+            &mut renderer,
+        )?;
+        Ok(())
     }
 
     #[test]
