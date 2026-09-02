@@ -1,4 +1,5 @@
 /target/
+/dev/
 /.codebase-memory/
 /.idea/
 /.vscode/

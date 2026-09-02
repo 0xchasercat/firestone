@@ -2,7 +2,9 @@
 
 Read `SPEC.md` before changing code. It is the source of truth. Normative sections require a decision-log entry in SPEC.md section 21 when changed.
 
-Read `docs/PROJECT_STATUS.md` before starting work. Update the row for your task in the same pull request if its scope, dependencies, acceptance criteria, or status changed.
+Read `dev/PROJECT_STATUS.md` before starting work. Update the row for your task there when its scope, dependencies, acceptance criteria, or status changed.
+
+`dev/` is local-only and untracked. It holds the orchestrator's working state, and git ignores it, so your status row never shows up in a pull request. Edit the local file anyway; that file is how the orchestrator tracks the sprint.
 
 ## Architecture rules
 
@@ -40,7 +42,7 @@ Commits use `area: what`. Explain the reason in the body when the title cannot.
 - Rebase or merge the current `origin/main` before final verification.
 - Push the branch and open a pull request. Do not merge it.
 - The pull request body lists SPEC sections implemented, files owned, tests run, Linux/KVM verification performed, and remaining limits.
-- Keep pull requests bounded to one row in `docs/PROJECT_STATUS.md` unless the orchestrator changes the assignment.
+- Keep pull requests bounded to one row in `dev/PROJECT_STATUS.md` unless the orchestrator changes the assignment.
 
 ## Codebase Memory
 

@@ -17,7 +17,7 @@ firestone doctor
 firestone doctor --fix
 ```
 
-`doctor --fix` creates Firestone's directories, unpacks its embedded helpers, downloads the pinned firmware, and generates its SSH key. It changes no sysctl and no device permission; for those it prints the exact command for you to run. The one privileged step it can take, an AppArmor profile on Ubuntu, is shown in full and confirmed by you first. Building from source is covered in the [user guide](docs/user-guide.md#install).
+`doctor --fix` creates Firestone's directories, unpacks its embedded helpers, downloads the pinned firmware, and generates its SSH key. It changes no sysctl and no device permission; for those it prints the exact command for you to run. The one privileged step it can take, an AppArmor profile on Ubuntu, is shown in full and confirmed by you first. Building from source is covered on the [install page](docs/install.md#build-from-source).
 
 ## Sixty seconds
 
@@ -60,9 +60,18 @@ Everything above is one model behind three surfaces. The CLI, `firestone.toml`, 
 
 ## Documentation
 
-- [User guide](docs/user-guide.md): install, first machine, the web UI, images, OCI, snapshots, clone, resize, metrics, networking, cloud-init, REST, troubleshooting.
+The user guide is one page per topic, indexed in [docs/README.md](docs/README.md):
+
+- [Install](docs/install.md) and [quick start](docs/quickstart.md): get it onto a host and boot something.
+- [Machines](docs/machines.md): lifecycle, logs, snapshots, clone, resize, metrics.
+- [Images](docs/images.md): the catalog, the image store, and OCI container images.
+- [Networking](docs/networking.md) and [cloud-init](docs/cloud-init.md): forwards, tap, mounts, keys, passwords.
+- [Web interface](docs/web-ui.md) and [CLI and REST](docs/cli-and-rest.md): the two other surfaces over the same model.
+- [Troubleshooting](docs/troubleshooting.md) and [security](docs/security.md): what to do when it breaks, and what it does and does not promise.
+
+Two more references:
+
 - [SPEC.md](SPEC.md): the design, normative section by normative section, plus the decision log behind every choice.
-- [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md): what is built, what is verified on real KVM hardware, and what is still open.
 - [docs/openapi.json](docs/openapi.json): the static OpenAPI 3.1 contract for the REST API.
 
 ## Where it runs
