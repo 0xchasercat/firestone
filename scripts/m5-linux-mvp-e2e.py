@@ -69,7 +69,7 @@ FINAL_SIGNAL_MASK: set[signal.Signals] | None = None
 # literal cannot catch a lock edited without updating its pin.
 EXPECTED_FILE_HASHES = {
     "catalog/images.toml": "23affd021f17f46f52ce909ec6c9e1b524cee46d54e8cd71f3db32fd7f5cb028",
-    "deps.toml": "c3ecf1a49a4bf415a57d639269e058b70ea9c5ce55872d5175cdbdc481e011fa",
+    "deps.toml": "c486192fc3815c62a9027d5299e8863a9292d6a2ae9f21f99148b77db781c220",
     "docs/verification/doctor-matrix.md": "c3254636863e741ae237f61b86b1fca0bbc8d097f1f40f799d090325e4eeb844",
     "scripts/m1-kvm-e2e.py": "719660526334393f2cb5df6b0b7d2eaf5a106f6e41674fdf3feb9476da11d124",
     "scripts/m2-kvm-e2e.py": "152a8f0ae19a0f46b2415186f545e4109c1d4ca47dbd57e335e0757e72f6d66f",

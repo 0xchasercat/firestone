@@ -11,6 +11,7 @@ resolver = "3"
 version = "0.1.4"
 edition = "2024"
 rust-version = "1.85"
+license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 axum = { version = "=0.8.4", default-features = false, features = ["form", "http1", "json", "query", "tokio", "ws"] }
