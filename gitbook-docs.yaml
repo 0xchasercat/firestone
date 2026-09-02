@@ -1,5 +1,10 @@
-root: ./docs/
-
-structure:
-  readme: README.md
-  summary: SUMMARY.md
+$schema: https://api.gitbook.com/openapi.yaml#/components/schemas/GitSyncSiteConfig
+site:
+  title: Firestone
+  structure:
+    - type: space
+      key: docs
+      title: Documentation
+      path: docs
+      content:
+        directory: ./docs
