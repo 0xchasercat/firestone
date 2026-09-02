@@ -3687,6 +3687,46 @@ fn stable_image_id(
     )
 }
 
+/// Reads one stored image's recorded boot mode straight from its sidecar.
+///
+/// The §11.8 SSH surfaces need exactly this one field, and they must answer
+/// before any connection attempt. `ImageStore::inspect` answers the same
+/// question but constructs a store, takes the store lock and re-hashes the
+/// whole qcow2 first, which would make `firestone shell` pay for a
+/// multi-gigabyte read before printing a usage error.
+///
+/// # Errors
+///
+/// Returns the sidecar's own error when it is missing, insecure, oversized, or
+/// not JSON.
+pub fn stored_image_kind(paths: &Paths, id: &str) -> Result<ImageKind, FirestoneError> {
+    #[derive(Deserialize)]
+    struct SidecarKind {
+        #[serde(default)]
+        kind: ImageKind,
+    }
+
+    validate_image_id(id)?;
+    let sidecar = paths.image_metadata(id)?;
+    let bytes = read_owned_bounded(
+        paths,
+        &sidecar,
+        "image sidecar",
+        SIDECAR_FILE_MODE,
+        MAX_SIDECAR_BYTES,
+    )?;
+    serde_json::from_slice::<SidecarKind>(&bytes)
+        .map(|sidecar| sidecar.kind)
+        .map_err(|source| {
+            FirestoneError::new(
+                ErrorKind::Dependency,
+                format!("cannot parse image sidecar '{}'", sidecar.display()),
+            )
+            .with_hint("replace the sidecar with strict version-one metadata")
+            .with_source(source)
+        })
+}
+
 /// Applies the §8.5 OCI classifier to one reference.
 ///
 /// Returns `Ok(Some(reference))` when the value is an OCI reference that parses,

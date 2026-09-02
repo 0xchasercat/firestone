@@ -1100,6 +1100,9 @@ where
     }
 
     drop(start_signals);
+    // SPEC §11.8: `run` on an OCI machine performs create and start and then
+    // reports the shell refusal, leaving the machine running.
+    dispatcher.refuse_ssh_surface(&name, &machine.state, "firestone shell")?;
     let user = user_override.unwrap_or_else(|| machine.spec.user.clone());
     let executable = current_firestone_executable()?;
     let plan = match shell_ssh_plan(&paths, &executable, &name, &user, terminal.stdin, command) {
@@ -1276,6 +1279,7 @@ where
         return Err(not_running_terminal_error(&arguments.name));
     }
     drop(start_signals);
+    dispatcher.refuse_ssh_surface(&arguments.name, &machine.state, "firestone shell")?;
     let user = arguments.user.unwrap_or(machine.spec.user);
     let executable = current_firestone_executable()?;
     let plan = shell_ssh_plan(
@@ -1384,6 +1388,7 @@ where
     let dispatcher =
         LocalDispatcher::new(paths.clone(), global, catalog).with_source_base(source_base);
     let machine = dispatcher.terminal_machine(&name)?;
+    dispatcher.refuse_ssh_surface(&name, &machine.state, "firestone ssh-config")?;
     let executable = current_firestone_executable()?;
     let plan = ssh_config_plan(&paths, &executable, &name, &machine.spec.user)?;
     let payload = SshConfigResult {

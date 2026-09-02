@@ -160,6 +160,41 @@ impl LocalDispatcher {
         })
     }
 
+    /// Refuses an SSH-dependent surface on a machine that boots `firestone-init`.
+    ///
+    /// SPEC §11.8: an OCI guest has no sshd, no vsock SSH listener and no guest
+    /// host key, so `shell` and `ssh-config` fail up front with a `usage` error
+    /// naming `console` and `logs` instead of waiting through a connection that
+    /// can never succeed. The boot mode is a property of the pinned image, so
+    /// the answer comes from the machine's own sidecar.
+    pub fn refuse_ssh_surface(
+        &self,
+        name: &str,
+        state: &MachineState,
+        surface: &str,
+    ) -> Result<(), FirestoneError> {
+        let Some(id) = state.image.id.as_deref() else {
+            return Ok(());
+        };
+        // A machine whose sidecar is gone has a bigger problem than its shell
+        // surface, and the SSH path reports that with its own error.
+        let Ok(kind) = firestone_core::stored_image_kind(&self.paths, id) else {
+            return Ok(());
+        };
+        if !kind.is_oci() {
+            return Ok(());
+        }
+        Err(FirestoneError::new(
+            ErrorKind::Usage,
+            format!(
+                "machine `{name}` runs an OCI image and has no sshd, so `{surface}` cannot reach it"
+            ),
+        )
+        .with_hint(format!(
+            "attach with `firestone console {name}` or read `firestone logs {name}`"
+        )))
+    }
+
     fn validate_machine_storage(&self) -> Result<(), FirestoneError> {
         self.paths
             .validate_owned_data_directory(self.paths.data_dir(), "data directory", true)?;
@@ -6729,6 +6764,108 @@ esac
             .err()
             .ok_or("metrics for a missing machine unexpectedly succeeded")?;
         assert_eq!(error.kind(), ErrorKind::NotFound);
+        Ok(())
+    }
+
+    /// Writes one published image pair whose sidecar records the given kind.
+    fn publish_stored_image(
+        paths: &Paths,
+        id: &str,
+        kind: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let images = paths.images_dir();
+        fs::create_dir_all(&images)?;
+        fs::set_permissions(&images, fs::Permissions::from_mode(0o700))?;
+        let base = paths.image_base(id)?;
+        let body = b"QFI\xfbstored-image-body";
+        fs::write(&base, body)?;
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o400))?;
+        let digest = "1".repeat(64);
+        let mut sidecar = serde_json::json!({
+            "version": 1,
+            "id": id,
+            "generation": 1,
+            "source_ref": "docker.io/library/alpine:3.20",
+            "source_url": null,
+            "source_sha256": digest,
+            "stored_sha256": digest,
+            "architecture": "x86_64",
+            "firmware": null,
+            "source_format": "raw",
+            "stored_format": "qcow2",
+            "verification_algorithm": "sha256",
+            "verification_digest": digest,
+            "size": body.len(),
+            "pulled_at": "2026-09-02T00:00:00Z",
+        });
+        if kind == "oci" {
+            sidecar["kind"] = serde_json::json!("oci");
+            sidecar["oci"] = serde_json::json!({
+                "registry_ref": "docker.io/library/alpine:3.20",
+                "manifest_digest": format!("sha256:{digest}"),
+                "config_digest": format!("sha256:{digest}"),
+                "entrypoint": [],
+                "cmd": ["/bin/sh"],
+                "env": ["PATH=/usr/bin"],
+                "workdir": "/",
+                "user": null,
+                "boot": "firestone-init",
+            });
+        }
+        write_owned(&paths.image_metadata(id)?, sidecar.to_string().as_bytes())?;
+        Ok(())
+    }
+
+    #[test]
+    fn ssh_surfaces_are_refused_on_an_oci_machine_and_allowed_on_a_disk_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, dispatcher, paths) = fixture()?;
+        let oci_id = format!("image-{}", "a".repeat(64));
+        let disk_id = format!("image-{}", "b".repeat(64));
+        publish_stored_image(&paths, &oci_id, "oci")?;
+        publish_stored_image(&paths, &disk_id, "disk")?;
+
+        let mut state = firestone_core::MachineState {
+            version: firestone_core::StateVersion,
+            status: MachineStatus::Running,
+            image: firestone_core::StateImage {
+                r#ref: "docker.io/library/alpine:3.20".to_owned(),
+                id: Some(oci_id),
+                sha256: Some("1".repeat(64)),
+            },
+            mac: None,
+            cid: 3,
+            instance_id: None,
+            shim_pid: None,
+            vmm_pid: None,
+            sidecar_pids: std::collections::BTreeMap::new(),
+            runtime_dir: paths.machine_runtime_dir("oci-machine")?,
+            started_at: None,
+            forwards: Vec::new(),
+            degraded: Vec::new(),
+            last_exit: None,
+        };
+        let refusal = dispatcher
+            .refuse_ssh_surface("oci-machine", &state, "firestone shell")
+            .err()
+            .ok_or("an OCI machine accepted the shell surface")?;
+        assert_eq!(refusal.kind(), ErrorKind::Usage);
+        assert!(
+            refusal.message().contains("no sshd"),
+            "{}",
+            refusal.message()
+        );
+        assert!(
+            refusal
+                .hint()
+                .is_some_and(|hint| hint.contains("console") && hint.contains("logs")),
+            "{refusal:?}"
+        );
+
+        state.image.id = Some(disk_id);
+        dispatcher.refuse_ssh_surface("disk-machine", &state, "firestone shell")?;
+        state.image.id = None;
+        dispatcher.refuse_ssh_surface("unpinned", &state, "firestone shell")?;
         Ok(())
     }
 }
