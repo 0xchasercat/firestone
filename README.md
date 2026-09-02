@@ -20,8 +20,10 @@
   <a href="https://firestonevm.gitbook.io/quickstart">Quick start</a> ·
   <a href="https://firestonevm.gitbook.io/api-reference">API reference</a>
 </p>
-<p align="center"><img src="https://i.ibb.co/rK2kJVYf/firestone.png" alt="firestone" border="0" /></p>
 
+<p align="center">
+  ![Firestone UI](./docs/webui-screenshot.png)
+</p>
 Firestone runs Linux virtual machines on Cloud Hypervisor, and it runs OCI container images as virtual machines too. It ships as one executable of about 22 MB with the VMM, `passt` and `qemu-img` inside it, so there is no daemon to keep alive and no libvirt to configure. Firestone runs as your user. A machine is a directory of plain files under `~/.local/share/firestone` that you can read with `ls` and `cat`, and every command prints each step, what it is waiting on, and how long it took.
 
 ## Install
@@ -100,3 +102,4 @@ Two more references:
 Firestone needs a Linux x86_64 host with KVM: `/dev/kvm` has to exist and open read/write for your user. `firestone doctor` reports both and prints the group command when the device is present but not accessible.
 
 There is no macOS or Windows host support, and none is planned; Firestone is a KVM tool. The aarch64 target compiles and its catalog metadata is in place, but no aarch64 runtime release exists and `doctor` refuses an aarch64 host, because nothing has been booted there. Compiling is not evidence.
+
