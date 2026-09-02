@@ -1363,6 +1363,18 @@ def read_marker(harness: Harness, name: str) -> str:
 
 def write_marker(harness: Harness, name: str, value: str) -> None:
     harness.guest(name, f"printf '{value}' > {MARKER_PATH}; sync")
+    require(read_marker(harness, name) == value, f"the guest did not record the marker {value!r}")
+
+
+def require_marker(harness: Harness, name: str, expected: str, message: str) -> None:
+    observed = ""
+    deadline = time.monotonic() + GUEST_SETTLE_SECONDS
+    while time.monotonic() < deadline:
+        observed = read_marker(harness, name)
+        if observed == expected:
+            return
+        time.sleep(2.0)
+    raise AcceptanceError(f"{message}: expected {expected!r}, the guest holds {observed!r}")
 
 
 def http_get_forward(port: int, timeout: float) -> bytes:
@@ -1408,7 +1420,6 @@ def scenario_warm_snapshot(harness: Harness, name: str, forward_port: int) -> di
     require(resumed_uptime > uptime, "the guest uptime did not advance after the resume")
 
     write_marker(harness, name, "warm-mutated")
-    require(read_marker(harness, name) == "warm-mutated", "the guest mutation did not land")
     harness.stop(name)
 
     _, restored = harness.object_command(
@@ -1421,11 +1432,7 @@ def scenario_warm_snapshot(harness: Harness, name: str, forward_port: int) -> di
         timeout=START_TIMEOUT_SECONDS,
     )
     require(restored.get("started") is True, "a warm restore did not start the machine")
-    wait_for(
-        lambda: read_marker(harness, name) == "base",
-        GUEST_SETTLE_SECONDS,
-        "the warm restore did not roll the guest file back",
-    )
+    require_marker(harness, name, "base", "the warm restore did not roll the guest file back")
     restored_boot_id, _ = guest_boot_identity(harness, name)
     require(restored_boot_id == boot_id, "the warm restore booted a fresh kernel")
     restored_page = http_get_forward(forward_port, 120)
@@ -1444,6 +1451,7 @@ def scenario_warm_snapshot(harness: Harness, name: str, forward_port: int) -> di
 
 
 def scenario_cold_snapshot(harness: Harness, name: str) -> dict[str, Any]:
+    require_marker(harness, name, "base", "the machine does not hold the cold baseline")
     harness.stop(name)
     _, created = harness.object_command(
         "snapshot", "create", name, "cold1", action="snapshot-create", timeout=600
@@ -1456,6 +1464,7 @@ def scenario_cold_snapshot(harness: Harness, name: str) -> dict[str, Any]:
     require(names == {"warm1", "cold1"}, f"snapshot list is {sorted(names)}")
 
     harness.start(name)
+    require_marker(harness, name, "base", "the cold snapshot's machine lost its baseline")
     write_marker(harness, name, "cold-mutated")
     harness.stop(name)
     _, restored = harness.object_command(
@@ -1468,7 +1477,7 @@ def scenario_cold_snapshot(harness: Harness, name: str) -> dict[str, Any]:
         timeout=START_TIMEOUT_SECONDS,
     )
     require(restored.get("started") is True, "the cold restore did not honor --start")
-    require(read_marker(harness, name) == "base", "the cold restore did not roll the guest back")
+    require_marker(harness, name, "base", "the cold restore did not roll the guest back")
     return {
         "kind": "cold",
         "disk_bytes": created.get("disk_bytes"),
