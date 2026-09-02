@@ -215,8 +215,8 @@ grep -q 'releases/latest$' "$fixture/requests.log" || fail 'the API endpoint was
 grep -q 'download/v9.9.9/firestone-v9.9.9-x86_64-unknown-linux-musl$' "$fixture/requests.log" ||
     fail 'the release asset for the resolved tag was not requested'
 [[ -f $install_dir/firestone ]] || fail 'the binary was not installed'
-mode=$(ls -l "$install_dir/firestone" | cut -c1-10)
-[[ $mode == '-rwxr-xr-x' ]] || fail "installed mode is $mode, expected -rwxr-xr-x"
+mode=$(stat -c '%a' "$install_dir/firestone" 2>/dev/null || stat -f '%OLp' "$install_dir/firestone")
+[[ $mode == 755 ]] || fail "installed mode is $mode, expected 755"
 shopt -s nullglob
 staging_files=("$install_dir"/.firestone.install.*)
 shopt -u nullglob
