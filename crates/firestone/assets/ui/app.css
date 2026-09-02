@@ -315,6 +315,12 @@ textarea {
   align-items: center;
   gap: 11px;
   padding: 2px 6px 20px;
+  text-decoration: none;
+}
+
+.fs-brand:hover,
+.fs-brand:focus-visible {
+  text-decoration: none;
 }
 
 .fs-brand__mark {
