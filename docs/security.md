@@ -1,3 +1,7 @@
+---
+icon: shield-halved
+---
+
 # Security
 
 Firestone's security posture and trust boundaries.

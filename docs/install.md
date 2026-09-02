@@ -1,3 +1,7 @@
+---
+icon: download
+---
+
 # Install
 
 Getting the Firestone executable onto a Linux x86_64 host, from the release or from source.

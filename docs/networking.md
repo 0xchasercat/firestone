@@ -1,3 +1,7 @@
+---
+icon: network-wired
+---
+
 # Networking
 
 Network modes, port forwards and their restart rule, and shared folders.

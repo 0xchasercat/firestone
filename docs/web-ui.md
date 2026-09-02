@@ -1,3 +1,7 @@
+---
+icon: browser
+---
+
 # Web interface
 
 What `firestone ui` serves, what each screen holds, and how the terminal page attaches to a guest.

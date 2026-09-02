@@ -1,3 +1,7 @@
+---
+icon: terminal
+---
+
 # CLI and REST
 
 Copying files, the REST server over both transports, the prune ladder, and what `--json` guarantees.

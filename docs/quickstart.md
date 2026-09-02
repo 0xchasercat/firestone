@@ -1,3 +1,7 @@
+---
+icon: bolt
+---
+
 # Quick start
 
 Check the host with `doctor`, then boot your first machine.

@@ -1,3 +1,7 @@
+---
+icon: layer-group
+---
+
 # Images
 
 The built-in catalog, the owned image store, and running an OCI container image as a VM.

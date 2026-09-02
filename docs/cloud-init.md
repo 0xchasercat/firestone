@@ -1,3 +1,7 @@
+---
+icon: cloud
+---
+
 # Cloud-init
 
 Provisioning, SSH keys, console passwords, static addressing, and what Firestone does with the secrets you give it.

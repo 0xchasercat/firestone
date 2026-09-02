@@ -1,3 +1,7 @@
+---
+icon: code
+---
+
 # API reference
 
 Every operation the REST server exposes, generated from the same OpenAPI contract the test suite enforces.

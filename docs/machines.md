@@ -1,3 +1,7 @@
+---
+icon: server
+---
+
 # Machines
 
 The machine lifecycle, plus snapshots, clone, resize and metrics.

@@ -1,3 +1,7 @@
+---
+icon: wrench
+---
+
 # Troubleshooting
 
 Symptom-to-repair table for the thirteen error kinds, and how Firestone decides what is recoverable.
