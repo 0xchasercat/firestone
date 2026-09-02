@@ -141,6 +141,9 @@ fn stdout_broken_pipe_is_a_normal_exit() -> TestResult {
 fn doctor_failed_checks_emit_report_and_dependency_exit() -> TestResult {
     let directory = tempfile::tempdir()?;
     let home = directory.path().join("home");
+    // `doctor` repairs what needs no administrator, so point the vendored
+    // downloads at a port nothing listens on: this test counts checks, and it
+    // has no business fetching a release asset to do it.
     let output = Command::new(env!("CARGO_BIN_EXE_firestone"))
         .args([
             "--json",
@@ -148,6 +151,14 @@ fn doctor_failed_checks_emit_report_and_dependency_exit() -> TestResult {
             home.to_str().ok_or("temporary home is not UTF-8")?,
             "doctor",
         ])
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("https_proxy", "http://127.0.0.1:1")
+        .env("HTTP_PROXY", "http://127.0.0.1:1")
+        .env("http_proxy", "http://127.0.0.1:1")
+        .env("ALL_PROXY", "http://127.0.0.1:1")
+        .env("all_proxy", "http://127.0.0.1:1")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
         .output()?;
 
     assert_eq!(output.status.code(), Some(5));

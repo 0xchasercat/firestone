@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
@@ -102,10 +102,17 @@ pub struct DoctorCheck {
     pub id: DoctorCheckId,
     pub status: DoctorStatus,
     pub reason: String,
+    /// True when this run repaired the check rather than merely finding it well.
+    #[serde(default, skip_serializing_if = "is_not_fixed")]
+    pub fixed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+}
+
+fn is_not_fixed(fixed: &bool) -> bool {
+    !*fixed
 }
 
 impl DoctorCheck {
@@ -114,6 +121,7 @@ impl DoctorCheck {
             id,
             status,
             reason: reason.into(),
+            fixed: false,
             fix: None,
             hint: None,
         }
@@ -357,7 +365,7 @@ pub fn run_doctor(
 ) -> Result<DoctorReport, FirestoneError> {
     if !options.fix {
         let stale_state = reconcile_machine_states(context, &VMM_PING_PROBE);
-        return Ok(inspect(context, &BTreeMap::new(), &stale_state));
+        return Ok(inspect(context, &FixOutcome::default(), &stale_state));
     }
 
     match HttpsDownloader::new() {
@@ -391,13 +399,22 @@ fn run_doctor_with_options(
     options: DoctorOptions,
     fetcher: &dyn ArtifactFetcher,
 ) -> DoctorReport {
-    let failures = if options.fix {
+    let outcome = if options.fix {
         perform_fixes(context, fetcher, options.elevation_confirmed)
     } else {
-        BTreeMap::new()
+        FixOutcome::default()
     };
     let stale_state = reconcile_machine_states(context, &VMM_PING_PROBE);
-    inspect(context, &failures, &stale_state)
+    inspect(context, &outcome, &stale_state)
+}
+
+/// What one repair pass changed and what it could not.
+#[derive(Debug, Default)]
+struct FixOutcome {
+    failures: BTreeMap<DoctorCheckId, FixFailure>,
+    /// Checks this run actually repaired, such as a downloaded binary or a
+    /// generated SSH key. A check that was already well is not in this set.
+    repaired: BTreeSet<DoctorCheckId>,
 }
 
 #[derive(Debug, Default)]
@@ -494,7 +511,7 @@ impl ArtifactFetcher for HttpsDownloader {
                     ErrorKind::Dependency,
                     format!("cannot download dependency artifact from {url}"),
                 )
-                .with_hint("check network access and retry `firestone doctor --fix`")
+                .with_hint("check network access and retry `firestone doctor`")
                 .with_source(source)
             })?;
         if content_length_exceeds_limit(response.content_length()) {
@@ -521,7 +538,7 @@ fn copy_bounded(
             ErrorKind::Dependency,
             format!("cannot write dependency download from {url}"),
         )
-        .with_hint("check free space and retry `firestone doctor --fix`")
+        .with_hint("check free space and retry `firestone doctor`")
         .with_source(source)
     })?;
     if copied > maximum {
@@ -543,9 +560,10 @@ fn artifact_too_large(url: &Url) -> FirestoneError {
 
 fn inspect(
     context: &DoctorContext,
-    fix_failures: &BTreeMap<DoctorCheckId, FixFailure>,
+    outcome: &FixOutcome,
     stale_state: &StaleStateReport,
 ) -> DoctorReport {
+    let fix_failures = &outcome.failures;
     let kvm = check_kvm(context);
     let mut checks = vec![
         check_architecture(context),
@@ -574,6 +592,9 @@ fn inspect(
                 check.hint.clone_from(&failure.hint);
             }
         }
+        // A repair only reads as `fixed` once the re-inspection agrees the
+        // check is well; a repair that left it failing keeps its own status.
+        check.fixed = check.status == DoctorStatus::Ok && outcome.repaired.contains(&check.id);
     }
 
     debug_assert_eq!(
@@ -2282,8 +2303,9 @@ fn perform_fixes(
     context: &DoctorContext,
     fetcher: &dyn ArtifactFetcher,
     elevation_confirmed: bool,
-) -> BTreeMap<DoctorCheckId, FixFailure> {
+) -> FixOutcome {
     let mut failures = BTreeMap::new();
+    let mut repaired = BTreeSet::new();
 
     let data_ready = record_directory_fix(
         &context.paths,
@@ -2328,6 +2350,7 @@ fn perform_fixes(
                 DoctorCheckId::VendoredBinaries,
                 fetcher,
                 &mut failures,
+                &mut repaired,
             );
         }
         fix_artifact(
@@ -2336,22 +2359,31 @@ fn perform_fixes(
             DoctorCheckId::Virtiofsd,
             fetcher,
             &mut failures,
+            &mut repaired,
         );
     }
 
     if key_ready && path_is_missing(&ssh_private_key) && path_is_missing(&ssh_public_key) {
-        if let Err(error) = generate_ssh_key(context) {
-            record_fix_failure(&mut failures, DoctorCheckId::SshKey, error);
+        match generate_ssh_key(context) {
+            Ok(()) => {
+                repaired.insert(DoctorCheckId::SshKey);
+            }
+            Err(error) => record_fix_failure(&mut failures, DoctorCheckId::SshKey, error),
         }
     }
 
     let userns = diagnose_user_namespaces(context);
     if userns.apparmor_remediation {
-        if let Err(failure) = fix_apparmor_passt(context, elevation_confirmed) {
-            record_fix_failure_value(&mut failures, DoctorCheckId::UserNamespaces, failure);
+        match fix_apparmor_passt(context, elevation_confirmed) {
+            Ok(()) => {
+                repaired.insert(DoctorCheckId::UserNamespaces);
+            }
+            Err(failure) => {
+                record_fix_failure_value(&mut failures, DoctorCheckId::UserNamespaces, failure);
+            }
         }
     }
-    failures
+    FixOutcome { failures, repaired }
 }
 
 #[derive(Debug, Clone)]
@@ -2722,6 +2754,7 @@ fn fix_artifact(
     check_id: DoctorCheckId,
     fetcher: &dyn ArtifactFetcher,
     failures: &mut BTreeMap<DoctorCheckId, FixFailure>,
+    repaired: &mut BTreeSet<DoctorCheckId>,
 ) {
     let artifact = match context.manifest.artifact(dependency, &context.architecture) {
         Ok(artifact) => artifact,
@@ -2735,8 +2768,11 @@ fn fix_artifact(
     if artifact_state(&context.paths.bin_dir(), &artifact).is_ok() {
         return;
     }
-    if let Err(error) = install_artifact(&context.paths.bin_dir(), &artifact, fetcher) {
-        record_fix_failure(failures, check_id, error);
+    match install_artifact(&context.paths.bin_dir(), &artifact, fetcher) {
+        Ok(()) => {
+            repaired.insert(check_id);
+        }
+        Err(error) => record_fix_failure(failures, check_id, error),
     }
 }
 
@@ -2750,7 +2786,7 @@ fn record_fix_failure(
 
 fn dependency_install_io_hint(directory: &Path) -> String {
     format!(
-        "check read/write permissions and free space for {} and retry `firestone doctor --fix`",
+        "check read/write permissions and free space for {} and retry `firestone doctor`",
         directory.display()
     )
 }
@@ -4040,6 +4076,43 @@ fi"#,
         Ok(())
     }
 
+    /// SPEC §17.3. A check this run repaired says so, and a check that was
+    /// already well does not: `fixed` reports what changed on the host, so a
+    /// second run of the same repairs marks nothing.
+    #[test]
+    fn repaired_checks_report_fixed_and_an_unchanged_host_reports_none()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::healthy()?;
+        let artifact = fixture.context.manifest.artifact("virtiofsd", "x86_64")?;
+        fs::remove_file(fixture.context.paths.bin_dir().join(artifact.install_name))?;
+        fs::remove_file(fixture.context.paths.ssh_private_key())?;
+        fs::remove_file(fixture.context.paths.ssh_public_key())?;
+        let fetcher = FakeFetcher::new(fixture.payloads.clone());
+
+        let report = run_doctor_with(&fixture.context, true, &fetcher);
+
+        let fixed = report
+            .checks
+            .iter()
+            .filter(|check| check.fixed)
+            .map(|check| check.id)
+            .collect::<Vec<_>>();
+        assert_eq!(fixed, vec![DoctorCheckId::Virtiofsd, DoctorCheckId::SshKey]);
+        assert!(
+            report
+                .checks
+                .iter()
+                .all(|check| !check.fixed || check.status == DoctorStatus::Ok)
+        );
+
+        let second = run_doctor_with(&fixture.context, true, &fetcher);
+        assert!(second.checks.iter().all(|check| !check.fixed));
+
+        let inspected = run_doctor_with(&fixture.context, false, &fetcher);
+        assert!(inspected.checks.iter().all(|check| !check.fixed));
+        Ok(())
+    }
+
     #[test]
     fn install_io_failures_keep_dependency_kind_path_phase_and_actionable_hint()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -4081,11 +4154,7 @@ fi"#,
         let hash_hint = hash_error
             .hint()
             .ok_or("hash I/O error should have a hint")?;
-        for expected in [
-            "read/write permissions",
-            "free space",
-            "firestone doctor --fix",
-        ] {
+        for expected in ["read/write permissions", "free space", "firestone doctor"] {
             assert!(hash_hint.contains(expected));
         }
 

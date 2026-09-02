@@ -77,10 +77,11 @@ pub use initconfig::{
 };
 pub use lock::MachineLock;
 pub use metrics::{
-    COUNTER_SENTINEL_FLOOR, MetricsBlockDevice, MetricsCpu, MetricsMemory, MetricsNetDevice,
-    MetricsResult, VmmProcessSample, counter_is_sentinel, cpu_ticks_to_nanoseconds,
-    parse_proc_stat_cpu_ticks, parse_proc_status_rss_bytes, project_device_counters,
-    sample_vmm_process,
+    COUNTER_SENTINEL_FLOOR, HostMetricsCpu, HostMetricsDisk, HostMetricsMemory, HostMetricsResult,
+    MetricsBlockDevice, MetricsCpu, MetricsMemory, MetricsNetDevice, MetricsResult,
+    VmmProcessSample, counter_is_sentinel, cpu_ticks_to_nanoseconds, filesystem_capacity,
+    parse_proc_loadavg, parse_proc_meminfo_bytes, parse_proc_stat_cpu_ticks,
+    parse_proc_status_rss_bytes, project_device_counters, sample_host, sample_vmm_process,
 };
 pub use network::{
     DEFAULT_NETWORK_READINESS_POLL_INTERVAL, DEFAULT_NETWORK_READINESS_TIMEOUT, NetworkPlan,

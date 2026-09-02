@@ -134,6 +134,9 @@ pub enum Command {
 
     /// Inspect and reclaim host-wide Firestone storage.
     System(SystemArgs),
+
+    /// Remove the firestone executable, and with --purge its data.
+    Uninstall(UninstallArgs),
 }
 
 /// Arguments accepted by firestone system.
@@ -148,6 +151,9 @@ pub struct SystemArgs {
 pub enum SystemCommand {
     /// Reclaim disk space held by Firestone's own artifacts.
     Prune(SystemPruneArgs),
+
+    /// Print one sample of host CPU, memory, and data-directory space.
+    Metrics,
 }
 
 /// Arguments accepted by firestone system prune.
@@ -293,9 +299,33 @@ pub struct ServeArgs {
     )]
     pub listen: Option<ListenAddress>,
 
+    /// Loopback address to bind with --port. Defaults to 127.0.0.1.
+    #[arg(
+        long,
+        value_name = "ADDR",
+        conflicts_with = "listen",
+        requires = "port"
+    )]
+    pub host: Option<String>,
+
+    /// Loopback TCP port to bind. Same listener as --listen tcp:127.0.0.1:PORT.
+    #[arg(long, value_name = "PORT", conflicts_with = "listen")]
+    pub port: Option<u16>,
+
     /// File holding the 64-hexadecimal-character session token. TCP only.
     #[arg(long, value_name = "FILE")]
     pub token: Option<PathBuf>,
+}
+
+/// Arguments accepted by firestone uninstall.
+#[derive(Debug, Args)]
+#[command(
+    after_help = "By default uninstall removes only the firestone executable and keeps every\nmachine, image, and setting. --purge also deletes the config, data, and\nruntime directories, which destroys every machine and image on this host."
+)]
+pub struct UninstallArgs {
+    /// Also delete the config, data, and runtime directories.
+    #[arg(long)]
+    pub purge: bool,
 }
 
 /// Arguments accepted by firestone ui.
@@ -1223,6 +1253,83 @@ mod tests {
         Ok(())
     }
 
+    /// SPEC §16.1. `--host`/`--port` are sugar for one `--listen tcp:` form,
+    /// so they cannot be combined with it.
+    #[test]
+    fn serve_host_and_port_parse_and_refuse_to_share_a_line_with_listen() -> Result<(), clap::Error>
+    {
+        let port_only = Cli::try_parse_from(["firestone", "serve", "--port", "8080"])?;
+        assert!(matches!(
+            port_only.command,
+            Command::Serve(arguments)
+                if arguments.port == Some(8080)
+                    && arguments.host.is_none()
+                    && arguments.listen.is_none()
+        ));
+
+        let both = Cli::try_parse_from([
+            "firestone",
+            "serve",
+            "--host",
+            "::1",
+            "--port",
+            "8080",
+            "--token",
+            "/run/t",
+        ])?;
+        assert!(matches!(
+            both.command,
+            Command::Serve(arguments)
+                if arguments.host.as_deref() == Some("::1") && arguments.port == Some(8080)
+        ));
+
+        let conflict = Cli::try_parse_from([
+            "firestone",
+            "serve",
+            "--listen",
+            "tcp:127.0.0.1:8080",
+            "--port",
+            "9090",
+        ])
+        .expect_err("--port and --listen name the same listener");
+        assert_eq!(conflict.kind(), ErrorKind::ArgumentConflict);
+        assert!(conflict.to_string().contains("--listen"), "{conflict}");
+        assert!(conflict.to_string().contains("--port"), "{conflict}");
+
+        let lonely_host = Cli::try_parse_from(["firestone", "serve", "--host", "127.0.0.1"])
+            .expect_err("--host alone names no port");
+        assert_eq!(lonely_host.kind(), ErrorKind::MissingRequiredArgument);
+        Ok(())
+    }
+
+    #[test]
+    fn uninstall_grammar_defaults_to_keeping_data() -> Result<(), clap::Error> {
+        let bare = Cli::try_parse_from(["firestone", "uninstall"])?;
+        assert!(matches!(
+            bare.command,
+            Command::Uninstall(arguments) if !arguments.purge
+        ));
+
+        let purge = Cli::try_parse_from(["firestone", "uninstall", "--purge", "--yes"])?;
+        assert!(purge.yes);
+        assert!(matches!(
+            purge.command,
+            Command::Uninstall(arguments) if arguments.purge
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn system_metrics_parses_as_a_host_wide_subcommand() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["firestone", "system", "metrics"])?;
+        assert!(matches!(
+            cli.command,
+            Command::System(arguments)
+                if matches!(arguments.command, crate::cli::SystemCommand::Metrics)
+        ));
+        Ok(())
+    }
+
     #[test]
     fn serve_grammar_rejects_routable_and_wildcard_tcp_listener_addresses() {
         for address in [
@@ -1443,7 +1550,9 @@ mod tests {
         let bare = Cli::try_parse_from(["firestone", "system", "prune"])?;
         match bare.command {
             Command::System(arguments) => {
-                let crate::cli::SystemCommand::Prune(arguments) = arguments.command;
+                let crate::cli::SystemCommand::Prune(arguments) = arguments.command else {
+                    panic!("expected system prune")
+                };
                 assert!(!arguments.machines);
                 assert!(!arguments.images);
                 assert!(!arguments.all);
@@ -1465,7 +1574,9 @@ mod tests {
         ])?;
         match every.command {
             Command::System(arguments) => {
-                let crate::cli::SystemCommand::Prune(arguments) = arguments.command;
+                let crate::cli::SystemCommand::Prune(arguments) = arguments.command else {
+                    panic!("expected system prune")
+                };
                 assert!(arguments.machines);
                 assert!(arguments.images);
                 assert!(arguments.all);

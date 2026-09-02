@@ -65,6 +65,15 @@ A browser cannot open a Unix socket, so `serve` also takes a loopback TCP listen
 firestone serve --listen tcp:127.0.0.1:8642 --token ~/.local/share/firestone/api-token
 ```
 
+`--host ADDR` and `--port PORT` spell the same listener more briefly. `--port 8642` alone means `tcp:127.0.0.1:8642`, and `--host` picks which loopback address to bind:
+
+```sh
+firestone serve --port 8642 --token ~/.local/share/firestone/api-token
+firestone serve --host ::1 --port 8642 --token ~/.local/share/firestone/api-token
+```
+
+They are sugar for `--listen`, so passing both spellings is a usage error, and every rule above still holds: a non-loopback address is refused, and a TCP listener still needs `--token`.
+
 The token file is created mode 0600 when it does not exist, and validated when it does. Send it as a bearer token:
 
 ```sh
@@ -76,6 +85,17 @@ curl --fail --silent --show-error \
 Every TCP request passes a `Host` allowlist before the token is compared, which is what stops a rebound DNS name from spending a cookie your browser would attach for it. A WebSocket upgrade must additionally prove same origin. The transport is plaintext, so anything with local root can read it. Loopback TCP is a convenience for the browser, not a replacement for the 0600 socket.
 
 Two routes leave HTTP: `GET /v1/machines/{name}/console/ws` and `GET /v1/machines/{name}/shell/ws` carry a terminal as a byte stream. An attached terminal has no idle point, so shutting `serve` down closes an open terminal rather than waiting for the person at it.
+
+## Host and machine samples
+
+`GET /v1/machines/{name}/metrics` samples one running machine. `GET /v1/host/metrics` samples the host itself: processor count and load averages, memory, and free space on the filesystem holding the data directory. It needs no machine and takes no lock. The CLI prints the same sample:
+
+```sh
+firestone system metrics
+firestone system metrics --json
+```
+
+Firestone keeps no history, so a figure it cannot read is `null` rather than a zero, and a rate is two samples and a subtraction on your side.
 
 ## Reclaiming disk space
 

@@ -10,7 +10,7 @@ Firestone's security posture and trust boundaries.
 
 Firestone avoids privilege escalation. It still runs a hypervisor and hands the guest controlled access to host resources, so the boundaries are worth stating plainly.
 
-Firestone runs as your user, and `doctor --fix` makes no privileged host change without displaying it and asking first. The REST Unix socket, the runtime sockets, the console, the SSH identity, machine disks, logs and state are all your user's authority. Firestone rejects an unsafe owner, mode, file type or symlink instead of quietly repairing it.
+Firestone runs as your user, and `doctor` makes no privileged host change without displaying it and asking first. The REST Unix socket, the runtime sockets, the console, the SSH identity, machine disks, logs and state are all your user's authority. Firestone rejects an unsafe owner, mode, file type or symlink instead of quietly repairing it.
 
 A TCP listener is loopback-only and always authenticated. Firestone refuses a routable or wildcard bind, and refuses TCP without a token, before it creates the listener. The web interface performs no privileged action of its own; it renders the same results and calls the same `/v1` endpoints, so it holds exactly the authority you already have.
 
@@ -36,7 +36,7 @@ Firestone resolves every path once, at process startup:
 Use an isolated root for experiments, so nothing you try touches your real machines:
 
 ```sh
-firestone --home "$PWD/.firestone-sandbox" doctor --fix
+firestone --home "$PWD/.firestone-sandbox" doctor
 firestone --home "$PWD/.firestone-sandbox" create sandbox ubuntu
 ```
 

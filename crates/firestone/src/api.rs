@@ -144,6 +144,7 @@ define_rest_routes! {
     "/v1/machines/{name}/logs" => get(machine_logs);
     "/v1/machines/{name}/vmconfig" => get(machine_vmconfig);
     "/v1/machines/{name}/metrics" => get(machine_metrics);
+    "/v1/host/metrics" => get(host_metrics);
     "/v1/machines/{name}/console/ws" => get(ws::console);
     "/v1/machines/{name}/shell/ws" => get(ws::shell);
     "/v1/images" => get(images);
@@ -664,6 +665,12 @@ async fn machine_vmconfig(State(state): State<ApiState>, ApiPath(name): ApiPath)
 
 async fn machine_metrics(State(state): State<ApiState>, ApiPath(name): ApiPath) -> Response {
     payload_response(&state, Action::Metrics { name }, "metrics", StatusCode::OK).await
+}
+
+/// One sample of the host itself, for a client that wants to know whether
+/// this machine has room to run another VM.
+async fn host_metrics(State(state): State<ApiState>) -> Response {
+    payload_response(&state, Action::HostMetrics, "host-metrics", StatusCode::OK).await
 }
 
 async fn catalog(State(state): State<ApiState>) -> Response {

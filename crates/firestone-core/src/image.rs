@@ -49,6 +49,14 @@ const MAX_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SIDECAR_BYTES: u64 = 64 * 1024;
 const MAX_DEPENDENCY_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a pull waits for another pull to release the store lock.
+///
+/// One pull holds the lock for as long as its own download, conversion and
+/// rootfs packing take, and each of those is bounded at 30 minutes. A second
+/// request for the same reference must outwait all three to reach the cached
+/// result the first one publishes; with the ordinary 10 second timeout it
+/// would instead fail `busy` while the work it wanted was already running.
+const PULL_LOCK_TIMEOUT: Duration = Duration::from_secs(95 * 60);
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -1169,13 +1177,17 @@ impl ImageStore {
     }
 
     /// Pulls and verifies an image, always publishing an owned qcow2 base.
+    ///
+    /// Two requests for the same reference are deduplicated by the store lock:
+    /// the second waits for the first to publish and then returns its cached
+    /// result instead of downloading the same bytes again (SPEC §8.3).
     pub fn pull(
         &self,
         request: &ImagePullRequest,
         events: &mut dyn EventSink,
     ) -> Result<PulledImage, FirestoneError> {
         self.ensure_store()?;
-        let _lock = self.acquire_lock()?;
+        let _lock = self.acquire_pull_lock(events)?;
         self.cleanup_stale_partials()?;
         let source = self.resolve(
             &request.image,
@@ -1369,7 +1381,9 @@ impl ImageStore {
     ) -> Result<PreparedMachineImage, FirestoneError> {
         self.validate_machine_lock(name, machine_lock)?;
         self.ensure_store()?;
-        let _lock = self.acquire_lock()?;
+        // This path may pull the machine's image itself, and it waits behind
+        // any pull already in flight, so it takes the pull deadline.
+        let _lock = self.acquire_pull_lock(events)?;
         self.cleanup_stale_partials()?;
 
         let image = match (&state.image.id, &state.image.sha256) {
@@ -3018,6 +3032,29 @@ impl ImageStore {
 
     fn acquire_lock(&self) -> Result<ImageStoreLock, FirestoneError> {
         ImageStoreLock::acquire(&self.paths, LOCK_TIMEOUT, LOCK_POLL_INTERVAL)
+    }
+
+    /// Takes the store lock with the deadline a running pull needs.
+    ///
+    /// The wait can last as long as the work it is waiting for, so a caller
+    /// that does not get the lock at once is told why it is standing still
+    /// rather than watching a silent command.
+    fn acquire_pull_lock(
+        &self,
+        events: &mut dyn EventSink,
+    ) -> Result<ImageStoreLock, FirestoneError> {
+        match ImageStoreLock::acquire(&self.paths, Duration::ZERO, LOCK_POLL_INTERVAL) {
+            Ok(lock) => Ok(lock),
+            Err(error) if error.kind() == ErrorKind::Busy => {
+                events.emit(Event::Log {
+                    level: Level::Info,
+                    message: "another image operation is running; waiting for it to finish"
+                        .to_owned(),
+                })?;
+                ImageStoreLock::acquire(&self.paths, PULL_LOCK_TIMEOUT, LOCK_POLL_INTERVAL)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn cleanup_stale_partials(&self) -> Result<(), FirestoneError> {
@@ -6861,6 +6898,43 @@ else:
         fs::write(&release, b"release")?;
         assert!(child.wait()?.success());
         Ok(())
+    }
+
+    /// SPEC §8.3. Two requests for one reference are deduplicated by the store
+    /// lock: both succeed, one publishes and the other reports the cache.
+    #[test]
+    fn concurrent_pulls_of_one_reference_both_succeed_with_one_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new(false)?;
+        let source = fixture.write_source("shared.qcow2", b"QFI\xFBSHARED")?;
+        let request = local_request(&source, &fixture.root);
+
+        let (first, second) = thread::scope(|scope| {
+            let store = &fixture.store;
+            let first = scope.spawn(|| store.pull(&request, &mut Vec::new()));
+            let second = scope.spawn(|| store.pull(&request, &mut Vec::new()));
+            (first.join(), second.join())
+        });
+        let first = first.map_err(|_| "first pull panicked")??;
+        let second = second.map_err(|_| "second pull panicked")??;
+
+        assert_eq!(first.metadata.id, second.metadata.id);
+        assert_eq!(first.path, second.path);
+        assert_eq!(
+            usize::from(first.cached) + usize::from(second.cached),
+            1,
+            "exactly one pull publishes the image"
+        );
+        assert_eq!(fixture.store.list()?.len(), 1);
+        Ok(())
+    }
+
+    /// The pull deadline has to outlast the work another pull may be doing
+    /// under the lock, or waiting for it would fail `busy` on a slow download.
+    #[test]
+    fn pull_lock_timeout_outlasts_a_download_convert_and_pack() {
+        assert!(PULL_LOCK_TIMEOUT > LOCK_TIMEOUT);
+        assert!(PULL_LOCK_TIMEOUT > HTTP_REQUEST_TIMEOUT + QEMU_CONVERT_TIMEOUT + MKFS_TIMEOUT);
     }
 
     #[test]
