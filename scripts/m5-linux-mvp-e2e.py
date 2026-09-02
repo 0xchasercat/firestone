@@ -87,14 +87,6 @@ EXPECTED_RELEASE_DEPENDENCIES = {
         "version": "ch-1e1b96f126",
         "sha256": "9fb511fc0dd423d90a79615a90a8ace9b9e078b4a115ea2c459e0ac2f4e60218",
     },
-    "passt": {
-        "version": "2025_02_17.a1e48a0",
-        "sha256": "a60b0b5e54e6f48caa5984b0a6b21938a9e57ba2222cddb9c0ca021f10e9b10e",
-    },
-    "qemu-img": {
-        "version": "8.2.2",
-        "sha256": "7d7f32b1f6861140a95c4daa31c013a888dcc02c04551136f05e7da519d7e0ed",
-    },
     "rust-hypervisor-firmware": {
         "version": "0.5.0",
         "sha256": "4a0a1e977368f6b15d2198a216bdedf9a350bf5e5ae07e29e695373ec16ad958",
@@ -107,6 +99,20 @@ EXPECTED_RELEASE_DEPENDENCIES = {
 
 # Pinned in deps.toml and reported by `version`, but never installed by an M5
 # machine: the OCI direct-boot kernel is materialized only for M6 OCI boots.
+# Embedded into the standalone binary and materialized on first use, so the
+# M1 evidence inventory of downloaded artifacts never contains them; their
+# deps.toml rows are still validated below.
+EXPECTED_EMBEDDED_DEPENDENCIES = {
+    "passt": {
+        "version": "2025_02_17.a1e48a0",
+        "sha256": "a60b0b5e54e6f48caa5984b0a6b21938a9e57ba2222cddb9c0ca021f10e9b10e",
+    },
+    "qemu-img": {
+        "version": "8.2.2",
+        "sha256": "7d7f32b1f6861140a95c4daa31c013a888dcc02c04551136f05e7da519d7e0ed",
+    },
+}
+
 EXPECTED_LAZY_DEPENDENCIES = {
     "cloud-hypervisor-kernel": {
         "version": "ch-release-v6.16.9-20260508",
@@ -122,7 +128,9 @@ EXPECTED_LAZY_DEPENDENCIES = {
     },
 }
 
-EXPECTED_MANIFEST_DEPENDENCIES = EXPECTED_RELEASE_DEPENDENCIES | EXPECTED_LAZY_DEPENDENCIES
+EXPECTED_MANIFEST_DEPENDENCIES = (
+    EXPECTED_RELEASE_DEPENDENCIES | EXPECTED_EMBEDDED_DEPENDENCIES | EXPECTED_LAZY_DEPENDENCIES
+)
 
 # FIRESTONE_VERSION and CARGO_LOCK_SHA256 are absent for the same reason: both
 # are consequences of the release version, and validate_pins derives and checks
