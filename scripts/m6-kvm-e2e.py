@@ -742,9 +742,10 @@ class Harness:
         require(sha256(binary) == sha256(source), "the staged Firestone binary changed bytes")
         return binary
 
-    def environment(self) -> dict[str, str]:
+    def environment(self, overrides: dict[str, str] | None = None) -> dict[str, str]:
         environment = os.environ.copy()
         environment["FIRESTONE_HOME"] = os.fspath(self.home)
+        environment.update(overrides or {})
         return environment
 
     def record_command(self, argv: list[str | os.PathLike[str]]) -> list[str]:
@@ -761,6 +762,7 @@ class Harness:
         timeout: float = COMMAND_TIMEOUT_SECONDS,
         check: bool = True,
         record: bool = True,
+        env_overrides: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
         command = self.record_command(argv) if record else [os.fspath(value) for value in argv]
         rendered = shlex.join(command)
@@ -768,7 +770,7 @@ class Harness:
             completed = subprocess.run(
                 command,
                 cwd=REPO_ROOT,
-                env=self.environment(),
+                env=self.environment(env_overrides),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1494,10 +1496,33 @@ def scenario_pending_forwards(
     response = http_request(endpoint, "PATCH", f"/v1/machines/{name}", body)
     require(response.status == 200, f"PATCH answered {response.status}")
     patched = json.loads(response.body)
-    warnings = patched.get("warnings", [])
     require(
-        any("port forwards apply on restart" in warning for warning in warnings),
-        f"PATCH did not warn about pending forwards: {warnings!r}",
+        canonical_forwards(patched["spec"]["network"]["forward"])
+        == canonical_forwards(configured),
+        "PATCH did not persist the configured forwards",
+    )
+    # §12.5's warning is an `Event::Log`, which the CLI edit surface renders and
+    # the aggregating PATCH route does not carry, so it is asserted there.
+    editor = harness.workspace / "noop-editor.sh"
+    editor.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    os.chmod(editor, 0o700)
+    edited = harness.run(
+        [harness.binary, "--json", "edit", name],
+        timeout=COMMAND_TIMEOUT_SECONDS,
+        env_overrides={"VISUAL": f"sh {editor}"},
+    )
+    logs = [
+        json.loads(line).get("message", "")
+        for line in edited.stdout.splitlines()
+        if line and json.loads(line).get("type") == "Log"
+    ]
+    require(
+        any("port forwards apply on restart" in message for message in logs),
+        f"edit did not warn about pending forwards: {logs!r}",
+    )
+    require(
+        any("machine is running" in message for message in logs),
+        f"edit did not warn that the machine is running: {logs!r}",
     )
     _, rows = harness.json_command("ls", action="list")
     row = machine_row(rows, name)
