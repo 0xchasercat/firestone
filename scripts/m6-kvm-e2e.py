@@ -1612,9 +1612,17 @@ def scenario_clone(harness: Harness, endpoint: Endpoint, name: str, clone: str) 
     require(isinstance(cloned.get("disk_bytes"), int) and cloned["disk_bytes"] > 0,
             "the clone copied no overlay")
 
-    body = json.dumps({"network": {"forward": []}}, separators=(",", ":")).encode()
+    # The clone inherits the source's spec byte for byte, so both would bind the
+    # same host ports; `clear` is the only spelling that empties a vector leaf.
+    body = json.dumps({"clear": ["network.forward"]}, separators=(",", ":")).encode()
     response = http_request(endpoint, "PATCH", f"/v1/machines/{clone}", body)
-    require(response.status == 200, f"clearing the clone's forwards answered {response.status}")
+    require(
+        response.status == 200,
+        f"clearing the clone's forwards answered {response.status}: "
+        f"{compact_bytes(response.body)}",
+    )
+    cleared = json.loads(response.body)["spec"]["network"]["forward"]
+    require(not cleared, f"the clone still configures {cleared!r}")
 
     harness.start(name)
     harness.start(clone)
