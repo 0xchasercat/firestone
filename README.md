@@ -1,4 +1,25 @@
-# Firestone
+<p align="center">
+  <a href="https://firestonevm.gitbook.io"><img src="https://raw.githubusercontent.com/0xchasercat/firestone/main/crates/firestone/assets/ui/logo.svg" width="92" alt="Firestone"></a>
+</p>
+
+<h1 align="center">Firestone</h1>
+
+<p align="center">Linux VMs and OCI container images on Cloud Hypervisor, from one binary.</p>
+
+<p align="center">
+  <a href="https://github.com/0xchasercat/firestone/releases/latest"><img src="https://img.shields.io/github/v/release/0xchasercat/firestone?label=release&color=e0491f" alt="Latest release"></a>
+  <a href="https://github.com/0xchasercat/firestone/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/0xchasercat/firestone/ci.yml?branch=main&label=ci" alt="CI status"></a>
+  <a href="https://firestonevm.gitbook.io"><img src="https://img.shields.io/badge/docs-firestonevm.gitbook.io-e0491f" alt="Documentation"></a>
+  <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License: MIT OR Apache-2.0">
+  <img src="https://img.shields.io/badge/platform-linux%20x86__64-lightgrey" alt="Platform: Linux x86_64">
+</p>
+
+<p align="center">
+  <a href="https://firestonevm.gitbook.io">Documentation</a> ·
+  <a href="https://firestonevm.gitbook.io/install">Install</a> ·
+  <a href="https://firestonevm.gitbook.io/quickstart">Quick start</a> ·
+  <a href="https://firestonevm.gitbook.io/api-reference">API reference</a>
+</p>
 
 Firestone runs Linux virtual machines on Cloud Hypervisor, and it runs OCI container images as virtual machines too. It ships as one executable of about 22 MB with the VMM, `passt` and `qemu-img` inside it, so there is no daemon to keep alive and no libvirt to configure. Firestone runs as your user. A machine is a directory of plain files under `~/.local/share/firestone` that you can read with `ls` and `cat`, and every command prints each step, what it is waiting on, and how long it took.
 
@@ -59,7 +80,7 @@ Everything above is one model behind three surfaces. The CLI, `firestone.toml`, 
 
 ## Documentation
 
-The user guide is one page per topic, indexed in [docs/README.md](docs/README.md):
+The user guide lives at [firestonevm.gitbook.io](https://firestonevm.gitbook.io), one page per topic, with the interactive [API reference](https://firestonevm.gitbook.io/api-reference) alongside it. The same pages are in this repository, indexed in [docs/README.md](docs/README.md):
 
 - [Install](docs/install.md) and [quick start](docs/quickstart.md): get it onto a host and boot something.
 - [Machines](docs/machines.md): lifecycle, logs, snapshots, clone, resize, metrics.
