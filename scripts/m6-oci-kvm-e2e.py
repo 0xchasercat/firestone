@@ -989,8 +989,11 @@ def run_acceptance(harness: Harness) -> None:
     scenarios = harness.evidence["scenarios"]
     alpine = scenario_pull(harness, ALPINE_REFERENCE)
     harness.evidence["artifacts"] = {
+        # `mkfs.ext4` is run on the host, so it is published executable; the
+        # `firestone-init` payload and the direct-boot kernel are data the host
+        # only copies, so both are published 0644 (SPEC 17.2).
         "mkfs-ext4": require_materialized(harness, "mkfs-ext4", 0o755),
-        "firestone-init": require_materialized(harness, "firestone-init", 0o755),
+        "firestone-init": require_materialized(harness, "firestone-init", 0o644),
     }
     scenarios["alpine_pull"] = alpine
     scenarios["alpine_boot"] = scenario_alpine_boot(harness, ALPINE_MACHINE, ALPINE_REFERENCE)
