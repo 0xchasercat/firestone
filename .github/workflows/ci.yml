@@ -34,3 +34,18 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Run tests
         run: cargo test
+
+  installer:
+    name: Installer script
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Check shell syntax
+        run: |
+          sh -n install.sh
+          bash -n install.sh scripts/tests/test-install.sh
+      - name: Lint the installer
+        run: shellcheck install.sh scripts/tests/test-install.sh
+      - name: Run installer tests
+        run: scripts/tests/test-install.sh
