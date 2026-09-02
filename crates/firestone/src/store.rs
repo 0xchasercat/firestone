@@ -26,9 +26,10 @@ use firestone_core::{
     StateVersion, StopResult, Supervision, ValidationContext, VersionDependency, VersionIdentity,
     VersionPaths, VersionResult, VmmApi, atomic, cancel_prepared, classify_cp_operands,
     disk_shrink_error, forwards_differ, launch_prepared_cancellable, overlay_virtual_size,
-    prepare_start, project_device_counters, read_reconciled_machine_state_live,
-    read_reconciled_machine_state_live_locked, run_doctor, sample_vmm_process, scp_command_plan,
-    stop_unsupervised, validate_machine_spec, wait_for_ssh_ready,
+    overlay_virtual_size_shared, prepare_start, project_device_counters,
+    read_reconciled_machine_state_live, read_reconciled_machine_state_live_locked, run_doctor,
+    sample_vmm_process, scp_command_plan, stop_unsupervised, validate_machine_spec,
+    wait_for_ssh_ready,
 };
 use firestone_core::{CloneResult, StepId};
 use firestone_core::{
@@ -174,10 +175,7 @@ impl LocalDispatcher {
         let machine_dir = self.paths.machine_dir(name)?;
         let spec_path = self.paths.machine_spec(name)?;
         ensure_machine_exists(&self.paths, name, &machine_dir)?;
-        let lock_path = self.paths.machine_lock(name)?;
-        let lock = MachineLock::acquire(name, &lock_path, events)?;
-        ensure_machine_exists(&self.paths, name, &machine_dir)?;
-        let observed_state = self.read_live_state_locked(name, &lock)?;
+        let (_lock, observed_state, _running) = self.open_spec_write(name, &machine_dir, events)?;
         let original = read_file(&spec_path, "machine spec", ErrorKind::NotFound)?;
         let candidate = spec_path.with_extension("toml.edit");
         atomic::write_with_mode(&candidate, &original, MACHINE_SPEC_FILE_MODE)?;
@@ -1405,6 +1403,40 @@ impl LocalDispatcher {
         )
     }
 
+    /// Opens one spec write, taking the machine lock only when it can be taken.
+    ///
+    /// A running machine's shim owns the machine lock for the machine's whole
+    /// lifetime (§4.3), so a spec write that waited for it could never finish:
+    /// `firestone edit`, `PUT` and `PATCH` on a running machine always ended in
+    /// `busy` after the ten-second wait, which made §12.5's whole pending-
+    /// forwards contract — edit a running machine, see `forwards_pending`,
+    /// restart — unreachable. A spec write touches only `firestone.toml`, which
+    /// the shim never writes, so the running path takes no lock, exactly as
+    /// `resize` does (§9.5 step 4).
+    fn open_spec_write(
+        &self,
+        name: &str,
+        machine_dir: &Path,
+        events: &mut dyn EventSink,
+    ) -> Result<(Option<MachineLock>, LiveMachineState, bool), FirestoneError> {
+        let preliminary = self.read_live_state(name)?;
+        if preliminary.state.status == MachineStatus::Running {
+            return Ok((None, preliminary, true));
+        }
+        let lock_path = self.paths.machine_lock(name)?;
+        let lock = MachineLock::acquire(name, &lock_path, events)?;
+        ensure_machine_exists(&self.paths, name, machine_dir)?;
+        let observed = self.read_live_state_locked(name, &lock)?;
+        if observed.state.status == MachineStatus::Running {
+            return Err(FirestoneError::new(
+                ErrorKind::Conflict,
+                format!("machine `{name}` started while its specification was being written"),
+            )
+            .with_hint(format!("retry the change to machine {name:?}")));
+        }
+        Ok((Some(lock), observed, false))
+    }
+
     fn set_spec(
         &self,
         name: &str,
@@ -1414,13 +1446,10 @@ impl LocalDispatcher {
         self.validate_machine_storage()?;
         let machine_dir = self.paths.machine_dir(name)?;
         ensure_machine_exists(&self.paths, name, &machine_dir)?;
-        let lock_path = self.paths.machine_lock(name)?;
-        let lock = MachineLock::acquire(name, &lock_path, events)?;
-        ensure_machine_exists(&self.paths, name, &machine_dir)?;
-        let observed_state = self.read_live_state_locked(name, &lock)?;
+        let (_lock, observed_state, running) = self.open_spec_write(name, &machine_dir, events)?;
         let pinned_image_ref = pinned_image_reference(&observed_state.state);
         let warnings = self.validate_action_spec(&mut spec, pinned_image_ref)?;
-        self.refuse_disk_shrink(name, &spec)?;
+        self.refuse_disk_shrink(name, &spec, running)?;
         let previous = self.previous_spec_when_running(name, &observed_state.state)?;
         let document = render_spec(&spec)?;
         atomic::write_with_mode(
@@ -1444,10 +1473,7 @@ impl LocalDispatcher {
         self.validate_machine_storage()?;
         let machine_dir = self.paths.machine_dir(name)?;
         ensure_machine_exists(&self.paths, name, &machine_dir)?;
-        let lock_path = self.paths.machine_lock(name)?;
-        let lock = MachineLock::acquire(name, &lock_path, events)?;
-        ensure_machine_exists(&self.paths, name, &machine_dir)?;
-        let observed_state = self.read_live_state_locked(name, &lock)?;
+        let (_lock, observed_state, running) = self.open_spec_write(name, &machine_dir, events)?;
         let source = read_file(
             &self.paths.machine_spec(name)?,
             "machine spec",
@@ -1473,7 +1499,7 @@ impl LocalDispatcher {
             .iter()
             .map(SpecWarningPayload::from)
             .collect::<Vec<_>>();
-        self.refuse_disk_shrink(name, &loaded.spec)?;
+        self.refuse_disk_shrink(name, &loaded.spec, running)?;
         let previous = self.previous_spec_when_running(name, &observed_state.state)?;
         let document = render_spec(&loaded.spec)?;
         atomic::write_with_mode(
@@ -1499,7 +1525,12 @@ impl LocalDispatcher {
     ///
     /// qcow2 shrink truncates the guest filesystem. A machine that has never
     /// been started owns no overlay yet, so any `disk` remains free to change.
-    fn refuse_disk_shrink(&self, name: &str, spec: &MachineSpec) -> Result<(), FirestoneError> {
+    fn refuse_disk_shrink(
+        &self,
+        name: &str,
+        spec: &MachineSpec,
+        running: bool,
+    ) -> Result<(), FirestoneError> {
         let overlay = self.paths.machine_disk(name)?;
         let exists = overlay.try_exists().map_err(|source| {
             filesystem_error(
@@ -1512,7 +1543,17 @@ impl LocalDispatcher {
         if !exists {
             return Ok(());
         }
-        let Some(current) = overlay_virtual_size(&self.qemu_img_program()?, &overlay)? else {
+        let qemu_img = self.qemu_img_program()?;
+        // A running machine's VMM holds the overlay's qemu-img lock, so the
+        // plain inspection fails on exactly the machines `resize` and a
+        // running-machine spec write must inspect. Share the image for this
+        // read-only size question instead (SPEC §9.5).
+        let measured = if running {
+            overlay_virtual_size_shared(&qemu_img, &overlay)?
+        } else {
+            overlay_virtual_size(&qemu_img, &overlay)?
+        };
+        let Some(current) = measured else {
             return Ok(());
         };
         if spec.disk.as_bytes() < current {
@@ -1620,7 +1661,7 @@ impl LocalDispatcher {
             .map(SpecWarningPayload::from)
             .collect::<Vec<_>>();
 
-        self.refuse_disk_shrink(name, &loaded.spec)?;
+        self.refuse_disk_shrink(name, &loaded.spec, running)?;
 
         let applied_live = if running {
             let capacity = published_vmconfig_capacity(name, &self.read_published_vmconfig(name)?)?;

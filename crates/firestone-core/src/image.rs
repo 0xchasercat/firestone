@@ -4510,11 +4510,29 @@ fn validate_overlay_info(
 
 /// Uses the pinned qemu-img 8.2.2 JSON inspection argv from verify 4/5.
 fn qemu_info_with(qemu_img: &Path, path: &Path) -> Result<QemuInfo, FirestoneError> {
-    let output = Cmd::new(qemu_img.as_os_str())
+    qemu_info_shared(qemu_img, path, false)
+}
+
+/// The same inspection, optionally sharing an image another process has open.
+///
+/// `qemu-img info` takes an exclusive image lock by default, and a running
+/// Cloud Hypervisor already holds one on the machine overlay. Every read-only
+/// inspection of a live machine's overlay therefore has to pass `-U`, which
+/// asks qemu-img to share the image for this one header read.
+fn qemu_info_shared(
+    qemu_img: &Path,
+    path: &Path,
+    force_share: bool,
+) -> Result<QemuInfo, FirestoneError> {
+    let mut command = Cmd::new(qemu_img.as_os_str())
         .arg("info")
         .arg("--output=json")
         .arg("-f")
-        .arg("qcow2")
+        .arg("qcow2");
+    if force_share {
+        command = command.arg("-U");
+    }
+    let output = command
         .arg(path.as_os_str())
         .timeout(QEMU_INFO_TIMEOUT)
         .error_kind(ErrorKind::Dependency)
@@ -4561,8 +4579,32 @@ pub fn overlay_virtual_size(
     qemu_img: &Path,
     overlay: &Path,
 ) -> Result<Option<u64>, FirestoneError> {
+    overlay_virtual_size_with(qemu_img, overlay, false)
+}
+
+/// The same report for an overlay a running VMM already holds open.
+///
+/// `resize` and a spec write on a running machine both have to compare the
+/// requested `disk` with the live overlay (SPEC §9.5), and the VMM holds that
+/// image's qemu-img lock for the machine's whole lifetime. Without the shared
+/// read every such call fails with `Failed to lock byte 201` instead of
+/// answering the size question.
+pub fn overlay_virtual_size_shared(
+    qemu_img: &Path,
+    overlay: &Path,
+) -> Result<Option<u64>, FirestoneError> {
+    overlay_virtual_size_with(qemu_img, overlay, true)
+}
+
+fn overlay_virtual_size_with(
+    qemu_img: &Path,
+    overlay: &Path,
+    force_share: bool,
+) -> Result<Option<u64>, FirestoneError> {
     match fs::symlink_metadata(overlay) {
-        Ok(_) => Ok(Some(qemu_info_with(qemu_img, overlay)?.virtual_size)),
+        Ok(_) => Ok(Some(
+            qemu_info_shared(qemu_img, overlay, force_share)?.virtual_size,
+        )),
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(image_file_error("inspect", overlay, source)),
     }

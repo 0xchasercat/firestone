@@ -69,6 +69,7 @@ pub use image::{
     ImagePullRequest, ImageRemoveResult, ImageSourceLocation, ImageStore, ImageVerification,
     OciSidecar, OverlayInfo, PreparedMachineImage, PrunedImageArtifact, PulledImage,
     ResolvedImageSource, StoredImage, disk_shrink_error, overlay_virtual_size,
+    overlay_virtual_size_shared,
 };
 pub use initconfig::{
     PublishedInitConfig, build_config_disk, config_disk_identity, publish_init_config,

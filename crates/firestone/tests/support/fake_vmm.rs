@@ -609,7 +609,9 @@ fn run_qemu(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             fs::write(target, output)?;
         }
         Some("info") => {
-            let path = Path::new(arguments.get(5).ok_or("missing info path")?);
+            // The inspected path is always the final operand; an optional `-U`
+            // sits between the format flag and it (SPEC §9.5 shared read).
+            let path = Path::new(arguments.last().ok_or("missing info path")?);
             let data = fs::read(path)?;
             let suffix = data.get(4..).unwrap_or_default();
             if suffix.starts_with(b"OVERLAY\n") {
