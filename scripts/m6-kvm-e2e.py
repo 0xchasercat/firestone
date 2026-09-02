@@ -881,8 +881,11 @@ class Harness:
         timeout: float = GUEST_TIMEOUT_SECONDS,
         check: bool = True,
     ) -> str:
+        # `ssh` joins its command words with single spaces and the guest login
+        # shell re-splits the result, so the command travels as one word and is
+        # parsed once, on the guest, exactly as it was written here.
         completed = self.run(
-            [self.binary, "shell", name, "--", "sh", "-c", command],
+            [self.binary, "shell", name, "--", command],
             timeout=timeout,
             check=check,
         )
@@ -1221,6 +1224,10 @@ def scenario_resize(harness: Harness, name: str) -> dict[str, Any]:
         "the guest never onlined the hotplugged memory",
     )
     after_memory = parse_free_total_bytes(harness.guest(name, "free -b"))
+    require(
+        after_memory >= 3 * 1024**3 // 2,
+        f"free -b reports {after_memory} bytes after a resize to 2 GiB",
+    )
     return {
         "applied_live": True,
         "before_nproc": before_nproc,
