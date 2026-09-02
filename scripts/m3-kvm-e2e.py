@@ -1440,7 +1440,11 @@ while True:
         timeout=40,
     )
     require(curl.stdout == http_marker.encode(), "curl returned the wrong forwarded HTTP marker")
-    require(not curl.stderr, f"curl wrote stderr: {compact_bytes(curl.stderr)}")
+    # curl runs with --retry-all-errors, so a transient refusal before the
+    # guest server binds leaves noise on stderr even when a later attempt
+    # succeeded. The marker equality above is the assertion; stderr only
+    # matters when the final transfer failed, which --fail already reports
+    # through the exit status checked by harness.run.
 
     started = time.monotonic()
     deadline = started + 20

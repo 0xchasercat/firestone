@@ -72,7 +72,7 @@ EXPECTED_FILE_HASHES = {
     "deps.toml": "c486192fc3815c62a9027d5299e8863a9292d6a2ae9f21f99148b77db781c220",
     "scripts/m1-kvm-e2e.py": "719660526334393f2cb5df6b0b7d2eaf5a106f6e41674fdf3feb9476da11d124",
     "scripts/m2-kvm-e2e.py": "152a8f0ae19a0f46b2415186f545e4109c1d4ca47dbd57e335e0757e72f6d66f",
-    "scripts/m3-kvm-e2e.py": "61c6b2d74b3ee609b63409aaaafbf59851340c47d27eb84ba0e629796b7b473f",
+    "scripts/m3-kvm-e2e.py": "69f87c06d19b1f5ee4ad67ac2a04ffc38a2e29defaf3632c036256d1354e7742",
     "scripts/m4-kvm-e2e.py": "16a14771c0c0e6916d49554f0ed1af24b8fa8ef7e9c28ad9351e587e86c3a99e",
     "scripts/m5-catalog-kvm-e2e.py": "500e414ab16e08b25e592d049491e6c51e3240ce1569dc1207f8efdbc27d833b",
     "scripts/m5-doctor-matrix.py": "dc6e0b44e9c37194089ad84953065349edf65d7525bfb1a81bf9762873286aa6",
@@ -1218,13 +1218,24 @@ def nested_value(document: dict[str, Any], *keys: str) -> Any:
 
 
 def validate_installed_artifacts(document: dict[str, Any], identifier: str) -> None:
+    """Each sub-harness inventories the artifacts its own scenarios install.
+
+    m1 exercises no passt machine, so only the four downloaded artifacts can
+    appear there; m3 runs passt machines, so the embedded helpers materialize
+    and its inventory carries all six.
+    """
+    expected_sets = {
+        "m1": EXPECTED_RELEASE_DEPENDENCIES,
+        "m3": EXPECTED_RELEASE_DEPENDENCIES | EXPECTED_EMBEDDED_DEPENDENCIES,
+    }
+    expected_set = expected_sets.get(identifier, EXPECTED_RELEASE_DEPENDENCIES)
     artifacts = document.get("artifacts")
     require(isinstance(artifacts, dict), f"{identifier} artifact evidence is missing")
     require(
-        set(artifacts) == set(EXPECTED_RELEASE_DEPENDENCIES),
+        set(artifacts) == set(expected_set),
         f"{identifier} artifact evidence has the wrong dependency set",
     )
-    for name, expected in EXPECTED_RELEASE_DEPENDENCIES.items():
+    for name, expected in expected_set.items():
         artifact = artifacts.get(name)
         require(isinstance(artifact, dict), f"{identifier} artifact {name} is invalid")
         require(artifact.get("version") == expected["version"], f"{identifier} artifact {name} version changed")
