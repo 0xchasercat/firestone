@@ -231,6 +231,14 @@ def http_response_complete(response: bytes) -> bool:
     return False
 
 
+def http_status_code(head: bytes) -> int:
+    """The status code of one HTTP response's status line."""
+    line = head.split(b"\r\n", 1)[0]
+    parts = line.split()
+    require(len(parts) >= 2 and parts[1].isdigit(), f"malformed HTTP status line: {line!r}")
+    return int(parts[1])
+
+
 def parse_http_response(response: bytes) -> "HttpResponse":
     header_end = response.find(b"\r\n\r\n")
     require(header_end >= 0, "HTTP response has no header terminator")
@@ -462,8 +470,27 @@ class WebSocketClient:
         self.response = self._read_handshake(timeout)
 
     def _read_handshake(self, timeout: float) -> HttpResponse:
+        """Reads the response, keeping any frames that follow a `101`.
+
+        A refusal is an ordinary REST error with a body worth reading, and an
+        upgrade is a header block whose next byte already belongs to the frame
+        stream. The two cases therefore stop at different points.
+        """
         deadline = time.monotonic() + timeout
-        while b"\r\n\r\n" not in self.buffer:
+        closed = False
+        while True:
+            header_end = self.buffer.find(b"\r\n\r\n")
+            if header_end >= 0:
+                status = http_status_code(bytes(self.buffer[:header_end]))
+                if status == 101:
+                    head = bytes(self.buffer[: header_end + 4])
+                    del self.buffer[: header_end + 4]
+                    return parse_http_response(head)
+                if closed or http_response_complete(bytes(self.buffer)):
+                    whole = bytes(self.buffer)
+                    self.buffer.clear()
+                    return parse_http_response(whole)
+            require(not closed, f"WebSocket handshake for {self.path} closed early")
             remaining = deadline - time.monotonic()
             require(remaining > 0, f"WebSocket handshake for {self.path} timed out")
             self.socket.settimeout(min(1.0, remaining))
@@ -471,28 +498,11 @@ class WebSocketClient:
                 block = self.socket.recv(65_536)
             except TimeoutError:
                 continue
-            require(bool(block), f"WebSocket handshake for {self.path} closed early")
+            if not block:
+                closed = True
+                continue
             self.buffer.extend(block)
             require(len(self.buffer) <= MAX_OUTPUT_BYTES, "handshake response exceeded 8 MiB")
-        header_end = self.buffer.find(b"\r\n\r\n") + 4
-        head = bytes(self.buffer[:header_end])
-        del self.buffer[:header_end]
-        response = parse_http_response(head)
-        if response.status != 101:
-            body = bytearray(self.buffer)
-            length = int(response.headers.get("content-length", "0") or 0)
-            deadline = time.monotonic() + min(5.0, timeout)
-            while len(body) < length and time.monotonic() < deadline:
-                self.socket.settimeout(1.0)
-                try:
-                    block = self.socket.recv(65_536)
-                except TimeoutError:
-                    continue
-                if not block:
-                    break
-                body.extend(block)
-            response.body = bytes(body[:length]) if length else bytes(body)
-        return response
 
     def require_upgraded(self) -> None:
         require(
