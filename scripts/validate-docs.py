@@ -27,6 +27,7 @@ GLOBAL_SWITCH_OPTIONS = {
     "--yes",
     "-y",
 }
+SUBCOMMAND_GROUPS = {"images", "snapshot", "system"}
 
 
 class DocumentationError(RuntimeError):
@@ -190,12 +191,13 @@ def command_path(tokens: list[str]) -> tuple[list[str], int]:
         raise DocumentationError(f"Firestone invocation has no command: {tokens!r}")
     path = [tokens[index]]
     command_index = index
-    if tokens[index] == "images":
+    if tokens[index] in SUBCOMMAND_GROUPS:
+        group = tokens[index]
         index += 1
         while index < len(tokens) and tokens[index].startswith("-"):
             index += 1
         if index >= len(tokens):
-            raise DocumentationError(f"images invocation has no subcommand: {tokens!r}")
+            raise DocumentationError(f"{group} invocation has no subcommand: {tokens!r}")
         path.append(tokens[index])
     return path, command_index
 
