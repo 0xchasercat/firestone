@@ -61,7 +61,7 @@ jobs:
       - name: Validate guide commands and local links
         run: >-
           python3 scripts/validate-docs.py --binary target/release/firestone
-          README.md docs/*.md
+          README.md docs/*.md docs/api-reference/*.md
       - name: Upload Firestone binary
         uses: actions/upload-artifact@v4
         with:

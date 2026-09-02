@@ -11,3 +11,18 @@
 - [CLI and REST](cli-and-rest.md)
 - [Troubleshooting](troubleshooting.md)
 - [Security](security.md)
+
+## API reference
+
+- [Overview](api-reference/README.md)
+- ```yaml
+  type: builtin:openapi
+  props:
+    models: false
+    downloadLink: true
+  dependencies:
+    spec:
+      ref:
+        kind: openapi
+        spec: firestone
+  ```

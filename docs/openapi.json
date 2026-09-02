@@ -3774,7 +3774,7 @@
           },
           "image_pending": {
             "type": "boolean",
-            "description": "The spec's image reference, resolved through the catalog by the \u00a78.2 rules, names an image other than the one this running machine booted. Catalog aliases and default references resolve first, so a machine created as 'ubuntu' and running 'ubuntu:24.04' is not pending. Always false unless the machine is running."
+            "description": "The spec's image reference, resolved through the catalog by the §8.2 rules, names an image other than the one this running machine booted. Catalog aliases and default references resolve first, so a machine created as 'ubuntu' and running 'ubuntu:24.04' is not pending. Always false unless the machine is running."
           }
         },
         "additionalProperties": false,
@@ -7412,5 +7412,6 @@
       "default": 200
     },
     "event_channel_capacity": 16
-  }
+  },
+  "x-hideTryItPanel": true
 }
