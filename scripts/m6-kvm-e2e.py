@@ -1005,6 +1005,69 @@ def free_loopback_port() -> int:
         return int(probe.getsockname()[1])
 
 
+def dependency_artifact(name: str, architecture: str = "x86_64") -> dict[str, Any]:
+    manifest = tomllib.loads((REPO_ROOT / "deps.toml").read_text(encoding="utf-8"))
+    dependency = manifest["dependency"].get(name)
+    require(isinstance(dependency, dict), f"deps.toml has no [dependency.{name}]")
+    artifact = dependency.get(architecture)
+    require(isinstance(artifact, dict), f"deps.toml pins no {architecture} {name}")
+    return {"version": dependency["version"], **artifact}
+
+
+def helper_cache_dir() -> Path:
+    configured = os.environ.get("FIRESTONE_E2E_HELPER_CACHE")
+    cache = (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / ".cache" / "firestone-e2e-helpers"
+    )
+    cache.mkdir(parents=True, exist_ok=True)
+    return cache
+
+
+def stage_pinned_helper(harness: Harness, name: str) -> dict[str, Any]:
+    """Installs one `deps.toml` helper a standalone release would embed.
+
+    `doctor --fix` downloads only the three vendored dependencies; `passt` and
+    `qemu-img` reach a release through the embedded-helper payload, which a
+    plain `cargo build` does not carry. The harness therefore stages the exact
+    pinned bytes into the run's own `data/bin`, which is where `doctor` looks
+    first, so the run measures the pinned helper rather than whatever the host
+    happens to carry.
+    """
+    import urllib.request
+
+    artifact = dependency_artifact(name)
+    cached = helper_cache_dir() / artifact["install_name"]
+    if not cached.is_file() or sha256(cached) != artifact["sha256"]:
+        partial = cached.with_name(f".{cached.name}.{os.getpid()}.partial")
+        request = urllib.request.Request(  # noqa: S310 - a pinned HTTPS release asset
+            artifact["url"], headers={"Accept-Encoding": "identity"}
+        )
+        require(artifact["url"].startswith("https://"), f"{name} is not pinned over HTTPS")
+        with urllib.request.urlopen(request, timeout=120) as stream:  # noqa: S310
+            partial.write_bytes(stream.read(256 * 1024 * 1024))
+        os.replace(partial, cached)
+        require(
+            sha256(cached) == artifact["sha256"],
+            f"the downloaded {name} does not match its deps.toml checksum",
+        )
+    bin_dir = harness.home / "data" / "bin"
+    bin_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for directory in (harness.home / "data", bin_dir):
+        os.chmod(directory, 0o700)
+    target = bin_dir / artifact["install_name"]
+    shutil.copy2(cached, target)
+    os.chmod(target, 0o755)
+    require(sha256(target) == artifact["sha256"], f"the staged {name} changed bytes")
+    return {
+        "version": artifact["version"],
+        "install_name": artifact["install_name"],
+        "sha256": artifact["sha256"],
+        "staged_from": artifact["url"],
+    }
+
+
 def installed_artifacts(harness: Harness) -> dict[str, Any]:
     manifest = tomllib.loads((REPO_ROOT / "deps.toml").read_text(encoding="utf-8"))
     dependencies = manifest["dependency"]
@@ -1713,6 +1776,9 @@ def run_acceptance(harness: Harness) -> None:
         "initial_home_empty": True,
     }
 
+    harness.evidence["staged_helpers"] = {
+        name: stage_pinned_helper(harness, name) for name in ("passt", "qemu-img")
+    }
     harness.object_command("doctor", "--fix", action="doctor", timeout=DOCTOR_TIMEOUT_SECONDS)
     _, doctor = harness.object_command("doctor", action="doctor", timeout=DOCTOR_TIMEOUT_SECONDS)
     failures = [check for check in doctor["checks"] if check.get("status") == "fail"]
