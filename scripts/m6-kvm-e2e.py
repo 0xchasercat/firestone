@@ -288,9 +288,15 @@ def decode_chunked(value: bytes) -> bytes:
 
 
 def canonical_forwards(values: list[str]) -> list[str]:
-    """Normalizes forward specs into the comparable multiset of SPEC §12.5."""
+    """Normalizes forward specs into the comparable multiset of SPEC §12.5.
+
+    Both spellings Firestone shows are accepted: the configuration form
+    `[proto:][bind:]HOST:GUEST` and the `ls` column's `HOST→GUEST`.
+    """
     canonical: list[str] = []
-    for value in values:
+    for raw in values:
+        head, arrow, tail = raw.rpartition("→")
+        value = f"{head}:{tail}" if arrow else raw
         parts = value.split(":")
         proto = "tcp"
         if parts and parts[0] in {"tcp", "udp"}:
@@ -1491,15 +1497,19 @@ def scenario_cold_snapshot(harness: Harness, name: str) -> dict[str, Any]:
 def scenario_pending_forwards(
     harness: Harness, endpoint: Endpoint, name: str, first: int, second: int
 ) -> dict[str, Any]:
-    configured = [f"{first}:{GUEST_HTTP_PORT}", f"{second}:{GUEST_SECOND_PORT}"]
-    body = json.dumps({"network": {"forward": configured}}, separators=(",", ":")).encode()
+    applied = [f"{first}:{GUEST_HTTP_PORT}"]
+    added = [f"{second}:{GUEST_SECOND_PORT}"]
+    configured = applied + added
+    # An action patch appends to a vector leaf rather than replacing it (§7.1),
+    # so the machine's own forward stays and the new one joins it.
+    body = json.dumps({"network": {"forward": added}}, separators=(",", ":")).encode()
     response = http_request(endpoint, "PATCH", f"/v1/machines/{name}", body)
     require(response.status == 200, f"PATCH answered {response.status}")
     patched = json.loads(response.body)
+    observed = patched["spec"]["network"]["forward"]
     require(
-        canonical_forwards(patched["spec"]["network"]["forward"])
-        == canonical_forwards(configured),
-        "PATCH did not persist the configured forwards",
+        canonical_forwards(observed) == canonical_forwards(configured),
+        f"PATCH persisted {observed!r}, expected {configured!r}",
     )
     # §12.5's warning is an `Event::Log`, which the CLI edit surface renders and
     # the aggregating PATCH route does not carry, so it is asserted there.
@@ -1528,8 +1538,8 @@ def scenario_pending_forwards(
     row = machine_row(rows, name)
     require(row["forwards_pending"] is True, "ls --json did not mark the forwards pending")
     require(
-        canonical_forwards(row["forwards"]) == canonical_forwards([f"{first}:{GUEST_HTTP_PORT}"]),
-        "the pending row stopped showing the applied forwards",
+        canonical_forwards(row["forwards"]) == canonical_forwards(applied),
+        f"the pending row shows {row['forwards']!r}, expected the applied {applied!r}",
     )
     _, restarted = harness.object_command(
         "restart", name, action="restart", timeout=START_TIMEOUT_SECONDS
