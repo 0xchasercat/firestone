@@ -594,6 +594,30 @@
       });
   }
 
+  /* Paste and IME text never reach the emulator's key handler, so the screen
+   * host forwards them to whichever session is live. Attached once: the
+   * listeners survive reconnects and always resolve the current session.
+   * Newlines become carriage returns because the guest line discipline
+   * expects CR from a terminal. */
+  screenEl.addEventListener("paste", function (event) {
+    if (!session || !event.clipboardData) {
+      return;
+    }
+    var text = event.clipboardData.getData("text");
+    if (!text) {
+      return;
+    }
+    event.preventDefault();
+    send(session, text.replace(/\r?\n/g, "\r"));
+  });
+  screenEl.addEventListener("beforeinput", function (event) {
+    if (!session || event.inputType !== "insertText" || !event.data) {
+      return;
+    }
+    event.preventDefault();
+    send(session, event.data);
+  });
+
   function buildTerminal(current) {
     return loadEmulator()
       .then(function () {

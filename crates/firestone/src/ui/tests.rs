@@ -2774,3 +2774,19 @@ async fn the_detail_head_reports_no_image_drift_for_a_catalog_alias() -> TestRes
     );
     Ok(())
 }
+
+/// Paste and IME insertText must reach the guest: the emulator's key handler
+/// never sees either, so term.js forwards both from the screen host. A merge
+/// once dropped that block and pasting into the terminal silently did nothing.
+#[test]
+fn the_terminal_forwards_paste_and_ime_text() {
+    let source = include_str!("../../assets/ui/term.js");
+    assert!(
+        source.contains("addEventListener(\"paste\""),
+        "term.js lost its paste forwarding"
+    );
+    assert!(
+        source.contains("insertText"),
+        "term.js lost its IME insertText forwarding"
+    );
+}
