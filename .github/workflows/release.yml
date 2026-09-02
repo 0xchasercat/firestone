@@ -92,7 +92,7 @@ jobs:
             grep -q "^version = \"$REQUESTED_VERSION\"\$" Cargo.toml ||
               { echo 'failed to bump Cargo.toml version' >&2; exit 1; }
 
-            for pkg in firestone firestone-core; do
+            for pkg in firestone firestone-core firestone-init firestone-initproto; do
               awk -v pkg="$pkg" -v old="$current_version" -v new="$REQUESTED_VERSION" '
                 $0 == "name = \"" pkg "\"" { in_pkg = 1 }
                 in_pkg && $0 == "version = \"" old "\"" { $0 = "version = \"" new "\""; in_pkg = 0 }
