@@ -24,6 +24,19 @@
 <p align="center">
   <img src="./docs/webui-screenshot.png" alt="Firestone WebUI" />
 </p>
+
+---
+
+<p align="center">
+  <sub>Sponsored by heretic bot mitigation and anti-fraud</sub><br/>
+  <a href="https://heretic.tech">
+    <img src="https://raw.githubusercontent.com/heretic-hq/.github/refs/heads/main/heretic-gh.png" width="800" alt="Sponsored by Heretic" />
+  </a>
+</p>
+
+---
+
+
 Firestone runs Linux virtual machines on Cloud Hypervisor, and it runs OCI container images as virtual machines too. It ships as one executable of about 22 MB with the VMM, `passt` and `qemu-img` inside it, so there is no daemon to keep alive and no libvirt to configure. Firestone runs as your user. A machine is a directory of plain files under `~/.local/share/firestone` that you can read with `ls` and `cat`, and every command prints each step, what it is waiting on, and how long it took.
 
 ## Install
